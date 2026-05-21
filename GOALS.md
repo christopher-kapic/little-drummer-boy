@@ -1,0 +1,2281 @@
+# cockpit-cli (cockpit) — Goals
+
+`cockpit` is an AI coding harness written in Rust. Its design is informed
+by [opencode](https://opencode.ai), [Claude Code](https://www.anthropic.com/claude-code),
+and [codex](https://github.com/openai/codex) — but it is **not** a
+drop-in for any of them. It has its own config files, its own session
+DB, and its own opinions about file locking, context pruning, and
+multi-harness orchestration.
+
+This document is the authoritative statement of *what* `cockpit` is for. Design
+trade-offs and feature-by-feature decisions live in the companion docs:
+
+- [`opencode-features-review.md`](./opencode-features-review.md) — a
+  design comparison with opencode (what to copy, what to deliberate,
+  what to skip). Not a compatibility map.
+- [`miscellaneous.md`](./miscellaneous.md) — Windows packaging, shell handling,
+  and other cross-cutting concerns that don't have a doc of their own.
+
+---
+
+## Strategic vision
+
+The feature set below is shaped by three load-bearing claims about
+who `cockpit` is for and how it competes:
+
+1. **Primary target: open-source models with ~120k context
+   windows.** The harness is deliberately optimized for OS models,
+   not for frontier models. Frontier models will of course work,
+   but optimizing for them is not the differentiator. This is
+   what drives the token-economy obsession (§10) and the
+   tool-input repair layer (§12) — they earn their keep
+   precisely because OS models bite harder on contract failures.
+2. **24/7 plan execution with human-in-the-loop.** The endgame is
+   a user who runs `cockpit` as a daemon, kicks off ralph plans,
+   and resolves questions from a phone or browser over the
+   course of a day. The system labor-multiplies the user, not
+   the user's context window. This is what drives the daemon-in-v1
+   (§8), the leaf-terminated invocation tree (§3a), the
+   needs-attention queue (§3b), and the caller-based `coder` mode
+   (§3b).
+3. **Remote control via dashboard (v2).** `cockpit connect` (§8d)
+   is a hosted WebSocket relay so users can monitor plans,
+   resolve needs-attention queue entries, and steer agents from
+   anywhere. The v1 daemon architecture is shaped to make this
+   layering trivial — same wire protocol, different transport
+   (§8c).
+
+When a design choice trades convenience for OS-model viability,
+OS-model viability wins. When a v1 decision constrains v2 (the
+remote dashboard), prefer the v1 decision that makes v2 easier
+even if it's marginally more work now.
+
+---
+
+## 1. Codex-style TUI
+
+The user-facing interaction loop is modeled on the **codex** TUI (built with
+`ratatui`). Concretely:
+
+- Full-screen TUI with a chat surface, composer at the bottom, and a status
+  line / footer.
+- Slash commands (`/model`, `/agent`, `/skills`, `/help`, etc.) discoverable
+  from a leader-less slash menu.
+- Streaming markdown rendering with syntax-highlighted code blocks.
+- Approval dialogs for sensitive actions.
+- Configurable keymap.
+
+Use `kcl ask codex "<question>"` whenever you need to inspect codex's
+behavior in detail — codex's own source is the reference implementation
+for "what does this look like."
+
+### 1a. TUI status line: cwd + git branch + context (always)
+
+The TUI must **always** show the current working directory, the git
+branch (when the cwd is inside a git repo), and a live **context usage
+indicator**. These are not opt-in via `/statusline`; they are part of
+the chrome.
+
+- cwd: shown abbreviated (`~/p/d/cockpit-cli`) when it would otherwise
+  overflow.
+- git branch: shown with a leading `` symbol; absent (no slot, no
+  placeholder) when the cwd is not a git repo.
+- context: `ctx 65% → 42% prunable` — current fraction of the active
+  model's window, plus the projected fraction after `/prune` would run.
+  Ambient at all times; promoted (color shift, bolder treatment) when
+  current usage crosses a configurable threshold (default 80%) so the
+  user notices when the decision matters but isn't trained to ignore a
+  constantly-screaming number.
+- active agent: the name of the agent currently driving the
+  conversation (e.g. `orchestrator-build`, `coder`, `explore`).
+  Required because interactive subagents become the primary while
+  they work (§3b) — the user must always know who they're talking
+  to. Visually distinct from the cwd / branch slot.
+
+### 1b. Vim keybinds in the composer
+
+Editing the prompt with arrow keys is unacceptable. The composer **must**
+support a Vim-mode editor with the standard Vim keybinds:
+
+- Normal mode: `h j k l w b e 0 $ gg G x D Y p P i a I A o O d{motion}
+  y{motion}`.
+- Insert mode: `Esc` returns to normal mode; everything else passes through
+  to the standard editor.
+- Toggle is a **default-on** preference (not opt-in like codex's `/vim`),
+  but can be disabled in `config.json` or via a slash command for users
+  who want raw editor mode.
+
+Implementation may borrow heavily from codex's `textarea.rs` Vim
+state machine.
+
+### 1c. Composer behavior: queued-message editing (must-have)
+
+The user must be able to **type and send while the model is busy**.
+Messages sent during a model turn are added to a per-session
+**queue**, and the queue is delivered with the next inference
+request the runtime makes for that session — not the next *user
+turn*, but the next *inference call*. So if the model is mid-tool-
+loop, the queued message rides along on the next tool-result →
+inference round-trip. The agent sees the user's input as soon as
+the runtime is going to talk to the model anyway.
+
+Three behaviors are required, and they are non-negotiable:
+
+1. **Up-arrow in an empty composer pops the most recently queued
+   message back into the composer for editing — and removes it
+   from the queue.** opencode loads the message into the composer
+   but leaves the original in the queue, so the same message gets
+   sent twice. That bug is the reason this is called out as a
+   must-have. cockpit's rule: pop is destructive. Edit, then either
+   re-send (queues at the tail again) or `Esc` / `Ctrl+C` to
+   discard. Repeated up-arrows pop progressively older queued
+   messages, then fall through to the standard send-history
+   recall once the queue is empty.
+2. **Multiple queued messages are folded into one message** before
+   being sent. Two consecutive queued items `A` and `B` become a
+   single user message `A\n\nB`. The user composed them as
+   separate thoughts; the model sees one coherent message. No
+   special framing or numbering — the user added structure if
+   they wanted it.
+3. **The queue is delivered at the next inference boundary**, not
+   buffered until the model finishes its turn. Mid-tool-loop:
+   the next tool result going back to the model has the queued
+   message attached as the next user content. End-of-turn: the
+   queue is delivered as the first content of the next request.
+   Empty: no queue, no behavior change.
+
+Affordances:
+
+- The chrome shows a queued-count indicator (`queued: 2`) so
+  the user knows what's pending.
+- `/queue` (no args) shows the queue stack and lets the user
+  drop or reorder; `/queue clear` empties it.
+- The active-agent name in the chrome (§1a) tells the user *who*
+  the queued messages will be delivered to — important when an
+  interactive subagent has been swapped into the foreground
+  (§3b).
+
+Interaction with interrupt: `Enter` sends/queues; the explicit
+interrupt path (`Ctrl+C` or `Esc Esc`, TBD) cancels the in-flight
+model call without affecting the queue.
+
+### 1d. Exit leaves the transcript tail in the terminal
+
+When the user runs `/exit` (or `Ctrl+D` from an empty composer),
+cockpit tears down the TUI but **writes the tail of the conversation
+to the primary terminal buffer** before quitting. The user can
+scroll up in their terminal and copy commands, paths, or any text
+the agent produced in the last few turns.
+
+This is a deliberate divergence from the typical
+full-screen-TUI-in-alt-screen pattern, where exiting wipes
+everything the user saw during the session. Claude Code does
+this right (it renders directly in the primary buffer the whole
+time); opencode and codex use the alt screen and the session is
+gone on exit. cockpit splits the difference: alt screen *during*
+the session for the clean full-screen experience (status line,
+floating slash menu, approval dialogs), then on exit it leaves
+the alt screen and prints the last N turns to stdout before
+returning control to the shell.
+
+- **Default:** the last 3 turns (or everything since the last
+  `/clear`, whichever is fewer).
+- **Configurable:** `tui.exit_tail_turns` in `config.json`. Set to
+  `0` to disable (clean exit, no tail); set to `-1` for the whole
+  session.
+- **Formatting:** transcript is rendered in a copy-friendly form —
+  no box characters, no color codes (or stripped via `NO_COLOR`
+  semantics), agent names prefixed (`orchestrator-build:`,
+  `coder:`) so multi-agent sessions stay readable. Code blocks
+  preserved verbatim. The point is: commands the agent gave you
+  should paste cleanly.
+
+### 1e. Composer `@`-tagging: inline files and directories
+
+The user can `@`-tag files and directories in the composer. When
+the message is sent, cockpit inlines the referenced content into
+the request **before** it reaches the model. This is a composer
+feature (the TUI does the inlining); the model sees a normal
+user message with the file content attached, not a special
+syntax.
+
+Syntax:
+
+- `@path/to/file.rs` — inline the file. Path is resolved
+  relative to the cwd; absolute paths work too. Tab-completion
+  in the composer offers file/directory completions.
+- `@path/to/file.rs:10-80` — inline lines 10 through 80
+  inclusive (1-indexed, half-open or closed range is the same
+  syntax Claude Code uses — closed range here). For a single
+  line: `@file.rs:42`.
+- `@path/to/dir/` (trailing slash, or detected directory) —
+  inline a directory listing (name + type + size, sorted),
+  not its contents recursively.
+
+Behavior:
+
+- **The `read` tool is what does the inlining.** The composer
+  calls `read(path, offset?, limit?)` (per the relational-
+  default rules in §12, where defaulting `limit` to 2000 lines
+  prepends a one-line note) and pastes the result into the user
+  message between fenced markers (`<file path="...">...</file>`)
+  so the model can disambiguate user prose from inlined content.
+  Same chokepoint as the model-invoked `read` — same truncation
+  marker, same redaction, same byte cap.
+- **Directory listings have their own cap.** Default 100
+  entries, sorted (directories first, then alphabetical). If
+  the directory has more, the footer is `... N more entries;
+  @-tag a subdirectory or ask explore for a search`. **All
+  files are listed by default**, including hidden
+  (`.`-prefixed) files and files matching `.gitignore`
+  patterns — knowing a file exists is much lower-risk than
+  sharing its contents, and the user usually wants to see
+  the whole directory when they tag it. Users who want
+  quieter listings can set
+  `composer.tagging.list_hidden_in_directories = false` to
+  drop dot-prefixed entries from `@dir/` output.
+- **Long files are partial-read by default.** If the inlined
+  content would exceed the `read` tool's standard byte cap
+  (~8 KB), the trailing portion is truncated with the same
+  marker the model sees: `... [truncated, ask read with
+  offset/limit to see more]`. The model can then re-`read` the
+  rest itself. The user can also pass an explicit range to
+  override the default cap.
+- **Redaction runs over inlined content.** A `.env` file
+  tagged with `@.env` is scanned for secret-shaped values
+  before the request is built (§7). Same chokepoint, no
+  bypass — `@`-tagging is one more input source for the
+  redaction layer to handle.
+- **Inlining cost is visible.** The composer's queued-count
+  indicator (§1c) gains an "attached: N files, ≈M tokens"
+  affordance so the user sees how much they're spending on
+  this turn before they hit Enter.
+
+- **Gitignored files cannot be `@`-tagged by default.** If
+  the cwd is inside a git repo, cockpit parses the active
+  `.gitignore`s (`<repo>/.gitignore`, ancestor
+  `.gitignore`s, `.git/info/exclude`, and the user's
+  `core.excludesfile`) and **refuses** to inline files that
+  match. The refusal message names the matched pattern and
+  the rationale: *"`.env` matches `.gitignore` pattern
+  `.env`; gitignored files are blocked from @-tagging
+  because they frequently contain secrets. Enable
+  `composer.tagging.allow_gitignored_files` to override
+  (see §4)."* The redaction layer (§7) is the last line of
+  defense, but blocking at the input boundary is cheaper
+  and surfaces the choice to the user. Outside a git repo,
+  no `.gitignore` semantics apply — all readable files are
+  tag-able.
+
+Failure modes:
+
+- `@nonexistent.rs` — composer shows a warning inline and
+  refuses to send until the user fixes or removes the tag.
+  Silently dropping a tag would be confusing.
+- `@huge-binary.bin` (matches a binary heuristic: NUL bytes in
+  the first 1KB, or extension blacklist) — refused with a
+  message suggesting `head` via the bash tool if the user
+  really meant it.
+- Symlinks resolve to their target; loops are detected and
+  refused. The gitignore check runs against the **target**
+  path, not the link path — a symlink into a gitignored
+  directory is still blocked.
+
+---
+
+## 2. cockpit-native config
+
+`cockpit` has its own config files, in its own locations. It does **not**
+parse opencode's `opencode.json` / `.opencode/` directories, and it
+does not write to opencode's locations. An earlier draft of this doc
+promised a drop-in opencode replacement; that goal was dropped — the
+implementation complexity and the constant pull toward opencode's
+schema were a poor trade for the convenience of "no migration step."
+
+Layout — **layered, with walk-up discovery.** cockpit's config is
+not a single global file with a single project overlay; it's a chain
+of `.cockpit/` directories the resolver walks up from cwd, with
+more-specific (deeper) layers overriding less-specific (shallower)
+ones.
+
+Discovery algorithm:
+
+1. Start at cwd. For each ancestor directory, check for a
+   `.cockpit/` directory. Collect every hit, deepest-first.
+2. **Stop at the first ancestor that is one of `$HOME`, `/srv`, or
+   `/opt`** — *inclusive*: that directory's own `.cockpit/` is
+   read before the walk halts. This keeps the search from leaking
+   past `$HOME` into `/`, and prevents service trees under
+   `/srv/<orgname>/<project>/...` or `/opt/<vendor>/<project>/...`
+   from reading siblings they shouldn't.
+3. If cwd is not under any of those three roots (e.g.
+   `/tmp/scratch`), skip the upward walk and use only
+   `<cwd>/.cockpit/` (if present) plus the home-level configs
+   in step 4.
+4. Home-level configs are always considered: `~/.cockpit/`
+   (least specific — broadest user-level default) and
+   `~/.config/cockpit/` (XDG-canonical user-level). When both
+   exist, `~/.config/cockpit/` overrides `~/.cockpit/` on
+   conflict (matching the "more-specific wins" rule and the
+   intent of the ordering above).
+5. `COCKPIT_CONFIG` env var overrides discovery entirely — when set,
+   it points at one specific config file used in place of the walk.
+
+Example: cwd `~/projects/orgname/projectparent/project` reads (in
+order from most-specific to least-specific):
+
+1. `~/projects/orgname/projectparent/project/.cockpit/`
+2. `~/projects/orgname/projectparent/.cockpit/`
+3. `~/projects/orgname/.cockpit/`
+4. `~/projects/.cockpit/`
+5. `~/.config/cockpit/`
+6. `~/.cockpit/`  (inclusive stop at `$HOME`)
+
+Each discovered `.cockpit/` directory may contain `config.json`,
+plus optional `agents/`, `commands/`, and `skills/` subdirectories.
+Agent, command, and skill discovery walks the same chain (§3, §5).
+
+The motivation is that one user often has meaningfully different
+defaults across `~/projects/orgname-a/` and `~/projects/orgname-b/`
+(different models, different agents, different permission rules)
+and a flat global-plus-project model forces them to re-declare
+org-level decisions in every project. Layering with a per-directory
+override gives "set the rule once at the level it applies to."
+
+The config schema is cockpit's own. We are free to borrow opencode's
+schema shape where it's good (the `permission` block's
+allow/ask/deny model, the agent-frontmatter format, the
+provider-block structure), but the file names, directory layout,
+and exact key set are ours. Migration from opencode is a one-shot
+`cockpit config import-from-opencode` command, not an ongoing dual-read.
+
+### 2a. The `extended-config.json` collapse
+
+The original design split cockpit's config into two files:
+`opencode.json` (compat layer) plus `extended-config.json`
+(cockpit-only). With opencode-compat dropped, there's no longer a
+reason for two files — everything goes into `config.json`. The
+keys formerly described in §4 below now live under top-level
+namespaces in the single config file. Migration: trivial; we
+weren't shipping `extended-config.json` separately yet.
+
+### 2b. Merge modes
+
+When more than one layer is discovered (per §2), the resolved
+config is the merge of every layer from least-specific to
+most-specific. The merge isn't uniform — each config field is
+**tagged in the schema** with one of four merge modes:
+
+- **`replace`** — smaller-scope value wins outright; parent is
+  dropped. Default for scalars.
+- **`concat`** — values from all scopes are combined. May be paired
+  with a negative counterpart list (e.g. `redact.allowlist` +
+  `redact.denylist`; the resolved set is `(∪ allowlists) − (∪
+  denylists)`).
+- **`key-merge`** — concat + smaller-scope wins per key; the list
+  is treated as a map keyed by an identifier field. The schema
+  must specify the key identifier and any normalization rules
+  (whitespace, glob equivalence, etc.).
+- **`deep-merge`** — for maps; recurse into nested keys. Default
+  for map-shaped fields.
+
+A single global merge rule does not work for every field: `agents`
+wants replace-on-collision (a project re-declaring an agent should
+drop the parent version), `redact.allowlist` wants concat (a global
+list of test-fixture strings should not be lost when a project adds
+project-specific allowlist entries), and `providers.*` wants
+deep-merge (a project setting `providers.anthropic.base_url` must
+not nuke the global `providers.anthropic.api_key`). The four-mode
+taxonomy is the smallest set that covers every case seen so far.
+
+Per-field tags live alongside each schema field in §4.
+
+### 2c. `/config` TUI
+
+The TUI `/config` slash command opens a tabbed window — one tab per
+discovered config layer plus an implicit "merged" view — for
+inspecting and editing each layer in isolation. Each tab includes:
+
+- The on-disk path of that layer's `config.json` (or "not yet
+  created at this level" with a **create-file affordance** so users
+  can introduce a new layer at, e.g., `~/projects/orgname/.cockpit/`
+  without leaving the TUI).
+- A form over a curated subset of high-traffic settings (model,
+  default agent, vim mode, redaction toggle, theme).
+- An "open in `$EDITOR`" escape hatch for everything the form
+  doesn't cover.
+
+Curated form over auto-reflected schema is deliberate: full
+reflection would make every new config field a UI task and the
+editor would drift out of sync with the schema. Curated means some
+settings still require hand-editing the file — the open-in-editor
+affordance is the escape hatch for everything not in the form.
+
+The resolver runs in the daemon (§8): the TUI never walks the
+filesystem itself. It receives a structured `{layers: [...],
+merged: {...}}` payload over the daemon wire schema and renders
+tabs from it. The same payload is what the v2 websocket relay
+will deliver to remote clients (§8d) — one config surface, two
+transports.
+
+---
+
+## 3. Arbitrary agent definition files
+
+Most coding harnesses require agent files to live in a fixed config
+directory. That's limiting: many users have agent definitions that
+live elsewhere — in shared dotfiles repos, in another tool's
+config, or checked into a project at a path other than the default.
+
+`cockpit` allows arbitrary agent paths. Three mechanisms:
+
+1. **Per-invocation flag**: `cockpit --agent-file ./path/to/agent.md run "…"`
+   — load this single file as the active agent for this invocation,
+   regardless of where it lives.
+2. **Directory inclusion**: in `config.json`, an `agent_dirs: []`
+   array adds extra directories to the agent search path. Files in
+   these directories are merged with the cockpit-native locations
+   (`<project>/.cockpit/agents/`, `~/.config/cockpit/agents/`).
+3. **Symlink-friendly**: the standard pattern of symlinking external
+   directories into the agents folder continues to work (e.g.
+   `~/.config/cockpit/agents/ralph2 -> ~/.ralph2/agents`). This
+   is supported by file-system semantics; cockpit just doesn't fight it.
+
+Agent files use a frontmatter shape compatible with
+opencode/Claude-Code-style agent definitions (`description`, `mode`,
+`model`, `temperature`, `tools`, `permission`, `prompt`, etc.) — we
+borrow the format because it's well-designed, not because we promise
+file-level compatibility. An agent file written for opencode will
+parse cleanly in cockpit; the reverse is not guaranteed if the cockpit
+agent uses keys that opencode doesn't recognize.
+
+### 3a. Bundled agent cast (v1)
+
+cockpit ships five built-in agents (two orchestrator variants + three
+specialists). The cast is deliberately minimal — these compose into
+"plan ↔ build → look at project → look at deps → write." Anything
+else is a user-authored agent.
+
+| Agent                 | Mode     | Cwd | Purpose |
+|-----------------------|----------|-----|---------|
+| `orchestrator-build`  | primary  | project root | The traditional coding-harness experience. Owns the user's conversation when the focus is *making the change*. Tools: `read` (shallow inspection of files the user references; not for searching), `task` (delegation), `skill`. May invoke `explore` interactively (one at a time) or in the background (multiple in parallel). May invoke `coder` interactively (one at a time). Does not directly `write`/`edit` and does not hold file locks. |
+| `orchestrator-plan`   | primary  | project root | Ralph-style planner. Owns the user's conversation when the focus is *deciding what to do*. Tools: `read` (shallow inspection), `task`, `skill`, plus plan-graph tools (create / append / update / delete / trigger). Sees in-progress and not-yet-implemented plans (completed plans are hidden by default; see "plan visibility" below). Triggering hands the plan off to the ralph executor (see §3b "Background agents") — `orchestrator-plan` does **not** hold the user's conversation while the plan runs; the user keeps talking to `orchestrator-plan` about other plans. Delegates to `explore` (interactive one-at-a-time, or background multi-parallel). Does not write code. |
+| `explore`             | subagent | project root | Read-only investigator over the **current project**. Tools restricted to `read`/`glob`/`grep`. Cannot invoke subagents. Returns `file:line` citations, not prose summaries. |
+| `coder`               | subagent | project root | The only agent that holds file locks and writes/edits. Tools: `read`/`readlock`/`write`/`writeunlock`/`unlock`/`edit`/`glob`/`grep`/`bash`/`task`. The `task` permission is scoped to `docs` only (noninteractive, may run multiple in parallel). Receives a scoped task from its caller, makes the changes, returns a structured report. Mode is set by caller: interactive when invoked by `orchestrator-build`, noninteractive when invoked by the ralph executor (see §3b). |
+| `docs`                | subagent | `agents.docs_dir` (configurable; see §4) | Read-only investigator over the **docs directory** — a user-configured location with dependency source code cloned into subdirectories. Same `read`/`glob`/`grep` surface as `explore`, same citation-style output. Cannot invoke subagents. |
+
+**Why two orchestrators.** "Plan" and "build" are different
+cognitive modes, not different priorities of the same mode. A
+planning conversation talks about the *graph* (nodes, edges,
+dependencies, what to do next); a building conversation talks
+about the *code* (this file, this function, this diff). Bundling
+both into one agent forces the model to context-switch every turn
+and produces worse output in both modes. `/plan` and `/build`
+slash commands swap which orchestrator owns the conversation.
+
+**Structural payoff of the specialist split.** Only `coder`
+writes. The file-lock manager (`plan.md` §4.1) therefore has a
+single writer per delegation tree — much simpler concurrency
+reasoning than "any agent might write at any time." Parallel
+`coder` instances (under graph plans driven by `orchestrator-plan`)
+are arbitrated by the lock manager as designed.
+
+**Invocation tree (who can spawn whom).** The hierarchy is
+deliberately shallow and leaf-terminated:
+
+```
+orchestrator-build → explore, coder
+orchestrator-plan  → explore   (+ triggers plans via the ralph executor)
+coder              → docs
+explore            → (leaf, cannot spawn)
+docs               → (leaf, cannot spawn)
+```
+
+The leaf-termination rule (explore and docs cannot spawn) is what
+keeps context aggregation tractable: every delegation tree has a
+bounded depth and a single writer.
+
+**Orchestrators may read, but should delegate searches.** Both
+orchestrators get `read` so the user can `@`-tag a file (see §1e)
+or ask "what does foo.rs say on line 42?" without a subagent
+round-trip. The `read` tool's description, when surfaced to
+orchestrators, includes a one-line nudge: *"For multi-file
+investigation, codebase searches, or anything you'd describe
+as 'figuring out where X lives,' spawn an `explore` subagent
+instead — it returns `file:line` citations under a token cap."*
+Orchestrators do **not** get `glob` or `grep` directly — those
+are the routes that earn the explore round-trip.
+
+**Plan visibility on `orchestrator-plan`.** To keep the context
+manageable on long-lived projects, `orchestrator-plan` sees only
+**in-progress** and **not-yet-implemented** plans by default.
+Completed plans are hidden from the default view but remain
+accessible on request (`/plans completed`, or by name). A config
+knob `plans.hide_completed_after_days` (default `30`) sets how
+quickly completed plans drop out of the agent's working set.
+Additionally, **on completion** each plan's transcript is
+summarized into a one-paragraph result so the graph view stays
+roughly fixed-size regardless of project age.
+
+**Triggering plans is explicit, not automatic.** Plans never
+run on their own — the user (or the user-controlled agent)
+must trigger each run. This is so a workflow like "implement
+plan A, review the PR, pull main, then start plan B" can avoid
+merge conflicts the planner couldn't have predicted.
+
+Users who want named personas, or who want a reviewer / committer /
+researcher role, author their own agent files (see mechanisms 1-3
+above). The bundled cast does not grow opportunistically.
+
+### 3b. Subagents vs background agents
+
+cockpit distinguishes two delegation models that share machinery
+but serve very different purposes:
+
+#### Subagents
+
+A subagent is spawned by an orchestrator (or by another
+non-leaf agent like `coder` → `docs`) for a *scoped piece of work*.
+Subagents run in two modes; **the mode is set by the caller, not
+by the subagent**.
+
+- **Noninteractive.** The subagent runs to completion without
+  user interaction; the caller receives only the final structured
+  report. Reports are token-capped (see §10). This is the
+  classic delegate-and-report pattern (`plan.md` §3d). Multiple
+  noninteractive subagents may run in parallel under a single
+  caller — this is how `orchestrator-build` / `orchestrator-plan`
+  fan out `explore`, and how `coder` fans out `docs`.
+
+- **Interactive.** The subagent **becomes the primary agent**
+  while it works. The user sees the subagent's outputs in the
+  composer, talks to it directly, and approves its actions. The
+  caller is paused — its conversation is preserved, just not
+  active. When the subagent completes (or the user explicitly
+  returns control), the caller resumes and receives the
+  subagent's report. Interactive subagents are strictly
+  one-at-a-time per caller (only one agent can hold the user's
+  conversation at a time).
+
+  In interactive mode, the user sometimes asks the subagent for
+  things that are *outside its assigned task* — "while you're at
+  it, also check X" or "what was the orchestrator going to do
+  next?". The subagent doesn't try to do them itself (scope
+  discipline is what makes the report contract work). Instead it
+  uses a `defer_to_caller(message)` tool to **write the request
+  into a deferred-request log** and continues with its assigned
+  task. When the caller resumes, it reads its subagent's report
+  plus the deferred-request log, and decides what to do about
+  each entry (spawn a follow-up subagent, answer the user
+  directly, ask a clarifying question, etc.).
+
+  The TUI must make active-agent identity unambiguous —
+  current-agent name shown in the chrome (alongside cwd / branch /
+  ctx%) so the user always knows who they're talking to.
+
+**Caller-based mode selection for `coder`.** `coder` is a special
+case because it has two callers with opposite needs:
+
+- Invoked by `orchestrator-build` (the user is hands-on): `coder`
+  runs **interactive** (the user can intervene mid-edit, see what's
+  about to be written, approve actions). One coder at a time per
+  user session.
+- Invoked by the **ralph executor** (background plan execution;
+  see "Background agents" below): `coder` runs **noninteractive**.
+  Multiple coders may run in parallel across plan nodes, arbitrated
+  by the file-lock manager. Each `coder` can `raise_interrupt(
+  description, question?)` to pause itself and push an item onto
+  the daemon's **needs-attention queue** (see §8).
+
+##### Interrupt payload schema
+
+Every `raise_interrupt` call has a `description` (always) and an
+optional `question`. The description is free-text — what
+happened, why the agent paused, what state the work is in.
+**If no question is provided, the user resolves with a free-text
+reply** (often empty, meaning "you can continue"):
+
+> Description: *"I could not modify `/etc/hosts` because I
+> don't have OS-level write permission for it. Please `chmod`
+> the file (or `sudo` me into it) and let me know when it's
+> good to go."*
+>
+> User resolves with: *(empty)* — agent reads as "continue"; or
+> *"I modified the file for you, continue."* — agent reads as
+> context for its next action.
+
+When the agent does have a specific question, it sets
+`question.kind` to one of three shapes:
+
+- **`single`** — mutually-exclusive options. Used for yes/no
+  questions and "which one?" decisions.
+
+  ```jsonc
+  {
+    "kind": "single",
+    "prompt": "The migration adds a NOT NULL column. Backfill strategy?",
+    "options": [
+      { "id": "default_now",    "label": "Backfill with NOW()" },
+      { "id": "default_null",   "label": "Allow NULL, backfill later" },
+      { "id": "block_writes",   "label": "Take a brief write lock and backfill atomically" }
+    ],
+    "allow_freetext": true   // user may also reply with a free-text alternative
+  }
+  ```
+
+- **`multi`** — non-mutually-exclusive options. Used when the
+  agent is enumerating things to do/skip.
+
+  ```jsonc
+  {
+    "kind": "multi",
+    "prompt": "Which test files should I update?",
+    "options": [
+      { "id": "auth",     "label": "tests/auth.rs" },
+      { "id": "session",  "label": "tests/session.rs" },
+      { "id": "redact",   "label": "tests/redact.rs" }
+    ],
+    "allow_freetext": true   // user may add an additional option
+  }
+  ```
+
+- **`freetext`** — no options; just a question. The user types
+  the answer.
+
+  ```jsonc
+  {
+    "kind": "freetext",
+    "prompt": "What error message did the CI run show? (paste relevant section)"
+  }
+  ```
+
+`allow_freetext` on `single` and `multi` gives the user a
+permanent escape hatch — agents can't always predict the right
+option set, and the cost of being wrong is the user can't reply
+at all. Defaulting `allow_freetext: true` is the safer choice;
+agents may set it `false` only when the option list is truly
+exhaustive (rare).
+
+The daemon's needs-attention queue (§8) stores these payloads
+verbatim; the TUI client and the future web/mobile client both
+render the same schema. Resolution writes a typed answer back
+to the paused agent, which resumes from its tool call.
+
+#### Background agents = ralph plan executions
+
+Background agents are **not** a separate kind of agent — they are
+**plan executions run by the ralph executor**, decoupled from
+the user's interactive conversation.
+
+Concretely:
+
+- When `orchestrator-plan` (or the user directly, via slash
+  command) triggers a plan, control passes to the **ralph
+  executor**, a daemon-resident process (see §8) that walks the
+  plan graph and spawns `coder` / `explore` / `docs` subagents to
+  execute each node.
+- The ralph executor is the *caller* for all subagents it spawns,
+  so subagent reports flow back to it (not to `orchestrator-plan`,
+  which has moved on to the user's next request).
+- These subagents run **noninteractive** by default — they
+  produce reports, not real-time conversation. When a `coder` in
+  this mode needs human input, it uses `raise_interrupt` to push
+  a typed question onto the needs-attention queue. The
+  user resolves the question from the TUI (or, later, a remote
+  client per §8), the answer is delivered to the paused agent,
+  and execution continues.
+- Status, progress, deferred questions, and final reports for
+  every running plan are observable via the daemon's event
+  stream — this is what powers the future dashboard surface.
+
+**Why "background agent" is just a perspective, not a kind.**
+The same `coder` binary running the same prompt has different
+*caller semantics* depending on whether `orchestrator-build` or
+the ralph executor spawned it. Modeling them as one primitive
+keeps the file-lock manager, redaction layer, and tool registry
+single-implementation. The difference is purely about which
+process holds the report-back end of the channel.
+
+---
+
+## 4. Config schema (`config.json`)
+
+> **Note:** Prior drafts split this into a separate
+> `extended-config.json` layered on top of opencode's config (see
+> §2a on the collapse). With opencode-compat dropped, the schema
+> below lives as the *top level* of cockpit's own `config.json`, under
+> the namespaces shown. Schema field names are otherwise unchanged.
+
+**Merge modes (per §2b).** Each field below is tagged with the
+merge mode the resolver uses when combining layers:
+
+| Field                                                 | Merge mode |
+|-------------------------------------------------------|------------|
+| `harnesses`                                           | `deep-merge` |
+| `agent_guidance_files`                                | `replace` |
+| `default_delegation`                                  | `replace` |
+| `agent_dirs`                                          | `concat` |
+| `agents.docs_dir`                                     | `replace` |
+| `redact.{enabled, scan_environment, scan_dotenv, min_secret_length, placeholder}` | `replace` |
+| `redact.extra_dotenv_paths`                           | `concat` |
+| `redact.allowlist`                                    | `concat`; subtracted by `redact.denylist` |
+| `redact.denylist`                                     | `concat`; subtracts from `redact.allowlist` |
+| `tui.*`                                               | `replace` per scalar |
+| `composer.tagging.*`                                  | `replace` per scalar |
+| `permission` (added per §6a)                          | `key-merge` by `tool` pattern, smaller-scope ordered first — *pending confirmation* |
+| Discovered agent set (`.cockpit/agents/` per §3)  | `key-merge` by agent name |
+
+The `redact.allowlist` / `redact.denylist` pair is the canonical
+example of paired concat: the resolved set is `(∪ allowlists) −
+(∪ denylists)`. All denylists subtract from the union, not just
+the smallest-scope one. That lets a project add a one-off
+redaction the global config doesn't know about *and* punch a hole
+in a global allowlist when needed.
+
+Initial schema:
+
+```jsonc
+{
+  "$schema": "https://app.flycockpit.dev/schema/config.json",
+
+  // 4a. Other harnesses on the device.
+  // The key is the harness name; the value describes how to invoke it.
+  // See ralph-rs and kctx-local for the same shape.
+  "harnesses": {
+    "claude": {
+      "command": "claude",
+      "args": ["-p", "{prompt}"],
+      "prompt_mode": "arg",            // "arg" | "stdin"
+      "model_args": ["--model", "{model}"],
+      "default_model": null,
+      "supports_skills": true,
+      "supports_agent_file": true,
+      "agent_file_args": ["--agent-file", "{agent_file}"]
+    },
+    "codex": {
+      "command": "codex",
+      "args": ["exec", "{prompt}"],
+      "prompt_mode": "arg",
+      "model_args": ["-m", "{model}"]
+    },
+    "opencode": {
+      "command": "opencode",
+      "args": ["run", "{prompt}"],
+      "prompt_mode": "arg",
+      "model_args": ["-m", "{model}"]
+    }
+  },
+
+  // 4b. Agent guidance file resolution.
+  // The first existing file in the cwd (or its ancestors up to the git root)
+  // wins. If none match, no guidance file is loaded. The order matters.
+  "agent_guidance_files": [
+    "AGENTS.md",
+    "CLAUDE.md",
+    ".github/copilot-instructions.md",
+    ".cursorrules"
+  ],
+
+  // 4c. Multi-context primitives.
+  // Both run in-process; this isn't about subprocess isolation.
+  //
+  // - subagent: child agent with a FRESH, scoped context (just a task
+  //   brief — no inherited conversation). Returns a structured report;
+  //   parent never sees the transcript. Pattern: "delegate this scoped
+  //   piece of work; report back."
+  //
+  // - fork: branch the parent's conversation thread at a turn boundary.
+  //   The branch INHERITS the parent's history up to the fork point and
+  //   diverges from there. Both branches continue independently; the
+  //   user (or agent) can switch between them. Pattern: "explore an
+  //   alternative direction from here." (Codex's ForkSnapshot model,
+  //   oh-my-pi's branch summaries.)
+  //
+  // The two are complementary, not mutually exclusive — a session uses
+  // whichever fits the moment. The config knob below sets the DEFAULT
+  // for the `task` tool when neither the model nor the user picks.
+  "default_delegation": "subagent",    // "subagent" | "fork"
+
+  // 4d. Agent search paths beyond cockpit's built-in locations (see §3).
+  "agent_dirs": [
+    "~/dotfiles/agents",
+    "/srv/team-agents"
+  ],
+
+  // 4d-bis. Docs directory — read-only source-code clones of
+  // dependencies, scoped to the `docs` bundled agent (see §3a,
+  // plan.md §4.6.d). Convention is `<docs_dir>/<repohost>/<org>/<repo>`
+  // (e.g., `~/packages/github.com/tokio-rs/tokio`). Population is the
+  // user's responsibility (manual `git clone`, or a future
+  // `cockpit docs add <repo>` helper).
+  "agents": {
+    "docs_dir": "~/packages"
+  },
+
+  // 4e. Secret redaction (see §7) — toggles and additional sources.
+  "redact": {
+    "enabled": true,
+    "scan_environment": true,
+    "scan_dotenv": true,
+    "extra_dotenv_paths": [],
+    "min_secret_length": 8,           // skip short env values that would false-positive
+    "placeholder": "***redacted-by-cockpit***",
+    "allowlist": [],                  // values to NEVER redact (test fixtures, etc); concat across layers (§2b)
+    "denylist": []                    // values to ALWAYS redact (project-specific); concat across layers; subtracts from allowlist (§2b)
+  },
+
+  // 4f. TUI preferences.
+  "tui": {
+    "vim_mode": true,
+    "show_cwd": true,
+    "show_branch": true
+  },
+
+  // 4g. Composer @-tagging (see §1e).
+  "composer": {
+    "tagging": {
+      // DANGEROUS. When true, @-tagging is allowed on files matching
+      // .gitignore patterns. Defaults to false because gitignored
+      // files commonly contain secrets (`.env`, key material, build
+      // outputs) and the redaction layer (§7) is a last line of
+      // defense, not a first one. Enable per-project, not globally,
+      // unless you trust every project's `.gitignore` discipline.
+      "allow_gitignored_files": false,
+
+      // When true (default), @dir/ listings include dot-prefixed
+      // entries and gitignored entries — knowing a file exists is
+      // much lower-risk than sharing its contents, and a complete
+      // listing is what users usually want. Set false to omit
+      // dot-prefixed entries from listings (gitignored entries are
+      // still shown — set `.gitignore` entries themselves to hide
+      // them at the source).
+      "list_hidden_in_directories": true
+    }
+  }
+}
+```
+
+`cockpit` mutates this file via its own commands (e.g. `cockpit harness
+add`, `cockpit redact disable`). No other tool reads or writes it.
+
+---
+
+## 5. Claude skills support
+
+`cockpit` supports Claude-Code-style skills. Skill discovery walks
+both cockpit-native locations and the cross-tool sharing locations
+that other harnesses also read (so a user's `~/.claude/skills/`
+investment doesn't have to be duplicated):
+
+- `<cwd>/.cockpit/skills/*/SKILL.md` and ancestors up to the git
+  worktree root.
+- `<cwd>/.claude/skills/*/SKILL.md`, `<cwd>/.agents/skills/*/SKILL.md`
+  — cross-tool sharing locations.
+- `~/.config/cockpit/skills/` — cockpit's per-user location.
+- `~/.claude/skills/`, `~/.agents/skills/` — cross-tool sharing
+  locations.
+
+We read the cross-tool locations because skills are *content* the
+user authored, not config, and demanding duplication into a
+cockpit-only directory would be hostile. We do **not** read opencode's
+config-tree skill locations (`.opencode/skills/`,
+`~/.config/opencode/skills/`) — those are inside opencode's config
+directory, and reading them would imply the broader opencode-config
+compatibility we dropped (§2).
+
+Skills are loaded on-demand via a native `skill` tool exposed to
+the model. The frontmatter shape is the Claude-compatible one
+(`name`, `description`, plus an optional `model`-gated trigger
+block).
+
+`cockpit` does **not** require a separate `cockpit init` to enable skills
+— they are auto-discovered.
+
+---
+
+## 6. `cockpit meta` — meta-harness
+
+`cockpit meta` is a top-level subcommand that turns `cockpit` into an
+orchestrator over **other** harnesses on the device. From inside `cockpit
+meta`, the agent can:
+
+- Invoke any harness declared in `config.json`'s `harnesses` block,
+  including `cockpit` itself recursively.
+- Read and manage `ralph-rs` plans and runs (`cockpit meta ralph status`,
+  `cockpit meta ralph run …`). `ralph` loops and `cockpit meta` are designed to
+  cooperate: a meta-agent can launch a ralph plan, watch it, and resume on
+  failure.
+- Inspect `kctx`-style codebase Q&A across local clones.
+
+The meta-harness is itself just a `cockpit` agent (the agent file ships with
+`cockpit`) plus a small set of built-in tools:
+
+- `harness_invoke(name, prompt, agent_file?, model?)` — non-interactive
+  call into another harness; returns stdout/stderr/exit.
+- `ralph_*` family — list/show/run/resume/cancel plans.
+- `cockpit_subagent(prompt, agent?)` — recursive `cockpit` invocation.
+
+The intent is that **`cockpit meta` is the primary entry point for users
+who do not have a single preferred harness** — it is the harness that
+picks the harness.
+
+---
+
+## 7. Environment-variable redaction
+
+Before any prompt — system, user, tool result, retry, anything — is sent
+to a model provider, `cockpit` scans it for environment variable values and
+substitutes them with a placeholder.
+
+Scope:
+
+- **OS environment** (`std::env::vars()`).
+- **Project `.env`** files: `<cwd>/.env`, `<cwd>/.env.local`, plus any
+  paths in `redact.extra_dotenv_paths`. Walks up to the git root.
+- Future: other secret sources (1Password, op, vault) are out of scope
+  for v1 but the pluggable design must allow adding them later.
+
+Algorithm (v1):
+
+1. On startup, build a redaction table: `value -> name` for every env var
+   whose value is at least `min_secret_length` characters long and is
+   not in a small allowlist (e.g. `PATH`, `HOME`, `SHELL`, `TERM`, `LANG`).
+2. Before each provider request, replace every occurrence of `value` in
+   the request body with `***redacted-by-cockpit***` (configurable
+   placeholder).
+3. Replacement is case-sensitive and substring-aware (so a token embedded
+   in a longer URL is still redacted).
+4. The redaction table is rebuilt when `.env` files change on disk
+   (debounced).
+5. Redaction failures (e.g. unreadable `.env`) emit a TUI warning **and
+   block the request** by default — this is a security feature, not a
+   convenience. Users can opt out via `redact.enabled = false`.
+
+The placeholder is intentionally distinctive (`***redacted-by-cockpit***`)
+so leaks into provider logs are easy to grep for.
+
+---
+
+## 8. Daemon architecture and remote control
+
+cockpit runs as a **long-lived daemon process** that owns the
+session DB, the file-lock manager, the ralph executor, the
+provider clients, the redaction layer, and the config-hierarchy
+resolver (§2). The TUI is a *client* of the daemon — not the
+process that does the work. This is
+true in v1 (locally, over a Unix socket) and forward-compatible
+with `cockpit connect` later (remotely, over a WebSocket relay).
+
+### 8a. Why a daemon in v1
+
+The agent/subagent design in §3 only earns its keep if
+long-running work outlasts any single terminal window:
+
+- The ralph executor (background plan executions, §3b) needs to
+  keep running across `cockpit` invocations and across the user
+  closing their terminal.
+- The file-lock manager must be a single in-process authority
+  across all parallel subagents; running it inside whichever
+  TUI happens to be open is fragile.
+- The session DB and ongoing inference calls need crash recovery
+  to survive a closed terminal without losing in-flight work.
+
+Making the daemon part of v1 also lets `cockpit connect` (§8d)
+layer cleanly on top — the daemon's wire protocol is the same;
+only the transport changes.
+
+### 8b. Lifecycle and the "first invocation becomes the daemon" UX
+
+The first `cockpit` invocation on a machine **auto-promotes to a
+detached background daemon** and the foreground terminal
+becomes a TUI client attached to it. Subsequent invocations
+detect the running daemon and attach as additional clients.
+
+- Promotion uses `setsid` + a double-fork on Unix (similar
+  pattern on Windows via `DETACHED_PROCESS`) so the daemon
+  outlives the original terminal.
+- The TUI client shows a **one-time toast** the first time it
+  promotes a daemon, of the form:
+
+  > `cockpit` daemon started (pid 12345). Closing this terminal
+  > will not stop the daemon. Manage with `cockpit daemon
+  > {status,stop}`.
+
+  Dismissible; never shown again on that machine (recorded in
+  `~/.local/state/cockpit/state.json`). This is what keeps
+  users from being confused by a background process they didn't
+  knowingly start.
+- Daemon lifecycle commands: `cockpit daemon start|stop|status|restart`.
+- **Auto-start is not a system service by default.** Install
+  scripts may *suggest* installing a `systemd --user` unit or a
+  launchd plist for users who want the daemon running across
+  reboots, but the default is "starts when you first run
+  `cockpit`, stops when you tell it to." This matches the
+  user's expectation: not everyone wants a background process
+  living through restarts.
+- If the daemon crashes, ongoing model calls die but the
+  session DB and file-lock manager state are durable
+  (`rusqlite`-backed). The next `cockpit` invocation starts a
+  fresh daemon that reconnects to in-progress sessions and
+  resumes plan executions from the last completed node.
+
+### 8c. IPC: same wire protocol, different transports
+
+cockpit defines **one** message schema for client↔daemon
+communication. The schema is transport-agnostic; the choice of
+transport is per-link:
+
+| Link                          | v1 transport      | Notes |
+|-------------------------------|-------------------|-------|
+| Local TUI ↔ local daemon       | **Unix socket** at `~/.local/state/cockpit/daemon.sock` (Windows: named pipe at `\\.\pipe\cockpit-<user>`) | Filesystem perms gate access. Simple, no port management. |
+| Local daemon ↔ relay (later)   | **WebSocket** outbound to a hosted relay | Daemon initiates; relay does not initiate to the daemon. |
+| Relay ↔ remote browser/mobile  | **WebSocket** | Same schema as the daemon↔relay leg. |
+
+The wire schema (event types, request/response envelopes) is
+the contract; transports are just framing. This is the
+explicit promise that lets `cockpit connect` ship later without
+a protocol rewrite.
+
+### 8d. `cockpit connect` — remote control (v2)
+
+(Planned for a later milestone, scoped here so v1 doesn't paint
+us into a corner.)
+
+Users will be able to pay a monthly subscription to control their
+`cockpit` instance from anywhere — typically a phone — by:
+
+1. Running `cockpit connect` on the device that hosts the daemon.
+2. The daemon opens an outbound WebSocket to a hosted relay
+   (operated by us).
+3. The user's phone or browser connects to the same relay
+   (auth'd by their account) and gets a thin web UI that mirrors
+   the TUI and adds a **plans dashboard** (in-flight plan runs,
+   needs-attention queue from §3b, per-plan progress).
+
+Implications already captured in v1 architecture:
+
+- The session/event log is already decoupled from the TUI (it
+  lives in the daemon).
+- All secret material (API keys, env vars) stays on the device.
+  The relay sees only the redacted event stream (per §7) plus
+  user input.
+- The TUI and the future web client are peers of the same
+  daemon; the daemon doesn't know or care which type of client
+  is attached.
+
+### 8e. Multiple TUI clients (deferred)
+
+The architecture allows multiple TUI clients to attach to one
+daemon (e.g., one per terminal window, viewing different
+sessions). v1 ships single-client; the daemon's session model
+is designed to support multi-client later without protocol
+changes.
+
+---
+
+## 9. Cross-platform (incl. Windows)
+
+`cockpit` must work on Linux, macOS, and Windows. Windows in particular has
+caveats around shell semantics (no POSIX `sh`), path handling, and
+process-group signals. See `miscellaneous.md` for the bundled-gitbash
+discussion and the full Windows compatibility plan.
+
+---
+
+## 10. Token economy — keep cockpit's overhead off the model
+
+Every byte `cockpit` puts into the model's context is a byte the model
+can't use to reason. We treat the LLM context window as a **scarce
+shared resource** and aggressively minimize cockpit's footprint in it.
+
+This is not a soft preference; it is a load-bearing design constraint
+that touches every subsystem.
+
+### Concrete commitments
+
+- **Tool descriptions are terse.** A tool's `description` field is one
+  sentence. Parameter `description` fields are short noun-phrases, not
+  paragraphs. No examples, no rationale, no "use this when…" prose —
+  the model is smart enough to figure it out from the name + one line.
+  If a tool genuinely needs a long explanation, that's a sign the tool
+  should be split or renamed.
+- **System prompt is minimal.** The base system prompt is under
+  ~400 tokens. AGENTS.md and skills are layered on top *only when
+  applicable* (skills lazy-load, AGENTS.md only loads if the file
+  resolves).
+- **Skills are lazy.** Discovery returns `(name, one-line description)`
+  pairs only — never the full skill body. The model invokes
+  `skill <name>` to load the body on demand. This is opencode's design
+  too; we keep it and never regress to "load all skills' frontmatter
+  into the system prompt."
+- **AGENTS.md walk-up is one file, not a chain.** We load the **first**
+  matching guidance file (per `agent_guidance_files` in `config.json`) and
+  stop. We do not concatenate AGENTS.md from every ancestor directory.
+- **Tool results are bounded.** `bash` output, `read` of large files,
+  `grep` with many matches all clip at a configurable limit (default
+  ~8 KB) with a `... [truncated, use offset/limit to see more]`
+  trailer that tells the model how to page through.
+- **Two complementary context-reduction commands.** `/prune` is
+  deterministic, mechanical, and reviewable — it collapses superseded
+  snapshot tool results (older `read`/`ls`/`grep`/`git status` calls
+  that a newer call has obsoleted) into one-line markers, with no LLM
+  in the loop. `/compact` is the heavyweight option: it asks the model
+  to draft a handoff prompt summarizing the work so far, then starts a
+  fresh thread seeded with that prompt (the old thread is preserved on
+  disk and recoverable). Automatic background staleness/dedup (T6.a/b
+  in `plan.md`) runs continuously; the slash commands are the
+  user-facing escape hatches when the budget gets tight. opencode's
+  inline summarization-style compaction is **replaced** by the
+  fresh-thread handoff model — it avoids compaction sediment (no
+  summarizing summaries) and is friendlier to provider caches (the new
+  thread starts with a clean cache rather than mutating the old one).
+- **Built-in tool surface is small.** v1 ships `read, readlock, write,
+  writeunlock, edit, bash, glob, grep, task, skill, webfetch`. The
+  lock-aware tool set (`readlock` / `write` / `writeunlock`) is
+  required for the multi-agent file-locking model (see `plan.md`
+  §4.1); plain `read` is the unlocked snapshot variant for exploration
+  that doesn't intend to modify. No `websearch` (provider-side search
+  exists; if a user wants `cockpit`-side, they pipe `curl` through
+  `bash`). No tool we couldn't justify removing.
+- **No MCP** (already a non-goal). MCP servers' tool descriptions
+  routinely run thousands of tokens each; this is the largest single
+  win for context economy and the original reason for §11's MCP
+  exclusion.
+- **Subagent reports, not transcripts.** When a `task` finishes in
+  subagent mode, the parent receives the subagent's **final reply
+  only**, not the subagent's full conversation — and the subagent
+  itself only ever saw the task brief, not the parent's history.
+  Two layers of context-economy in one primitive. Fork mode is a
+  different trade-off (see §4c): the branch inherits parent context
+  on purpose so that "explore an alternative" preserves the setup
+  cost; pick fork when the *shared history* is the value.
+- **Subagent reports are token-capped.** Default report budget is
+  **≈2K tokens**; the caller may override on the `task` invocation
+  up to a **hard ceiling of ≈10K tokens**. The cap is enforced
+  deterministically at report-finalization time, not just suggested
+  to the subagent in the system prompt — over-budget reports are
+  truncated and a footer is appended:
+  `[... ≈N tokens elided; re-invoke with report_budget=X to see more ...]`
+  so the parent knows truncation happened and how to ask for more.
+  Token counts are approximate (the truncation contract is "≈",
+  not "="); cockpit uses a default tokenizer (cl100k_base via
+  `tiktoken-rs`) as the budget enforcer when the active provider
+  doesn't expose its own counter, and prefers the provider's
+  counter when available. This matters most at fan-out: five
+  parallel `explore` subagents reporting back to `orchestrator-plan`
+  with 2K each is 10K of citations to weigh; with no cap it could be
+  50K. Across deep delegation trees the savings compound.
+- **Redaction placeholder is short.** `***redacted-by-cockpit***`
+  is 30 chars; we deliberately don't include the var name. Naming
+  `OPENAI_API_KEY` in 47 places across a transcript is a leak vector
+  (it telegraphs which providers the user has configured) and a token
+  cost.
+
+### Operational hygiene
+
+- A nightly `cargo run --bin context-budget` (or a CI check) prints the
+  exact token count of the base system prompt and every tool
+  description, so regressions are visible in PRs.
+- The `cockpit debug context` command (cockpit-specific addition; mirror
+  `cockpit debug redact`) dumps the complete prompt that *would* be sent
+  for the next turn, with token counts, so users can audit what cockpit
+  is spending their budget on.
+
+### Why this matters
+
+A 200K-token model that loses 30K to bloated tool descriptions and
+redundant guidance files is effectively a 170K-token model. Long
+sessions, big repos, and any "let me read the whole file" pattern all
+trade against that overhead. cockpit's competitive edge over opencode (and
+its own future ambitions like `cockpit meta`, where multiple harnesses
+chain together) depends on **not being the thing that ate the user's
+context budget**.
+
+---
+
+## 11. Naming and the `cock` shortcut
+
+- **Binary:** `cockpit`. Crate: `cockpit-cli` on crates.io
+  (the crate keeps the `-cli` suffix because the unsuffixed name
+  may already be claimed by an unrelated project; the binary
+  installed by the crate is just `cockpit`).
+- **Optional shortcut `cock`** installed via opt-in prompt at
+  install time (or on first run for `cargo install` users) —
+  see `miscellaneous.md` §3a. The shim sets `COCKPIT_ROOSTER=1`
+  and execs `cockpit`; the binary detects the env var on launch
+  and renders an ASCII-rooster splash. Pure easter egg; `cock`
+  is identical to `cockpit` in every other respect. Lifecycle
+  managed by `cockpit shortcut {install,remove,status}`.
+- **Naming-conflict note:** the cockpit-project.org server
+  admin UI also ships a `cockpit` binary on some Linux distros.
+  `miscellaneous.md` §9a covers the mitigations (PATH
+  precedence, the `cock` shortcut as a guaranteed-unique alias,
+  one-time launch warning if a conflicting binary is detected
+  ahead of ours on PATH).
+
+---
+
+## 12. Tool-input repair — make open-source models first-class
+
+A strict tool-call schema filters out a lot of recoverable noise.
+Large commercial models eat that cost invisibly because they've seen
+enough of every JSON contract during pretraining; open-weights models
+pay it loudly. The failure modes, across DeepSeek, GLM, Qwen, and
+similar, are not random — they're a small finite compositional set of
+*shape* mistakes ("sent `null` for an optional field", "emitted an
+array as a JSON string", "passed a bare string where the schema wants
+an array"), not capability gaps.
+
+`cockpit` ships a tool-input repair layer between rig's tool-call JSON
+and the typed dispatcher. This pairs directly with §10 (token
+economy): a repaired call costs one extra validate pass; a
+non-repaired call costs a full retry round-trip (re-inference, re-
+streamed assistant turn, re-emitted tool args).
+
+### Concrete commitments
+
+- **Validate first, repair on failure — never preprocess.** Inputs
+  that validate as-is are dispatched unchanged. A preprocessing pass
+  that rewrites inputs *before* the schema sees them is a known
+  silent-corruption hazard (`write` content that happens to be
+  JSON-shaped getting "fixed" before it hits disk). When validation
+  fails, the layer walks the validator's issue list and tries the
+  catalogued repairs at the specific paths the schema disagreed at;
+  on success it re-validates and dispatches. The schema localizes the
+  bug for us; we only spend repair budget where it actually
+  disagreed.
+- **Catalog (v1), in this order.** `null`-for-optional → omit the
+  field; stringified JSON array (`'["a","b"]'`) → parse to array;
+  single-arg `{…}` where the schema wants an array → wrap in array;
+  bare string where the schema wants an array → wrap in `[string]`.
+  Order matters: parse-stringified-array must run before
+  wrap-bare-string, or `'["a","b"]'` becomes `['["a","b"]']`. The
+  catalog is small on purpose — every new repair must justify its
+  presence against a logged failure mode (see observability below).
+- **Schema hints, not raw `String`, for shape-prone fields.** Path
+  parameters use a `PathString` newtype (or a `#[cockpit(path)]`
+  marker on the parameter struct field) rather than `String`. The
+  dispatcher unwraps degenerate markdown-link paths
+  (`"/x/[notes.md](http://notes.md)"` → `"/x/notes.md"`) at the
+  `PathString` boundary, leaving real markdown links
+  (`[click](https://example.com)`) untouched. The hint centralizes
+  the fix: every path field across every tool inherits it; no other
+  field is affected. The same pattern is available for any field
+  where the model's post-training distribution leaks through (URLs,
+  shell commands).
+- **Relational invariants extend the tool's semantics, not the
+  repair catalog.** Repairs handle *shape* problems — wrong type,
+  missing key, wrong container. *Relational* problems (e.g. `read`
+  requires `offset` and `limit` together, or neither) are handled by
+  filling in the missing field with a sane default and prepending a
+  one-line note to the tool result so the model can self-correct on
+  the next turn: "Note: `limit` defaulted to 2000; pass both
+  `offset` and `limit` to override." No `Error:` prefix — the TUI
+  doesn't paint the result red, and the model sees what we picked.
+  Transparency over silent magic.
+- **Retry message on hard failure is model-readable.** When all
+  repairs fail, the layer returns a short message that names the
+  offending field and the expected shape — not a raw validator
+  issues blob. The model can act on "field `paths` expected array of
+  string, got string"; it cannot act on a 600-token zod-style dump.
+- **Repaired calls flow through the §14 wire/user split.** A
+  repaired tool input is written to `wire_input` on the assistant
+  turn's session-DB row; the model's original emission is preserved
+  in `original_input`; `recovery` is set to
+  `{kind: "shape_repair", repair: <repair-name>, path: <json-path>}`.
+  The model's attention pass sees the clean, schema-valid form; the
+  user transcript shows the original with a `⟲ repaired` chip. No
+  in-prose `Note:` is emitted on success — the model learns from a
+  self-consistent transcript, the user sees what the model actually
+  did. Relational defaults are the one exception: they *do* prepend
+  the `Note:` line described above, because the default is a
+  semantic choice cockpit made, not a syntactic fix to a
+  schema-invalid input. The user transcript marks those rows with a
+  `relational_default` recovery kind.
+
+### Observability — repairs must be investigatable by agents
+
+Improving the repair catalog as we onboard new models depends on
+seeing exactly where calls break and which model broke them. This is
+non-optional: a tool-input repair feature without per-(model, tool,
+kind) telemetry rots silently.
+
+- **Structured `tracing` events.** Every repair attempt emits a
+  record with `tool`, `model`, `kind` (one of the catalog names, or
+  `relational_default`, or `markdown_link_unwrap`), `outcome`
+  (`repaired` | `invalid`), and a redacted excerpt of the offending
+  input. Same log destination as everything else
+  (`~/.local/state/cockpit/logs/`, per `miscellaneous.md` §5). The
+  redaction layer (§7) runs over the excerpt before it hits disk —
+  repair telemetry never carries secrets.
+- **`cockpit debug repair`.** Text summary of repair rates per
+  `(model, tool, kind)` over the last N days plus the top failure
+  modes that fell *through* the catalog (the ones we couldn't fix).
+  Used by users to spot a model regressing on a contract before
+  users do, and by agents asked "where are our tool corrections
+  falling down?".
+- **`cockpit debug repair --raw`.** JSONL stream of individual
+  repair events with input-before / input-after / outcome, designed
+  to be piped into a follow-up agent invocation (`cockpit run`) that
+  proposes new repairs or new schema hints. This is the loop that
+  lets the catalog grow against evidence.
+
+Repair telemetry never leaves the device. Both commands read from
+the rotating log files only.
+
+### Why this matters
+
+A lot of what looks like model capability is actually contract
+design. Without this layer, swapping from a frontier model to a
+strong open-weights model regresses tool-calling reliability
+sharply, for reasons that have nothing to do with the model's actual
+ability. The harness is where you mediate between provider
+distributions — that's a cockpit responsibility, not the user's
+problem.
+
+---
+
+## 13. File I/O tool semantics — `read`, `edit`, `write`
+
+The read/edit/write trio is the model's primary contact with the
+user's files. The design has to balance three competing concerns:
+token cost (a `read` of a 4 KLOC file blows the context budget),
+edit success rate on weaker models (exact-string match fails on
+trailing whitespace), and "do not silently corrupt the file" (a
+write that thinks it patched line 47 but actually patched line 49).
+
+The §10 token-economy rules and the §12 repair layer set the
+context; this section spells out the per-tool semantics.
+
+### 13a. `read` — paginated, line-numbered, capped
+
+- **Always paginated.** `read(path, offset, limit)` with `offset`
+  1-indexed and `limit` in lines. There is no "read the whole file"
+  call. The §12 relational-default rule fills missing fields
+  (defaulting `limit` to 2000 lines, `offset` to 1) and prepends a
+  `Note:` line to the result so the model sees what was filled in.
+- **Output is line-numbered:** each line is emitted as
+  `${line_number}: ${line_text}`. The line-number tax is ~3–5% of
+  output bytes and pays for itself by giving the model durable
+  citations (`file.rs:120`) and a frame of reference for follow-up
+  reads. Line numbers are for *citation*, not for use as a write
+  address (see §13d).
+- **Two caps, whichever is smaller:** 2000 lines or ~8 KB. Hitting
+  either truncates with the marker `... [truncated, ask read with
+  offset N to see more]`, where `N` is the next offset the model
+  should pass. This is the same chokepoint and the same marker that
+  composer `@`-tagging (§1e) uses — exactly one read path through the
+  codebase.
+- **Same redaction.** Output runs through §7 redaction before it
+  hits the model context, with no per-call bypass.
+- **`read` is the unlocked snapshot variant.** `readlock` (§10's
+  tool surface, `plan.md` §4.1) is the locking variant for work that
+  intends to modify. They share the formatting, caps, and redaction
+  rules — locking is the only difference.
+- **Binary files are refused, not silently mangled.** Same
+  heuristic as composer `@`-tagging (§1e): NUL bytes in the first
+  1 KB, or an extension on the binary blacklist. The error names
+  the heuristic that fired so the model can choose to invoke `bash`
+  with `head -c` or `file` if it really wants a binary inspection.
+
+### 13b. `edit` — search/replace with a fuzzy fallback cascade
+
+Edits are addressed by **content anchors** (`old_string` →
+`new_string`), not by line number. Why content anchors are the only
+addressing mode is in §13d.
+
+When the exact `old_string` doesn't match, the tool runs an
+eight-stage cascade, falling through on each failure:
+
+1. **Exact match.** The cheapest stage; the only stage that
+   succeeds for well-behaved frontier models most of the time.
+2. **Line-trim match.** Trim trailing whitespace per line on both
+   sides.
+3. **Block-anchor match.** Use the first and last lines of
+   `old_string` as anchors, find candidate regions in the file, and
+   pick the one with the smallest Levenshtein distance against the
+   interior.
+4. **Whitespace-normalized match.** Collapse all whitespace runs to
+   single spaces.
+5. **Indent-flexible match.** Strip common leading indentation
+   from both sides before comparing.
+6. **Escape-normalized match.** Reconcile `\n` / `\t` / `\"`
+   mismatches (the model emitted a literal escape; the file had the
+   character).
+7. **Trimmed-boundary match.** Trim outer whitespace of the whole
+   block.
+8. **Context-aware match.** First and last lines match exactly;
+   interior matches ≥50% by character content.
+
+If a stage matches **multiple** regions and `replace_all` is not
+set, the tool errors with `Found multiple matches; pass more
+surrounding context or set replace_all: true.` — the same loud
+failure mode opencode uses. Ambiguous edits never silently pick
+the first hit.
+
+If **no** stage matches, the tool errors with a near-miss
+diagnostic (see §13c).
+
+This design is cribbed from opencode; the cockpit-specific addition
+is in §13c.
+
+### 13c. Edit corrections — rewrite the model's tool call into its canonical form
+
+When the cascade succeeds at any stage past stage 1, cockpit
+populates the row's `wire_input.old_string` with the canonical
+bytes the cascade matched (see §14 for the wire/user transcript
+split). `original_input` keeps the model's actual emission;
+`recovery` is set to `{kind: "edit_cascade", stage: <name>, path:
+"old_string"}`. The next inference call carries `wire_input`, so
+the model's attention pass over its own prior outputs sees the
+form that *would have* matched at stage 1 — and the tool result
+returned is a clean success, identical to what a stage-1 exact
+match would have produced. No `Note:` line, no correction prose,
+no token tax. The user transcript renders `original_input` with a
+recovery chip; the model never sees the chip.
+
+The rewrite is deterministic and content-equivalent: every stage
+of the cascade is a semantic-equivalence match (whitespace,
+indentation, escape forms, anchor-bounded interior content), so
+substituting the canonical form for the submitted form does not
+change the edit's effect. The bytes replaced and the bytes written
+are unchanged; only the *address* the model nominally used is
+normalized.
+
+Scope of the rewrite:
+
+- **`old_string` is rewritten** in `wire_input` to the exact bytes
+  from the file that the cascade matched.
+- **`new_string` is not touched.** It's the model's intent and we
+  respect it verbatim.
+- **The assistant's reasoning text is not touched** in either
+  projection. If the model said "I'll trim the whitespace and patch
+  this block," the reasoning stays even though `wire_input.old_string`
+  is now the canonical un-trimmed form. Mild incongruence between
+  reasoning and args is acceptable; rewriting prose is a much
+  bigger intervention than rewriting structured tool args.
+
+Cache implications:
+
+- Rewriting `wire_input` changes the bytes sent on the next
+  inference call, which invalidates the provider's prompt cache
+  from that point forward. To bound the cost, cockpit places cache
+  breakpoints **after each tool result** rather than at session
+  start. A cascade rewrite then invalidates at most the in-flight
+  turn's worth of cache (≈1 turn of prompt), not the entire prior
+  session. For sessions with frequent cascade hits this is a
+  measurable cost; for frontier models that rarely hit the cascade
+  it's noise.
+
+**On total miss (no stage matched).** There is no canonical form to
+rewrite to, so this case falls back to a model-readable error: the
+closest near-miss in the file plus a diff against the submitted
+`old_string`. The error message is the only path where the model
+sees a correction in prose — and it's an error message, where the
+model already knows it has to act.
+
+```
+Error: no match for `old_string` in <path>.
+Closest near-miss (lines 47-53):
+<near-miss bytes, fenced>
+
+Difference from your `old_string`:
+- you submitted: 2-space indent, no trailing newline
+- file actually: tab indent, trailing newline present
+```
+
+**Escalation for repeat offenders.** Pure-rewrite teaches the model
+silently by example, which works when the model can pattern-match
+its own prior outputs. For models that don't generalize from their
+own corrected outputs (typically smaller open-weights models with
+shallow in-context learning), cockpit pins an explicit
+system-reminder after the same `(model, stage)` rewrite fires N
+times in a session (default N=3): `this model has been
+under-indenting Python edits by 4 spaces; check indentation before
+submitting old_string`. Pinned reminders expire after K turns
+without recurrence (default K=10). The rewrite is the primary
+mechanism; the reminder is the v2-grade fallback for models the
+rewrite alone doesn't reach.
+
+This is genuinely cockpit-original; nothing in the surveyed
+harnesses does it. opencode runs the cascade silently *and* leaves
+the malformed `old_string` in the transcript — the next imperfect
+edit gets nothing from the prior one.
+
+### 13d. `write` — full file only, content-anchored, no line addressing
+
+- **`write` overwrites the entire file.** It is the right tool for
+  new files and for total rewrites. For partial changes, use
+  `edit`. Two tools, two jobs.
+- **`write` requires a prior `read`.** Mirroring Claude Code's
+  invariant: the model must have `read` (or `readlock`'d) the file
+  in this session before `write` will accept a payload for that
+  path. The check exists to prevent the "rewrote a file it never
+  looked at" failure mode. Lock-aware variants (`writeunlock`)
+  carry the same prerequisite via the lock-acquisition handshake.
+- **Line endings preserved.** Per `miscellaneous.md` §1g: a CRLF
+  file round-trips as CRLF; an LF file round-trips as LF. The
+  heuristic looks at the first 1 KB before overwriting.
+- **No line-range write tool.** cockpit does not offer "replace
+  lines N–M with this content." Line numbers go stale the moment
+  another tool runs (an intervening `edit` shifts line numbers; a
+  read of a different range doesn't, but the model has no reliable
+  way to know which is which). Open-weights models routinely
+  miscount line ranges by 1–2, and the failure is *silent
+  corruption of an adjacent function* rather than a loud no-match.
+  Content anchors fail loudly; line numbers fail quietly. We pick
+  loud.
+
+### 13e. No `apply_patch` / unified-diff tool
+
+opencode ships `apply_patch` (unified-diff format) alongside its
+`edit` tool; codex's primary write path is OpenAI's `*** Update
+File:` patch format. cockpit ships neither.
+
+- It's a **second way to do the job `edit` already does.** Two
+  write paths means two failure surfaces, two locking dances, two
+  schemas to repair against (§12).
+- Unified diff requires the model to keep accurate context-line
+  counts and `@@ line @@` ranges. Weaker open-weights models
+  consistently miscount, and the §13b cascade gives us cheaper
+  recovery from the same class of mistake.
+- A multi-hunk edit can be expressed as repeated `edit` calls. The
+  total token cost is comparable; the transcript stays legible;
+  per-call locking semantics stay simple.
+
+If a real workflow emerges where this is wrong — e.g. an LSP-driven
+multi-file refactor that fits a clean unified diff but not a
+sequence of search/replaces — we'll revisit. Until then, one write
+path.
+
+---
+
+## 14. Wire transcript vs user transcript — two projections over one session log
+
+§12 (shape repair) and §13c (edit-cascade rewrite) both fix model
+mistakes deterministically and dispatch the corrected call. The
+question is: when the model emits a malformed `tool_use` and the
+harness repairs it, **what does each audience see afterwards?**
+
+cockpit's answer is: one session DB, two projections.
+
+- **Wire transcript** — what crosses the network on every
+  subsequent inference call. Always carries the **canonical /
+  repaired form** of every tool input. The model attends only to
+  this projection; its own prior outputs, when it looks back at
+  them, are well-formed by construction.
+- **User transcript** — what the TUI renders, what
+  `cockpit transcript view` shows, what gets persisted to
+  on-device scrollback and exported on `cockpit session export`.
+  Always carries the **original input** the model actually emitted,
+  plus a structured `recovery` annotation describing what the
+  harness fixed.
+
+Both projections are derived from the same row in the session DB.
+There is no fork, no double-write, no drift risk — just two render
+paths over a row that holds both forms.
+
+### 14a. Session DB row shape
+
+Every tool invocation is one row in the `tool_call_events` table
+(see §15b for the full schema). The fields that drive the
+wire/user split:
+
+- `original_input_json` — exact bytes the model emitted. Immutable
+  after the turn lands.
+- `wire_input_json` — what the next inference call carries. Equal
+  to `original_input_json` for clean calls; differs when §12 or
+  §13c fired.
+- `recovery_kind` / `recovery_stage` — `NULL` for clean calls;
+  otherwise the structured annotation:
+  - `(shape_repair, wrap_bare_string)` (§12)
+  - `(edit_cascade, whitespace_normalized)` (§13c)
+  - `(relational_default, limit)` (§12; not counted as malformed,
+    see §15h)
+- `hard_fail` — `1` if all repair stages failed and the model
+  received an error result.
+
+The §12 repair telemetry stream and the §15 `/stats` pane both
+read from these columns. There is one source of truth; the two
+audiences (developer-grade `cockpit debug repair` and user-grade
+`/stats`) are different projections over the same rows.
+
+### 14b. What each audience sees
+
+- **The model** sees `wire_input` only. From its perspective, every
+  prior tool call it emitted in this session was syntactically
+  perfect and produced a clean success. Future calls inherit
+  well-formed examples from the model's own outputs.
+- **The user** sees `original_input` with a visual marker when
+  `recovery != null` — e.g., a small `⟲ recovered (whitespace-norm)`
+  chip on the tool-call row in the TUI, click-to-expand for the
+  before/after comparison.
+- **`cockpit debug repair`** reads the same `recovery` field and
+  rolls it up per `(model, kind)` (already specified in §12).
+
+### 14c. Per-model performance surfaces naturally
+
+Because every recovery is annotated on the row that triggered it,
+the harness can compute per-model recovery rates with no extra
+instrumentation:
+
+```
+$ cockpit debug models
+Model                    Tool calls  Shape repairs  Edit cascades  Recovery%
+claude-opus-4-7-1m              145              0              2       1.4%
+gpt-5                            87              1              5       6.9%
+qwen3-30b-coder                 132             12             47      44.7%
+deepseek-v3                      94              3             21      25.5%
+```
+
+This is the user-visible signal the §13c rewrite enabled. The model
+gets full utility from the repair layer; the user gets a
+calibrated view of how much repair each model needed. Both
+audiences are served by the same recovery annotation.
+
+### 14d. Where this pattern applies
+
+Today (v1):
+
+- §12 shape repairs (`null`→omit, wrap-bare-string, parse-stringified-array, etc.)
+- §12 relational defaults (e.g. `read` `offset`/`limit` pairing)
+- §13c edit-cascade rewrites
+- `PathString` markdown-link unwrap (§12)
+
+Future extensions should follow the same pattern: when a
+deterministic correction exists, store the canonical form as
+`wire_input`, keep the original as `original_input`, annotate
+`recovery`, and let the two projections render themselves.
+
+### 14e. What does *not* go through the wire/user split
+
+- **The model's natural-language reasoning** is never rewritten.
+  Both projections show it verbatim.
+- **The system prompt** and pinned reminders are not user-facing
+  by default (already a kind of wire-only content, but distinct
+  from the recovery flow — they aren't responses to a model
+  mistake).
+- **Hard failures** that the harness could not repair are surfaced
+  identically to both audiences: the model sees an `Error:`
+  result; the user sees the same `Error:` in the transcript.
+  There's nothing to project differently.
+
+### 14f. Why this design
+
+Two reasons to keep them as projections rather than literal
+separate logs:
+
+1. **No drift.** A two-log world has a synchronization problem the
+   instant a turn is edited, replayed, or compacted. A
+   one-row-two-projections world cannot drift; `original_input` and
+   `wire_input` are pinned to the same row's lifecycle.
+2. **Compaction and replay stay simple.** §10's `/compact` (fresh-
+   thread handoff) and `/prune` (mechanical staleness collapse) read
+   the user transcript for what to summarize, and emit a new wire
+   transcript for the fresh thread. Both operations remain pure
+   transformations over one log, not a join across two.
+
+---
+
+## 15. `/stats` — on-device model and project performance
+
+The §12 repair telemetry and §14 recovery annotations already
+record everything needed to surface model performance to the user.
+`/stats` is the user-facing pane that exposes it. Same data is
+also available as `cockpit stats` for headless / scripted use.
+
+All stats are local-only — they're a SQL query over the session DB
+in `~/.local/share/cockpit/cockpit.db`. Nothing leaves the machine,
+ever (this is a per-machine surface; cross-device aggregation is a
+non-goal).
+
+### 15a. What the pane shows
+
+Three sections in one pane, each with a **scope** toggle (current
+project / all projects on this machine) and a **range** toggle
+(last 7 days / all time):
+
+1. **Token spend** per model. Columns: model, input, output,
+   cached-input, total, optional dollar cost. Cost is shown only
+   when a price table is available (see §15d).
+2. **Tool-call recovery** per model. Columns: total calls,
+   malformed%, recovered%, hard-fail%. Press Enter on a row to
+   expand into per-tool and per-`(kind, stage)` breakdowns
+   (`edit_cascade/whitespace-norm`, `shape_repair/wrap-bare-string`,
+   etc.). This is the per-model strength signal previewed in §14c.
+3. **Language breakdown** of tool-call activity (§15c). A
+   horizontal bar showing percentage of `read`/`edit`/`write`
+   calls per language, plus a count column.
+
+Each section is one screenful at most; the pane scrolls vertically
+if the model list is long.
+
+**Definitions.** `malformed = recovered + hard_fail`. `recovered`
+= tool calls where `recovery != null` and the harness produced a
+clean dispatch. `hard_fail` = tool calls where validation failed,
+no repair stage succeeded, and the model received an error result.
+Relational defaults (§12) are *not* counted as malformed — they
+are choices, not corrections.
+
+### 15b. Schema — one event log, one aggregate table, one derived view
+
+All session data — sessions, turns, tool calls, inference calls —
+lives in the single `cockpit.db` SQLite database in
+`~/.local/share/cockpit/`. The stats pane reads from two new
+tables and one view; audit queries cross-reference the existing
+session and turn tables.
+
+**1. `tool_call_events` — one row per tool invocation.** This is
+the denormalized analytics-friendly event log. Every tool the
+model calls (whether the call was malformed, recovered, or clean)
+becomes one row here, with enough columns inline to answer "show
+me per-(model, provider, tool, project, language) performance"
+without joins.
+
+```sql
+CREATE TABLE tool_call_events (
+  event_id            TEXT    PRIMARY KEY,
+  session_id          TEXT    NOT NULL,
+  call_id             TEXT    NOT NULL,            -- references inference_calls.call_id
+  timestamp           INTEGER NOT NULL,            -- epoch seconds
+
+  -- denormalized for fast group-bys (model/provider/project rarely change inside a call)
+  model               TEXT    NOT NULL,
+  provider            TEXT    NOT NULL,
+  project_id          TEXT    NOT NULL,            -- hash of project root
+  project_root        TEXT    NOT NULL,            -- displayed path
+
+  tool                TEXT    NOT NULL,            -- read / readlock / edit / write / bash / ...
+  path                TEXT,                        -- NULL for non-file tools
+  language            TEXT,                        -- resolved from path at write time; NULL for non-file
+
+  -- recovery telemetry (§14)
+  recovery_kind       TEXT,                        -- NULL | edit_cascade | shape_repair | relational_default
+  recovery_stage      TEXT,                        -- the specific stage/repair name; NULL when kind is NULL
+  hard_fail           INTEGER NOT NULL DEFAULT 0,  -- 1 = no repair worked, model received an error
+
+  -- audit (the same fields §14 describes as living on the tool-call row)
+  original_input_json TEXT NOT NULL,               -- model's emission
+  wire_input_json     TEXT NOT NULL,               -- canonical form sent to provider on next call
+
+  duration_ms         INTEGER
+);
+
+CREATE INDEX idx_tce_project_ts ON tool_call_events (project_id, timestamp);
+CREATE INDEX idx_tce_model_ts   ON tool_call_events (model, timestamp);
+CREATE INDEX idx_tce_tool_ts    ON tool_call_events (tool, timestamp);
+CREATE INDEX idx_tce_lang_ts    ON tool_call_events (language, timestamp);
+```
+
+**2. `inference_calls` — one row per LLM call.** Per-call token
+counts and (optional) cost. One inference call can contain many
+tool calls; the join is `tool_call_events.call_id =
+inference_calls.call_id`. Tool-level aggregates are *not* stored
+here — they're computed from `tool_call_events` directly so there
+is one source of truth.
+
+```sql
+CREATE TABLE inference_calls (
+  call_id              TEXT    PRIMARY KEY,
+  session_id           TEXT    NOT NULL,
+  project_id           TEXT    NOT NULL,
+  project_root         TEXT    NOT NULL,
+  model                TEXT    NOT NULL,
+  provider             TEXT    NOT NULL,
+  timestamp            INTEGER NOT NULL,
+  input_tokens         INTEGER NOT NULL,
+  output_tokens        INTEGER NOT NULL,
+  cached_input_tokens  INTEGER NOT NULL DEFAULT 0,
+  cost_usd_micros      INTEGER                     -- NULL unless price table available
+);
+CREATE INDEX idx_ic_project_ts ON inference_calls (project_id, timestamp);
+CREATE INDEX idx_ic_model_ts   ON inference_calls (model, timestamp);
+```
+
+**3. `tool_call_stats` — derived view that surfaces `recoverable` and `severity`.**
+Defined as a SQL VIEW so the rubric (§15h) can evolve without a
+backfill. Queries against the view look identical to queries
+against a denormalized table; the rubric mapping is just expressed
+in SQL.
+
+```sql
+CREATE VIEW tool_call_stats AS
+SELECT
+  event_id, session_id, call_id, timestamp,
+  model, provider, project_id, project_root,
+  tool, path, language,
+  recovery_kind, recovery_stage, hard_fail,
+
+  -- recoverable: did the harness save the model from a malformed call?
+  -- (relational_default doesn't count — it's a choice, not a save)
+  CASE
+    WHEN recovery_kind IS NOT NULL
+     AND recovery_kind != 'relational_default'
+     AND hard_fail = 0
+    THEN 1 ELSE 0
+  END AS recoverable,
+
+  -- severity 0..1; see §15g for the rubric and rationale
+  CASE
+    WHEN hard_fail = 1                                  THEN 1.0
+    WHEN recovery_kind IS NULL                          THEN 0.0
+    WHEN recovery_kind = 'relational_default'           THEN 0.0
+    WHEN recovery_kind = 'edit_cascade'
+         AND recovery_stage = 'line_trim'               THEN 0.10
+    WHEN recovery_kind = 'shape_repair'
+         AND recovery_stage = 'null_for_optional'       THEN 0.20
+    WHEN recovery_kind = 'edit_cascade'
+         AND recovery_stage = 'whitespace_normalized'   THEN 0.30
+    WHEN recovery_kind = 'shape_repair'
+         AND recovery_stage = 'wrap_bare_string'        THEN 0.30
+    WHEN recovery_kind = 'edit_cascade'
+         AND recovery_stage = 'indent_flexible'         THEN 0.40
+    WHEN recovery_kind = 'shape_repair'
+         AND recovery_stage = 'parse_stringified_array' THEN 0.40
+    WHEN recovery_kind = 'edit_cascade'
+         AND recovery_stage = 'escape_normalized'       THEN 0.50
+    WHEN recovery_kind = 'shape_repair'
+         AND recovery_stage = 'wrap_single_arg'         THEN 0.50
+    WHEN recovery_kind = 'edit_cascade'
+         AND recovery_stage = 'block_anchor'            THEN 0.60
+    WHEN recovery_kind = 'edit_cascade'
+         AND recovery_stage = 'trimmed_boundary'        THEN 0.70
+    WHEN recovery_kind = 'edit_cascade'
+         AND recovery_stage = 'context_aware'           THEN 0.90
+    ELSE 0.50                                            -- unknown stage; safe middle
+  END AS severity
+FROM tool_call_events;
+```
+
+**Why this split.**
+
+- `tool_call_events` is the source of truth for everything tool-
+  shaped: audit, recovery telemetry, language attribution,
+  /stats. One row per tool call, indexed three ways, with the
+  audit blobs colocated so `cockpit transcript view` is also a
+  simple SELECT.
+- `inference_calls` is per-LLM-call; token spend and cost don't
+  factor down to individual tool calls (a single LLM call emits
+  many tool calls, all sharing the same input-token bill).
+- `tool_call_stats` is the view. `recoverable` and `severity` are
+  computed from the underlying columns via CASE expressions, not
+  stored. **The rubric can change without a backfill.** A user
+  who upgrades cockpit and gets a new severity weighting sees the
+  new weights applied to all historical rows on the next stats
+  query.
+- `language` *is* stored at write time, not derived in the view.
+  Extension→language attribution is stable enough that we
+  prefer the storage cost (a few bytes per row) over the
+  query-time computation. If the v2 hyperpolyglot upgrade lands
+  and reclassifies anything, `cockpit stats rebuild --languages`
+  is a one-shot UPDATE.
+
+**`project_id` is stable per project root.** Resolved at session
+creation: `git rev-parse --show-toplevel` if the cwd is inside a
+git repo, otherwise the realpath of the cwd. The displayed
+`project_root` is the human-readable path; `project_id` is a
+short hash so renames and symlink shifts don't fragment history.
+
+### 15c. Language attribution
+
+For every `tool_calls` row with a non-`NULL` `path`, attribute the
+call to a language by file extension. Bucket non-file tools
+(`bash`, `grep`, `task`, ...) as `shell` and report them in a
+separate "non-file activity" row beneath the language bar.
+
+**v1: static extension table.** A baked-in map of ~40 extensions
+to languages (`rs` → Rust, `ts`/`tsx` → TypeScript, `py` → Python,
+`go` → Go, `md` → Markdown, ...). Anything unmapped becomes
+`Other`. The table lives in `src/stats/languages.rs` and is
+trivially extensible.
+
+**v2 (deferred): GitHub-Linguist-style heuristics** via the
+[`hyperpolyglot`](https://github.com/monkslc/hyperpolyglot) crate
+or equivalent. Linguist's value is disambiguating extensions like
+`.h` (C / C++ / Objective-C), `.m` (Objective-C / MATLAB), `.t`
+(Perl / Turing), and shebang sniffing for extensionless files. v1's
+static table gets ~95% of the value without that complexity; we
+add hyperpolyglot only if real users hit the ambiguous-extension
+edge cases. The attribution is computed at query time, not at
+write time, so swapping the v1 table for v2 heuristics doesn't
+require a backfill.
+
+The bar uses one row per language, sorted descending by call
+count, with the top 8 shown and a rolled-up `Other` row for the
+tail. GitHub Linguist's project-composition bar is the visual
+reference; the difference is we're showing *tool-call activity*
+distribution, not bytes-on-disk distribution.
+
+### 15d. Cost computation
+
+Token counts are accurate from the provider; converting them to
+dollar cost needs a per-(model, input-vs-output-vs-cached) price
+table.
+
+- **v1:** no built-in price table; the pane shows tokens only.
+  Users who care about dollars can supply
+  `~/.cockpit/prices.json` (schema: `{model: {input_per_mtok,
+  output_per_mtok, cached_input_per_mtok}}`). When the file exists
+  and a row for the current model is present, the pane fills the
+  `Cost` column; otherwise the column reads `—`.
+- **v1.5:** ship a curated `prices.json` with the binary,
+  refreshed each release; users' `prices.json` overrides.
+- **Out of scope:** automatic price-table fetching from a remote
+  source. Pricing is data, not behavior; pulling it at runtime
+  would be one more network dependency and one more attack
+  surface. Users update on release cadence or by editing the file.
+
+### 15e. `/stats` UI sketch
+
+```
+┌─ /stats ─ project: cockpit-cli   scope: [project ▼]  range: [7d ▼] ─┐
+│                                                                     │
+│  Token spend                                                        │
+│    Model                  In       Out    Cached    Total    Cost   │
+│    claude-opus-4-7-1m    12.3K    4.1K    45.2K    61.6K    $0.92   │
+│    gpt-5                  3.1K    1.4K        0     4.5K    $0.05   │
+│    qwen3-30b-coder       18.7K    5.9K        0    24.6K       —    │
+│                                                                     │
+│  Tool-call recovery                                                 │
+│    Model                  Calls  Malformed%  Recovered%  Hard-fail% │
+│    claude-opus-4-7-1m       145        1.4%        1.4%        0.0% │
+│    gpt-5                     87        6.9%        5.7%        1.1% │
+│    qwen3-30b-coder          132       58.3%       44.7%       13.6% │
+│    ↳ enter expands per-tool / per-stage                             │
+│                                                                     │
+│  Language (file-touching tool calls)                                │
+│    ████████████████░░░░░░░░░░░░░░░░  Rust         45.2%   189 calls │
+│    ████████░░░░░░░░░░░░░░░░░░░░░░░░  TypeScript   22.1%    92 calls │
+│    █████░░░░░░░░░░░░░░░░░░░░░░░░░░░  Python       14.0%    58 calls │
+│    ███░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  Markdown      8.3%    35 calls │
+│    ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  Other        10.4%    43 calls │
+│                                                                     │
+│  Non-file activity: 412 bash / 76 grep / 22 task                    │
+│                                                                     │
+└─ q quit  s switch scope  r switch range  e expand row  ─────────────┘
+```
+
+### 15f. CLI mirror — `cockpit stats`
+
+Same data, plain-text. Useful for scripting and for the `cockpit
+meta` workflow (an outer harness can query the inner harness's
+performance). Flags: `--project=current|all`, `--range=7d|all`,
+`--format=table|json|csv`. Implementation is a thin wrapper around
+the same queries the TUI runs.
+
+`cockpit debug repair` (§12) stays as the developer-oriented per-
+event view; `cockpit stats` is the user-oriented rolled-up view.
+They read the same telemetry; they exist at different abstraction
+levels.
+
+### 15g. Severity rubric
+
+The `severity` column in `tool_call_stats` is a float in `[0.0,
+1.0]`. The interpretation is *"how badly off was the model's
+emission from a clean, schema-valid tool call?"* — not *"how bad
+was the outcome,"* since the harness recovers most of these.
+
+Bands:
+
+| Severity | Meaning |
+|----------|---------|
+| **0.0** | Clean call. Schema-valid input, no repair needed. Tools without recovery semantics (`bash`, `grep`, plain `read`) sit here unless they hard-fail. |
+| **0.1–0.3** | Trivial mismatch. Whitespace trim, single-field shape fix, or escape normalization. Fully semantics-preserving recovery; the model was *almost* right. |
+| **0.4–0.6** | Moderate mismatch. Multiple normalizations needed, or a structural rearrangement of the args (`wrap_single_arg`, `parse_stringified_array`, `escape_normalized`). |
+| **0.7–0.9** | Major mismatch. The harness recovered (e.g. anchor-based or context-aware cascade matched), but the model emitted something substantially different from the file's bytes. A 0.9 is a near-miss-of-the-near-miss; only the last cascade stage saved it. |
+| **1.0** | Hard fail. No repair stage matched; the model received an error result. |
+
+Per-stage assignments (this is the table the §15b VIEW
+encodes):
+
+| Recovery kind | Stage | Severity | Rationale |
+|---------------|-------|----------|-----------|
+| `null` (clean) | — | 0.0 | Nothing to repair. |
+| `relational_default` | any field | 0.0 | The harness made a semantic *choice* (default `limit`, etc.). Not a model mistake. |
+| `edit_cascade` | `line_trim` | 0.10 | One trailing-whitespace miss; model essentially correct. |
+| `shape_repair` | `null_for_optional` | 0.20 | Emitted `null` instead of omitting an optional field. Common LLM tic. |
+| `edit_cascade` | `whitespace_normalized` | 0.30 | All-whitespace differences across the block. |
+| `shape_repair` | `wrap_bare_string` | 0.30 | Emitted `"a"` where the schema wants `["a"]`. |
+| `edit_cascade` | `indent_flexible` | 0.40 | Indentation level wrong throughout the block. |
+| `shape_repair` | `parse_stringified_array` | 0.40 | Emitted `'["a","b"]'` instead of `["a","b"]`. |
+| `edit_cascade` | `escape_normalized` | 0.50 | Confused `\n`/`\t` with the literal character. |
+| `shape_repair` | `wrap_single_arg` | 0.50 | Emitted an object where the schema wants an array of objects. |
+| `edit_cascade` | `block_anchor` | 0.60 | First/last lines correct, interior content wrong; recovered by Levenshtein on the middle. |
+| `edit_cascade` | `trimmed_boundary` | 0.70 | Outer-whitespace and content both off; recovered by trimming + comparison. |
+| `edit_cascade` | `context_aware` | 0.90 | Only ≥50% of interior content matched; this is the last-chance stage and a strong signal of model miscalibration. |
+| any | `hard_fail = 1` | 1.0 | Nothing matched; model received an error. |
+
+The rubric is **deterministic and stage-keyed**, not learned. We
+don't want severity to vary call-to-call for the same `(kind,
+stage)`; that would make aggregates unstable. New repair stages
+added to §12's catalog or §13b's cascade get a one-line addition
+to the rubric and a band assignment based on which family of
+mistake they cover.
+
+For tools that don't participate in recovery (`bash`, `grep`,
+plain `read`, `task`, `skill`, ...), severity is binary: 0.0 or
+1.0. The middle of the scale is empty, which is fine — they're
+still useful to roll up (average severity per project, per model,
+per language) and the binary case doesn't drag the average around
+much.
+
+**Why store stage names, not severity values.** Storing
+`recovery_stage` instead of a baked-in severity scalar means:
+
+- Rubric corrections after release are free (a SQL VIEW change, no migration).
+- Stage-level breakdowns are still available for the per-row expand-on-Enter view.
+- Cross-stage analytics ("how often does block_anchor fire on Python edits vs Rust edits?") are trivial.
+- Telemetry stays portable: a `cockpit stats export --raw` JSONL stream carries the stage names; the consumer can apply any rubric they want.
+
+### 15h. What `/stats` is not
+
+- **Not a billing system.** Token counts and the optional cost
+  column are for user awareness; we don't enforce budgets, alert
+  on overruns, or stop calls when a quota is hit. (A future
+  feature could; v1 stays observational.)
+- **Not cross-device, by default.** `/stats` is local-only. The
+  one path that ever crosses the network is §16's opt-in benchmark
+  telemetry, which is off until the user explicitly enables it and
+  ships only k-anonymized aggregates, never the audit blobs.
+- **Not a generic model benchmark.** Recovery% on the local pane
+  measures how often cockpit's safety net catches *this user's
+  models* on *cockpit's specific* tool contract. The cross-user
+  public benchmark in §16 is the artifact that *is* a model
+  benchmark — `/stats` itself is a per-user observability surface.
+
+---
+
+## 16. Opt-in tool-call performance telemetry — the "at-scale" model question
+
+The interesting research question §15 cannot answer alone: **how
+do various models actually perform on cockpit's tool contract at
+scale, across many users and many projects?** Right now nobody has
+that data published. The local `/stats` pane answers it for one
+machine; an opt-in, aggregated, anonymized cross-user channel
+would answer it for the community — and the output is a public
+benchmark anyone can cite when picking a model.
+
+This is the *only* path through which any cockpit data crosses
+the network on its own. It is off until the user opts in. It is
+never gated behind payment (see Non-goals). It is aggregated
+before transmission and carries no inputs, no outputs, no paths,
+no installation IDs.
+
+### 16a. What is sent
+
+Per tool-call event, the following categorical fields are eligible
+for inclusion in an aggregated batch:
+
+- `model` (e.g. `claude-opus-4-7`, `qwen3-30b-coder`)
+- `provider` (e.g. `anthropic`, `together`, `ollama`)
+- `tool` (e.g. `edit`, `read`, `bash`)
+- `language` (the §15c attribution — `Rust`, `Python`, `shell`, ...)
+- `recovery_kind` and `recovery_stage` (NULL / cascade stage / repair name)
+- `hard_fail` (boolean)
+- `duration_bucket` (one of `50ms`, `100ms`, `250ms`, `500ms`, `1s`, `2.5s`, `5s`, `5s+`)
+- `hour_bucket` (timestamp truncated to the hour, UTC)
+
+That's it. Eight categorical columns. Every field is low-cardinality
+on purpose — nothing here uniquely identifies a project, file, or
+user.
+
+### 16b. What is never sent
+
+- `original_input_json` / `wire_input_json` — the actual bytes the
+  model emitted or the bytes cockpit substituted. **Never.**
+- `path` — the file path the call touched, in any form (raw,
+  hashed, normalized).
+- `project_id` / `project_root` — even the hash. A hash of
+  `/home/$USER/projects/foo` is correlatable across batches for
+  the same project and is therefore not safe to publish.
+- `session_id` / `call_id` / `event_id` — anything that could
+  string events together into a per-user timeline.
+- Installation identifier of any kind. Each upload is independent.
+- IP addresses. The relay logs the request *body* only; the source
+  IP is dropped at TLS termination and never written to disk.
+- Model output text, prose reasoning, conversation history,
+  user prompts.
+- Anything `redact::scrub()` (§7) would have caught. The
+  telemetry flush runs through the same chokepoint as a final
+  sanity check; if it ever flags a hit, the batch is dropped and
+  a local error is logged.
+
+The wire payload is a JSON document of count-only aggregates.
+There are no per-event rows on the wire.
+
+### 16c. Aggregation and k-anonymity
+
+Events accumulate in a local `cockpit_telemetry_queue` table for
+one hour. At flush time, the daemon groups events by the
+eight-tuple in §16a and emits a count per cell:
+
+```json
+{
+  "schema": 1,
+  "hour": "2026-05-20T14:00:00Z",
+  "cells": [
+    {"model": "qwen3-30b-coder", "provider": "together", "tool": "edit",
+     "language": "Rust", "recovery_kind": "edit_cascade",
+     "recovery_stage": "whitespace_normalized", "hard_fail": false,
+     "duration_bucket": "100ms", "count": 23},
+    ...
+  ]
+}
+```
+
+**k-anonymity threshold.** Cells with `count < k` (default
+`k = 5`, configurable via `telemetry.k_threshold`) are dropped
+from the batch entirely — they don't get merged into a "rare
+events" bucket, they just don't ship. Rare combinations are
+fingerprinting risks; if you're the only user on the planet
+making `edit_cascade/context_aware` calls on Brainfuck files, we
+don't want to publish that you exist.
+
+**No installation continuity across batches.** Each hourly flush
+is one independent POST with no client ID. The relay cannot join
+batches from the same machine.
+
+### 16d. Disclosure, control, revocation
+
+Off by default. Opt-in is explicit and gated behind a confirmation
+flow:
+
+- `cockpit telemetry enable` (or `/telemetry` in the TUI) opens a
+  dialog showing:
+  - A sample payload (the literal JSON that would be sent for
+    the user's last hour of activity, in dry-run form).
+  - The list of fields that are sent and the list that are not.
+  - A link to the published privacy notice.
+  - A required "I understand what is being sent" checkbox.
+- `cockpit telemetry status` — current state, last flush time,
+  total cells sent in the last 24h, total cells sent ever.
+- `cockpit telemetry preview` — dry-run the next batch. Shows the
+  cells that would ship; nothing is transmitted.
+- `cockpit telemetry disable` — stops immediately. Any cells still
+  in the local queue are dropped.
+- `cockpit telemetry delete` — best-effort deletion request to the
+  relay. Best-effort because the aggregates may have already been
+  merged into the published quarterly dataset. Pre-publication
+  cells can be dropped; post-publication data cannot be reliably
+  un-aggregated. The CLI surfaces this honestly.
+
+The `/stats` pane shows a one-line telemetry-status footer:
+`telemetry: opt-in · last flush 2h ago · 412 cells sent today`
+(or `telemetry: off`).
+
+### 16e. Public benchmark — the actual point
+
+The data exists to be published. Quarterly, the cockpit project
+releases:
+
+- **A human-readable report** ("cockpit tool-call performance,
+  Q3 2026"): model leaderboards by recovery%, per-language
+  breakdowns, per-tool patterns, time-trend deltas as new model
+  versions ship. Hosted on the cockpit project website.
+- **A machine-readable dataset** (JSONL on a public CDN) under
+  **CC-BY-4.0** so anyone — model labs, research groups,
+  competing harness authors — can build on it.
+
+This is a public good. There is no published baseline today for
+"how well do various LLMs behave on a specific harness's tool
+contract at scale." Model labs benefit from it. Open-weights
+projects benefit from it. End users benefit from it when picking
+a model for cockpit. The benchmark cites cockpit by name; cockpit
+gets distribution from being the harness that publishes the data.
+
+The benchmark methodology page documents:
+
+- The exact set of fields collected (mirrors §16a).
+- The k-anonymity threshold and other suppression rules.
+- The §15g severity rubric (so a reader can interpret stage
+  weights consistently).
+- The cockpit version range each quarter's data covers
+  (rubric/cascade changes are versioned).
+- A reproducibility note: any cockpit user can re-derive the same
+  statistics over their own opted-in data via `cockpit stats
+  export --aggregate`.
+
+### 16f. Implementation sketch
+
+- New table `cockpit_telemetry_queue` (mirrors the §16a fields,
+  plus `flushed_at` for retention bookkeeping). Written at tool-
+  call completion only when opt-in is active.
+- Daemon flush task wakes every hour, applies §16c aggregation
+  and the k-anonymity threshold, POSTs to a relay endpoint over
+  HTTPS, then marks the rows `flushed_at` for 14-day local
+  retention (so the user can audit what's been sent). After 14
+  days, rows are dropped.
+- **Relay endpoint** is a stateless HTTPS service distinct from
+  the §8d WebSocket relay. It accepts batched aggregates and
+  appends them to a public S3-style bucket. No accounts, no
+  per-source tracking, no IP retention beyond the connection
+  lifetime. The relay source code is open and published in the
+  cockpit organization for inspection.
+- **Failure mode:** if the relay is unreachable, batches stay
+  queued locally and retry on the next flush. Telemetry transport
+  failures are silent (no toast, no log spam) and **never affect
+  local cockpit operation**.
+- **Schema versioning:** the payload's `"schema"` field lets us
+  evolve the wire format without breaking older clients. Clients
+  refuse to ship a payload whose schema number the relay's most
+  recent published methodology doesn't acknowledge.
+
+### 16g. Why this isn't the consent-or-pay design
+
+The two could look superficially similar — both involve telemetry.
+They differ in the load-bearing direction of consent:
+
+- **Consent-or-pay** (rejected, see Non-goals): the *default* is
+  data collection; payment is the escape hatch. The user's choice
+  is between "give us data" and "pay us money." GDPR Article 7(4)
+  scrutinizes this hard because the consent isn't freely given.
+- **§16 opt-in benchmark** (this design): the *default* is no
+  data collection; explicit opt-in is the escape hatch. The
+  user's choice is between "contribute to a public benchmark" and
+  "use cockpit privately forever." No money is involved on either
+  side. Consent is freely given because refusal carries no
+  detriment.
+
+The 16e public benchmark is the *reason* an opted-in user opted
+in — they're contributing to a public good, not buying their way
+out of a tax.
+
+---
+
+## Non-goals
+
+- **MCP support is out of scope.** opencode supports MCP natively
+  (stdio + remote, OAuth, etc.). `cockpit` deliberately does **not**.
+  MCP servers add to the model's context window per call and are
+  token-expensive. Users who want MCP should install
+  [`mcp2cli-rs`](https://github.com/christopher-kapic/mcp2cli-rs) (`mcp2cli`
+  on `crates.io`) and let the model invoke MCP tools through the much
+  cheaper `bash` tool. The recommended onboarding flow when a user reaches
+  for `cockpit mcp ...` is to print a one-line pointer to mcp2cli and exit.
+- **Web UI / remote-accessible HTTP server** (`opencode serve`,
+  `opencode web`, `opencode acp`). v1 ships a local daemon (§8)
+  with a TUI client, no web UI. The daemon's socket is
+  local-only and listens on a Unix socket (or per-user named
+  pipe on Windows), not a TCP port. The remote story is
+  `cockpit connect` (§8d), which is a daemon-initiated outbound
+  WebSocket to a hosted relay — not a server the user exposes.
+- **Hosted session sharing** (opencode `/share`). Privacy concerns plus
+  no clear user demand.
+- **Auto-update** (`opencode upgrade`). Users install via cargo or
+  their package manager; `cockpit` does not self-modify.
+- **GitHub agent** (`opencode github`). Out of scope for the
+  user-controlled-harness use case.
+- **Hosted plugin marketplace** (`opencode plugin <npm-pkg>`). Plugins
+  are out of scope; the meta-harness (§6) covers most extension needs.
+- **Paywalled telemetry opt-out is out of scope.** cockpit does not
+  gate the right to refuse data collection behind a paid SKU.
+  Consent-or-pay is legally exposed in the EU (GDPR Article 7(4),
+  EDPB April 2024 opinion), creates a financial-incentive-disclosure
+  obligation under CCPA, and would be a community-relations
+  liability for an open-source developer tool. The §16 opt-in
+  benchmark channel is the only mechanism through which cockpit
+  ever transmits data, and it is off until the user explicitly
+  enables it. Cloud features that inherently require telemetry
+  (the §8d remote dashboard, cross-device sync) may be paid in the
+  future, but the data collection is bundled with the feature it
+  powers, not a condition for avoiding it.

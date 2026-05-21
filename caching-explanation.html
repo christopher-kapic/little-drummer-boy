@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Context Pruning vs. Prompt Caching — cpit design note</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #171a21;
+    --panel-2: #1d2129;
+    --ink: #e6e8ec;
+    --muted: #9aa3b2;
+    --line: #2a2f3a;
+    --accent: #6ea8fe;
+    --good: #4ec9a4;
+    --bad: #e5707e;
+    --warn: #e3b341;
+    --code: #c8d3f5;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font-family: var(--sans); line-height: 1.65; font-size: 16px;
+  }
+  .wrap { max-width: 880px; margin: 0 auto; padding: 56px 24px 120px; }
+  h1 { font-size: 30px; line-height: 1.25; margin: 0 0 6px; letter-spacing: -0.01em; }
+  h2 {
+    font-size: 22px; margin: 56px 0 14px; padding-bottom: 8px;
+    border-bottom: 1px solid var(--line); letter-spacing: -0.01em;
+  }
+  h3 { font-size: 17px; margin: 28px 0 8px; color: var(--ink); }
+  p, li { color: var(--ink); }
+  .sub { color: var(--muted); margin: 0 0 28px; font-size: 15px; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  code { font-family: var(--mono); font-size: 0.88em; color: var(--code);
+    background: var(--panel-2); padding: 1px 6px; border-radius: 4px; }
+  .toc {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 10px; padding: 18px 22px; margin: 28px 0;
+  }
+  .toc ol { margin: 6px 0 0; padding-left: 22px; }
+  .toc li { margin: 3px 0; color: var(--muted); }
+  .toc a { color: var(--ink); }
+  .panel {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 10px; padding: 18px 22px; margin: 18px 0;
+  }
+  .diagram {
+    font-family: var(--mono); font-size: 13px; line-height: 1.5;
+    background: #0c0e12; border: 1px solid var(--line); border-radius: 10px;
+    padding: 18px; margin: 18px 0; overflow-x: auto; color: var(--code);
+    white-space: pre;
+  }
+  .callout { border-left: 3px solid var(--line); padding: 12px 18px;
+    margin: 16px 0; border-radius: 0 8px 8px 0; background: var(--panel); }
+  .callout.good { border-color: var(--good); }
+  .callout.bad  { border-color: var(--bad); }
+  .callout.warn { border-color: var(--warn); }
+  .callout .tag { font-size: 12px; font-weight: 700; letter-spacing: 0.08em;
+    text-transform: uppercase; display: block; margin-bottom: 4px; }
+  .callout.good .tag { color: var(--good); }
+  .callout.bad  .tag { color: var(--bad); }
+  .callout.warn .tag { color: var(--warn); }
+  table { border-collapse: collapse; width: 100%; margin: 18px 0; font-size: 14px; }
+  th, td { border: 1px solid var(--line); padding: 10px 12px; text-align: left;
+    vertical-align: top; }
+  th { background: var(--panel-2); color: var(--ink); font-weight: 600; }
+  td { color: var(--muted); }
+  td strong { color: var(--ink); }
+  .pill { display: inline-block; font-size: 12px; font-family: var(--mono);
+    padding: 2px 8px; border-radius: 999px; border: 1px solid var(--line);
+    color: var(--muted); }
+  .pill.read { color: var(--good); border-color: #2e5247; }
+  .pill.write { color: var(--warn); border-color: #5a4a1f; }
+  .stable { color: var(--good); }
+  .volatile { color: var(--warn); }
+  .bp { color: var(--accent); }
+  hr { border: none; border-top: 1px solid var(--line); margin: 48px 0; }
+  .foot { color: var(--muted); font-size: 13px; margin-top: 60px;
+    border-top: 1px solid var(--line); padding-top: 18px; }
+  ul.tight li { margin: 4px 0; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>Context Pruning vs. Prompt Caching</h1>
+  <p class="sub">Design note for <code>cpit</code> — can we deterministically prune context for more intelligence without wrecking cache economics?</p>
+
+  <div class="toc">
+    <strong>Contents</strong>
+    <ol>
+      <li><a href="#hypothesis">The hypothesis</a></li>
+      <li><a href="#caching">How Anthropic prompt caching actually works</a></li>
+      <li><a href="#variations">The variations, and why they fail</a></li>
+      <li><a href="#proposal">The proposal: two layers split by a breakpoint</a></li>
+      <li><a href="#hard">The actual hard problem (it isn't caching)</a></li>
+      <li><a href="#toggle">The user-facing toggle: cache vs. context</a></li>
+      <li><a href="#summary">Summary table</a></li>
+    </ol>
+  </div>
+
+  <h2 id="hypothesis">1. The hypothesis</h2>
+  <p>
+    A core thesis of <code>cpit</code>: we can <strong>intelligently and deterministically prune
+    context</strong> to get more intelligence out of an LLM. Less noise in the window means
+    sharper attention and better answers.
+  </p>
+  <p>
+    The headline risk: <strong>pruning context breaks prompt caching</strong>, and broken
+    caching makes every subsequent inference dramatically more expensive. So the design
+    question is: <em>can we prune aggressively while keeping the cache warm?</em>
+  </p>
+  <p>
+    The original idea: keep tool-call <em>results</em> at the end of the conversation so we can
+    cache everything up to (but not including) them. Then if a later request changes, removes,
+    or shrinks an old tool result, the cached prefix survives and we still get the pruning
+    benefit. A follow-up variation: push <em>all</em> tool calls <em>and</em> results to the end.
+  </p>
+
+  <h2 id="caching">2. How Anthropic prompt caching actually works</h2>
+  <p>
+    The one mental model that decides everything here:
+    <strong>the cache is a prefix, not a set of blocks.</strong>
+  </p>
+  <ul class="tight">
+    <li>A request is serialized in a fixed order: <code>tools</code> → <code>system</code> →
+      <code>messages</code> (messages in array order). The cache key is the <em>literal byte
+      prefix</em> of that serialization up to a <code>cache_control</code> breakpoint.</li>
+    <li>On each request, Anthropic finds the <strong>longest previously-cached prefix that still
+      byte-matches</strong>, and reads it at ~<span class="pill read">0.1× input</span>.
+      Everything after the first mismatch is reprocessed; writing the new segment costs
+      <span class="pill write">1.25× (5-min TTL)</span> or
+      <span class="pill write">2× (1-hour TTL)</span>.</li>
+    <li>Up to <strong>4 breakpoints</strong>. TTL is 5 min by default, <em>refreshed on every
+      cache hit</em> (a hot prefix stays warm indefinitely); 1-hour TTL is opt-in and pricier.</li>
+    <li>Minimum cacheable segment ≈ <strong>1024 tokens</strong> (2048 on Haiku).</li>
+  </ul>
+
+  <div class="callout bad">
+    <span class="tag">The rule that governs everything</span>
+    Any byte change at position <em>i</em> invalidates the cache from <em>i</em> to the end of
+    the prompt. There is no per-block "ignore this" mechanism. The cache is content-addressed by
+    prefix, full stop.
+  </div>
+
+  <p>A normal tool-use conversation is serialized like this:</p>
+  <div class="diagram"><span class="bp">tools</span>            ← stable, huge, rarely changes
+<span class="bp">system</span>           ← stable
+messages[0]  user      "do X"
+messages[1]  assistant  text + <span class="volatile">tool_use A</span>
+messages[2]  user       <span class="volatile">tool_result A</span>
+messages[3]  assistant  text + <span class="volatile">tool_use B</span>
+messages[4]  user       <span class="volatile">tool_result B</span>
+messages[5]  assistant  final answer</div>
+
+  <h2 id="variations">3. The variations, and why they fail</h2>
+
+  <h3>Variation A — keep tool <em>results</em> at the end</h3>
+  <div class="callout bad">
+    <span class="tag">Why it fails</span>
+    <strong>API pairing constraint:</strong> a <code>tool_result</code> must appear in the user
+    message <em>immediately after</em> the assistant message containing the matching
+    <code>tool_use</code>. You cannot defer results to the end — the Messages API validates the
+    adjacency and rejects anything else.<br><br>
+    <strong>Prefix causality:</strong> even if you could, a turn-3 result is "at the end" only
+    on turn 3's request. By turn 20 it sits deep in the prefix of every later request — and
+    turns 4–20 were <em>generated conditioned on it</em>. Editing or pruning it invalidates the
+    cache from turn 3 onward regardless of where it physically sits. That is exactly the cache
+    break we were trying to avoid.
+  </div>
+
+  <h3>Variation B — push <em>all</em> tool calls <em>and</em> results to the end</h3>
+  <div class="callout bad">
+    <span class="tag">Why it fails</span>
+    Same pairing constraint: you can't collect a conversation's worth of <code>tool_use</code>
+    blocks and defer their results. The <em>only</em> legal batching is <strong>parallel tool
+    calls</strong> — many <code>tool_use</code> blocks in one assistant turn, all their
+    <code>tool_result</code> blocks in the very next user turn.<br><br>
+    And "the end" is the end <em>only for the current inference step</em>. The moment the agent
+    takes another step, this step's results are frozen mid-prefix again. Pruning them later
+    still breaks the cache from that point. Reordering never escapes prefix causality.
+  </div>
+
+  <div class="callout good">
+    <span class="tag">What the hypothesis got right</span>
+    The instinct — "isolate the volatile stuff so it doesn't poison the stable prefix" — is
+    correct. It just can't be achieved by <em>reordering history</em>. It's achieved by
+    <em>layering</em> the prompt around a cache breakpoint (next section).
+  </div>
+
+  <h2 id="proposal">4. The proposal: two layers split by a breakpoint</h2>
+  <p>
+    Stop thinking "reorder the history." Think <strong>"stable prefix + regenerable volatile
+    tail, split by a breakpoint."</strong>
+  </p>
+
+  <div class="diagram">┌─────────────────────────────────────────────────────────┐
+│ <span class="stable">STABLE PREFIX</span>                                             │
+│   tools  →  system  →  task  →  summarized reasoning      │
+│   (text only — no dangling tool_use)                      │
+└─────────────────────────────────────────────────────────┘
+                  <span class="bp">⟂  cache breakpoint  (1-hour TTL)</span>
+┌─────────────────────────────────────────────────────────┐
+│ <span class="volatile">VOLATILE TAIL</span>                                             │
+│   this step's tool_use + tool_result, paired              │
+│   freely rewritten / pruned / rebuilt every turn          │
+└─────────────────────────────────────────────────────────┘</div>
+
+  <ul class="tight">
+    <li>Everything <em>after</em> the last breakpoint can be rewritten, pruned, or rebuilt every
+      turn — and you only re-bill the cheap tail. The expensive
+      <code>tools</code>/<code>system</code> block is <strong>never</strong> invalidated.</li>
+    <li>To advance a step you do <strong>not</strong> append raw results to the stable prefix.
+      You fold a <em>compressed</em> form into the stable narrative (a small, stable extension →
+      one cheap write) and discard the raw output.</li>
+    <li>Tool results therefore <strong>never become permanent prefix</strong>. They live in a
+      regenerable scratchpad behind the breakpoint. This is the legitimate realization of the
+      original instinct.</li>
+  </ul>
+  <p>
+    Net effect: a prune costs one <span class="pill write">1.25× write</span> on the small tail,
+    then every subsequent turn that shares the new prefix reads at
+    <span class="pill read">0.1×</span>. The expensive layer rides a 1-hour cache and is
+    effectively free after the first call.
+  </p>
+
+  <div class="callout good">
+    <span class="tag">Free win, available now</span>
+    Emit tool calls as <strong>parallel batches</strong> (one assistant turn, one result turn)
+    instead of sequential round-trips. Fewer prefix-extension points, a cleaner volatile tail,
+    fewer cache writes per task — independent of everything else here.
+  </div>
+
+  <h2 id="hard">5. The actual hard problem (it isn't caching)</h2>
+  <p>
+    With the two-layer scheme, caching is the <em>easy</em> part — the strict-suffix rule solves
+    it cleanly. The hard part is <strong>coherence</strong>.
+  </p>
+  <div class="callout warn">
+    <span class="tag">The real risk</span>
+    An earlier assistant decision was generated <em>conditioned on</em> a tool result. Prune
+    that result and the model loses the grounding for a decision still sitting in its history.
+    The thesis lives or dies on <strong>what you summarize the result into</strong>, not on
+    where you put it. Get the compression right and the cache economics fall out for free.
+  </div>
+
+  <h2 id="toggle">6. The user-facing toggle: cache vs. context</h2>
+  <p>
+    These two goals genuinely trade off, so expose them as a setting. The two-layer scheme is
+    the substrate; the toggle tunes <em>how aggressively the volatile tail is pruned</em> and
+    <em>how often raw results are folded into the stable prefix</em>.
+  </p>
+
+  <table>
+    <thead>
+      <tr><th>Mode</th><th>Behavior</th><th>Cost profile</th><th>Best for</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Prioritize cache</strong></td>
+        <td>Append-only; never prune mid-history. Compact rarely, only at large thresholds and
+          at breakpoint boundaries. Tolerate context bloat.</td>
+        <td>Cheap per turn (mostly <span class="pill read">0.1× reads</span>), but larger input
+          token counts; occasional big re-cache at compaction.</td>
+        <td>Long iterative sessions on one task; latency-sensitive; cost-sensitive work where
+          the model still does fine with a noisy window.</td>
+      </tr>
+      <tr>
+        <td><strong>Prioritize context</strong></td>
+        <td>Aggressively summarize/prune the volatile tail every step; fold compressed results
+          into the stable narrative frequently.</td>
+        <td>More frequent <span class="pill write">1.25× writes</span>, but much smaller total
+          token counts; potentially fewer retries / better outcomes.</td>
+        <td>Complex reasoning where stale or bulky tool output measurably degrades quality or
+          misleads the model.</td>
+      </tr>
+      <tr>
+        <td><strong>Balanced (default)</strong></td>
+        <td>Stable prefix always protected behind a 1-hour breakpoint. Tail pruned on a
+          moderate threshold; fold-into-prefix on step boundaries only.</td>
+        <td>Predictable: one cheap write per compaction, cheap reads in between.</td>
+        <td>The common case; safe starting point before a user tunes toward either pole.</td>
+      </tr>
+    </tbody>
+  </table>
+  <p>
+    Crucially, <strong>both poles sit on the same machinery</strong>. The
+    <code>tools</code>/<code>system</code> layer is cached on a 1-hour TTL in every mode — the
+    toggle never risks the expensive block. It only decides how chatty vs. how lean the tail is,
+    and how often we pay the small write to compress it.
+  </p>
+
+  <h2 id="summary">7. Summary table</h2>
+  <table>
+    <thead>
+      <tr><th>Idea</th><th>Verdict</th><th>Reason</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Tool <em>results</em> at end of conversation</td><td><span style="color:var(--bad)">✗ Fails</span></td><td>API pairing constraint + prefix causality</td></tr>
+      <tr><td>All tool calls + results at end</td><td><span style="color:var(--bad)">✗ Fails</span></td><td>Same; reordering never escapes the prefix</td></tr>
+      <tr><td>Surgically edit old tool results in place</td><td><span style="color:var(--bad)">✗ Fails</span></td><td>Invalidates cache from first changed byte</td></tr>
+      <tr><td>Two layers split by a breakpoint</td><td><span style="color:var(--good)">✓ Works</span></td><td>Volatile tail is strict suffix; stable prefix protected</td></tr>
+      <tr><td>Parallel tool-call batching</td><td><span style="color:var(--good)">✓ Works</span></td><td>Fewer prefix extension points, cleaner tail</td></tr>
+      <tr><td>Compaction at breakpoint boundaries</td><td><span style="color:var(--good)">✓ Works</span></td><td>One cheap write, then cheap reads until next compaction</td></tr>
+      <tr><td>Cache-vs-context user toggle</td><td><span style="color:var(--warn)">~ Tunable</span></td><td>Real tradeoff; both poles ride the same protected prefix</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout good">
+    <span class="tag">Bottom line</span>
+    You can't keep a stable prefix <em>through</em> a mid-history edit — that's fundamental, not
+    an implementation gap. But you can make pruning a <strong>strict-suffix operation behind a
+    breakpoint</strong>, so the expensive layer is never touched and pruning costs one small
+    write. The intelligence win is then gated by summarization quality, not by cache economics.
+  </div>
+
+  <p class="foot">
+    cpit design note · prompt-caching mechanics current as of the Anthropic Messages API
+    behavior at time of writing · reconcile any concrete budgets against
+    <code>GOALS.md</code> §10 before implementation.
+  </p>
+
+</div>
+</body>
+</html>
