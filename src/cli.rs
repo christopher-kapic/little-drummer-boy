@@ -58,6 +58,9 @@ pub enum Command {
     /// List available models for a provider.
     Models(ModelsArgs),
 
+    /// Refresh model lists from every configured provider's /models endpoint.
+    FetchModels(FetchModelsArgs),
+
     /// Manage sessions.
     #[command(subcommand)]
     Session(SessionCommand),
@@ -186,6 +189,18 @@ pub enum ProvidersCommand {
 #[derive(Debug, clap::Args)]
 pub struct ModelsArgs {
     pub provider: Option<String>,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct FetchModelsArgs {
+    /// Only refresh this provider id.
+    #[arg(long, value_name = "ID")]
+    pub provider: Option<String>,
+
+    /// `keep` | `remove` — skip the interactive prompt when configured
+    /// models drift from the upstream listing.
+    #[arg(long, value_name = "POLICY")]
+    pub on_unlisted: Option<String>,
 }
 
 // ---- sessions ----

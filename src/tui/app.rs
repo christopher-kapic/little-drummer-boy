@@ -56,6 +56,10 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "Quit cockpit",
     },
     SlashCommand {
+        name: "fetch-models",
+        description: "Refresh model lists from every configured provider",
+    },
+    SlashCommand {
         name: "model",
         description: "Switch the active model",
     },
@@ -176,6 +180,7 @@ impl App {
     fn event_loop(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         loop {
             self.sync_repo_status();
+            self.dialog.tick();
             self.maybe_grow_pane(terminal)?;
             if self.maybe_spill_history()? {
                 terminal.clear()?;
@@ -366,6 +371,18 @@ impl App {
                 self.dialog = Dialog::open(&self.launch.cwd);
                 return false;
             }
+            "fetch-models" => {
+                // Kick the user into the Providers list; the CLI command
+                // `cockpit fetch-models` does the actual cross-provider
+                // pull. Once the async runtime grows we can move the loop
+                // in here, but the list at least surfaces the entries.
+                self.dialog = Dialog::open_providers(&self.launch.cwd);
+                self.history.push(
+                    "/fetch-models: opened Providers — run `cockpit fetch-models` in another shell to pull all /models endpoints."
+                        .to_string(),
+                );
+                return false;
+            }
             "compact" => "/compact: stub — context compaction not wired yet.",
             "prune" => "/prune: stub — history pruning not wired yet.",
             "model" => "/model: stub — model picker not wired yet.",
@@ -499,11 +516,17 @@ impl App {
                 .iter()
                 .enumerate()
                 .map(|(i, cmd)| {
-                    let marker = if i == 0 { "▸ " } else { "  " };
+                    let is_best = i == 0;
+                    let marker = if is_best { "▸ " } else { "  " };
                     let name_padded = format!("/{:<width$}", cmd.name, width = name_w);
+                    let name_style = if is_best {
+                        Style::default().fg(Color::Yellow)
+                    } else {
+                        Style::default().fg(Color::White)
+                    };
                     Line::from(vec![
                         Span::raw(marker),
-                        Span::styled(name_padded, Style::default().fg(Color::Yellow)),
+                        Span::styled(name_padded, name_style),
                         Span::raw("  "),
                         Span::styled(cmd.description.to_string(), muted),
                     ])

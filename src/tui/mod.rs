@@ -19,4 +19,5 @@ pub mod composer;
 pub mod geometry;
 pub mod settings;
 pub mod slash;
+pub mod textfield;
 pub mod theme;

@@ -9,6 +9,7 @@ pub mod agent;
 pub mod connect;
 pub mod debug;
 pub mod export;
+pub mod fetch_models;
 pub mod import;
 pub mod init;
 pub mod mcp;

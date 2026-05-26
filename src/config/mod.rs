@@ -14,4 +14,5 @@
 pub mod dirs;
 pub mod extended;
 pub mod provider;
+pub mod providers;
 pub mod resolve;
