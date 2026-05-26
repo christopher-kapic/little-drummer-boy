@@ -161,15 +161,15 @@ pub fn print(project: Option<&Path>) {
     println!("{}", info.agent_name);
 }
 
-/// Print just the launch header (4 lines: logo + title, logo + provider,
-/// logo + path, logo bottom). Used by the TUI at startup so the header
-/// lands in normal terminal output — it scrolls naturally with the chat
-/// and ends up in scrollback once enough messages arrive.
+/// The 4-line launch header as ANSI-styled strings (logo + title,
+/// logo + provider, logo + path, logo bottom). Shared by `print_header`
+/// (startup, raw `println!`) and the TUI's `/new` path (mid-session,
+/// piped through `insert_above_viewport`).
 ///
 /// Spacing: P51 art renders 10 columns wide; the 3-space separator lines
 /// content up at column 13, matching the TUI's 11-wide icon column +
 /// 2-space text indent.
-pub fn print_header(info: &LaunchInfo) {
+pub fn header_lines(info: &LaunchInfo) -> Vec<String> {
     let title = format!("{BOLD}{APP_NAME}{RESET} {GREY}v{}{RESET}", info.version);
     match info.user_name.as_deref() {
         Some(name) if !name.is_empty() => {
@@ -177,26 +177,34 @@ pub fn print_header(info: &LaunchInfo) {
             // line slots in between the title and the provider line.
             // All four logo rows carry text; the trailing empty-art row
             // is sacrificed since the logo is only four lines tall.
-            println!("{}   {}", P51_ANSI_LINES[0], title);
-            println!(
-                "{}   {GREY}Welcome, {BOLD}{name}{RESET}",
-                P51_ANSI_LINES[1]
-            );
-            println!(
-                "{}   {GREY}{}{RESET}",
-                P51_ANSI_LINES[2], info.provider_line
-            );
-            println!("{}   {}", P51_ANSI_LINES[3], path_line_ansi(info));
+            vec![
+                format!("{}   {}", P51_ANSI_LINES[0], title),
+                format!("{}   {GREY}Welcome, {BOLD}{name}{RESET}", P51_ANSI_LINES[1]),
+                format!(
+                    "{}   {GREY}{}{RESET}",
+                    P51_ANSI_LINES[2], info.provider_line
+                ),
+                format!("{}   {}", P51_ANSI_LINES[3], path_line_ansi(info)),
+            ]
         }
-        _ => {
-            println!("{}   {}", P51_ANSI_LINES[0], title);
-            println!(
+        _ => vec![
+            format!("{}   {}", P51_ANSI_LINES[0], title),
+            format!(
                 "{}   {GREY}{}{RESET}",
                 P51_ANSI_LINES[1], info.provider_line
-            );
-            println!("{}   {}", P51_ANSI_LINES[2], path_line_ansi(info));
-            println!("{}", P51_ANSI_LINES[3]);
-        }
+            ),
+            format!("{}   {}", P51_ANSI_LINES[2], path_line_ansi(info)),
+            P51_ANSI_LINES[3].to_string(),
+        ],
+    }
+}
+
+/// Print just the launch header (4 lines). Used by the TUI at startup
+/// so the header lands in normal terminal output — it scrolls naturally
+/// with the chat and ends up in scrollback once enough messages arrive.
+pub fn print_header(info: &LaunchInfo) {
+    for line in header_lines(info) {
+        println!("{line}");
     }
 }
 

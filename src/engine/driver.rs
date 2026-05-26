@@ -165,6 +165,28 @@ impl Driver {
                 TurnOutcome::Done => {
                     if self.stack.len() > 1 {
                         let child = self.stack.pop().unwrap();
+                        // Drop any locks the child still held — the
+                        // §3c invariant doesn't extend across the
+                        // child's lifetime, and lingering locks would
+                        // block whatever takes its slot next.
+                        if let Err(e) = self
+                            .locks
+                            .suspend_agent(&child.agent.name, self.session.id)
+                        {
+                            tracing::warn!(error = ?e, agent = %child.agent.name, "suspend_agent on pop failed");
+                        }
+                        // The agent now back on top regains its lock
+                        // set for files whose hash matches the snapshot
+                        // taken when it was suspended (see SpawnSubagent
+                        // below).
+                        if let Some(parent) = self.stack.last() {
+                            if let Err(e) = self
+                                .locks
+                                .resume_agent(&parent.agent.name, self.session.id)
+                            {
+                                tracing::warn!(error = ?e, agent = %parent.agent.name, "resume_agent on pop failed");
+                            }
+                        }
                         let report = collect_final_text(&child.history);
                         let _ = tx
                             .send(TurnEvent::SubagentReport {
@@ -203,6 +225,19 @@ impl Driver {
                     task_call_id,
                     task_function_call_id,
                 } => {
+                    // Snapshot the outgoing primary's locks before the
+                    // child takes over. If the parent ever resumes (the
+                    // child pops via TurnOutcome::Done above), the
+                    // matching-hash files can come back without a re-
+                    // readlock round-trip.
+                    if let Some(parent) = self.stack.last() {
+                        if let Err(e) = self
+                            .locks
+                            .suspend_agent(&parent.agent.name, self.session.id)
+                        {
+                            tracing::warn!(error = ?e, agent = %parent.agent.name, "suspend_agent on push failed");
+                        }
+                    }
                     let child = crate::engine::builtin::load(&child_agent, &self.spawn_args())?;
                     self.stack.push(AgentSession {
                         agent: Arc::new(child),

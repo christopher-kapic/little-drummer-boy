@@ -83,6 +83,10 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "Switch the active model",
     },
     SlashCommand {
+        name: "new",
+        description: "Clear the chat and start a fresh session",
+    },
+    SlashCommand {
         name: "prune",
         description: "Drop the oldest messages",
     },
@@ -176,6 +180,11 @@ pub struct App {
     /// suppressed until the active `@partial` token is dropped (e.g.
     /// whitespace appears after `@` or the `@` is deleted).
     at_dismissed: bool,
+    /// `/new` was invoked; the event loop services it on the next tick
+    /// (needs the terminal handle for `insert_before` so the existing
+    /// history spills to scrollback before the welcome header is
+    /// reprinted above the viewport).
+    pending_new_session: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -248,6 +257,7 @@ impl App {
             last_cursor_shape: None,
             at_selected: 0,
             at_dismissed: false,
+            pending_new_session: false,
         };
         app.pane_height = app.geometry().desired_pane_height();
         app
@@ -388,6 +398,7 @@ impl App {
             // longer need to follow it with `terminal.clear()` (the
             // old hand-rolled spill path's flicker source).
             self.maybe_spill_history(terminal)?;
+            self.maybe_service_new_session(terminal)?;
             terminal.draw(|frame| self.render(frame))?;
             self.sync_cursor_shape();
 
@@ -496,6 +507,72 @@ impl App {
         Ok(true)
     }
 
+    /// `/new` was invoked: spill the current chat into terminal
+    /// scrollback, reprint the welcome header above the viewport, and
+    /// drop the daemon-attached runner so the next user message creates
+    /// a fresh session.
+    fn maybe_service_new_session(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
+        if !self.pending_new_session {
+            return Ok(());
+        }
+        self.pending_new_session = false;
+
+        // Spill the visible history first so the user can scroll up to
+        // see what was on screen before the reset.
+        self.finalize_pending();
+        if !self.history.is_empty() {
+            let plain: Vec<String> = self
+                .history
+                .iter()
+                .flat_map(|entry| {
+                    let mut lines = entry_to_plain_lines(entry);
+                    if matches!(entry, HistoryEntry::User { .. } | HistoryEntry::Agent { .. }) {
+                        lines.push(String::new());
+                    }
+                    lines
+                })
+                .collect();
+            let n = plain.len() as u16;
+            if n > 0 {
+                terminal.insert_before(n, |buf| {
+                    use ratatui::text::Line;
+                    use ratatui::widgets::{Paragraph, Widget};
+                    let lines: Vec<Line<'static>> =
+                        plain.iter().map(|s| Line::raw(s.clone())).collect();
+                    Paragraph::new(lines).render(buf.area, buf);
+                })?;
+            }
+        }
+
+        // Reset transcript state.
+        self.history.clear();
+        self.queue.clear();
+        self.pending = None;
+        self.clickable_rows.clear();
+        self.chat_area = None;
+        // prompt_history is shell-style across sessions — keep it.
+        self.prompt_history_cursor = 0;
+        // Reload from disk in case settings changed and refresh the
+        // greeting.
+        self.reload_launch_info();
+        self.reload_tui_config();
+
+        // Reprint the welcome header into scrollback. Use raw stdout
+        // writes so the ANSI styling survives (ratatui's `Paragraph`
+        // would render the escapes as literal characters).
+        let header = welcome::header_lines(&self.launch);
+        insert_above_viewport(self.pane_height, &header)?;
+        // ratatui's buffer no longer reflects the actual terminal —
+        // force a full repaint of the viewport on the next draw.
+        terminal.clear()?;
+
+        // Drop the runner so the next submit re-attaches the daemon
+        // with `session_id: None`, opening a fresh session.
+        self.agent_runner = None;
+
+        Ok(())
+    }
+
     fn handle_key(&mut self, key: KeyEvent) -> bool {
         if key.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('d'))
@@ -559,9 +636,12 @@ impl App {
             if self.dialog.handle_key(key) {
                 // Closing the settings dialog can change the active
                 // provider/model — reload launch info so the status
-                // line and header refresh.
+                // line and header refresh. TUI-side settings (vim
+                // mode, thinking display, markdown) are also reloaded
+                // so they apply without a restart.
                 self.dialog = Dialog::None;
                 self.reload_launch_info();
+                self.reload_tui_config();
             }
             return false;
         }
@@ -1334,6 +1414,10 @@ impl App {
                 }
                 return false;
             }
+            "new" => {
+                self.pending_new_session = true;
+                return false;
+            }
             "compact" => "/compact: stub — context compaction not wired yet.",
             "prune" => "/prune: stub — history pruning not wired yet.",
             _ => return false,
@@ -1352,6 +1436,25 @@ impl App {
         // background poller and is fresher than a re-read here.
         fresh.repo_status = self.launch.repo_status.clone();
         self.launch = fresh;
+    }
+
+    /// Re-read the TUI-side config (vim mode, thinking display,
+    /// markdown rendering) so changes made via `/settings` take effect
+    /// immediately on dialog close.
+    fn reload_tui_config(&mut self) {
+        let tui_cfg = load_tui_config(&self.launch.cwd);
+        self.vim_setting = tui_cfg.vim_mode;
+        self.thinking_setting = tui_cfg.thinking;
+        self.markdown_opts = MarkdownOpts {
+            agent: tui_cfg.render_agent_markdown,
+            user: tui_cfg.render_user_markdown,
+        };
+        let vim_enabled = self.vim_setting.vim_enabled();
+        if self.composer.vim_enabled() != vim_enabled {
+            self.composer.set_vim_enabled(vim_enabled);
+            // Mode stays whatever the composer was in; if vim flipped
+            // off the composer will treat further input as Insert.
+        }
     }
 
     /// Kick off a non-interactive cross-provider `/models` refresh.

@@ -160,7 +160,7 @@ pub struct Rendered {
 /// background to the full width.
 ///
 /// `thinking` controls how reasoning is surfaced:
-/// - [`ThinkingDisplay::Condensed`] (default) — clickable chip, expands on click
+/// - [`ThinkingDisplay::Condensed`] (default) — chip, expands on `Ctrl+R`
 /// - [`ThinkingDisplay::Hidden`] — drop the chip and reasoning entirely
 /// - [`ThinkingDisplay::Verbose`] — force expanded regardless of the stored flag
 pub fn render_entry(
@@ -394,9 +394,9 @@ fn render_agent(
     if has_reasoning {
         let arrow = if expanded { "▼" } else { "▶" };
         let action_hint = if expanded {
-            "click to collapse"
+            "ctrl+r to collapse"
         } else {
-            "click to expand"
+            "ctrl+r to expand"
         };
         let label = match think_duration {
             Some(d) => format!(
