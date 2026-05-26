@@ -9,7 +9,7 @@ use rusqlite::params;
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::db::{Db, lang::language_for_path};
+use crate::db::{lang::language_for_path, Db};
 use crate::engine::repair::Recovery;
 
 #[derive(Debug, Clone)]
@@ -89,6 +89,76 @@ impl Db {
         })
     }
 
+    /// Recent rows where the call either hard-failed or fired any
+    /// recovery. Newest-first. Used by `cockpit debug failed-calls` to
+    /// surface candidates for new repair-catalog entries.
+    ///
+    /// Filtering:
+    /// - `since_epoch`: only include rows with `timestamp >= since_epoch`.
+    /// - `tool`, `model`, `project_id`: exact-match filters (NULL =
+    ///   "any").
+    /// - `include_recovered`: when `false`, only `hard_fail = 1` rows
+    ///   are returned. When `true`, rows with any non-NULL
+    ///   `recovery_kind` are included too — useful for spotting
+    ///   patterns the catalog is already catching.
+    /// - `limit`: max rows returned.
+    pub fn list_failed_tool_calls(&self, filter: FailedCallsFilter) -> Result<Vec<ToolCallEvent>> {
+        self.with_conn(|conn| {
+            let mut sql = String::from(
+                "SELECT event_id, session_id, call_id, timestamp,
+                        model, provider, project_id, project_root,
+                        agent, tool, path,
+                        recovery_kind, recovery_stage, hard_fail,
+                        original_input_json, wire_input_json,
+                        output, truncated, duration_ms
+                   FROM tool_call_events
+                  WHERE timestamp >= ?1",
+            );
+            let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(filter.since_epoch)];
+
+            if filter.include_recovered {
+                sql.push_str(" AND (hard_fail = 1 OR recovery_kind IS NOT NULL)");
+            } else {
+                sql.push_str(" AND hard_fail = 1");
+            }
+
+            if let Some(t) = &filter.tool {
+                sql.push_str(" AND tool = ?");
+                sql.push_str(&format!("{}", params_vec.len() + 1));
+                params_vec.push(Box::new(t.clone()));
+            }
+            if let Some(m) = &filter.model {
+                sql.push_str(" AND model = ?");
+                sql.push_str(&format!("{}", params_vec.len() + 1));
+                params_vec.push(Box::new(m.clone()));
+            }
+            if let Some(p) = &filter.project_id {
+                sql.push_str(" AND project_id = ?");
+                sql.push_str(&format!("{}", params_vec.len() + 1));
+                params_vec.push(Box::new(p.clone()));
+            }
+
+            sql.push_str(" ORDER BY timestamp DESC, rowid DESC LIMIT ?");
+            sql.push_str(&format!("{}", params_vec.len() + 1));
+            params_vec.push(Box::new(filter.limit as i64));
+
+            let mut stmt = conn
+                .prepare(&sql)
+                .context("preparing list_failed_tool_calls")?;
+            let param_refs: Vec<&dyn rusqlite::ToSql> =
+                params_vec.iter().map(|b| b.as_ref()).collect();
+            let rows = stmt
+                .query_map(param_refs.as_slice(), decode_row)
+                .context("querying tool_call_events")?;
+            let mut out = Vec::new();
+            for r in rows {
+                let raw = r.context("decoding tool_call row")?;
+                out.push(raw.try_into()?);
+            }
+            Ok(out)
+        })
+    }
+
     /// All tool-call rows for one session, oldest-first. Used by
     /// `Attach` to rebuild the user transcript on the client.
     pub fn list_tool_calls_for_session(&self, session_id: Uuid) -> Result<Vec<ToolCallEvent>> {
@@ -108,39 +178,7 @@ impl Db {
                 .context("preparing list_tool_calls")?;
 
             let rows = stmt
-                .query_map([session_id.to_string()], |row| {
-                    let event_id: String = row.get("event_id")?;
-                    let sid: String = row.get("session_id")?;
-                    let original_json: String = row.get("original_input_json")?;
-                    let wire_json: String = row.get("wire_input_json")?;
-                    let recovery_kind: Option<String> = row.get("recovery_kind")?;
-                    let recovery_stage: Option<String> = row.get("recovery_stage")?;
-                    let hard_fail: i64 = row.get("hard_fail")?;
-                    let truncated: i64 = row.get("truncated")?;
-                    let duration_ms: Option<i64> = row.get("duration_ms")?;
-
-                    Ok(ToolCallEventRaw {
-                        event_id,
-                        session_id: sid,
-                        call_id: row.get("call_id")?,
-                        timestamp: row.get("timestamp")?,
-                        model: row.get("model")?,
-                        provider: row.get("provider")?,
-                        project_id: row.get("project_id")?,
-                        project_root: row.get("project_root")?,
-                        agent: row.get("agent")?,
-                        tool: row.get("tool")?,
-                        path: row.get("path")?,
-                        recovery_kind,
-                        recovery_stage,
-                        hard_fail: hard_fail != 0,
-                        original_input_json: original_json,
-                        wire_input_json: wire_json,
-                        output: row.get("output")?,
-                        truncated: truncated != 0,
-                        duration_ms: duration_ms.unwrap_or(0) as u64,
-                    })
-                })
+                .query_map([session_id.to_string()], decode_row)
                 .context("querying tool_call_events")?;
 
             let mut out = Vec::new();
@@ -151,6 +189,51 @@ impl Db {
             Ok(out)
         })
     }
+}
+
+/// Filter for [`Db::list_failed_tool_calls`].
+#[derive(Debug, Clone)]
+pub struct FailedCallsFilter {
+    pub since_epoch: i64,
+    pub tool: Option<String>,
+    pub model: Option<String>,
+    pub project_id: Option<String>,
+    pub include_recovered: bool,
+    pub limit: usize,
+}
+
+fn decode_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ToolCallEventRaw> {
+    let event_id: String = row.get("event_id")?;
+    let sid: String = row.get("session_id")?;
+    let original_json: String = row.get("original_input_json")?;
+    let wire_json: String = row.get("wire_input_json")?;
+    let recovery_kind: Option<String> = row.get("recovery_kind")?;
+    let recovery_stage: Option<String> = row.get("recovery_stage")?;
+    let hard_fail: i64 = row.get("hard_fail")?;
+    let truncated: i64 = row.get("truncated")?;
+    let duration_ms: Option<i64> = row.get("duration_ms")?;
+
+    Ok(ToolCallEventRaw {
+        event_id,
+        session_id: sid,
+        call_id: row.get("call_id")?,
+        timestamp: row.get("timestamp")?,
+        model: row.get("model")?,
+        provider: row.get("provider")?,
+        project_id: row.get("project_id")?,
+        project_root: row.get("project_root")?,
+        agent: row.get("agent")?,
+        tool: row.get("tool")?,
+        path: row.get("path")?,
+        recovery_kind,
+        recovery_stage,
+        hard_fail: hard_fail != 0,
+        original_input_json: original_json,
+        wire_input_json: wire_json,
+        output: row.get("output")?,
+        truncated: truncated != 0,
+        duration_ms: duration_ms.unwrap_or(0) as u64,
+    })
 }
 
 struct ToolCallEventRaw {
@@ -185,8 +268,8 @@ impl TryFrom<ToolCallEventRaw> for ToolCallEvent {
             .with_context(|| format!("session_id `{}`", r.session_id))?;
         let original_input_json: Value = serde_json::from_str(&r.original_input_json)
             .context("deserializing original_input_json")?;
-        let wire_input_json: Value = serde_json::from_str(&r.wire_input_json)
-            .context("deserializing wire_input_json")?;
+        let wire_input_json: Value =
+            serde_json::from_str(&r.wire_input_json).context("deserializing wire_input_json")?;
         let recovery = decode_recovery(&r.recovery_kind, &r.recovery_stage);
 
         Ok(Self {
@@ -212,17 +295,34 @@ impl TryFrom<ToolCallEventRaw> for ToolCallEvent {
     }
 }
 
-/// Inverse of [`Recovery::db_fields`]. v0 only persists `shape_repair`
-/// and `relational_default`; unknown kinds round-trip as `Clean` so a
-/// new release that adds stages doesn't crash older history readers.
-fn decode_recovery(kind: &Option<String>, _stage: &Option<String>) -> Recovery {
+/// Inverse of [`Recovery::db_fields`]. Stages live in a fixed catalog
+/// (see [`crate::engine::repair::EDIT_CASCADE_STAGES`] /
+/// [`crate::engine::repair::SHAPE_REPAIR_STAGES`]); we round-trip by
+/// matching the stored stage name against the catalog so we can hand the
+/// `&'static str` back without leaking. Unknown / future stages fall
+/// back to `Clean` so a new release that adds a stage doesn't crash
+/// older readers.
+fn decode_recovery(kind: &Option<String>, stage: &Option<String>) -> Recovery {
+    use crate::engine::repair::{EDIT_CASCADE_STAGES, SHAPE_REPAIR_STAGES};
+    let stage_str = stage.as_deref().unwrap_or("");
     match kind.as_deref() {
         None => Recovery::Clean,
-        // We carry the stage as &'static str through Recovery::ShapeRepair;
-        // since the rubric assignment is by stage name, we reconstitute
-        // by leaking. For now, treat unknown / read-back values as Clean
-        // — the canonical write-time annotation is what powers
-        // /stats, and we don't yet read recovery back into the engine.
+        Some("shape_repair") => SHAPE_REPAIR_STAGES
+            .iter()
+            .find(|s| **s == stage_str)
+            .map(|s| Recovery::ShapeRepair {
+                stage: *s,
+                path: String::new(),
+            })
+            .unwrap_or(Recovery::Clean),
+        Some("edit_cascade") => EDIT_CASCADE_STAGES
+            .iter()
+            .find(|s| **s == stage_str)
+            .map(|s| Recovery::EditCascade {
+                stage: *s,
+                path: "old_string".to_string(),
+            })
+            .unwrap_or(Recovery::Clean),
         Some(_) => Recovery::Clean,
     }
 }
@@ -270,6 +370,103 @@ mod tests {
     }
 
     #[test]
+    fn list_failed_tool_calls_filters_correctly() {
+        let db = Db::open_in_memory().unwrap();
+        let sid = fixture(&db);
+        let mk = |tool: &str, ts: i64, hard_fail: bool, recovery: Recovery| ToolCallEvent {
+            event_id: Uuid::new_v4(),
+            session_id: sid,
+            call_id: "c".into(),
+            timestamp: ts,
+            model: "claude-opus-4-7".into(),
+            provider: "anthropic".into(),
+            project_id: "p".into(),
+            project_root: "/x".into(),
+            agent: "coder".into(),
+            tool: tool.into(),
+            path: None,
+            recovery,
+            hard_fail,
+            original_input_json: json!({}),
+            wire_input_json: json!({}),
+            output: "".into(),
+            truncated: false,
+            duration_ms: 0,
+        };
+        db.insert_tool_call(&mk("read", 100, false, Recovery::Clean))
+            .unwrap();
+        db.insert_tool_call(&mk("read", 200, true, Recovery::Clean))
+            .unwrap();
+        db.insert_tool_call(&mk(
+            "editunlock",
+            300,
+            false,
+            Recovery::EditCascade {
+                stage: "line_trim",
+                path: "old_string".into(),
+            },
+        ))
+        .unwrap();
+        db.insert_tool_call(&mk("bash", 400, true, Recovery::Clean))
+            .unwrap();
+
+        // hard-fail only, newest-first.
+        let rows = db
+            .list_failed_tool_calls(FailedCallsFilter {
+                since_epoch: 0,
+                tool: None,
+                model: None,
+                project_id: None,
+                include_recovered: false,
+                limit: 10,
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].tool, "bash");
+        assert_eq!(rows[1].tool, "read");
+
+        // include recoveries.
+        let rows = db
+            .list_failed_tool_calls(FailedCallsFilter {
+                since_epoch: 0,
+                tool: None,
+                model: None,
+                project_id: None,
+                include_recovered: true,
+                limit: 10,
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+
+        // tool filter.
+        let rows = db
+            .list_failed_tool_calls(FailedCallsFilter {
+                since_epoch: 0,
+                tool: Some("bash".into()),
+                model: None,
+                project_id: None,
+                include_recovered: true,
+                limit: 10,
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].tool, "bash");
+
+        // since filter.
+        let rows = db
+            .list_failed_tool_calls(FailedCallsFilter {
+                since_epoch: 250,
+                tool: None,
+                model: None,
+                project_id: None,
+                include_recovered: true,
+                limit: 10,
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
     fn language_populated_from_extension() {
         let db = Db::open_in_memory().unwrap();
         let sid = fixture(&db);
@@ -296,11 +493,11 @@ mod tests {
         db.insert_tool_call(&ev).unwrap();
         let language: Option<String> = db
             .with_conn(|c| {
-                Ok(c.query_row(
-                    "SELECT language FROM tool_call_events LIMIT 1",
-                    [],
-                    |r| r.get(0),
-                )?)
+                Ok(
+                    c.query_row("SELECT language FROM tool_call_events LIMIT 1", [], |r| {
+                        r.get(0)
+                    })?,
+                )
             })
             .unwrap();
         assert_eq!(language.as_deref(), Some("Python"));

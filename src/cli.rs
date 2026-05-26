@@ -303,8 +303,38 @@ pub enum DebugCommand {
     /// that would be sent for the next turn, with token counts. Lets users
     /// audit cockpit's context overhead. See `GOALS.md` §10.
     Context,
+    /// **cockpit-specific:** list recent tool calls that hard-failed
+    /// (and optionally those that fired any recovery). Surfaces
+    /// candidates for the §12 repair catalog.
+    FailedCalls(FailedCallsArgs),
     /// Wait indefinitely (for debugging).
     Wait,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct FailedCallsArgs {
+    /// Only failures within the last N days. Default: 7.
+    #[arg(long, default_value_t = 7)]
+    pub days: u32,
+    /// Only this tool name (e.g. `editunlock`, `bash`).
+    #[arg(long)]
+    pub tool: Option<String>,
+    /// Only this model id.
+    #[arg(long)]
+    pub model: Option<String>,
+    /// Project path (resolves to project_id). Defaults to all projects.
+    #[arg(long, value_name = "PATH")]
+    pub project: Option<PathBuf>,
+    /// Max rows. Default: 50.
+    #[arg(long, default_value_t = 50)]
+    pub limit: u32,
+    /// Also include rows that succeeded after a recovery fired (any
+    /// non-NULL `recovery_kind`).
+    #[arg(long)]
+    pub include_recovered: bool,
+    /// Emit NDJSON instead of formatted text.
+    #[arg(long)]
+    pub json: bool,
 }
 
 // ---- meta / connect / pr / init ----

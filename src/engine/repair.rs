@@ -29,6 +29,11 @@ pub enum Recovery {
     /// A shape repair fired. `stage` is the catalog name
     /// (`null_for_optional`, `wrap_bare_string`, etc.).
     ShapeRepair { stage: &'static str, path: String },
+    /// The `edit` cascade matched at a stage past `exact`. `stage` is the
+    /// stage that matched (`line_trim`, `block_anchor`, …); `path` names
+    /// the argument the cascade rewrote (always `"old_string"` for v0).
+    /// See GOALS §13c.
+    EditCascade { stage: &'static str, path: String },
 }
 
 impl Recovery {
@@ -37,9 +42,26 @@ impl Recovery {
         match self {
             Recovery::Clean => (None, None),
             Recovery::ShapeRepair { stage, .. } => (Some("shape_repair"), Some(stage)),
+            Recovery::EditCascade { stage, .. } => (Some("edit_cascade"), Some(stage)),
         }
     }
 }
+
+/// Known cascade stage names. Used by the audit-row reader to round-trip
+/// `Recovery::EditCascade` without leaking strings.
+pub const EDIT_CASCADE_STAGES: &[&str] = &[
+    "exact",
+    "line_trim",
+    "block_anchor",
+    "whitespace_normalized",
+    "indent_flexible",
+    "escape_normalized",
+    "trimmed_boundary",
+    "context_aware",
+];
+
+/// Known shape-repair stage names. Same purpose as `EDIT_CASCADE_STAGES`.
+pub const SHAPE_REPAIR_STAGES: &[&str] = &["null_for_optional", "wrap_bare_string"];
 
 /// Try the catalog against `args` given knowledge of the tool's expected
 /// fields. For v0 we don't validate against a full schema — we just look

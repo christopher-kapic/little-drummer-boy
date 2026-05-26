@@ -137,6 +137,12 @@ const USER_INNER_PAD: usize = 1;
 /// callers don't sprinkle string literals.
 const AGENT_BULLET: &str = "";
 
+/// Left-side horizontal padding applied to every agent message line, so
+/// the text doesn't sit flush against the terminal edge now that the
+/// bullet is gone. Continuation lines inherit this indent; the first
+/// line gets it too, with the timestamp reserve on the right side.
+const AGENT_INDENT: usize = 2;
+
 /// One rendered history entry. The chrome assembles a flat list of
 /// `Rendered` for the chat pane, then uses each entry's `chip_row` to
 /// build a click-targeting map: a click on row N of the pane resolves
@@ -365,11 +371,13 @@ fn render_agent(
     markdown: bool,
 ) -> Rendered {
     let _ = name;
-    let bullet_width: usize = if AGENT_BULLET.is_empty() {
-        0
-    } else {
-        AGENT_BULLET.chars().count() + 1 // bullet + space
-    };
+    let bullet_width: usize = AGENT_INDENT
+        + if AGENT_BULLET.is_empty() {
+            0
+        } else {
+            AGENT_BULLET.chars().count() + 1 // bullet + space
+        };
+    let indent_span = || Span::raw(" ".repeat(AGENT_INDENT));
     let has_reasoning = !reasoning.trim().is_empty();
     let reserve_first = TIMESTAMP_WIDTH + 1;
 
@@ -403,7 +411,7 @@ fn render_agent(
             .flat_map(|raw_line| wrap_with_reserved_first_line(raw_line, text_width, 0))
             .collect();
 
-        let mut chip_spans: Vec<Span<'static>> = Vec::new();
+        let mut chip_spans: Vec<Span<'static>> = vec![indent_span()];
         if !AGENT_BULLET.is_empty() {
             chip_spans.push(Span::styled(
                 format!("{AGENT_BULLET} "),
@@ -418,7 +426,7 @@ fn render_agent(
         ));
 
         let body_lines: Vec<Line<'static>> = if markdown {
-            markdown::render(text)
+            indent_lines(markdown::render(text), AGENT_INDENT)
         } else {
             wrapped
                 .iter()
@@ -433,7 +441,7 @@ fn render_agent(
             out.push(render_first_line_timestamped(chip_spans, timestamp, width, false));
             for raw_line in reasoning.lines() {
                 out.push(Line::from(vec![
-                    Span::raw("    "),
+                    Span::raw(" ".repeat(AGENT_INDENT + 4)),
                     Span::styled(
                         raw_line.to_string(),
                         Style::default().fg(REASONING_FG),
@@ -462,8 +470,9 @@ fn render_agent(
         }
     } else if markdown {
         // No reasoning + markdown: emit markdown lines, attaching the
-        // timestamp to the first line via right-edge padding.
-        let body = markdown::render(text);
+        // timestamp to the first line via right-edge padding. Every
+        // line carries AGENT_INDENT on the left.
+        let body = indent_lines(markdown::render(text), AGENT_INDENT);
         if body.is_empty() {
             out.extend(render_with_timestamp(vec![], timestamp, width));
         } else {
@@ -476,20 +485,21 @@ fn render_agent(
             }
         }
     } else {
-        // No reasoning — text starts at col 0 (no bullet), timestamp
-        // right-aligned on the first wrapped line.
+        // No reasoning, no markdown — text gets the standard left
+        // indent; the timestamp is right-aligned on the first wrapped
+        // line. The wrap is sized so `indent + chunk` fits in `width`.
         let chunks = wrap_with_reserved_first_line_and_prefix(
             text,
-            width as usize,
+            (width as usize).saturating_sub(bullet_width).max(1),
             reserve_first,
-            bullet_width,
+            0,
         );
         if chunks.is_empty() {
             out.extend(render_with_timestamp(vec![], timestamp, width));
         } else {
             for (i, chunk) in chunks.iter().enumerate() {
                 if i == 0 {
-                    let mut spans: Vec<Span<'static>> = Vec::new();
+                    let mut spans: Vec<Span<'static>> = vec![indent_span()];
                     if !AGENT_BULLET.is_empty() {
                         spans.push(Span::styled(
                             format!("{AGENT_BULLET} "),
@@ -548,6 +558,24 @@ fn render_first_line_with_timestamp(
     width: u16,
 ) -> Line<'static> {
     render_first_line_timestamped(spans, timestamp, width, true)
+}
+
+/// Prepend `n` cells of left padding to every line. Used to apply
+/// `AGENT_INDENT` to markdown-rendered agent bodies whose lines come
+/// back without any leading indent.
+fn indent_lines(lines: Vec<Line<'static>>, n: usize) -> Vec<Line<'static>> {
+    if n == 0 {
+        return lines;
+    }
+    let prefix = " ".repeat(n);
+    lines
+        .into_iter()
+        .map(|mut l| {
+            let mut spans = vec![Span::raw(prefix.clone())];
+            spans.append(&mut l.spans);
+            Line::from(spans)
+        })
+        .collect()
 }
 
 fn blank_bg_line(width: usize, bg: Color) -> Line<'static> {

@@ -1,25 +1,26 @@
 //! `editunlock` — search/replace with the §13b cascade, then release the lock.
 //!
-//! Eight-stage cascade per plan §13b:
+//! Eight-stage cascade per plan §13b, in order:
 //!   1. Exact match.
 //!   2. Line-trim (strip trailing whitespace per line).
-//!   3. Block-anchor (first + last lines pin the region, interior
-//!      matched by Levenshtein).
+//!   3. Block-anchor (first + last lines pin the region, interior char
+//!      overlap ≥ 90% with target).
 //!   4. Whitespace-normalized (collapse runs).
 //!   5. Indent-flexible (strip common leading indentation).
 //!   6. Escape-normalized (reconcile `\n` / `\t` / `\"`).
 //!   7. Trimmed-boundary (trim outer whitespace).
-//!   8. Context-aware (first + last lines exact, interior ≥50% by char
-//!      content).
+//!   8. Context-aware (first + last lines exact, interior char overlap
+//!      ≥ 50% — falls below the block-anchor threshold).
 //!
-//! On match the canonical bytes from the file get used as `old_string`
-//! when constructing the replacement, so the replacement is always
-//! against the file's actual bytes — exactly the §13c rewrite goal,
-//! limited to the local replace step. The persisted §14
-//! `wire_input.old_string` rewrite (so the model's *next* inference
-//! call carries the canonical form) is deferred to a follow-up; v0
-//! stores `recovery_stage` correctly but does not mutate
-//! `wire_input_json` away from the original. See plan §13c.
+//! On match, the canonical bytes from the file are used as `old_string`
+//! when constructing the replacement (so the replacement is always
+//! against the file's actual bytes). For matches past stage 1 the tool
+//! also returns a `Recovery::EditCascade { stage, path: "old_string" }`
+//! and the rewritten args back through [`ToolOutput::with_recovery`];
+//! the dispatcher persists the canonical args to
+//! `tool_call_events.wire_input_json` and mutates the in-history
+//! assistant `ToolCall` so the next inference carries the canonical
+//! form. This is plan §13c.
 //!
 //! Multiple matches at any stage with `replace_all = false` produce an
 //! ambiguity error (the same loud failure mode plan §13b prescribes).
@@ -28,6 +29,7 @@ use anyhow::{Result, bail};
 use async_trait::async_trait;
 use serde_json::Value;
 
+use crate::engine::repair::Recovery;
 use crate::engine::tool::{Tool, ToolCtx, ToolOutput};
 use crate::tools::common::{detect_crlf, normalize_line_endings, resolve};
 
@@ -119,12 +121,34 @@ impl Tool for EditunlockTool {
         ctx.locks.release(&path, &ctx.agent_id)?;
         ctx.locks.note_read(&path, &ctx.agent_id, ctx.session.id);
 
-        Ok(ToolOutput::text(format!(
+        let out = ToolOutput::text(format!(
             "edited `{}` ({}; {} bytes)",
             path.display(),
             stage,
             normalized.len()
-        )))
+        ));
+        // Per §13c, every cascade stage past `exact` is a content-
+        // equivalent rewrite: substituting `canonical` for the model's
+        // submitted `old_string` does not change the edit's effect, but
+        // does give the model's next attention pass over its own prior
+        // outputs the form that *would have* matched at stage 1. We
+        // hand the dispatcher both the recovery annotation and the
+        // rewritten args; it does the wire/history mutation.
+        if stage != "exact" {
+            let mut canonical_args = args.clone();
+            if let Value::Object(map) = &mut canonical_args {
+                map.insert("old_string".to_string(), Value::String(canonical.clone()));
+            }
+            Ok(out.with_recovery(
+                Recovery::EditCascade {
+                    stage,
+                    path: "old_string".to_string(),
+                },
+                canonical_args,
+            ))
+        } else {
+            Ok(out)
+        }
     }
 }
 
@@ -134,9 +158,9 @@ struct Match {
     stage: &'static str,
 }
 
-/// Walk the cascade. Returns `Ok(Some(_))` on a successful match (any
-/// stage), `Ok(None)` on total miss. An `Err` only fires for ambiguous
-/// matches (multiple-match errors per plan §13b).
+/// Walk the cascade in §13b order. Returns `Ok(Some(_))` on a
+/// successful match (any stage), `Ok(None)` on total miss. An `Err`
+/// only fires for ambiguous matches (multiple-match errors per §13b).
 fn find_match(file: &str, target: &str, replace_all: bool) -> Result<Option<Match>> {
     // Stage 1 — exact.
     if file.contains(target) {
@@ -155,6 +179,14 @@ fn find_match(file: &str, target: &str, replace_all: bool) -> Result<Option<Matc
     // Stage 2 — line-trim.
     if let Some(c) = match_via_normalizer(file, target, replace_all, line_trim_normalize)? {
         return Ok(Some(Match { canonical: c, stage: "line_trim" }));
+    }
+
+    // Stage 3 — block-anchor (anchored region with ≥90% interior overlap).
+    if let Some(c) = anchor_match(file, target, /*min_ratio=*/ 90)? {
+        return Ok(Some(Match {
+            canonical: c,
+            stage: "block_anchor",
+        }));
     }
 
     // Stage 4 — whitespace-normalized (collapse runs).
@@ -189,12 +221,13 @@ fn find_match(file: &str, target: &str, replace_all: bool) -> Result<Option<Matc
         }));
     }
 
-    // Stages 3 (block-anchor) and 8 (context-aware) require pairwise
-    // candidate scanning rather than a normalizer-equivalence check.
-    // Folded into a single anchor scan because both share the
-    // first-line-+-last-line anchor mechanic.
-    if let Some(m) = anchor_based_match(file, target, replace_all)? {
-        return Ok(Some(m));
+    // Stage 8 — context-aware (anchored region with ≥50% interior overlap;
+    // the looser cousin of stage 3).
+    if let Some(c) = anchor_match(file, target, /*min_ratio=*/ 50)? {
+        return Ok(Some(Match {
+            canonical: c,
+            stage: "context_aware",
+        }));
     }
 
     Ok(None)
@@ -300,10 +333,16 @@ fn trim_boundary_normalize(s: &str) -> String {
     s.trim().to_string()
 }
 
-/// Block-anchor / context-aware combined stage. Pin candidate regions
-/// by exact first + last lines; pick the one with the smallest
-/// edit-distance interior.
-fn anchor_based_match(file: &str, target: &str, _replace_all: bool) -> Result<Option<Match>> {
+/// Anchor-based match shared by stages 3 and 8. Pin candidate regions
+/// by exact first + last lines, then accept only candidates whose
+/// interior char overlap with `target` meets `min_ratio` percent. The
+/// caller picks the threshold: 90 for block-anchor (stage 3), 50 for
+/// context-aware (stage 8). Among acceptable candidates, the one with
+/// the highest overlap wins.
+///
+/// Char overlap is a cheap proxy for Levenshtein — sufficient for "is
+/// this region similar?" without pulling in an extra crate.
+fn anchor_match(file: &str, target: &str, min_ratio: usize) -> Result<Option<String>> {
     let target_lines: Vec<&str> = target.lines().collect();
     if target_lines.len() < 2 {
         return Ok(None);
@@ -316,7 +355,7 @@ fn anchor_based_match(file: &str, target: &str, _replace_all: bool) -> Result<Op
 
     let file_lines: Vec<&str> = file.split_inclusive('\n').collect();
     let n = target_lines.len();
-    let mut best: Option<(String, usize, &'static str)> = None;
+    let mut best: Option<(String, usize)> = None;
 
     for start in 0..=file_lines.len().saturating_sub(n) {
         let cand_first = file_lines[start].trim_end_matches('\n').trim();
@@ -342,9 +381,6 @@ fn anchor_based_match(file: &str, target: &str, _replace_all: bool) -> Result<Op
                 .unwrap_or_else(|| candidate.clone())
         };
 
-        // Interior comparison: char overlap ratio. Cheap proxy for
-        // Levenshtein — exact enough for "is this 50% similar?" without
-        // pulling in another crate.
         let target_chars: std::collections::HashMap<char, usize> = char_counts(target);
         let cand_chars: std::collections::HashMap<char, usize> = char_counts(&cand_for_compare);
         let common: usize = target_chars
@@ -355,17 +391,15 @@ fn anchor_based_match(file: &str, target: &str, _replace_all: bool) -> Result<Op
         let denom = target.chars().count().max(1);
         let ratio = common * 100 / denom;
 
-        let stage = if ratio >= 90 { "block_anchor" } else { "context_aware" };
-        if ratio < 50 {
+        if ratio < min_ratio {
             continue;
         }
-        let score = 100 - ratio;
-        if best.as_ref().map(|(_, s, _)| *s > score).unwrap_or(true) {
-            best = Some((cand_for_compare, score, stage));
+        if best.as_ref().map(|(_, r)| *r < ratio).unwrap_or(true) {
+            best = Some((cand_for_compare, ratio));
         }
     }
 
-    Ok(best.map(|(canonical, _, stage)| Match { canonical, stage }))
+    Ok(best.map(|(canonical, _)| canonical))
 }
 
 fn char_counts(s: &str) -> std::collections::HashMap<char, usize> {
@@ -435,5 +469,27 @@ mod tests {
         let file = "x\nx\n";
         assert!(find_match(file, "x", false).is_err());
         assert!(find_match(file, "x", true).is_ok());
+    }
+
+    #[test]
+    fn block_anchor_runs_before_whitespace_normalization() {
+        // First+last anchors match a region whose interior is char-
+        // identical to target (different whitespace shape inside).
+        // Stage 3 (block-anchor, 90% overlap) should fire — not stage 4
+        // (whitespace-normalized) — because of the new ordering.
+        let file = "fn foo() {\n    let a = 1;\n    let b = 2;\n}\n";
+        let target = "fn foo() {\n    let a=1;\n    let b=2;\n}";
+        let m = find_match(file, target, false).unwrap().unwrap();
+        assert_eq!(m.stage, "block_anchor");
+    }
+
+    #[test]
+    fn context_aware_matches_when_interior_loosely_similar() {
+        // Anchors match; interior overlap is between 50% and 90% — too
+        // sparse for block-anchor but fine for context-aware.
+        let file = "start\nentirely different middle content\nend\n";
+        let target = "start\nsome middle text\nend";
+        let m = find_match(file, target, false).unwrap().unwrap();
+        assert_eq!(m.stage, "context_aware");
     }
 }

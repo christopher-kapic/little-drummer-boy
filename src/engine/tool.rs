@@ -45,15 +45,32 @@ pub trait Tool: Send + Sync {
 
 /// Tool output shape.
 ///
-/// Currently a string; the `truncated` flag tells the §10 spillover
-/// path whether to write a full version to disk. The struct exists so
-/// we can grow other side-channels (e.g. structured citations from
-/// `explore`) without breaking the `Tool` trait.
+/// `content` is what the model sees on the next turn. `truncated` tells
+/// the §10 spillover path whether to write a full version to disk.
+///
+/// `recovery` and `canonical_args` let a tool communicate that the call
+/// it received was *recoverable* — it ran successfully, but only after
+/// the tool normalized the args in a way the model should learn from.
+/// The edit cascade (GOALS §13c) is the only v0 user: when an edit
+/// matches at stage > 1, the tool sets `recovery = EditCascade { stage,
+/// path: "old_string" }` and `canonical_args = <original args with
+/// old_string replaced by the matched bytes>`. The dispatcher uses
+/// these to persist the canonical form to the audit row's
+/// `wire_input_json` and to rewrite the in-memory assistant message so
+/// the next inference call carries canonical bytes.
 #[derive(Debug, Clone)]
 pub struct ToolOutput {
     pub content: String,
     /// True when [`content`] is capped (per the §10 truncation marker).
     pub truncated: bool,
+    /// Optional recovery annotation. `None` means the tool ran without
+    /// any normalization. The dispatcher prefers this over any
+    /// shape-repair recovery that fired earlier in the same call.
+    pub recovery: Option<crate::engine::repair::Recovery>,
+    /// Optional canonical args. When `Some`, the dispatcher uses this
+    /// as `wire_input_json` for the audit row and as the rewritten
+    /// arguments in the assistant message's `ToolCall` in history.
+    pub canonical_args: Option<serde_json::Value>,
 }
 
 impl ToolOutput {
@@ -61,6 +78,8 @@ impl ToolOutput {
         Self {
             content: content.into(),
             truncated: false,
+            recovery: None,
+            canonical_args: None,
         }
     }
 
@@ -68,7 +87,21 @@ impl ToolOutput {
         Self {
             content: content.into(),
             truncated: true,
+            recovery: None,
+            canonical_args: None,
         }
+    }
+
+    /// Attach a recovery annotation and the canonical arg form. See the
+    /// struct docs for the contract.
+    pub fn with_recovery(
+        mut self,
+        recovery: crate::engine::repair::Recovery,
+        canonical_args: serde_json::Value,
+    ) -> Self {
+        self.recovery = Some(recovery);
+        self.canonical_args = Some(canonical_args);
+        self
     }
 }
 

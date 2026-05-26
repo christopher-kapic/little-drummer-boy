@@ -1,17 +1,139 @@
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 
-use crate::cli::DebugCommand;
+use crate::cli::{DebugCommand, FailedCallsArgs};
+use crate::db::Db;
+use crate::db::tool_calls::{FailedCallsFilter, ToolCallEvent};
+use crate::session::project_id_for;
 
-pub async fn run(_cmd: DebugCommand) -> Result<()> {
-    // `cockpit debug redact` is cockpit-specific (see GOALS.md §7): dumps the
-    // env/.env values that would be substituted out of the next outbound
-    // prompt.
-    //
-    // `cockpit debug context` is cockpit-specific (see GOALS.md §10): dumps the
-    // exact prompt + tool descriptions + history that would be sent for
-    // the next turn, with per-section token counts. Lets users audit
-    // cockpit's context overhead.
-    anyhow::bail!(
-        "cockpit debug is not implemented yet (planned: config / paths / skill / agent / file / redact / context / wait)"
-    )
+pub async fn run(cmd: DebugCommand) -> Result<()> {
+    match cmd {
+        DebugCommand::FailedCalls(args) => failed_calls(args).await,
+        _ => anyhow::bail!(
+            "cockpit debug is not implemented yet (planned: config / paths / skill / agent / file / redact / context / wait)"
+        ),
+    }
+}
+
+/// `cockpit debug failed-calls` — see GOALS §12. Pulls recent rows where
+/// the tool either hard-failed or fired a recovery and prints them in a
+/// form designed for pattern-spotting (original arguments + brief
+/// output snippet), so the user can decide which patterns are worth
+/// turning into new repair-catalog entries.
+async fn failed_calls(args: FailedCallsArgs) -> Result<()> {
+    let db = Db::open_default()?;
+    let project_id = args.project.as_ref().map(project_id_for);
+    let since_epoch = Utc::now().timestamp() - (args.days as i64) * 86_400;
+
+    let rows = db.list_failed_tool_calls(FailedCallsFilter {
+        since_epoch,
+        tool: args.tool.clone(),
+        model: args.model.clone(),
+        project_id,
+        include_recovered: args.include_recovered,
+        limit: args.limit as usize,
+    })?;
+
+    if args.json {
+        for r in &rows {
+            println!("{}", serde_json::to_string(&row_as_json(r))?);
+        }
+        return Ok(());
+    }
+
+    if rows.is_empty() {
+        println!(
+            "No matching rows in the last {} day{}.",
+            args.days,
+            if args.days == 1 { "" } else { "s" }
+        );
+        return Ok(());
+    }
+
+    println!(
+        "{} row{} (last {} day{}):\n",
+        rows.len(),
+        if rows.len() == 1 { "" } else { "s" },
+        args.days,
+        if args.days == 1 { "" } else { "s" }
+    );
+    for r in &rows {
+        print_row(r);
+        println!();
+    }
+    Ok(())
+}
+
+fn print_row(r: &ToolCallEvent) {
+    let ts = DateTime::<Utc>::from_timestamp(r.timestamp, 0)
+        .map(|t| t.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+        .unwrap_or_else(|| r.timestamp.to_string());
+
+    let status = if r.hard_fail {
+        "HARD FAIL".to_string()
+    } else {
+        let (kind, stage) = r.recovery.db_fields();
+        match (kind, stage) {
+            (Some(k), Some(s)) => format!("recovered ({k}/{s})"),
+            (Some(k), None) => format!("recovered ({k})"),
+            _ => "recovered".to_string(),
+        }
+    };
+
+    println!(
+        "{ts}  {tool:<12} {model}  [{status}]",
+        ts = ts,
+        tool = r.tool,
+        model = r.model,
+        status = status
+    );
+    println!("  agent: {}  session: {}", r.agent, r.session_id);
+    if let Some(p) = &r.path {
+        println!("  path: {p}");
+    }
+    let args_pretty = serde_json::to_string_pretty(&r.original_input_json)
+        .unwrap_or_else(|_| r.original_input_json.to_string());
+    println!("  original_input:");
+    for line in args_pretty.lines() {
+        println!("    {line}");
+    }
+    if r.wire_input_json != r.original_input_json {
+        let wire_pretty = serde_json::to_string_pretty(&r.wire_input_json)
+            .unwrap_or_else(|_| r.wire_input_json.to_string());
+        println!("  wire_input (rewritten):");
+        for line in wire_pretty.lines() {
+            println!("    {line}");
+        }
+    }
+    println!("  output:");
+    for line in r.output.lines().take(8) {
+        println!("    {line}");
+    }
+    let extra = r.output.lines().count().saturating_sub(8);
+    if extra > 0 {
+        println!("    ... [{extra} more lines]");
+    }
+}
+
+fn row_as_json(r: &ToolCallEvent) -> serde_json::Value {
+    let (kind, stage) = r.recovery.db_fields();
+    serde_json::json!({
+        "event_id":         r.event_id,
+        "session_id":       r.session_id,
+        "timestamp":        r.timestamp,
+        "model":            r.model,
+        "provider":         r.provider,
+        "project_id":       r.project_id,
+        "agent":            r.agent,
+        "tool":             r.tool,
+        "path":             r.path,
+        "hard_fail":        r.hard_fail,
+        "recovery_kind":    kind,
+        "recovery_stage":   stage,
+        "original_input":   r.original_input_json,
+        "wire_input":       r.wire_input_json,
+        "output":           r.output,
+        "truncated":        r.truncated,
+        "duration_ms":      r.duration_ms,
+    })
 }

@@ -286,6 +286,23 @@ pub async fn turn(
 
         let result = dispatch_one(&agent.tools, &tc.function.name, args.clone(), &ctx).await;
 
+        // Per §13c: if the tool returned a recovery + canonical args
+        // (today only `editunlock` does), prefer the tool's recovery
+        // over the shape-repair one for this row, and use the canonical
+        // form as the row's `wire_input_json` AND the in-history
+        // assistant message's tool-call args. That last bit makes the
+        // model's next inference see the form that would have matched
+        // at stage 1.
+        let (tool_recovery, wire_args) = match &result {
+            Ok(out) => (out.recovery.clone(), out.canonical_args.clone()),
+            Err(_) => (None, None),
+        };
+        if let Some(canonical) = &wire_args {
+            args = canonical.clone();
+            rewrite_assistant_tool_call(history, &tc.id, canonical);
+        }
+        let recovery = tool_recovery.unwrap_or(recovery);
+
         let (raw_output, hard_fail) = match &result {
             Ok(ToolOutput { content, .. }) => (content.clone(), false),
             Err(e) => {
@@ -367,6 +384,32 @@ async fn dispatch_one(
         .get(name)
         .with_context(|| format!("unknown tool `{name}`"))?;
     tool.call(args, ctx).await
+}
+
+/// Mutate the most recent assistant message in `history` so the tool
+/// call identified by `call_id` carries `canonical_args` instead of the
+/// model's original arguments. Used by the §13c edit-cascade rewrite so
+/// the next inference's attention pass over its own outputs sees the
+/// form that would have matched at stage 1.
+///
+/// Walks backwards because the assistant turn we just pushed is the
+/// last element. Silent no-op if the message or the matching tool-call
+/// isn't found — the audit row still has the canonical form.
+fn rewrite_assistant_tool_call(history: &mut [Message], call_id: &str, canonical_args: &Value) {
+    use rig::message::AssistantContent;
+    for msg in history.iter_mut().rev() {
+        if let Message::Assistant { content, .. } = msg {
+            for c in content.iter_mut() {
+                if let AssistantContent::ToolCall(tc) = c
+                    && tc.id == call_id
+                {
+                    tc.function.arguments = canonical_args.clone();
+                    return;
+                }
+            }
+            return;
+        }
+    }
 }
 
 /// Allow `Recovery` to flow into telemetry plumbing without exposing the
