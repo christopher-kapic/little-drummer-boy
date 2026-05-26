@@ -48,6 +48,19 @@ pub struct ProvidersConfig {
     pub providers: BTreeMap<String, ProviderEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_unlisted_models_fetch: Option<OnUnlistedModelsFetch>,
+    /// Currently selected model. Written by `/model` and read by the
+    /// launch header + status line. Absent when nothing has been picked
+    /// yet (e.g. a freshly-scaffolded config).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_model: Option<ActiveModelRef>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ActiveModelRef {
+    pub provider: String,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_mode: Option<ThinkingMode>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -116,11 +129,19 @@ pub struct ModelEntry {
     pub thinking_modes: Vec<ThinkingMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inputs: Option<Inputs>,
+    /// Toggled by `/favorite`. The `/model` picker pins favorites at
+    /// the top of the list.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub favorite: bool,
     /// Free-form metadata the `/models` endpoint returned but we don't
     /// model explicitly. Preserved verbatim so re-saving doesn't drop
     /// fields the user (or provider) cares about.
     #[serde(default, skip_serializing_if = "Map::is_empty")]
     pub extra: Map<String, Value>,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -217,6 +238,11 @@ impl ConfigDoc {
         {
             cfg.on_unlisted_models_fetch = Some(parsed);
         }
+        if let Some(v) = self.raw.get("active_model")
+            && let Ok(parsed) = serde_json::from_value::<ActiveModelRef>(v.clone())
+        {
+            cfg.active_model = Some(parsed);
+        }
         cfg
     }
 
@@ -233,6 +259,15 @@ impl ConfigDoc {
             }
             None => {
                 obj.remove("on_unlisted_models_fetch");
+            }
+        }
+        match &cfg.active_model {
+            Some(active) => {
+                let s = serde_json::to_value(active).context("serializing active_model")?;
+                obj.insert("active_model".to_string(), s);
+            }
+            None => {
+                obj.remove("active_model");
             }
         }
         let pretty = serde_json::to_string_pretty(&self.raw).context("serializing config.json")?;
@@ -274,6 +309,7 @@ mod tests {
                     id: "claude-opus-4-7".into(),
                     name: Some("Claude Opus 4.7".into()),
                     thinking_modes: vec![ThinkingMode::Off, ThinkingMode::High],
+                    favorite: false,
                     inputs: Some(Inputs {
                         images: Some(true),
                         video: None,

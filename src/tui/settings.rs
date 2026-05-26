@@ -50,6 +50,10 @@ use crate::tui::theme::MUTED_COLOR_INDEX;
 /// Height (in rows) the dialog wants when active.
 pub const DIALOG_HEIGHT: u16 = 20;
 
+/// Number of selectable rows in the Edit-provider action menu.
+/// Index map: 0=URL · 1=Headers · 2=Favorite · 3=Refetch · 4=Delete · 5=Back.
+const EDIT_MENU_LEN: usize = 6;
+
 pub enum Dialog {
     None,
     PickConfig {
@@ -97,7 +101,11 @@ struct AddState {
     template: Option<&'static ProviderTemplate>,
     id_field: TextField,
     url_field: TextField,
-    auth_field: TextField,
+    headers: HeaderEditor,
+    /// Active OAuth device-flow attempt, when the picked template uses
+    /// `AuthKind::DeviceFlow`. Replaces the URL/Headers steps for
+    /// those templates.
+    codex_login: Option<CodexLoginState>,
     error: Option<String>,
     fetch: Option<FetchHandle>,
     saved_provider_id: Option<String>,
@@ -111,8 +119,12 @@ enum AddStep {
     EditId,
     /// Set the base URL.
     EditUrl,
-    /// Set the auth header value (`Bearer $TOKEN` shape).
-    EditAuth,
+    /// Add/remove HTTP headers (`Authorization: Bearer $TOKEN`, etc.).
+    EditHeaders,
+    /// Run the codex device-code OAuth flow. Lives in `s.codex_login`.
+    /// Reached directly after EditId when the template's auth is
+    /// `DeviceFlow`.
+    CodexLogin,
     /// Saving config + kicking off /models fetch.
     Saving,
     /// Background fetch is in flight.
@@ -124,19 +136,224 @@ enum AddStep {
 struct EditState {
     provider_id: String,
     entry: ProviderEntry,
-    /// 0 = URL, 1 = Authorization header, 2 = Favorite, 3 = Refetch, 4 = Delete, 5 = Back
+    /// Index into [`edit_menu_rows`].
     cursor: usize,
     editing_field: Option<EditField>,
     field_buf: TextField,
     status: Option<String>,
     fetch: Option<FetchHandle>,
     delete_pending: bool,
+    /// `Some(...)` when the user opens the headers sub-editor with `h`.
+    headers_editor: Option<HeaderEditor>,
 }
 
 #[derive(Copy, Clone)]
 enum EditField {
     Url,
-    AuthValue,
+}
+
+/// Multi-row header list with inline editing.
+///
+/// Layout (visible "rows" cursor can land on):
+///   - 0..n               actual header rows
+///   - n                  `[+ add header]`
+///   - n+1                `[continue →]` (used by the Add wizard)
+///
+/// In Browse mode the cursor selects a row; in `EditName(i)` /
+/// `EditValue(i)` keystrokes go to the matching field. Tab toggles
+/// between name and value while editing.
+struct HeaderEditor {
+    rows: Vec<HeaderSpec>,
+    cursor: usize,
+    mode: HeaderMode,
+    name_buf: TextField,
+    value_buf: TextField,
+    /// If false, the synthetic `[continue →]` row is suppressed (used
+    /// from the Edit page, where there's no next step).
+    show_continue: bool,
+}
+
+enum HeaderMode {
+    Browse,
+    EditName(usize),
+    EditValue(usize),
+}
+
+enum HeaderResult {
+    Stay,
+    Continue,
+    Back,
+}
+
+impl HeaderEditor {
+    fn new(rows: Vec<HeaderSpec>, show_continue: bool) -> Self {
+        Self {
+            rows,
+            cursor: 0,
+            mode: HeaderMode::Browse,
+            name_buf: TextField::default(),
+            value_buf: TextField::default(),
+            show_continue,
+        }
+    }
+
+    fn n_rows(&self) -> usize {
+        self.rows.len()
+    }
+
+    fn add_row_idx(&self) -> usize {
+        self.n_rows()
+    }
+
+    fn continue_idx(&self) -> Option<usize> {
+        if self.show_continue {
+            Some(self.n_rows() + 1)
+        } else {
+            None
+        }
+    }
+
+    fn max_cursor(&self) -> usize {
+        self.continue_idx().unwrap_or(self.add_row_idx())
+    }
+
+    fn commit_edit(&mut self) {
+        match self.mode {
+            HeaderMode::EditName(i) => {
+                if let Some(row) = self.rows.get_mut(i) {
+                    row.name = self.name_buf.text().to_string();
+                }
+            }
+            HeaderMode::EditValue(i) => {
+                if let Some(row) = self.rows.get_mut(i) {
+                    row.value = self.value_buf.text().to_string();
+                }
+            }
+            HeaderMode::Browse => {}
+        }
+    }
+
+    fn start_edit(&mut self, i: usize) {
+        if let Some(row) = self.rows.get(i) {
+            self.name_buf = TextField::new(row.name.clone());
+            self.value_buf = TextField::new(row.value.clone());
+            // Start on the value (the field the user usually wants to edit).
+            self.mode = HeaderMode::EditValue(i);
+        }
+    }
+
+    fn handle_key(&mut self, key: KeyEvent) -> HeaderResult {
+        match &mut self.mode {
+            HeaderMode::Browse => self.handle_browse_key(key),
+            HeaderMode::EditName(_) | HeaderMode::EditValue(_) => self.handle_edit_key(key),
+        }
+    }
+
+    fn handle_browse_key(&mut self, key: KeyEvent) -> HeaderResult {
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.cursor = self.cursor.saturating_sub(1);
+                HeaderResult::Stay
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.cursor = (self.cursor + 1).min(self.max_cursor());
+                HeaderResult::Stay
+            }
+            KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') | KeyCode::Backspace => {
+                HeaderResult::Back
+            }
+            KeyCode::Char('a') => {
+                self.rows.push(HeaderSpec {
+                    name: String::new(),
+                    value: String::new(),
+                });
+                let i = self.rows.len() - 1;
+                self.cursor = i;
+                self.name_buf = TextField::default();
+                self.value_buf = TextField::default();
+                self.mode = HeaderMode::EditName(i);
+                HeaderResult::Stay
+            }
+            KeyCode::Char('x') | KeyCode::Delete => {
+                if self.cursor < self.rows.len() {
+                    self.rows.remove(self.cursor);
+                    if self.cursor > 0 && self.cursor >= self.rows.len() {
+                        self.cursor -= 1;
+                    }
+                }
+                HeaderResult::Stay
+            }
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                if self.cursor < self.rows.len() {
+                    self.start_edit(self.cursor);
+                    HeaderResult::Stay
+                } else if self.cursor == self.add_row_idx() {
+                    // [+ add header]
+                    self.rows.push(HeaderSpec {
+                        name: String::new(),
+                        value: String::new(),
+                    });
+                    let i = self.rows.len() - 1;
+                    self.cursor = i;
+                    self.name_buf = TextField::default();
+                    self.value_buf = TextField::default();
+                    self.mode = HeaderMode::EditName(i);
+                    HeaderResult::Stay
+                } else if Some(self.cursor) == self.continue_idx() {
+                    HeaderResult::Continue
+                } else {
+                    HeaderResult::Stay
+                }
+            }
+            _ => HeaderResult::Stay,
+        }
+    }
+
+    fn handle_edit_key(&mut self, key: KeyEvent) -> HeaderResult {
+        match key.code {
+            KeyCode::Esc => {
+                // Cancel the in-flight edit by reverting the buffers
+                // (committed values came from the row originally, so
+                // just exit Browse without commit).
+                self.mode = HeaderMode::Browse;
+                HeaderResult::Stay
+            }
+            KeyCode::Tab => {
+                self.commit_edit();
+                self.mode = match self.mode {
+                    HeaderMode::EditName(i) => HeaderMode::EditValue(i),
+                    HeaderMode::EditValue(i) => HeaderMode::EditName(i),
+                    HeaderMode::Browse => HeaderMode::Browse,
+                };
+                HeaderResult::Stay
+            }
+            KeyCode::Enter => {
+                self.commit_edit();
+                self.mode = HeaderMode::Browse;
+                HeaderResult::Stay
+            }
+            _ => {
+                match self.mode {
+                    HeaderMode::EditName(_) => {
+                        self.name_buf.handle_key(key);
+                    }
+                    HeaderMode::EditValue(_) => {
+                        self.value_buf.handle_key(key);
+                    }
+                    HeaderMode::Browse => {}
+                }
+                HeaderResult::Stay
+            }
+        }
+    }
+
+    fn rows(&self) -> &[HeaderSpec] {
+        &self.rows
+    }
+
+    fn is_editing(&self) -> bool {
+        !matches!(self.mode, HeaderMode::Browse)
+    }
 }
 
 struct FetchAllState {
@@ -167,6 +384,81 @@ enum Nav {
     Replace(Page),
     /// Close the whole dialog.
     Close,
+}
+
+/// Codex device-code OAuth login state, shared between the dialog's
+/// render path and the background task driving the flow.
+pub struct CodexLoginState {
+    shared: Arc<Mutex<CodexLoginProgress>>,
+}
+
+#[derive(Clone)]
+pub enum CodexLoginProgress {
+    /// POSTing to the usercode endpoint.
+    Requesting,
+    /// Server returned a user code; waiting for the user to enter it
+    /// in a browser and for the poll loop to receive an authorization
+    /// code.
+    AwaitingUser {
+        verification_url: String,
+        user_code: String,
+    },
+    /// Persisted; the dialog can finalize the ProviderEntry.
+    Success {
+        saved_at: chrono::DateTime<chrono::Utc>,
+    },
+    /// Flow failed at any step. The dialog should show the message
+    /// and let the user retry.
+    Error(String),
+}
+
+impl CodexLoginState {
+    pub fn spawn() -> Self {
+        let cfg = crate::auth::codex::LoginConfig::default();
+        Self::spawn_with(cfg)
+    }
+
+    pub fn spawn_with(cfg: crate::auth::codex::LoginConfig) -> Self {
+        let shared = Arc::new(Mutex::new(CodexLoginProgress::Requesting));
+        let w = Arc::clone(&shared);
+        tokio::spawn(async move {
+            match crate::auth::codex::request_device_code(&cfg).await {
+                Err(e) => set(&w, CodexLoginProgress::Error(e.to_string())),
+                Ok(device) => {
+                    set(
+                        &w,
+                        CodexLoginProgress::AwaitingUser {
+                            verification_url: device.verification_url.clone(),
+                            user_code: device.user_code.clone(),
+                        },
+                    );
+                    match crate::auth::codex::complete_login(&cfg, &device).await {
+                        Err(e) => set(&w, CodexLoginProgress::Error(e.to_string())),
+                        Ok(stored) => set(
+                            &w,
+                            CodexLoginProgress::Success {
+                                saved_at: stored.saved_at,
+                            },
+                        ),
+                    }
+                }
+            }
+        });
+        Self { shared }
+    }
+
+    pub fn snapshot(&self) -> CodexLoginProgress {
+        self.shared
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or(CodexLoginProgress::Error("poisoned login state".into()))
+    }
+}
+
+fn set(shared: &Arc<Mutex<CodexLoginProgress>>, value: CodexLoginProgress) {
+    if let Ok(mut g) = shared.lock() {
+        *g = value;
+    }
 }
 
 /// Shared cell for an in-flight `/models` fetch. The background task
@@ -348,6 +640,60 @@ impl SettingsDialog {
         {
             self.apply_fetch_result(&handle.provider_id, result);
         }
+
+        // Advance the codex device-flow when the background task
+        // signals Success — write the ProviderEntry and move to Done.
+        self.advance_codex_login();
+    }
+
+    /// If the Add wizard is on the CodexLogin step and the device-flow
+    /// background task has finished, finalize the provider entry.
+    fn advance_codex_login(&mut self) {
+        let Page::Providers(ProvidersPage::Add(s)) = &mut self.page else {
+            return;
+        };
+        if !matches!(s.step, AddStep::CodexLogin) {
+            return;
+        }
+        let snap = match &s.codex_login {
+            Some(c) => c.snapshot(),
+            None => return,
+        };
+        match snap {
+            CodexLoginProgress::Success { saved_at } => {
+                let template = s.template.expect("template chosen");
+                let id = s.id_field.text().trim().to_string();
+                let entry = ProviderEntry {
+                    name: Some(template.display.to_string()),
+                    url: template.url.trim_end_matches('/').to_string(),
+                    headers: Vec::new(),
+                    models_fetched_at: None,
+                    favorite: None,
+                    credential_ref: Some("codex".to_string()),
+                    auth: Some(crate::config::providers::AuthKind::DeviceFlow),
+                    models: Vec::new(),
+                };
+                self.config.providers.insert(id.clone(), entry);
+                let msg = match self.save_config() {
+                    Ok(()) => format!(
+                        "codex: logged in (saved {}); provider `{id}` added",
+                        saved_at.format("%Y-%m-%d %H:%M UTC")
+                    ),
+                    Err(e) => format!("codex: logged in but config write failed: {e}"),
+                };
+                if let Page::Providers(ProvidersPage::Add(s)) = &mut self.page {
+                    s.error = Some(msg);
+                    s.codex_login = None;
+                    s.step = AddStep::Done;
+                }
+            }
+            CodexLoginProgress::Error(_)
+            | CodexLoginProgress::Requesting
+            | CodexLoginProgress::AwaitingUser { .. } => {
+                // Nothing to advance yet; the renderer reads the
+                // snapshot on its own.
+            }
+        }
     }
 
     fn apply_fetch_result(&mut self, provider_id: &str, result: Result<FetchOutcome, String>) {
@@ -473,10 +819,7 @@ impl SettingsDialog {
             ProvidersPage::List { cursor, status } => {
                 let ids: Vec<String> = self.config.providers.keys().cloned().collect();
                 match key.code {
-                    KeyCode::Esc
-                    | KeyCode::Left
-                    | KeyCode::Char('h')
-                    | KeyCode::Backspace => {
+                    KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') | KeyCode::Backspace => {
                         return Nav::Replace(Page::Root { cursor: 0 });
                     }
                     KeyCode::Char('q') => return Nav::Close,
@@ -487,9 +830,7 @@ impl SettingsDialog {
                         *cursor = (*cursor + 1).min(ids.len().saturating_sub(1).max(0));
                     }
                     KeyCode::Char('c') => {
-                        return Nav::Replace(Page::Providers(ProvidersPage::Add(
-                            AddState::new(),
-                        )));
+                        return Nav::Replace(Page::Providers(ProvidersPage::Add(AddState::new())));
                     }
                     KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
                         if let Some(id) = ids.get(*cursor).cloned()
@@ -531,27 +872,45 @@ impl SettingsDialog {
                 KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
                     let t = &templates::TEMPLATES[*cursor];
                     s.template = Some(t);
-                    s.id_field.set(t.id);
-                    s.url_field.set(t.url);
-                    if let Some((_, val)) = t.default_headers.iter().find(|(n, _)| {
-                        n.eq_ignore_ascii_case("authorization")
-                            || n.eq_ignore_ascii_case("x-api-key")
-                    }) {
-                        s.auth_field.set(*val);
+                    // Pre-fill id only for templates that map 1:1 to a
+                    // single vendor; for `openai-compatible` the user
+                    // must choose a unique name (they may add several).
+                    if t.use_id_as_default {
+                        s.id_field.set(t.id);
                     } else {
-                        s.auth_field.set("");
+                        s.id_field.set("");
                     }
+                    s.url_field.set(t.url);
+                    s.headers = HeaderEditor::new(
+                        templates::default_headers_for(t),
+                        /* show_continue */ true,
+                    );
                     s.step = AddStep::EditId;
                 }
                 _ => {}
             },
             AddStep::EditId => match key.code {
                 KeyCode::Enter => {
-                    if s.id_field.text().trim().is_empty() {
+                    let id = s.id_field.text().trim().to_string();
+                    if id.is_empty() {
                         s.error = Some("id cannot be empty".into());
+                    } else if !valid_id(&id) {
+                        s.error = Some("id must be lowercase letters, digits, `-`, or `_`".into());
+                    } else if self.config.providers.contains_key(&id) {
+                        s.error = Some(format!("a provider with id `{id}` already exists"));
                     } else {
                         s.error = None;
-                        s.step = AddStep::EditUrl;
+                        // Device-flow templates skip URL/Headers — the
+                        // OAuth login itself is the configuration.
+                        if matches!(
+                            s.template.map(|t| t.auth),
+                            Some(crate::config::providers::AuthKind::DeviceFlow)
+                        ) {
+                            s.codex_login = Some(CodexLoginState::spawn());
+                            s.step = AddStep::CodexLogin;
+                        } else {
+                            s.step = AddStep::EditUrl;
+                        }
                     }
                 }
                 _ => {
@@ -564,37 +923,31 @@ impl SettingsDialog {
                         s.error = Some("url must start with http:// or https://".into());
                     } else {
                         s.error = None;
-                        s.step = AddStep::EditAuth;
+                        s.step = AddStep::EditHeaders;
                     }
                 }
                 _ => {
                     s.url_field.handle_key(key);
                 }
             },
-            AddStep::EditAuth => match key.code {
-                KeyCode::Enter => {
+            AddStep::EditHeaders => {
+                match s.headers.handle_key(key) {
+                    HeaderResult::Stay => return Nav::Stay,
+                    HeaderResult::Back => {
+                        s.error = None;
+                        s.step = AddStep::EditUrl;
+                        return Nav::Stay;
+                    }
+                    HeaderResult::Continue => {
+                        // fall through to the save+fetch block below
+                    }
+                }
+
+                {
                     // Finalize and kick off the fetch.
                     let template = s.template.expect("template chosen");
                     let id = s.id_field.text().trim().to_string();
-                    let mut headers: Vec<HeaderSpec> = template
-                        .default_headers
-                        .iter()
-                        .map(|(n, _)| HeaderSpec {
-                            name: (*n).to_string(),
-                            value: String::new(),
-                        })
-                        .collect();
-                    if headers.is_empty() && !s.auth_field.text().is_empty() {
-                        headers.push(HeaderSpec {
-                            name: "Authorization".into(),
-                            value: s.auth_field.text().to_string(),
-                        });
-                    } else if let Some(h) = headers.iter_mut().find(|h| {
-                        h.name.eq_ignore_ascii_case("authorization")
-                            || h.name.eq_ignore_ascii_case("x-api-key")
-                    }) {
-                        h.value = s.auth_field.text().to_string();
-                    }
+                    let headers: Vec<HeaderSpec> = s.headers.rows().to_vec();
 
                     let entry = ProviderEntry {
                         name: Some(template.display.to_string()),
@@ -633,10 +986,24 @@ impl SettingsDialog {
                         }
                     }
                 }
-                _ => {
-                    s.auth_field.handle_key(key);
+            }
+            AddStep::CodexLogin => {
+                // Input handling for the device-code screen. Most
+                // movement is automatic (driven by the background
+                // task via `tick`); the user can press `r` to retry
+                // after an error.
+                let snap = s
+                    .codex_login
+                    .as_ref()
+                    .map(|c| c.snapshot())
+                    .unwrap_or(CodexLoginProgress::Error("no login state".into()));
+                match key.code {
+                    KeyCode::Char('r') if matches!(snap, CodexLoginProgress::Error(_)) => {
+                        s.codex_login = Some(CodexLoginState::spawn());
+                    }
+                    _ => {}
                 }
-            },
+            }
             AddStep::Saving | AddStep::Fetching => {
                 // Disable input while in-flight, except Esc (handled above).
             }
@@ -653,6 +1020,22 @@ impl SettingsDialog {
     }
 
     fn handle_edit_key(&mut self, key: KeyEvent, s: &mut EditState) -> Nav {
+        // Headers sub-editor open: all keys go there until it signals Back.
+        if let Some(editor) = s.headers_editor.as_mut() {
+            match editor.handle_key(key) {
+                HeaderResult::Stay | HeaderResult::Continue => {
+                    return Nav::Stay;
+                }
+                HeaderResult::Back => {
+                    if let Some(editor) = s.headers_editor.take() {
+                        s.entry.headers = editor.rows;
+                        s.status = Some("headers updated; press s to save".into());
+                    }
+                    return Nav::Stay;
+                }
+            }
+        }
+
         // Inline-edit mode: keystrokes go to the field until Enter/Esc.
         if let Some(field) = s.editing_field {
             match key.code {
@@ -668,20 +1051,6 @@ impl SettingsDialog {
                                 return Nav::Stay;
                             }
                         }
-                        EditField::AuthValue => {
-                            if let Some(h) = s.entry.headers.iter_mut().find(|h| {
-                                h.name.eq_ignore_ascii_case("authorization")
-                                    || h.name.eq_ignore_ascii_case("x-api-key")
-                            }) {
-                                h.value = new;
-                            } else {
-                                s.entry.headers.push(HeaderSpec {
-                                    name: "Authorization".into(),
-                                    value: new,
-                                });
-                            }
-                            s.status = Some("auth updated; press s to save".into());
-                        }
                     }
                     s.editing_field = None;
                 }
@@ -695,9 +1064,10 @@ impl SettingsDialog {
             return Nav::Stay;
         }
 
-        // Action menu.
+        // Action menu. Note: vim `h` is repurposed here as "open headers
+        // editor"; ← and Backspace still go back to the list.
         match key.code {
-            KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') | KeyCode::Backspace => {
+            KeyCode::Esc | KeyCode::Left | KeyCode::Backspace => {
                 return Nav::Replace(Page::Providers(ProvidersPage::List {
                     cursor: 0,
                     status: s.status.clone(),
@@ -707,7 +1077,14 @@ impl SettingsDialog {
                 s.cursor = s.cursor.saturating_sub(1);
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                s.cursor = (s.cursor + 1).min(5);
+                s.cursor = (s.cursor + 1).min(EDIT_MENU_LEN - 1);
+            }
+            KeyCode::Char('h') => {
+                s.headers_editor = Some(HeaderEditor::new(
+                    s.entry.headers.clone(),
+                    /* show_continue */ false,
+                ));
+                return Nav::Stay;
             }
             KeyCode::Char('s') => {
                 self.config
@@ -768,18 +1145,10 @@ impl SettingsDialog {
                         s.editing_field = Some(EditField::Url);
                     }
                     1 => {
-                        let current = s
-                            .entry
-                            .headers
-                            .iter()
-                            .find(|h| {
-                                h.name.eq_ignore_ascii_case("authorization")
-                                    || h.name.eq_ignore_ascii_case("x-api-key")
-                            })
-                            .map(|h| h.value.clone())
-                            .unwrap_or_default();
-                        s.field_buf = TextField::new(current);
-                        s.editing_field = Some(EditField::AuthValue);
+                        s.headers_editor = Some(HeaderEditor::new(
+                            s.entry.headers.clone(),
+                            /* show_continue */ false,
+                        ));
                     }
                     2 => {
                         let new = !s.entry.favorite.unwrap_or(false);
@@ -945,17 +1314,36 @@ impl SettingsDialog {
             }
             Page::Providers(ProvidersPage::Add(s)) => match s.step {
                 AddStep::PickTemplate { .. } => "↑/↓  enter: choose  esc: cancel",
-                AddStep::EditId | AddStep::EditUrl | AddStep::EditAuth => {
-                    "type to edit  enter: next  esc: cancel"
+                AddStep::EditId | AddStep::EditUrl => "type to edit  enter: next  esc: cancel",
+                AddStep::EditHeaders => {
+                    if s.headers.is_editing() {
+                        "type to edit  Tab: name/value  enter: apply  esc: cancel"
+                    } else {
+                        "↑/↓  a: add  enter: edit  x: delete  enter on continue: save  esc: back"
+                    }
+                }
+                AddStep::CodexLogin => {
+                    "open URL + enter code in browser  r: retry on error  esc: cancel"
                 }
                 AddStep::Saving | AddStep::Fetching => "(in progress)  esc: cancel",
                 AddStep::Done => "enter: back to list",
             },
             Page::Providers(ProvidersPage::Edit(s)) => {
-                if s.editing_field.is_some() {
+                if s.headers_editor.is_some() {
+                    let editing = s
+                        .headers_editor
+                        .as_ref()
+                        .map(HeaderEditor::is_editing)
+                        .unwrap_or(false);
+                    if editing {
+                        "type to edit  Tab: name/value  enter: apply  esc: cancel"
+                    } else {
+                        "↑/↓  a: add  enter: edit  x: delete  esc: close headers"
+                    }
+                } else if s.editing_field.is_some() {
                     "type to edit  enter: apply  esc: cancel"
                 } else {
-                    "↑/↓  enter: edit  s: save  r: refetch  f: favorite  d: delete  esc: back"
+                    "↑/↓  enter: edit  h: headers  s: save  r: refetch  f: favorite  d: delete  esc: back"
                 }
             }
             Page::Providers(ProvidersPage::FetchAll(_)) => {
@@ -1064,7 +1452,7 @@ impl SettingsDialog {
                     lines.push(Line::from(Span::styled(hint.to_string(), muted)));
                 }
             }
-            AddStep::EditId | AddStep::EditUrl | AddStep::EditAuth => {
+            AddStep::EditId | AddStep::EditUrl | AddStep::EditHeaders => {
                 let t = s.template.expect("template chosen");
                 lines.push(Line::from(vec![
                     Span::styled("Template: ", muted),
@@ -1083,39 +1471,86 @@ impl SettingsDialog {
                     &s.url_field,
                     matches!(s.step, AddStep::EditUrl),
                 );
-                if matches!(s.step, AddStep::EditAuth) || !s.auth_field.text().is_empty() {
-                    render_field_row(
-                        &mut lines,
-                        "auth header value",
-                        &s.auth_field,
-                        matches!(s.step, AddStep::EditAuth),
-                    );
-                    if matches!(s.step, AddStep::EditAuth) {
-                        let resolved = envref::resolve(s.auth_field.text());
-                        if resolved.has_missing() {
-                            lines.push(Line::from(Span::styled(
-                                format!(
-                                    "Environment variable not detected, make sure to set it: ${}",
-                                    resolved.missing.join(", $")
-                                ),
-                                yellow,
-                            )));
-                        } else if !resolved.referenced.is_empty() {
-                            lines.push(Line::from(Span::styled(
-                                format!(
-                                    "env var(s) detected: ${}",
-                                    resolved.referenced.join(", $")
-                                ),
-                                muted,
-                            )));
-                        }
-                    }
+                if matches!(s.step, AddStep::EditHeaders) {
+                    lines.push(Line::default());
+                    render_header_editor(&mut lines, &s.headers);
                 }
                 if matches!(s.step, AddStep::EditUrl)
                     && let Some(hint) = t.hint
                 {
                     lines.push(Line::default());
                     lines.push(Line::from(Span::styled(hint.to_string(), muted)));
+                }
+            }
+            AddStep::CodexLogin => {
+                let snap = s
+                    .codex_login
+                    .as_ref()
+                    .map(|c| c.snapshot())
+                    .unwrap_or(CodexLoginProgress::Error("no login state".into()));
+                lines.push(Line::from(Span::styled(
+                    "Codex device-code login".to_string(),
+                    Style::default().add_modifier(Modifier::BOLD),
+                )));
+                lines.push(Line::default());
+                match snap {
+                    CodexLoginProgress::Requesting => {
+                        lines.push(Line::from(Span::styled(
+                            "Requesting a device code from auth.openai.com…".to_string(),
+                            yellow,
+                        )));
+                    }
+                    CodexLoginProgress::AwaitingUser {
+                        verification_url,
+                        user_code,
+                    } => {
+                        lines.push(Line::from(vec![Span::styled(
+                            "1. Open this URL in a browser:".to_string(),
+                            muted,
+                        )]));
+                        lines.push(Line::from(vec![
+                            Span::raw("     "),
+                            Span::styled(
+                                verification_url,
+                                Style::default()
+                                    .fg(Color::Cyan)
+                                    .add_modifier(Modifier::UNDERLINED),
+                            ),
+                        ]));
+                        lines.push(Line::default());
+                        lines.push(Line::from(Span::styled(
+                            "2. Enter this code (expires in 15 minutes):".to_string(),
+                            muted,
+                        )));
+                        lines.push(Line::from(vec![
+                            Span::raw("     "),
+                            Span::styled(
+                                user_code,
+                                Style::default()
+                                    .fg(Color::Yellow)
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                        ]));
+                        lines.push(Line::default());
+                        lines.push(Line::from(Span::styled(
+                            "Waiting for authorization…".to_string(),
+                            muted,
+                        )));
+                    }
+                    CodexLoginProgress::Success { saved_at } => {
+                        lines.push(Line::from(Span::styled(
+                            format!("Logged in. Tokens saved at {saved_at}."),
+                            Style::default().fg(Color::Green),
+                        )));
+                    }
+                    CodexLoginProgress::Error(e) => {
+                        lines.push(Line::from(Span::styled(format!("Login failed: {e}"), red)));
+                        lines.push(Line::default());
+                        lines.push(Line::from(Span::styled(
+                            "Press r to retry, esc to cancel.".to_string(),
+                            muted,
+                        )));
+                    }
                 }
             }
             AddStep::Saving | AddStep::Fetching => {
@@ -1174,20 +1609,23 @@ impl SettingsDialog {
         ]));
         lines.push(Line::default());
 
-        let rows = [
-            ("URL", s.entry.url.clone()),
-            (
-                "Auth",
+        let headers_summary = if s.entry.headers.is_empty() {
+            "(none)".to_string()
+        } else {
+            format!(
+                "{} header(s): {}",
+                s.entry.headers.len(),
                 s.entry
                     .headers
                     .iter()
-                    .find(|h| {
-                        h.name.eq_ignore_ascii_case("authorization")
-                            || h.name.eq_ignore_ascii_case("x-api-key")
-                    })
-                    .map(|h| format!("{}: {}", h.name, h.value))
-                    .unwrap_or_else(|| "(none)".to_string()),
-            ),
+                    .map(|h| h.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        let rows = [
+            ("URL", s.entry.url.clone()),
+            ("Headers", headers_summary),
             (
                 "Favorite",
                 if s.entry.favorite.unwrap_or(false) {
@@ -1243,7 +1681,6 @@ impl SettingsDialog {
         if let Some(field) = s.editing_field {
             let prompt = match field {
                 EditField::Url => "URL: ",
-                EditField::AuthValue => "Auth: ",
             };
             lines.push(Line::default());
             lines.push(Line::from(vec![
@@ -1253,18 +1690,11 @@ impl SettingsDialog {
                     Style::default().fg(Color::White),
                 ),
             ]));
-            if matches!(field, EditField::AuthValue) {
-                let resolved = envref::resolve(s.field_buf.text());
-                if resolved.has_missing() {
-                    lines.push(Line::from(Span::styled(
-                        format!(
-                            "Environment variable not detected, make sure to set it: ${}",
-                            resolved.missing.join(", $")
-                        ),
-                        yellow,
-                    )));
-                }
-            }
+        }
+
+        if let Some(editor) = &s.headers_editor {
+            lines.push(Line::default());
+            render_header_editor(&mut lines, editor);
         }
 
         if let Some(status) = &s.status {
@@ -1398,6 +1828,109 @@ fn render_stub(frame: &mut Frame, area: Rect, title: &str, body: &str) {
         )),
     ];
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+}
+
+/// Render a [`HeaderEditor`] as rows + `[+ add header]` + (optional)
+/// `[continue →]`. The active cursor row is highlighted in yellow; the
+/// in-flight name/value buffer (when editing) replaces the row's value.
+fn render_header_editor(lines: &mut Vec<Line<'static>>, h: &HeaderEditor) {
+    let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+    let yellow = Style::default().fg(Color::Yellow);
+    lines.push(Line::from(Span::styled(
+        "Headers:".to_string(),
+        Style::default().add_modifier(Modifier::BOLD),
+    )));
+    let name_w = h
+        .rows()
+        .iter()
+        .map(|r| r.name.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max(13);
+
+    for (i, row) in h.rows().iter().enumerate() {
+        let cursor_here = h.cursor == i;
+        let marker = if cursor_here { "  ▸ " } else { "    " };
+        let editing_name = matches!(h.mode, HeaderMode::EditName(j) if j == i);
+        let editing_value = matches!(h.mode, HeaderMode::EditValue(j) if j == i);
+        let name_text = if editing_name {
+            h.name_buf.text().to_string()
+        } else {
+            row.name.clone()
+        };
+        let value_text = if editing_value {
+            h.value_buf.text().to_string()
+        } else {
+            row.value.clone()
+        };
+        let name_style = if editing_name {
+            Style::default().fg(Color::Yellow)
+        } else if cursor_here {
+            yellow.add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        let value_style = if editing_value {
+            Style::default().fg(Color::White)
+        } else {
+            muted
+        };
+        lines.push(Line::from(vec![
+            Span::raw(marker.to_string()),
+            Span::styled(format!("{:<width$}", name_text, width = name_w), name_style),
+            Span::raw("  "),
+            Span::styled(value_text.clone(), value_style),
+        ]));
+
+        // Missing-env warning for the row currently being edited.
+        if editing_value {
+            let resolved = envref::resolve(&value_text);
+            if resolved.has_missing() {
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "      Environment variable not detected, make sure to set it: ${}",
+                        resolved.missing.join(", $")
+                    ),
+                    yellow,
+                )));
+            } else if !resolved.referenced.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "      env var(s) detected: ${}",
+                        resolved.referenced.join(", $")
+                    ),
+                    muted,
+                )));
+            }
+        }
+    }
+
+    let add_idx = h.add_row_idx();
+    let add_cursor = h.cursor == add_idx;
+    let add_marker = if add_cursor { "  ▸ " } else { "    " };
+    let add_style = if add_cursor {
+        yellow.add_modifier(Modifier::BOLD)
+    } else {
+        muted
+    };
+    lines.push(Line::from(vec![
+        Span::raw(add_marker.to_string()),
+        Span::styled("[+ add header]".to_string(), add_style),
+    ]));
+
+    if let Some(cont_idx) = h.continue_idx() {
+        let cont_cursor = h.cursor == cont_idx;
+        let marker = if cont_cursor { "  ▸ " } else { "    " };
+        let style = if cont_cursor {
+            yellow.add_modifier(Modifier::BOLD)
+        } else {
+            muted
+        };
+        lines.push(Line::from(vec![
+            Span::raw(marker.to_string()),
+            Span::styled("[continue → save & fetch /models]".to_string(), style),
+        ]));
+    }
 }
 
 fn render_field_row(lines: &mut Vec<Line<'static>>, label: &str, field: &TextField, active: bool) {
@@ -1556,6 +2089,14 @@ fn valid_url(s: &str) -> bool {
     s.starts_with("http://") || s.starts_with("https://")
 }
 
+/// Provider ids are config-map keys. Restrict to a conservative
+/// shell/filename-safe set so they're easy to reference from the CLI.
+fn valid_id(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+}
+
 // ── Constructors for the inner states ────────────────────────────────────
 
 impl AddState {
@@ -1565,7 +2106,8 @@ impl AddState {
             template: None,
             id_field: TextField::default(),
             url_field: TextField::default(),
-            auth_field: TextField::default(),
+            headers: HeaderEditor::new(Vec::new(), true),
+            codex_login: None,
             error: None,
             fetch: None,
             saved_provider_id: None,
@@ -1584,6 +2126,7 @@ impl EditState {
             status: None,
             fetch: None,
             delete_pending: false,
+            headers_editor: None,
         }
     }
 }
@@ -1634,6 +2177,7 @@ mod tests {
                     name: None,
                     thinking_modes: vec![],
                     inputs: None,
+                    favorite: false,
                     extra: Default::default(),
                 })
                 .collect(),
@@ -1660,6 +2204,7 @@ mod tests {
                 name: None,
                 thinking_modes: vec![],
                 inputs: None,
+                favorite: false,
                 extra: Default::default(),
             },
             ModelEntry {
@@ -1667,6 +2212,7 @@ mod tests {
                 name: None,
                 thinking_modes: vec![],
                 inputs: None,
+                favorite: false,
                 extra: Default::default(),
             },
         ]);

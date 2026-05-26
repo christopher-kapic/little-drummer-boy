@@ -61,6 +61,10 @@ pub enum Command {
     /// Refresh model lists from every configured provider's /models endpoint.
     FetchModels(FetchModelsArgs),
 
+    /// Manage the background daemon (`start`, `stop`, `status`).
+    #[command(subcommand)]
+    Daemon(DaemonCommand),
+
     /// Manage sessions.
     #[command(subcommand)]
     Session(SessionCommand),
@@ -180,15 +184,41 @@ pub enum AgentCommand {
 pub enum ProvidersCommand {
     #[command(alias = "ls")]
     List,
+    /// Run an interactive login flow for a provider (currently only
+    /// `codex`; static-API-key providers use `$VAR` references in
+    /// their header values).
     Login {
-        url: Option<String>,
+        /// Provider id. Today only `codex` is supported.
+        provider: Option<String>,
     },
-    Logout,
+    /// Remove the stored credential for a provider.
+    Logout {
+        /// Provider id. Today only `codex` is supported.
+        provider: Option<String>,
+    },
 }
 
 #[derive(Debug, clap::Args)]
 pub struct ModelsArgs {
     pub provider: Option<String>,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum DaemonCommand {
+    /// Start the daemon (foreground by default; `--detach` spawns a child).
+    Start {
+        /// Run in the foreground. Used by the wrapper that spawns the
+        /// child — you usually want `--detach` from the command line.
+        #[arg(long)]
+        foreground: bool,
+        /// Spawn a detached background daemon and exit immediately.
+        #[arg(long)]
+        detach: bool,
+    },
+    /// Stop the running daemon.
+    Stop,
+    /// Print whether the daemon is running.
+    Status,
 }
 
 #[derive(Debug, clap::Args)]

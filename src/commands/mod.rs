@@ -7,6 +7,7 @@
 
 pub mod agent;
 pub mod connect;
+pub mod daemon;
 pub mod debug;
 pub mod export;
 pub mod fetch_models;

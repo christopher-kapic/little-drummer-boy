@@ -77,6 +77,14 @@ fn config_candidates(cwd: &Path) -> Vec<PathBuf> {
 }
 
 fn extract_provider_model(json: &Value) -> Option<(String, String)> {
+    // cockpit-native schema: top-level `active_model: { provider, model }`.
+    let active_provider = read_string(json.pointer("/active_model/provider"));
+    let active_model = read_string(json.pointer("/active_model/model"));
+    if let (Some(provider), Some(model)) = (active_provider, active_model) {
+        return Some((provider, model));
+    }
+
+    // Fallback for legacy / opencode-flavored shapes.
     let default_provider = read_string(json.pointer("/models/categories/default/provider"));
     let default_model = read_string(json.pointer("/models/categories/default/model"));
     if let (Some(provider), Some(model)) = (default_provider, default_model) {
@@ -94,6 +102,21 @@ fn extract_provider_model(json: &Value) -> Option<(String, String)> {
             && let Some(pair) = split_provider_model(&model)
         {
             return Some(pair);
+        }
+    }
+
+    // Last-resort fallback: surface the first configured provider's
+    // first listed model so a freshly-added provider isn't invisible.
+    if let Some(providers) = json.get("providers").and_then(Value::as_object) {
+        for (pid, entry) in providers {
+            if let Some(models) = entry.get("models").and_then(Value::as_array)
+                && let Some(model_id) = models
+                    .first()
+                    .and_then(|m| m.get("id"))
+                    .and_then(Value::as_str)
+            {
+                return Some((pid.clone(), model_id.to_string()));
+            }
         }
     }
 

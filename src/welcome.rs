@@ -32,6 +32,11 @@ const BRANCH_BADGE: &str = "\x1b[30;48;5;220m";
 pub struct LaunchInfo {
     pub version: &'static str,
     pub provider_line: String,
+    /// Currently selected (provider_id, model_id). None when nothing
+    /// has been picked yet.
+    pub active_model: Option<(String, String)>,
+    /// True when the active model has `favorite: true` in config.
+    pub active_model_is_favorite: bool,
     pub cwd: PathBuf,
     pub cwd_display: String,
     pub repo_status: Option<RepoStatus>,
@@ -40,19 +45,49 @@ pub struct LaunchInfo {
 
 pub fn load(project: Option<&Path>) -> LaunchInfo {
     let cwd = resolve_launch_dir(project);
-    let provider_line = detect_provider_model(&cwd)
+    let active_model = detect_provider_model(&cwd);
+    let provider_line = active_model
+        .clone()
         .map(|(provider, model)| format!("{provider} / {model}"))
         .unwrap_or_else(|| "No providers configured - run /settings to edit".to_string());
+    let active_model_is_favorite = active_model
+        .as_ref()
+        .map(|(p, m)| is_favorite_model(&cwd, p, m))
+        .unwrap_or(false);
     let repo_status = git::repo_status(&cwd).ok().flatten();
 
     LaunchInfo {
         version: env!("CARGO_PKG_VERSION"),
         provider_line,
+        active_model,
+        active_model_is_favorite,
         cwd_display: display_path(&cwd),
         cwd,
         repo_status,
         agent_name: DEFAULT_AGENT.to_string(),
     }
+}
+
+/// Look up `<provider>/<model>` in the first config.json on the
+/// discovered config path and return whether it carries
+/// `favorite: true`. Returns false on any error (missing file,
+/// missing provider, etc.).
+fn is_favorite_model(cwd: &Path, provider_id: &str, model_id: &str) -> bool {
+    use crate::config::dirs::discover_config_dirs;
+    use crate::config::providers::ConfigDoc;
+    for dir in discover_config_dirs(cwd) {
+        let path = dir.path.join("config.json");
+        let Ok(doc) = ConfigDoc::load(&path) else {
+            continue;
+        };
+        let cfg = doc.providers();
+        if let Some(entry) = cfg.providers.get(provider_id)
+            && let Some(model) = entry.models.iter().find(|m| m.id == model_id)
+        {
+            return model.favorite;
+        }
+    }
+    false
 }
 
 pub fn print(project: Option<&Path>) {

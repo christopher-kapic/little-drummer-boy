@@ -165,6 +165,7 @@ pub fn parse_models_body(body: &str) -> Result<Vec<ModelEntry>> {
                 name,
                 thinking_modes,
                 inputs,
+                favorite: false,
                 extra,
             })
         })

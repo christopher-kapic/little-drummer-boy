@@ -9,10 +9,12 @@
 //! See `GOALS.md` for what the binary is for.
 
 mod agents;
+mod auth;
 mod cli;
 mod commands;
 mod config;
 mod credentials;
+mod daemon;
 mod envref;
 mod git;
 mod harness;
@@ -43,6 +45,7 @@ async fn main() -> Result<()> {
         Some(Command::Providers(sub)) => commands::providers::run(sub).await,
         Some(Command::Models(args)) => commands::models::run(args).await,
         Some(Command::FetchModels(args)) => commands::fetch_models::run(args).await,
+        Some(Command::Daemon(sub)) => commands::daemon::run(sub).await,
         Some(Command::Session(sub)) => commands::session::run(sub).await,
         Some(Command::Export(args)) => commands::export::run(args).await,
         Some(Command::Import(args)) => commands::import::run(args).await,

@@ -37,6 +37,11 @@ pub struct ProviderTemplate {
     /// One-liner shown under the URL field — typically a link to the
     /// vendor's API-key page.
     pub hint: Option<&'static str>,
+    /// If `true`, the template's `id` may be used as the default when
+    /// adding. The OpenAI-compatible template is `false` because the
+    /// user is expected to add several of them (one per vendor) and
+    /// they must each have distinct ids.
+    pub use_id_as_default: bool,
 }
 
 /// The catalog the wizard cycles through. `openai-compatible` is first
@@ -50,7 +55,10 @@ pub const TEMPLATES: &[ProviderTemplate] = &[
         default_env_var: None,
         default_headers: &[("Authorization", "Bearer $API_KEY")],
         supports_models_endpoint: true,
-        hint: Some("Generic OpenAI-compatible endpoint (any vendor exposing /v1)."),
+        hint: Some(
+            "Generic OpenAI-compatible endpoint. You can add as many of these as you want; each one needs a unique id.",
+        ),
+        use_id_as_default: false,
     },
     ProviderTemplate {
         id: "z-ai",
@@ -61,6 +69,7 @@ pub const TEMPLATES: &[ProviderTemplate] = &[
         default_headers: &[("Authorization", "Bearer $Z_AI_API_KEY")],
         supports_models_endpoint: false,
         hint: Some("Generate a key at https://z.ai/manage-apikey/apikey-list"),
+        use_id_as_default: true,
     },
     ProviderTemplate {
         id: "minimax",
@@ -71,6 +80,7 @@ pub const TEMPLATES: &[ProviderTemplate] = &[
         default_headers: &[("Authorization", "Bearer $MINIMAX_API_KEY")],
         supports_models_endpoint: true,
         hint: Some("Generate a key at https://platform.minimaxi.com/"),
+        use_id_as_default: true,
     },
     ProviderTemplate {
         id: "opencode-zen",
@@ -81,6 +91,7 @@ pub const TEMPLATES: &[ProviderTemplate] = &[
         default_headers: &[("Authorization", "Bearer $OPENCODE_ZEN_TOKEN")],
         supports_models_endpoint: true,
         hint: Some("Generate a token at https://opencode.ai/zen"),
+        use_id_as_default: true,
     },
     ProviderTemplate {
         id: "codex",
@@ -93,6 +104,7 @@ pub const TEMPLATES: &[ProviderTemplate] = &[
         hint: Some(
             "Codex uses OAuth device flow. Run `cockpit providers login codex` from a terminal.",
         ),
+        use_id_as_default: true,
     },
 ];
 

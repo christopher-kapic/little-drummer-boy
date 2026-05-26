@@ -41,6 +41,14 @@ the secret-sauce notes:
 Every subsystem treats "tokens in the model's context" as scarce. The
 operational levers we ship from v1:
 
+- **Wire economy is a first-class constraint too.** SSH, mosh, local
+  daemon clients, and the future relay/mobile surfaces all punish
+  chatty defaults. The same instinct that avoids wasting model tokens
+  should avoid wasting transport bytes: summaries, deltas, citations,
+  spillover paths, and on-demand expansion beat full transcript
+  rebroadcasts or bulky always-live panes. Features that are
+  meaningfully data-heavy by default need explicit justification and,
+  usually, an opt-in path.
 - **Subagents start with fresh, scoped contexts.** A `task(mode:
   "subagent")` call spawns a child agent whose conversation begins
   empty save for the task brief (`TaskPacket`). The child never sees
@@ -1939,6 +1947,49 @@ re-delegates to another subagent which re-delegates. Named agents
 that themselves declare `mode: subagent` get the same treatment by
 default; advanced opt-in via `allow_re_delegate: true` in the agent
 frontmatter.
+
+**Interactive scope changes use `task_request`, not nested interactive
+delegation.** Real `task(...)` spawning remains the orchestrator's
+delegation primitive (and the graph executor's / `coder -> docs`
+structural primitive). But when an **interactive** specialist is asked
+to do something outside its current brief, it does not directly spawn
+another interactive child. Instead it emits a scheduler-owned
+`task_request(...)`:
+
+```jsonc
+task_request({
+  "objective": "Also add a compact /stats summary view",
+  "urgency": "now",                 // or "after_current"
+  "suggested_agent": "coder",       // optional; XOR with `category`
+  "seed_artifacts": [
+    {"kind": "read", "path": "src/tui/app.rs", "lines": "40-110"},
+    {"kind": "finding", "text": "stats footer already renders cost totals"},
+    {"kind": "question", "text": "Need to preserve SSH-friendly compact mode"}
+  ]
+})
+```
+
+Mechanics:
+
+- `urgency: "now"` means: suspend the currently active interactive
+  task, enqueue it for resumption, create a **fresh-context sibling**
+  task under the same caller, and switch the TUI to that new task.
+  When the urgent task finishes, control returns to the scheduler,
+  which normally resumes the suspended task unless the user or caller
+  explicitly redirects elsewhere.
+- `urgency: "after_current"` means: append the request to the caller's
+  pending-task queue. When the current interactive task finishes, the
+  caller/runtime decides whether to spawn the next queued task,
+  answer directly, or ask for clarification.
+- The active task may attach only **small, high-signal seed artifacts**
+  — exact reads, concise findings, open questions, file citations. No
+  transcript dumps. If the follow-up needs more, it re-reads on its
+  own. This preserves the fresh-context property without forcing the
+  next task to rediscover everything from scratch.
+- This keeps **interactive ownership flat** even when execution order
+  becomes stack-like. The scheduler owns the pause/resume queue; no
+  interactive session ever becomes the direct parent of another
+  interactive session.
 
 **Layer 4 — graph node directive.** Graph plan nodes can pin a
 category:

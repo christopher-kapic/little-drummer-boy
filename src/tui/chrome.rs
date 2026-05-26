@@ -32,6 +32,37 @@ pub fn status_line_spans(info: &LaunchInfo) -> Vec<Span<'static>> {
     spans
 }
 
+/// Bottom-left status: `provider/model · agent`.
+///
+///   - The model glyph is dark yellow when the active model is
+///     marked favorite, light grey otherwise.
+///   - Agents will eventually each carry a color; the default is blue.
+pub fn left_status_spans(info: &LaunchInfo) -> Vec<Span<'static>> {
+    let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+    let mut spans: Vec<Span<'static>> = Vec::new();
+
+    if let Some((provider, model)) = &info.active_model {
+        let model_style = if info.active_model_is_favorite {
+            // Dark yellow / amber (xterm 220 is the bright shade we use
+            // for the branch badge — 178 reads as "dark yellow" alongside
+            // the light grey).
+            Style::default().fg(Color::Indexed(178))
+        } else {
+            muted
+        };
+        spans.push(Span::styled(format!("{provider}/{model}"), model_style));
+        spans.push(Span::styled(" · ".to_string(), muted));
+    }
+
+    // Default agent color is blue. Per-agent overrides can replace this
+    // when agent definitions grow a `color:` field.
+    spans.push(Span::styled(
+        info.agent_name.clone(),
+        Style::default().fg(Color::Blue),
+    ));
+    spans
+}
+
 pub fn repo_counts(repo: &RepoStatus) -> String {
     let mut parts = Vec::new();
     if repo.staged > 0 {

@@ -59,6 +59,14 @@ notify = "8"
 aho-corasick = "1"
 dotenvy = "0.15"
 
+# OAuth device-code flow (Codex login). PKCE = SHA-256 + URL-safe base64
+# (no padding); `urlencoding` is just for the form-encoded body of the
+# RFC 8628 token exchange step.
+base64 = "0.22"
+sha2 = "0.10"
+rand = "0.9"
+urlencoding = "2"
+
 # Subprocess discovery (Windows: gitbash, on every platform: harness commands)
 which = "8"
 

@@ -20,7 +20,7 @@ trade-offs and feature-by-feature decisions live in the companion docs:
 
 ## Strategic vision
 
-The feature set below is shaped by three load-bearing claims about
+The feature set below is shaped by four load-bearing claims about
 who `cockpit` is for and how it competes:
 
 1. **Primary target: open-source models with ~120k context
@@ -44,11 +44,23 @@ who `cockpit` is for and how it competes:
    anywhere. The v1 daemon architecture is shaped to make this
    layering trivial — same wire protocol, different transport
    (§8c).
+4. **Data-efficient interaction over SSH and remote links.** The
+   harness should remain comfortable to use over SSH, mosh, and the
+   future relay/mobile surfaces. That means we optimize not just for
+   model-context economy but also for **wire economy**: summaries,
+   deltas, citations, and on-demand expansion beat full transcripts,
+   bulky live panes, and repeated large payloads. If a proposed
+   feature is meaningfully data-heavy by default, the design must
+   justify the cost explicitly rather than smuggling it in as
+   convenience.
 
 When a design choice trades convenience for OS-model viability,
 OS-model viability wins. When a v1 decision constrains v2 (the
 remote dashboard), prefer the v1 decision that makes v2 easier
 even if it's marginally more work now.
+When a design choice would increase routine SSH/remote bandwidth
+without a proportional payoff, the data-efficient design wins by
+default.
 
 ---
 
@@ -587,19 +599,28 @@ by the subagent**.
   returns control), the caller resumes and receives the
   subagent's report. Interactive subagents are strictly
   one-at-a-time per caller (only one agent can hold the user's
-  conversation at a time).
+  conversation at a time). Interactive subagents do **not**
+  directly spawn other interactive subagents; the interactive
+  ownership model stays scheduler-owned so pause/resume semantics,
+  event routing, and active-agent identity remain obvious.
 
   In interactive mode, the user sometimes asks the subagent for
   things that are *outside its assigned task* — "while you're at
   it, also check X" or "what was the orchestrator going to do
   next?". The subagent doesn't try to do them itself (scope
   discipline is what makes the report contract work). Instead it
-  uses a `defer_to_caller(message)` tool to **write the request
-  into a deferred-request log** and continues with its assigned
-  task. When the caller resumes, it reads its subagent's report
-  plus the deferred-request log, and decides what to do about
-  each entry (spawn a follow-up subagent, answer the user
-  directly, ask a clarifying question, etc.).
+  uses `task_request(...)` to hand the new work back to the
+  caller/runtime with an urgency of `now` or `after_current`.
+  `now` means "pause me and switch the user to a fresh-context
+  sibling task immediately"; `after_current` means "queue this for
+  the caller to schedule once I finish." The active subagent may
+  attach a small set of **seed artifacts** (specific file reads,
+  concise findings, open questions) so the follow-up starts with
+  the right context without inheriting the full interactive stack.
+  When the caller resumes, it reads its subagent's report plus the
+  queued task requests and decides what to do about each entry
+  (spawn a follow-up subagent, answer the user directly, ask a
+  clarifying question, etc.).
 
   The TUI must make active-agent identity unambiguous —
   current-agent name shown in the chrome (alongside cwd / branch /

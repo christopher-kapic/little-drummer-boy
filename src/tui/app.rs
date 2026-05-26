@@ -56,6 +56,10 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "Quit cockpit",
     },
     SlashCommand {
+        name: "favorite",
+        description: "Mark the active model as a favorite",
+    },
+    SlashCommand {
         name: "fetch-models",
         description: "Refresh model lists from every configured provider",
     },
@@ -87,6 +91,18 @@ pub struct App {
     /// but we never shrink it.
     pane_height: u16,
     dialog: Dialog,
+    /// `/model` picker. Mutually exclusive with `dialog` (we never show
+    /// both); kept separate so the picker doesn't clutter the settings
+    /// state machine.
+    model_picker: Option<crate::tui::model_picker::ModelPickerDialog>,
+    /// "Daemon not running" prompt shown at startup. Once the user picks,
+    /// this is taken and the prompt closes.
+    daemon_prompt: Option<crate::tui::daemon_prompt::DaemonPromptDialog>,
+    /// True after we've successfully connected to (or started) the daemon.
+    daemon_connected: bool,
+    /// Lines emitted by an in-flight `/fetch-models` task. The event
+    /// loop drains this each tick and appends to history.
+    fetch_models_progress: Arc<Mutex<Vec<String>>>,
 }
 
 impl App {
@@ -97,6 +113,21 @@ impl App {
         let launch = welcome::load(project);
         let repo_status = Arc::new(Mutex::new(launch.repo_status.clone()));
 
+        // Probe the daemon synchronously up front so the prompt shows
+        // immediately when we open the TUI rather than after a tick.
+        let (daemon_prompt, daemon_connected) = match crate::daemon::DaemonPaths::resolve() {
+            Ok(paths) => match crate::daemon::probe_blocking(&paths) {
+                crate::daemon::DaemonStatus::Running => (None, true),
+                status => (
+                    Some(crate::tui::daemon_prompt::DaemonPromptDialog::new(
+                        status, paths,
+                    )),
+                    false,
+                ),
+            },
+            Err(_) => (None, false),
+        };
+
         let mut app = Self {
             launch,
             composer,
@@ -104,14 +135,22 @@ impl App {
             repo_status,
             pane_height: 0,
             dialog: Dialog::None,
+            model_picker: None,
+            daemon_prompt,
+            daemon_connected,
+            fetch_models_progress: Arc::new(Mutex::new(Vec::new())),
         };
         app.pane_height = app.geometry().desired_pane_height();
         app
     }
 
     fn geometry(&self) -> PaneGeometry {
-        let dialog = if self.dialog.is_active() {
+        let dialog = if self.daemon_prompt.is_some() {
+            crate::tui::daemon_prompt::DIALOG_HEIGHT
+        } else if self.dialog.is_active() {
             settings::DIALOG_HEIGHT
+        } else if self.model_picker.is_some() {
+            crate::tui::model_picker::DIALOG_HEIGHT
         } else {
             0
         };
@@ -180,6 +219,7 @@ impl App {
     fn event_loop(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         loop {
             self.sync_repo_status();
+            self.drain_fetch_progress();
             self.dialog.tick();
             self.maybe_grow_pane(terminal)?;
             if self.maybe_spill_history()? {
@@ -199,6 +239,22 @@ impl App {
         }
 
         Ok(())
+    }
+
+    fn drain_fetch_progress(&mut self) {
+        let drained: Vec<String> = match self.fetch_models_progress.lock() {
+            Ok(mut buf) if !buf.is_empty() => buf.drain(..).collect(),
+            _ => return,
+        };
+        let touches_config = drained
+            .iter()
+            .any(|l| l.contains("model(s)") || l.ends_with(": done"));
+        for line in drained {
+            self.history.push(line);
+        }
+        if touches_config {
+            self.reload_launch_info();
+        }
     }
 
     fn sync_repo_status(&mut self) {
@@ -261,12 +317,75 @@ impl App {
             return true;
         }
 
+        // Modal dialog rule: whenever a modal is open we must
+        // `return false` (consume the key) before any other handler
+        // sees it. Otherwise navigation chars (`j`/`k`/etc.) that the
+        // modal interpreted as up/down also fall through to the
+        // composer's char-insert arm and leak into the textbox.
+        //
+        // The shape below is the same for every modal:
+        //   1. let inner handle the key
+        //   2. if it requested close: drain its result, close it
+        //   3. unconditionally `return false`
+        if let Some(prompt) = self.daemon_prompt.as_mut() {
+            let should_close = prompt.handle_key(key);
+            if !should_close {
+                return false;
+            }
+            let choice = prompt.take_choice();
+            match choice {
+                Some(crate::tui::daemon_prompt::DaemonChoice::StartAndConnect) => {
+                    match crate::daemon::DaemonPaths::resolve()
+                        .and_then(|_| crate::daemon::spawn_detached())
+                    {
+                        Ok(pid) => {
+                            self.history.push(format!(
+                                "daemon: spawned (pid {pid}); stop later with `cockpit daemon stop`"
+                            ));
+                            self.daemon_connected = true;
+                            self.daemon_prompt = None;
+                        }
+                        Err(e) => {
+                            if let Some(p) = self.daemon_prompt.as_mut() {
+                                p.set_error(format!("failed to spawn daemon: {e}"));
+                            }
+                        }
+                    }
+                }
+                Some(crate::tui::daemon_prompt::DaemonChoice::ContinueWithout) => {
+                    self.history.push(
+                        "daemon: continuing without — features that need the daemon will be limited"
+                            .to_string(),
+                    );
+                    self.daemon_prompt = None;
+                }
+                Some(crate::tui::daemon_prompt::DaemonChoice::Exit) | None => {
+                    return true;
+                }
+            }
+            return false;
+        }
+
         if self.dialog.is_active() {
             if self.dialog.handle_key(key) {
-                // TODO: when the settings pages actually mutate config,
-                // reload and re-apply to the running session here.
+                // Closing the settings dialog can change the active
+                // provider/model — reload launch info so the status
+                // line and header refresh.
                 self.dialog = Dialog::None;
+                self.reload_launch_info();
             }
+            return false;
+        }
+
+        if let Some(picker) = self.model_picker.as_mut() {
+            let should_close = picker.handle_key(key);
+            if should_close {
+                self.model_picker = None;
+                self.reload_launch_info();
+                self.history.push(self.model_summary_history_line());
+            }
+            // See the "modal dialog rule" comment above — always
+            // consume the key while the picker is open.
             return false;
         }
 
@@ -288,6 +407,16 @@ impl App {
                 } else {
                     self.complete_or_submit()
                 }
+            }
+            // Newline fallback for terminals that can't disambiguate
+            // Shift+Enter (most legacy terminfo entries, every plain
+            // xterm-256color, and the common path through tmux+ssh
+            // without the kitty keyboard protocol). Ctrl+J is the
+            // canonical LF on every Unix terminal and survives every
+            // multiplexer hop.
+            KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.composer.insert_char('\n');
+                false
             }
             KeyCode::Backspace => {
                 self.composer.delete_left();
@@ -372,24 +501,171 @@ impl App {
                 return false;
             }
             "fetch-models" => {
-                // Kick the user into the Providers list; the CLI command
-                // `cockpit fetch-models` does the actual cross-provider
-                // pull. Once the async runtime grows we can move the loop
-                // in here, but the list at least surfaces the entries.
-                self.dialog = Dialog::open_providers(&self.launch.cwd);
-                self.history.push(
-                    "/fetch-models: opened Providers — run `cockpit fetch-models` in another shell to pull all /models endpoints."
-                        .to_string(),
-                );
+                self.spawn_fetch_models();
+                return false;
+            }
+            "model" => {
+                match crate::tui::model_picker::ModelPickerDialog::open(&self.launch.cwd) {
+                    Ok(picker) => {
+                        self.model_picker = Some(picker);
+                    }
+                    Err(e) => {
+                        self.history.push(format!("/model: {e}"));
+                    }
+                }
+                return false;
+            }
+            "favorite" => {
+                match crate::tui::model_picker::toggle_active_favorite(&self.launch.cwd) {
+                    Ok((new, p, m)) => {
+                        let verb = if new { "marked" } else { "unmarked" };
+                        self.history
+                            .push(format!("/favorite: {verb} {p}/{m} as favorite"));
+                        self.reload_launch_info();
+                    }
+                    Err(e) => {
+                        self.history.push(format!("/favorite: {e}"));
+                    }
+                }
                 return false;
             }
             "compact" => "/compact: stub — context compaction not wired yet.",
             "prune" => "/prune: stub — history pruning not wired yet.",
-            "model" => "/model: stub — model picker not wired yet.",
             _ => return false,
         };
         self.history.push(msg.to_string());
         false
+    }
+
+    /// Re-read launch info (provider/model/favorite) from disk and
+    /// keep the cwd + repo_status we already have.
+    fn reload_launch_info(&mut self) {
+        let mut fresh = welcome::load(Some(&self.launch.cwd));
+        // Don't clobber the live repo status — it's maintained by the
+        // background poller and is fresher than a re-read here.
+        fresh.repo_status = self.launch.repo_status.clone();
+        self.launch = fresh;
+    }
+
+    /// Kick off a non-interactive cross-provider `/models` refresh.
+    /// Lines land in `fetch_models_progress`; the event loop drains
+    /// them into history.
+    fn spawn_fetch_models(&mut self) {
+        use crate::config::dirs::discover_config_dirs;
+        use crate::config::providers::{ConfigDoc, OnUnlistedModelsFetch};
+        use crate::providers::models_fetch::{self, FetchOutcome};
+        use std::time::Duration;
+
+        let cwd = self.launch.cwd.clone();
+        let progress = Arc::clone(&self.fetch_models_progress);
+        self.history.push("/fetch-models: starting…".to_string());
+
+        tokio::spawn(async move {
+            let push = |lines: &Arc<Mutex<Vec<String>>>, s: String| {
+                if let Ok(mut g) = lines.lock() {
+                    g.push(s);
+                }
+            };
+
+            let dirs = discover_config_dirs(&cwd);
+            let Some(dir) = dirs.first() else {
+                push(
+                    &progress,
+                    "/fetch-models: no cockpit config — run /settings to create one".into(),
+                );
+                return;
+            };
+            let path = dir.path.join("config.json");
+            let mut doc = match ConfigDoc::load(&path) {
+                Ok(d) => d,
+                Err(e) => {
+                    push(&progress, format!("/fetch-models: config load failed: {e}"));
+                    return;
+                }
+            };
+            let mut cfg = doc.providers();
+            let policy = cfg
+                .on_unlisted_models_fetch
+                .unwrap_or(OnUnlistedModelsFetch::Keep);
+
+            if cfg.providers.is_empty() {
+                push(&progress, "/fetch-models: no providers configured".into());
+                return;
+            }
+
+            let ids: Vec<String> = cfg.providers.keys().cloned().collect();
+            for id in &ids {
+                let entry = cfg.providers.get(id).cloned().unwrap();
+                let (_, missing) = models_fetch::resolve_headers(&entry.headers);
+                if !missing.is_empty() {
+                    push(
+                        &progress,
+                        format!(
+                            "/fetch-models: {id} skipped — missing env var(s): {}",
+                            missing.join(", ")
+                        ),
+                    );
+                    continue;
+                }
+                match models_fetch::fetch_models(
+                    &entry.url,
+                    &entry.headers,
+                    Some(Duration::from_secs(15)),
+                )
+                .await
+                {
+                    Ok(FetchOutcome::Models(remote)) => {
+                        let n = remote.len();
+                        let entry_mut = cfg.providers.get_mut(id).unwrap();
+                        match policy {
+                            OnUnlistedModelsFetch::Remove | OnUnlistedModelsFetch::Ask => {
+                                entry_mut.models = remote;
+                            }
+                            OnUnlistedModelsFetch::Keep => {
+                                let mut new = remote;
+                                for old in &entry_mut.models {
+                                    if !new.iter().any(|n| n.id == old.id) {
+                                        new.push(old.clone());
+                                    }
+                                }
+                                entry_mut.models = new;
+                            }
+                        }
+                        entry_mut.models_fetched_at = Some(chrono::Utc::now());
+                        push(&progress, format!("/fetch-models: {id} → {n} model(s)"));
+                    }
+                    Ok(FetchOutcome::Unsupported) => {
+                        push(
+                            &progress,
+                            format!("/fetch-models: {id} has no /models endpoint"),
+                        );
+                    }
+                    Err(e) => {
+                        push(&progress, format!("/fetch-models: {id} failed: {e}"));
+                    }
+                }
+            }
+
+            if let Err(e) = doc.write(&cfg) {
+                push(&progress, format!("/fetch-models: write failed: {e}"));
+            } else {
+                push(&progress, "/fetch-models: done".into());
+            }
+        });
+    }
+
+    fn model_summary_history_line(&self) -> String {
+        match &self.launch.active_model {
+            Some((p, m)) => format!(
+                "/model: active model is now {p}/{m}{}",
+                if self.launch.active_model_is_favorite {
+                    " (★)"
+                } else {
+                    ""
+                }
+            ),
+            None => "/model: no active model".to_string(),
+        }
     }
 
     fn slash_query(&self) -> Option<&str> {
@@ -418,8 +694,12 @@ impl App {
         let geom = self.geometry();
         let rects = geom.layout(frame.area());
 
-        if self.dialog.is_active() {
+        if let Some(prompt) = self.daemon_prompt.as_ref() {
+            prompt.render(frame, rects.body);
+        } else if self.dialog.is_active() {
             self.dialog.render(frame, rects.body);
+        } else if let Some(picker) = self.model_picker.as_ref() {
+            picker.render(frame, rects.body);
         } else {
             self.render_history(frame, rects.body);
             let cursor_pos = self.render_input(frame, rects.input);
@@ -537,16 +817,17 @@ impl App {
     }
 
     fn render_status(&self, frame: &mut ratatui::Frame, area: Rect) {
-        let status_spans = chrome::status_line_spans(&self.launch);
-        let status_width: u16 = status_spans
+        let right = chrome::status_line_spans(&self.launch);
+        let left = chrome::left_status_spans(&self.launch);
+        let right_width: u16 = right
             .iter()
             .map(|s| s.width() as u16)
             .sum::<u16>()
             .min(area.width);
         let bottom =
-            Layout::horizontal([Constraint::Min(0), Constraint::Length(status_width)]).split(area);
-        frame.render_widget(Paragraph::new(self.launch.agent_name.as_str()), bottom[0]);
-        frame.render_widget(Paragraph::new(Line::from(status_spans)), bottom[1]);
+            Layout::horizontal([Constraint::Min(0), Constraint::Length(right_width)]).split(area);
+        frame.render_widget(Paragraph::new(Line::from(left)), bottom[0]);
+        frame.render_widget(Paragraph::new(Line::from(right)), bottom[1]);
     }
 }
 
