@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use crossterm::cursor;
+use crossterm::cursor::{self, SetCursorStyle};
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
     KeyModifiers, KeyboardEnhancementFlags, MouseButton, MouseEvent, MouseEventKind,
@@ -24,14 +24,16 @@ use crossterm::terminal::{Clear, ClearType, size as terminal_size};
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, BorderType, Paragraph, Wrap};
 use ratatui::{DefaultTerminal, TerminalOptions, Viewport};
 
+use crate::config::dirs::discover_config_dirs;
+use crate::config::extended::{ExtendedConfig, VimModeSetting};
 use crate::engine::TurnEvent;
 use crate::git::{self, RepoStatus};
 use crate::tui::agent_runner::{self, AgentRunner};
 use crate::tui::chrome;
-use crate::tui::composer::{Composer, INPUT_PREFIX, VimMode, input_prefix_width};
+use crate::tui::composer::{Composer, INPUT_PREFIX, Operator, VimMode, input_prefix_width};
 use crate::tui::geometry::PaneGeometry;
 use crate::tui::history::{
     HistoryEntry, PendingMsg, Rendered, render_entry, render_pending, route_text_delta,
@@ -87,6 +89,15 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
 pub struct App {
     launch: LaunchInfo,
     composer: Composer,
+    /// User's vim_mode setting (hint/enabled/disabled). Drives whether
+    /// the Normal-mode hint chip is shown.
+    vim_setting: VimModeSetting,
+    /// Messages typed and submitted while an agent turn is in flight.
+    /// Mirrors the daemon's queue (GOALS §1c) for display; the daemon
+    /// is the source of truth — these get cleared on `ThinkingStarted`
+    /// because that event implies the daemon just drained the queue
+    /// into the next inference round.
+    queue: Vec<String>,
     history: Vec<HistoryEntry>,
     /// In-flight assistant turn (between `ThinkingStarted` and the
     /// matching `AssistantText`/tool boundary). When `Some`, the
@@ -133,14 +144,32 @@ pub struct App {
     /// lives there — or `None` for non-clickable rows. Refreshed every
     /// render.
     clickable_rows: Vec<Option<usize>>,
+    /// Last cursor-shape we asked the terminal to use. Tracked so we
+    /// only re-issue the escape when the desired shape changes (most
+    /// terminals tolerate redundant `SetCursorStyle` writes but a few
+    /// blink visibly).
+    last_cursor_shape: Option<CursorShape>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CursorShape {
+    /// User's default (matches Insert mode).
+    Default,
+    /// Solid block — used in Normal / Operator-pending mode.
+    Block,
 }
 
 impl App {
     pub fn new(project: Option<&Path>) -> Self {
-        let mut composer = Composer::new(true);
+        let launch = welcome::load(project);
+        let vim_setting = load_tui_vim_setting(&launch.cwd);
+        let mut composer = Composer::new(vim_setting.vim_enabled());
+        // We start in Insert mode regardless — landing in Normal on
+        // first keystroke is jarring for users new to the TUI. The
+        // hint (when enabled) tells them how to switch back if they
+        // Esc out.
         composer.set_vim_mode(VimMode::Insert);
 
-        let launch = welcome::load(project);
         let repo_status = Arc::new(Mutex::new(launch.repo_status.clone()));
 
         // Probe the daemon synchronously up front so the prompt shows
@@ -161,6 +190,8 @@ impl App {
         let mut app = Self {
             launch,
             composer,
+            vim_setting,
+            queue: Vec::new(),
             history: Vec::new(),
             pending: None,
             started_at: Instant::now(),
@@ -174,6 +205,7 @@ impl App {
             agent_runner: None,
             chat_area: None,
             clickable_rows: Vec::new(),
+            last_cursor_shape: None,
         };
         app.pane_height = app.geometry().desired_pane_height();
         app
@@ -191,6 +223,7 @@ impl App {
         };
         PaneGeometry::compute(
             self.input_height(),
+            self.queue_lines(),
             self.popup_lines(),
             self.total_history_lines(),
             dialog,
@@ -254,6 +287,10 @@ impl App {
         if kbd_enhanced {
             let _ = crossterm::execute!(stdout(), PopKeyboardEnhancementFlags);
         }
+        // Always restore the user's default cursor shape on exit —
+        // otherwise we'd leak a steady-block cursor into their shell
+        // if they quit while in Normal mode.
+        let _ = crossterm::execute!(stdout(), SetCursorStyle::DefaultUserShape);
         ratatui::try_restore()?;
         result
     }
@@ -310,6 +347,7 @@ impl App {
                 terminal.clear()?;
             }
             terminal.draw(|frame| self.render(frame))?;
+            self.sync_cursor_shape();
 
             if event::poll(EVENT_TICK)? {
                 match event::read()? {
@@ -499,13 +537,32 @@ impl App {
             return false;
         }
 
+        // Vim-aware dispatch. Normal / Operator-pending intercept
+        // char keys; Insert mode falls through to the standard editor
+        // path (also used when vim is disabled).
+        if self.composer.vim_enabled() {
+            match self.composer.vim_mode() {
+                VimMode::Normal => return self.handle_key_normal(key),
+                VimMode::Operator(op) => return self.handle_key_operator(key, op),
+                VimMode::Insert => {}
+            }
+        }
+        self.handle_key_insert(key)
+    }
+
+    fn handle_key_insert(&mut self, key: KeyEvent) -> bool {
         match key.code {
             KeyCode::Esc => {
-                // Esc never exits — too easy to hit accidentally. It
-                // cancels an in-progress slash command; otherwise no-op.
-                // Exit paths: `/exit`, Ctrl+C, Ctrl+D.
+                // Esc cancels an in-progress slash command. Otherwise:
+                // when vim is enabled, it drops the composer into
+                // Normal mode. When vim is disabled it's a no-op
+                // (deliberate — too easy to hit accidentally for an
+                // exit path; `/exit`, Ctrl+C, Ctrl+D cover that).
                 if self.slash_query().is_some() {
                     self.composer.clear();
+                } else if self.composer.vim_enabled() {
+                    self.composer.set_vim_mode(VimMode::Normal);
+                    self.composer.set_pending_g(false);
                 }
                 false
             }
@@ -569,6 +626,193 @@ impl App {
         }
     }
 
+    fn handle_key_normal(&mut self, key: KeyEvent) -> bool {
+        // Arrow keys + Backspace/Delete still work in Normal mode —
+        // they're convenient even for vim users. Char keys go through
+        // the vim dispatcher below.
+        match key.code {
+            KeyCode::Esc => {
+                // Already in Normal; clear any pending `g`.
+                self.composer.set_pending_g(false);
+                false
+            }
+            KeyCode::Enter => {
+                // Enter submits even from Normal mode — matches what
+                // most TUIs do, so users don't have to switch to
+                // Insert to send.
+                self.composer.set_pending_g(false);
+                self.complete_or_submit()
+            }
+            KeyCode::Left => {
+                self.composer.move_left();
+                self.composer.set_pending_g(false);
+                false
+            }
+            KeyCode::Right => {
+                self.composer.move_right();
+                self.composer.set_pending_g(false);
+                false
+            }
+            KeyCode::Up => {
+                self.composer.move_up();
+                self.composer.set_pending_g(false);
+                false
+            }
+            KeyCode::Down => {
+                self.composer.move_down();
+                self.composer.set_pending_g(false);
+                false
+            }
+            KeyCode::Char(ch) => {
+                let was_pending_g = self.composer.pending_g();
+                // Default: any char key clears the pending `g`; the
+                // `g` arm below re-arms it if applicable.
+                self.composer.set_pending_g(false);
+                match ch {
+                    'h' => self.composer.move_left(),
+                    'l' => self.composer.move_right(),
+                    'k' => self.composer.move_up(),
+                    'j' => self.composer.move_down(),
+                    'w' => self.composer.move_word_forward(false),
+                    'W' => self.composer.move_word_forward(true),
+                    'b' => self.composer.move_word_backward(false),
+                    'B' => self.composer.move_word_backward(true),
+                    '0' => self.composer.move_line_start(),
+                    '$' => self.composer.move_line_end(),
+                    'G' => self.composer.move_buffer_end(),
+                    'g' => {
+                        if was_pending_g {
+                            self.composer.move_buffer_start();
+                        } else {
+                            self.composer.set_pending_g(true);
+                        }
+                    }
+                    'i' => self.composer.set_vim_mode(VimMode::Insert),
+                    'I' => {
+                        self.composer.move_line_start();
+                        self.composer.set_vim_mode(VimMode::Insert);
+                    }
+                    'a' => {
+                        self.composer.move_right();
+                        self.composer.set_vim_mode(VimMode::Insert);
+                    }
+                    'A' => {
+                        self.composer.move_line_end();
+                        self.composer.set_vim_mode(VimMode::Insert);
+                    }
+                    'x' => self.composer.delete_right(),
+                    'D' => self.composer.delete_to_line_end(),
+                    'C' => {
+                        self.composer.delete_to_line_end();
+                        self.composer.set_vim_mode(VimMode::Insert);
+                    }
+                    'o' => {
+                        self.composer.open_below();
+                        self.composer.set_vim_mode(VimMode::Insert);
+                    }
+                    'O' => {
+                        self.composer.open_above();
+                        self.composer.set_vim_mode(VimMode::Insert);
+                    }
+                    'd' => self
+                        .composer
+                        .set_vim_mode(VimMode::Operator(Operator::Delete)),
+                    'c' => self
+                        .composer
+                        .set_vim_mode(VimMode::Operator(Operator::Change)),
+                    _ => {}
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+
+    /// Operator-pending: we just saw `d` or `c`; the next key is the
+    /// motion. `dd`/`cc` (doubled operator) deletes/changes the
+    /// current line; `dw`/`cw` etc. apply the operator to the range
+    /// covered by the motion. Any unrecognized key cancels back to
+    /// Normal.
+    fn handle_key_operator(&mut self, key: KeyEvent, op: Operator) -> bool {
+        let to_insert_on_change = matches!(op, Operator::Change);
+        // Esc always cancels operator-pending.
+        if matches!(key.code, KeyCode::Esc) {
+            self.composer.set_vim_mode(VimMode::Normal);
+            self.composer.set_pending_g(false);
+            return false;
+        }
+        // Pending `g` for `dgg` / `cgg` chord.
+        if let KeyCode::Char('g') = key.code {
+            if self.composer.pending_g() {
+                self.composer.delete_to_buffer_start();
+                self.composer.set_pending_g(false);
+                self.composer.set_vim_mode(if to_insert_on_change {
+                    VimMode::Insert
+                } else {
+                    VimMode::Normal
+                });
+                return false;
+            }
+            self.composer.set_pending_g(true);
+            return false;
+        }
+        self.composer.set_pending_g(false);
+        let applied = match key.code {
+            KeyCode::Char('w') => {
+                self.composer.delete_word_forward(false);
+                true
+            }
+            KeyCode::Char('W') => {
+                self.composer.delete_word_forward(true);
+                true
+            }
+            KeyCode::Char('b') => {
+                self.composer.delete_word_backward(false);
+                true
+            }
+            KeyCode::Char('B') => {
+                self.composer.delete_word_backward(true);
+                true
+            }
+            KeyCode::Char('$') => {
+                self.composer.delete_to_line_end();
+                true
+            }
+            KeyCode::Char('0') => {
+                self.composer.delete_to_line_start();
+                true
+            }
+            KeyCode::Char('G') => {
+                self.composer.delete_to_buffer_end();
+                true
+            }
+            KeyCode::Char('d') if matches!(op, Operator::Delete) => {
+                self.composer.delete_current_line();
+                true
+            }
+            KeyCode::Char('c') if matches!(op, Operator::Change) => {
+                // `cc` changes the current line — semantically: clear
+                // the line's content, leave the line itself, and enter
+                // Insert. vim does the same.
+                self.composer.move_line_start();
+                self.composer.delete_to_line_end();
+                true
+            }
+            _ => false,
+        };
+        if applied {
+            self.composer.set_vim_mode(if to_insert_on_change {
+                VimMode::Insert
+            } else {
+                VimMode::Normal
+            });
+        } else {
+            // Unrecognized motion — cancel.
+            self.composer.set_vim_mode(VimMode::Normal);
+        }
+        false
+    }
+
     fn complete_or_submit(&mut self) -> bool {
         if let Some(query) = self.slash_query() {
             if let Some(cmd) = slash_matches(query).first() {
@@ -585,12 +829,20 @@ impl App {
             return false;
         }
 
-        // Persist the user's text as a styled history entry — the
-        // renderer applies bg color + padding rows.
-        self.history.push(HistoryEntry::User {
-            text: submitted.clone(),
-            timestamp: chrono::Local::now(),
-        });
+        // If a turn is in flight, the daemon will queue this message
+        // and fold it into the next inference call (GOALS §1c). Track
+        // it locally so the user sees what's pending; cleared when the
+        // daemon emits `ThinkingStarted` (its drain signal).
+        let agent_busy = self.pending.is_some();
+        if agent_busy {
+            self.queue.push(submitted.clone());
+        } else {
+            // No queueing — render as the user's turn immediately.
+            self.history.push(HistoryEntry::User {
+                text: submitted.clone(),
+                timestamp: chrono::Local::now(),
+            });
+        }
 
         self.ensure_agent_runner();
         match self.agent_runner.as_ref() {
@@ -616,6 +868,12 @@ impl App {
             None => {}
         }
         self.composer.clear();
+        // Re-enter Normal mode on submit when vim is enabled, so the
+        // composer is ready to be navigated without typing into it.
+        // Mirror Insert otherwise.
+        if self.composer.vim_enabled() {
+            self.composer.set_vim_mode(VimMode::Insert);
+        }
         false
     }
 
@@ -645,6 +903,18 @@ impl App {
         match event {
             TurnEvent::ThinkingStarted { agent } => {
                 self.finalize_pending();
+                // Daemon drains its queue right before opening the next
+                // inference round (driver.rs). Mirror that here so the
+                // queued messages now appear as the user's next turn
+                // in history rather than silently vanishing.
+                if !self.queue.is_empty() {
+                    let folded = self.queue.join("\n\n");
+                    self.queue.clear();
+                    self.history.push(HistoryEntry::User {
+                        text: folded,
+                        timestamp: chrono::Local::now(),
+                    });
+                }
                 self.pending = Some(new_pending(agent));
             }
             TurnEvent::AssistantTextDelta { agent, delta } => {
@@ -799,6 +1069,27 @@ impl App {
         if let Some(HistoryEntry::Agent { expanded, .. }) = self.history.get_mut(entry_idx) {
             *expanded = !*expanded;
         }
+    }
+
+    /// Push the right cursor shape to the terminal based on vim mode.
+    /// Idempotent — only writes when the desired shape changes.
+    fn sync_cursor_shape(&mut self) {
+        let desired = if self.composer.vim_enabled()
+            && !matches!(self.composer.vim_mode(), VimMode::Insert)
+        {
+            CursorShape::Block
+        } else {
+            CursorShape::Default
+        };
+        if self.last_cursor_shape == Some(desired) {
+            return;
+        }
+        let style = match desired {
+            CursorShape::Block => SetCursorStyle::SteadyBlock,
+            CursorShape::Default => SetCursorStyle::DefaultUserShape,
+        };
+        let _ = crossterm::execute!(stdout(), style);
+        self.last_cursor_shape = Some(desired);
     }
 
     fn sync_active_agent(&mut self) {
@@ -1005,13 +1296,50 @@ impl App {
     fn popup_lines(&self) -> u16 {
         match self.slash_query() {
             Some(q) => slash_matches(q).len().max(1) as u16,
+            None if self.show_vim_hint() => 1,
             None => 0,
         }
     }
 
+    /// True when the Normal-mode hint chip should occupy the popup
+    /// strip. Hidden when the user has set `vim_mode` to `enabled`
+    /// (advanced user; doesn't need the prompt) or `disabled` (vim
+    /// off), and when the composer is in Insert mode.
+    fn show_vim_hint(&self) -> bool {
+        self.vim_setting.show_hint()
+            && self.composer.vim_enabled()
+            && self.composer.vim_mode() == VimMode::Normal
+    }
+
+    /// Height of the queued-messages strip above the input box. Zero
+    /// when nothing's queued; otherwise one row per queued message
+    /// (the strip is inset side rails only — no top/bottom border).
+    fn queue_lines(&self) -> u16 {
+        self.queue.len() as u16
+    }
+
     fn input_height(&self) -> u16 {
-        (self.composer.line_count() as u16).clamp(MIN_INPUT_CONTENT, MAX_INPUT_CONTENT)
-            + INPUT_BORDER
+        let (term_w, _) = crossterm::terminal::size().unwrap_or((80, 24));
+        // Inner content width = terminal width - 2 side rails.
+        let wrap_width = (term_w as usize).saturating_sub(2).max(1);
+        let prefix = input_prefix_width();
+        let text = self.composer.text();
+        let lines: Vec<&str> = if text.is_empty() {
+            vec![""]
+        } else {
+            text.split('\n').collect()
+        };
+        let mut visual: usize = 0;
+        for line in &lines {
+            let visual_chars = prefix + line.chars().count();
+            let n = if visual_chars == 0 {
+                1
+            } else {
+                visual_chars.div_ceil(wrap_width)
+            };
+            visual = visual.saturating_add(n.max(1));
+        }
+        (visual as u16).clamp(MIN_INPUT_CONTENT, MAX_INPUT_CONTENT) + INPUT_BORDER
     }
 
     fn total_history_lines(&self) -> u16 {
@@ -1021,12 +1349,16 @@ impl App {
         // User (padding + body + padding; multi-line bodies cost more
         // but for sizing this is fine), 2 rows per Agent, plus pending.
         let mut total: u16 = 0;
+        let mut prev_agent = false;
         for entry in &self.history {
             total = total.saturating_add(match entry {
                 HistoryEntry::Plain { .. } => 1,
                 HistoryEntry::User { text, .. } => {
                     let body = text.matches('\n').count() as u16 + 1;
-                    body.saturating_add(2)
+                    // Bubble = top border + body + bottom border (+2);
+                    // plus the trailing gap row inserted in render_history
+                    // (+1) so the chat area gets sized to fit the box.
+                    body.saturating_add(3)
                 }
                 HistoryEntry::Agent {
                     text,
@@ -1035,16 +1367,24 @@ impl App {
                     ..
                 } => {
                     let body = text.matches('\n').count() as u16 + 1;
+                    // When reasoning is collapsed, the chip shares the
+                    // first text row (see render_agent), so no extra
+                    // chip row to count. When expanded, +1 for chip
+                    // plus all the reasoning lines.
                     let mut rows = body;
-                    if !reasoning.trim().is_empty() {
+                    if !reasoning.trim().is_empty() && *expanded {
                         rows = rows.saturating_add(1);
-                        if *expanded {
-                            rows = rows.saturating_add(reasoning.lines().count() as u16);
-                        }
+                        rows = rows.saturating_add(reasoning.lines().count() as u16);
+                    }
+                    // Trailing gap row after agent — skipped when the
+                    // previous entry was also an agent.
+                    if !prev_agent {
+                        rows = rows.saturating_add(1);
                     }
                     rows
                 }
             });
+            prev_agent = matches!(entry, HistoryEntry::Agent { .. });
         }
         if self.pending.is_some() {
             total = total.saturating_add(1);
@@ -1064,6 +1404,9 @@ impl App {
             picker.render(frame, rects.body);
         } else {
             self.render_history(frame, rects.body);
+            if geom.queue > 0 {
+                self.render_queue(frame, rects.queue);
+            }
             let cursor_pos = self.render_input(frame, rects.input);
             if geom.popup > 0 {
                 self.render_popup(frame, rects.popup);
@@ -1071,6 +1414,44 @@ impl App {
             frame.set_cursor_position(cursor_pos);
         }
         self.render_status(frame, rects.status);
+    }
+
+    /// Queued-messages strip. Just inset side rails — one column of
+    /// padding on each side compared to the input box below, no
+    /// top/bottom border. One row per queued message; rails are light
+    /// grey, content is dimmed white.
+    fn render_queue(&self, frame: &mut ratatui::Frame, area: Rect) {
+        if area.height == 0 || area.width < 5 || self.queue.is_empty() {
+            return;
+        }
+        let grey = Color::Indexed(245);
+        let dim_white = Color::Indexed(250);
+        // Inset 1 column on each side compared to the input box. Then
+        // 1 col rail + 1 col padding on each side, leaving the rest
+        // for content.
+        let inset = 1usize;
+        let rail_pad = 1usize;
+        let outer_w = area.width as usize;
+        let inner_w = outer_w
+            .saturating_sub((inset + 1 + rail_pad) * 2) // outside-inset + rail + inside-pad, x2
+            .max(1);
+        let mut lines: Vec<Line<'static>> = Vec::with_capacity(area.height as usize);
+        for msg in &self.queue {
+            let body = first_line_truncated(msg, inner_w);
+            let body_w = body.chars().count();
+            let trailing = inner_w.saturating_sub(body_w);
+            lines.push(Line::from(vec![
+                Span::raw(" ".repeat(inset)),
+                Span::styled("│", Style::default().fg(grey)),
+                Span::raw(" ".repeat(rail_pad)),
+                Span::styled(body, Style::default().fg(dim_white)),
+                Span::raw(" ".repeat(trailing)),
+                Span::raw(" ".repeat(rail_pad)),
+                Span::styled("│", Style::default().fg(grey)),
+                Span::raw(" ".repeat(inset)),
+            ]));
+        }
+        frame.render_widget(Paragraph::new(lines), area);
     }
 
     fn render_history(&mut self, frame: &mut ratatui::Frame, area: Rect) {
@@ -1092,12 +1473,21 @@ impl App {
                 });
             }
             all.extend(lines);
-            // Insert a one-line gap between user/agent messages so the
-            // chat breathes. Plain entries (tool calls, errors) belong
-            // to the surrounding agent turn and don't get a gap.
-            if matches!(entry, HistoryEntry::User { .. } | HistoryEntry::Agent { .. }) {
+            // Insert a one-line gap after agent entries to separate from
+            // the next user message or pending turn. Skip consecutive
+            // agents so multi-turn blocks read as a single block.
+            if matches!(entry, HistoryEntry::User { .. }) {
                 all.push(Line::default());
                 targets.push(None);
+            } else if matches!(entry, HistoryEntry::Agent { .. }) {
+                let prev_is_agent = idx
+                    .checked_sub(1)
+                    .map(|i| matches!(self.history[i], HistoryEntry::Agent { .. }))
+                    .unwrap_or(false);
+                if !prev_is_agent {
+                    all.push(Line::default());
+                    targets.push(None);
+                }
             }
         }
         if let Some(pending) = &self.pending {
@@ -1126,12 +1516,13 @@ impl App {
             };
         self.clickable_rows = visible_targets;
 
-        frame.render_widget(Paragraph::new(visible), area);
+        frame.render_widget(Paragraph::new(visible).wrap(Wrap { trim: false }), area);
     }
 
     fn render_input(&self, frame: &mut ratatui::Frame, area: Rect) -> Position {
         let input_block = Block::default()
             .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(Color::White));
         let input_inner = input_block.inner(area);
 
@@ -1160,13 +1551,25 @@ impl App {
             .collect();
 
         let (cursor_line, cursor_col) = self.composer.cursor_line_col();
-        let cursor_line = cursor_line as u16;
-        let cursor_col = cursor_col as u16;
+        // Wrap-aware visual cursor position: a single logical line
+        // that's wider than the inner width spans multiple visible
+        // rows, and we need the cursor to follow.
+        let inner_w = input_inner.width as usize;
+        let (vis_row, vis_col) = cursor_visual_pos(
+            self.composer.text(),
+            cursor_line,
+            cursor_col,
+            prefix_width,
+            inner_w.max(1),
+        );
+        let cursor_row = vis_row as u16;
+        let cursor_col = vis_col as u16;
 
         let visible_rows = input_inner.height;
-        let scroll_y = cursor_line.saturating_sub(visible_rows.saturating_sub(1));
+        let scroll_y = cursor_row.saturating_sub(visible_rows.saturating_sub(1));
         let para = Paragraph::new(lines)
             .block(input_block)
+            .wrap(Wrap { trim: false })
             .scroll((scroll_y, 0));
         frame.render_widget(para, area);
 
@@ -1189,8 +1592,8 @@ impl App {
         }
 
         Position::new(
-            input_inner.x + prefix_width as u16 + cursor_col,
-            input_inner.y + cursor_line.saturating_sub(scroll_y),
+            input_inner.x + cursor_col,
+            input_inner.y + cursor_row.saturating_sub(scroll_y),
         )
     }
 
@@ -1238,6 +1641,26 @@ impl App {
     }
 
     fn render_popup(&self, frame: &mut ratatui::Frame, area: Rect) {
+        // Vim hint preempts the popup when the composer is in Normal
+        // mode and the user hasn't opted out via the vim_mode setting.
+        if self.slash_query().is_none() {
+            if self.show_vim_hint() {
+                let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+                let line = Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled("Press ", muted),
+                    Span::styled(
+                        "`i`",
+                        Style::default()
+                            .fg(Color::Yellow),
+                    ),
+                    Span::styled(" to resume typing. Disable vim mode in ", muted),
+                    Span::styled("/settings", muted),
+                ]);
+                frame.render_widget(Paragraph::new(line), area);
+            }
+            return;
+        }
         let query = self.slash_query().unwrap_or("");
         let matches = slash_matches(query);
         let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
@@ -1322,6 +1745,62 @@ fn format_token_count(n: u32) -> String {
     } else {
         n.to_string()
     }
+}
+
+/// First line of `s`, hard-clipped to `width` columns with a trailing
+/// `…` when truncated. Used by the queue strip; only previews the first
+/// line of multi-line queued messages to keep the box compact.
+fn first_line_truncated(s: &str, width: usize) -> String {
+    let first = s.lines().next().unwrap_or("");
+    if width == 0 {
+        return String::new();
+    }
+    if first.chars().count() <= width {
+        return first.to_string();
+    }
+    let mut out: String = first.chars().take(width.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
+/// Visual (row, col) of the cursor inside the input box's inner area,
+/// accounting for soft-wrap. `wrap_width` is the inner width; `prefix`
+/// is the width of the leading `❯ ` on the first logical line (a
+/// matching indent is used on subsequent logical lines, so the wrap
+/// math is symmetric).
+fn cursor_visual_pos(
+    text: &str,
+    cursor_line: usize,
+    cursor_col: usize,
+    prefix: usize,
+    wrap_width: usize,
+) -> (usize, usize) {
+    if wrap_width == 0 {
+        return (0, 0);
+    }
+    let mut visual_row: usize = 0;
+    let lines: Vec<&str> = if text.is_empty() {
+        vec![""]
+    } else {
+        text.split('\n').collect()
+    };
+    for (i, line) in lines.iter().enumerate().take(cursor_line) {
+        // Every logical line carries the same `prefix` width because
+        // the renderer inserts the prefix-width indent on lines after
+        // the first too. Result: line wraps identically.
+        let visual_chars = prefix + line.chars().count();
+        let n = if visual_chars == 0 {
+            1
+        } else {
+            visual_chars.div_ceil(wrap_width)
+        };
+        visual_row += n.max(1);
+        let _ = i;
+    }
+    let offset = prefix + cursor_col;
+    let row_within = offset / wrap_width;
+    let col_within = offset % wrap_width;
+    (visual_row + row_within, col_within)
 }
 
 fn new_pending(name: String) -> PendingMsg {
@@ -1460,6 +1939,22 @@ fn insert_above_viewport(pane_height: u16, lines: &[String]) -> Result<()> {
 
 fn accepts_key(key: &KeyEvent) -> bool {
     matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+}
+
+/// Walk the layered-config discovery and return the `tui.vim_mode`
+/// setting from the first `extended-config.json` we find. Defaults to
+/// `Hint` when no config exists or the file is unreadable / malformed
+/// (mirroring the rest of `extended.rs`'s tolerant loading).
+fn load_tui_vim_setting(cwd: &Path) -> VimModeSetting {
+    for dir in discover_config_dirs(cwd) {
+        let path = dir.path.join("extended-config.json");
+        if let Ok(bytes) = std::fs::read(&path)
+            && let Ok(cfg) = serde_json::from_slice::<ExtendedConfig>(&bytes)
+        {
+            return cfg.tui.vim_mode;
+        }
+    }
+    VimModeSetting::default()
 }
 
 /// Background task that polls `git status` every `GIT_REFRESH_INTERVAL`

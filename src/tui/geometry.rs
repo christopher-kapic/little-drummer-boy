@@ -18,8 +18,12 @@ pub const MIN_HISTORY_HEIGHT: u16 = 1;
 pub struct PaneGeometry {
     /// Input box height (content + border). Zero when a dialog is open.
     pub input: u16,
-    /// Slash-popup height. Zero when there's no slash query or a dialog
-    /// is open.
+    /// Queued-messages strip above the input. Zero when nothing is
+    /// queued. Includes its top border AND its shared bottom border
+    /// (the row that visually doubles as the input's top edge).
+    pub queue: u16,
+    /// Slash-popup / vim-hint height. Zero when there's no slash query
+    /// or a dialog is open.
     pub popup: u16,
     /// Status row height. Always `STATUS_HEIGHT`; named so that callers
     /// don't need to reach for the constant separately.
@@ -37,6 +41,9 @@ pub struct PaneRects {
     /// Where history renders (chat mode) or the dialog overlays
     /// (dialog mode).
     pub body: Rect,
+    /// Queued-messages strip above the input. Zero-area when the queue
+    /// is empty or a dialog is open.
+    pub queue: Rect,
     /// Input box rect. Zero-area when a dialog is open.
     pub input: Rect,
     /// Slash popup rect. Zero-area when there's no slash query or a
@@ -54,6 +61,7 @@ impl PaneGeometry {
     /// no dependency on the App or Composer types.
     pub fn compute(
         input_height: u16,
+        queue_height: u16,
         popup_height: u16,
         history_lines: u16,
         dialog_height: u16,
@@ -61,14 +69,20 @@ impl PaneGeometry {
         if dialog_height > 0 {
             Self {
                 input: 0,
+                queue: 0,
                 popup: 0,
                 status: STATUS_HEIGHT,
                 dialog: dialog_height,
                 history: history_lines.max(MIN_HISTORY_HEIGHT),
             }
         } else {
+            // Queue is just inset side rails (no top/bottom border)
+            // sitting directly above the input box, so its height is
+            // exactly the message count. Input always renders its
+            // full rounded box.
             Self {
                 input: input_height,
+                queue: queue_height,
                 popup: popup_height,
                 status: STATUS_HEIGHT,
                 dialog: 0,
@@ -84,7 +98,7 @@ impl PaneGeometry {
         if self.dialog > 0 {
             self.dialog + self.status
         } else {
-            self.history + self.input + self.popup + self.status
+            self.history + self.queue + self.input + self.popup + self.status
         }
     }
 
@@ -94,7 +108,7 @@ impl PaneGeometry {
         if self.dialog > 0 {
             self.status
         } else {
-            self.input + self.popup + self.status
+            self.queue + self.input + self.popup + self.status
         }
     }
 
@@ -105,6 +119,7 @@ impl PaneGeometry {
                 Layout::vertical([Constraint::Min(0), Constraint::Length(self.status)]).split(area);
             PaneRects {
                 body: parts[0],
+                queue: Rect::new(0, 0, 0, 0),
                 input: Rect::new(0, 0, 0, 0),
                 popup: Rect::new(0, 0, 0, 0),
                 status: parts[1],
@@ -112,6 +127,7 @@ impl PaneGeometry {
         } else {
             let parts = Layout::vertical([
                 Constraint::Min(0),
+                Constraint::Length(self.queue),
                 Constraint::Length(self.input),
                 Constraint::Length(self.popup),
                 Constraint::Length(self.status),
@@ -119,9 +135,10 @@ impl PaneGeometry {
             .split(area);
             PaneRects {
                 body: parts[0],
-                input: parts[1],
-                popup: parts[2],
-                status: parts[3],
+                queue: parts[1],
+                input: parts[2],
+                popup: parts[3],
+                status: parts[4],
             }
         }
     }

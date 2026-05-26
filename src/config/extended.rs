@@ -102,15 +102,63 @@ impl Default for RedactConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TuiConfig {
-    pub vim_mode: bool,
+    #[serde(default, deserialize_with = "deserialize_vim_mode_setting")]
+    pub vim_mode: VimModeSetting,
     pub show_cwd: bool,
     pub show_branch: bool,
+}
+
+/// Tri-state vim mode: `hint` (default; vim enabled, hint shown on
+/// entry to Normal), `enabled` (vim on, no hint), `disabled` (vim off).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum VimModeSetting {
+    #[default]
+    Hint,
+    Enabled,
+    Disabled,
+}
+
+impl VimModeSetting {
+    pub fn vim_enabled(self) -> bool {
+        !matches!(self, Self::Disabled)
+    }
+
+    pub fn show_hint(self) -> bool {
+        matches!(self, Self::Hint)
+    }
+}
+
+/// Accept the legacy `vim_mode: bool` schema as well as the new
+/// string enum. `true` maps to `Hint` (the default), `false` to
+/// `Disabled`. Lets us roll the schema forward without breaking
+/// existing configs on disk.
+fn deserialize_vim_mode_setting<'de, D>(d: D) -> Result<VimModeSetting, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    let v = serde_json::Value::deserialize(d)?;
+    match v {
+        serde_json::Value::Bool(true) => Ok(VimModeSetting::Hint),
+        serde_json::Value::Bool(false) => Ok(VimModeSetting::Disabled),
+        serde_json::Value::String(s) => match s.as_str() {
+            "hint" => Ok(VimModeSetting::Hint),
+            "enabled" => Ok(VimModeSetting::Enabled),
+            "disabled" => Ok(VimModeSetting::Disabled),
+            other => Err(D::Error::custom(format!(
+                "unknown vim_mode `{other}` (expected hint|enabled|disabled)"
+            ))),
+        },
+        serde_json::Value::Null => Ok(VimModeSetting::default()),
+        _ => Err(D::Error::custom("vim_mode must be a string or bool")),
+    }
 }
 
 impl Default for TuiConfig {
     fn default() -> Self {
         Self {
-            vim_mode: true,
+            vim_mode: VimModeSetting::default(),
             show_cwd: true,
             show_branch: true,
         }

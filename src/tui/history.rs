@@ -290,8 +290,9 @@ fn render_agent(
 
     // When the agent produced reasoning, the *first* row of this entry
     // is the bullet + chip line — replacing the "Thinking…" placeholder
-    // that lived there during streaming. Subsequent rows hold the
-    // assistant's text, indented to align under the bullet.
+    // that lived there during streaming.  The timestamp lands on the
+    // first actual text line (render_first_line_with_timestamp handles
+    // that naturally for the first wrapped text chunk).
     if has_reasoning {
         let arrow = if expanded { "▼" } else { "▶" };
         let action_hint = if expanded {
@@ -307,6 +308,13 @@ fn render_agent(
             None => format!("{arrow} thinking ({action_hint})"),
         };
         chip_row = Some(out.len());
+        let indent = " ".repeat(bullet_width);
+        let text_width = (width as usize).saturating_sub(bullet_width).max(1);
+        let wrapped: Vec<String> = text
+            .split('\n')
+            .flat_map(|raw_line| wrap_with_reserved_first_line(raw_line, text_width, 0))
+            .collect();
+
         let chip_spans = vec![
             Span::styled(
                 format!("{AGENT_BULLET} "),
@@ -319,8 +327,12 @@ fn render_agent(
                     .add_modifier(Modifier::DIM | Modifier::UNDERLINED),
             ),
         ];
-        out.push(render_first_line_with_timestamp(chip_spans, timestamp, width));
+
         if expanded {
+            // Chip alone on row 1; reasoning lines under it (indented
+            // four spaces, dimmed); then the agent's text. The user
+            // reads the reasoning *before* the conclusion.
+            out.push(render_first_line_timestamped(chip_spans, timestamp, width, false));
             for raw_line in reasoning.lines() {
                 out.push(Line::from(vec![
                     Span::raw("    "),
@@ -330,13 +342,19 @@ fn render_agent(
                     ),
                 ]));
             }
-        }
-        // Text wraps to the full area width; each line is indented to
-        // align under the bullet (col 2).
-        let indent = " ".repeat(bullet_width);
-        let text_width = (width as usize).saturating_sub(bullet_width).max(1);
-        for raw_line in text.split('\n') {
-            for chunk in wrap_with_reserved_first_line(raw_line, text_width, 0) {
+            for chunk in &wrapped {
+                out.push(Line::from(vec![Span::raw(format!("{indent}{chunk}"))]));
+            }
+        } else {
+            // Collapsed: chip + first text chunk on the same line so
+            // there's no visual blank between the chip and the answer.
+            let mut first_line_spans = chip_spans;
+            if !wrapped.is_empty() {
+                first_line_spans.push(Span::raw(" "));
+                first_line_spans.push(Span::raw(wrapped[0].clone()));
+            }
+            out.push(render_first_line_timestamped(first_line_spans, timestamp, width, false));
+            for chunk in wrapped.iter().skip(1) {
                 out.push(Line::from(vec![Span::raw(format!("{indent}{chunk}"))]));
             }
         }
@@ -391,14 +409,18 @@ fn render_with_timestamp(
     timestamp: DateTime<Local>,
     width: u16,
 ) -> Vec<Line<'static>> {
-    vec![render_first_line_with_timestamp(spans, timestamp, width)]
+    vec![render_first_line_timestamped(spans, timestamp, width, true)]
 }
 
-fn render_first_line_with_timestamp(
+fn render_first_line_timestamped(
     mut spans: Vec<Span<'static>>,
     timestamp: DateTime<Local>,
     width: u16,
+    add_timestamp: bool,
 ) -> Line<'static> {
+    if !add_timestamp {
+        return Line::from(spans);
+    }
     let area = width as usize;
     let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
     let ts = format_timestamp(timestamp);
@@ -407,6 +429,14 @@ fn render_first_line_with_timestamp(
     spans.push(Span::raw(" ".repeat(pad + 1)));
     spans.push(Span::styled(ts, Style::default().fg(TIMESTAMP_FG)));
     Line::from(spans)
+}
+
+fn render_first_line_with_timestamp(
+    spans: Vec<Span<'static>>,
+    timestamp: DateTime<Local>,
+    width: u16,
+) -> Line<'static> {
+    render_first_line_timestamped(spans, timestamp, width, true)
 }
 
 fn blank_bg_line(width: usize, bg: Color) -> Line<'static> {
@@ -547,6 +577,11 @@ pub fn route_text_delta(
                 reasoning.push_str(&remaining[..idx]);
                 remaining = &remaining[idx + CLOSE.len()..];
                 *inside_think = false;
+                // Drop a single `\n` directly after `</think>` so the
+                // answer doesn't render with a leading blank line.
+                if let Some(rest) = remaining.strip_prefix('\n') {
+                    remaining = rest;
+                }
             } else if let Some(idx) = trailing_partial_match(remaining, CLOSE) {
                 reasoning.push_str(&remaining[..idx]);
                 *tag_partial = remaining[idx..].to_string();
@@ -563,6 +598,11 @@ pub fn route_text_delta(
                 }
                 remaining = &remaining[idx + OPEN.len()..];
                 *inside_think = true;
+                // Drop a single `\n` directly after `<think>` so the
+                // reasoning block doesn't start with a blank line.
+                if let Some(rest) = remaining.strip_prefix('\n') {
+                    remaining = rest;
+                }
             } else if let Some(idx) = trailing_partial_match(remaining, OPEN) {
                 if idx > 0 {
                     text.push_str(&remaining[..idx]);
