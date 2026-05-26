@@ -53,7 +53,8 @@ impl Tool for WriteunlockTool {
         // calls see it.
         let exists = path.exists();
         if exists {
-            ctx.locks.check_write_permitted(&path, &ctx.agent_id)?;
+            ctx.locks
+                .check_write_permitted(&path, &ctx.agent_id, ctx.session.id)?;
         }
 
         // Decide line-ending mode based on the existing file (when
@@ -77,7 +78,7 @@ impl Tool for WriteunlockTool {
         ctx.locks.release(&path, &ctx.agent_id)?;
         // Mark as "read" too — a future tool call in the same session
         // can re-edit without needing another read first.
-        ctx.locks.note_read(&path, &ctx.agent_id);
+        ctx.locks.note_read(&path, &ctx.agent_id, ctx.session.id);
 
         Ok(ToolOutput::text(format!(
             "wrote `{}` ({} bytes, {})",

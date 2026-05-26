@@ -1,98 +1,117 @@
-//! Wires the [`crate::engine::Driver`] into a background tokio task and
-//! surfaces its events to the TUI via the same `Arc<Mutex<Vec<...>>>`
-//! pattern `app.rs` uses for `/fetch-models`.
+//! TUI ↔ daemon glue.
 //!
-//! Why not stream directly into `App.history`: the app's event loop
-//! holds `&mut self` during draws, so the only safe place to push from
-//! a tokio task is a `Mutex` the loop drains per tick. One drain pass
-//! per `EVENT_TICK` is plenty for a chat surface.
+//! Phase 4 of the daemon migration: the TUI no longer owns the
+//! engine. Instead [`try_spawn`] probes (or auto-promotes) the daemon
+//! via [`crate::daemon::client`], attaches a session at the cwd, and
+//! pipes the per-tick event stream from the daemon's broadcast back
+//! to the TUI in the same `Arc<Mutex<Vec<TurnEvent>>>` shape the rest
+//! of `app.rs` already consumes. The wire-shape of events is
+//! [`crate::daemon::proto::Event`]; we translate to [`TurnEvent`] at
+//! the boundary so the TUI rendering paths don't need to know they
+//! talk to a daemon.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc;
 
-use crate::config::dirs::discover_config_dirs;
-use crate::config::providers::{ConfigDoc, ProvidersConfig};
-use crate::engine::Driver;
+use crate::daemon::client::{LifecycleMode, probe_or_spawn};
+use crate::daemon::proto::{self, Request, Response};
 use crate::engine::TurnEvent;
-use crate::engine::builtin::{self, SpawnArgs};
-use crate::engine::model::{Model, ModelParams};
-use crate::locks::LockManager;
-use crate::session::Session;
 
-/// Handle the TUI keeps to talk to the engine.
+/// Handle the TUI keeps to talk to the engine (now via the daemon).
 pub struct AgentRunner {
-    /// Send user-typed messages here.
+    /// Send user-typed messages here. Each line becomes one
+    /// `SendUserMessage` request; the daemon's queue-folding (GOALS
+    /// §1c) is performed inside the worker, not here.
     pub input_tx: mpsc::Sender<String>,
     /// Drained per tick into [`crate::tui::app::App::history`].
     pub events: Arc<Mutex<Vec<TurnEvent>>>,
-    /// Mirrors the name of whoever's currently on top of the driver's
-    /// agent stack. The chrome reads this to update the active-agent
-    /// indicator (GOALS §1a).
+    /// Name of whoever's currently on top of the agent stack. The
+    /// chrome reads this for the active-agent slot (GOALS §1a).
     pub active_agent: Arc<Mutex<String>>,
 }
 
-/// Build the driver + spawn the task + return the handle. Errors out
-/// (so the TUI can fall back to its "input captured" stub message) when
-/// no provider is configured or its auth env var is missing.
+/// Probe for the daemon (auto-promoting one if needed), attach a
+/// fresh session at `cwd`, and return the runner handle.
+///
+/// Returns `Err(String)` instead of `anyhow::Error` so `app.rs` can
+/// render the message in its fallback "input captured" stub without
+/// having to format an anyhow chain.
 pub fn try_spawn(cwd: &Path) -> Result<AgentRunner, String> {
-    let providers_cfg = load_providers(cwd)?;
-    let model = Model::from_config(&providers_cfg).map_err(|e| format!("model: {e}"))?;
-    let model = Arc::new(model);
+    let runtime = tokio::runtime::Handle::try_current()
+        .map_err(|_| "no tokio runtime — cockpit must be invoked from main".to_string())?;
 
-    let session = Arc::new(Session::new(cwd.to_path_buf()));
-    if let Some(active) = &providers_cfg.active_model {
-        session.set_active_model(&active.provider, &active.model);
-    }
-    let locks = Arc::new(LockManager::new());
-
-    let spawn_args = SpawnArgs {
-        model: model.clone(),
-        params: ModelParams::default(),
-    };
-    let root = Arc::new(builtin::orchestrator_build(&spawn_args));
-
-    let (input_tx, input_rx) = mpsc::channel::<String>(32);
-    let (event_tx, mut event_rx) = mpsc::channel::<TurnEvent>(64);
-
-    let events = Arc::new(Mutex::new(Vec::new()));
-    let active_agent = Arc::new(Mutex::new(root.name.clone()));
-
-    let events_for_drain = events.clone();
-    let active_for_drain = active_agent.clone();
-
-    let mut driver = Driver::new(session, locks, cwd.to_path_buf(), root);
-
-    // Driver task: runs the engine's main loop, which itself drains
-    // the input channel between inference rounds for queued-message
-    // folding (GOALS §1c).
-    tokio::spawn(async move {
-        if let Err(e) = driver.run_main_loop(input_rx, &event_tx).await {
-            tracing::error!(error = ?e, "driver error");
-            let _ = event_tx
-                .send(TurnEvent::ToolError {
-                    agent: "engine".into(),
-                    call_id: String::new(),
-                    tool: "engine".into(),
-                    error: format!("{e:#}"),
+    // probe_or_spawn is async; we block the (async) caller on it so
+    // try_spawn returns a fully-attached handle to the TUI. We're
+    // already in a tokio context (`main` is `#[tokio::main]`), so we
+    // use `block_in_place` to run a `block_on` without panicking.
+    let attached = tokio::task::block_in_place(|| {
+        runtime.block_on(async {
+            let daemon = probe_or_spawn(LifecycleMode::AttachOrAutoPromote)
+                .await
+                .map_err(|e| format!("daemon probe: {e}"))?;
+            let project_root = cwd.to_string_lossy().into_owned();
+            let attached = daemon
+                .client
+                .request_ok(Request::Attach {
+                    session_id: None,
+                    project_root: Some(project_root),
                 })
-                .await;
-        }
-        // Final active-agent snapshot after the loop ends (unlikely;
-        // it ends only when the channel closes).
-        let name = driver.active_agent().to_string();
-        *active_for_drain.lock().unwrap() = name;
-    });
+                .await
+                .map_err(|e| format!("attach: {e}"))?;
+            let (session_id, active_agent_name) = match attached {
+                Response::Attached {
+                    session_id,
+                    active_agent,
+                    ..
+                } => (session_id, active_agent),
+                other => return Err(format!("unexpected attach response: {other:?}")),
+            };
+            Ok::<_, String>((daemon.client, session_id, active_agent_name))
+        })
+    })?;
+    let (client, session_id, initial_active_agent) = attached;
 
-    // Event-drain task: pushes events into the shared buffer the TUI
-    // reads per tick. Kept separate from the driver task so a slow TUI
-    // can't backpressure the model loop.
-    tokio::spawn(async move {
-        while let Some(event) = event_rx.recv().await {
-            events_for_drain.lock().unwrap().push(event);
-        }
-    });
+    let (input_tx, mut input_rx) = mpsc::channel::<String>(32);
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let active_agent = Arc::new(Mutex::new(initial_active_agent));
+
+    // Outbound: TUI sends a line → forward to daemon as
+    // SendUserMessage.
+    {
+        let client = client.clone();
+        tokio::spawn(async move {
+            while let Some(text) = input_rx.recv().await {
+                if let Err(e) = client
+                    .request(Request::SendUserMessage { text })
+                    .await
+                {
+                    tracing::warn!(error = ?e, "send_user_message transport failed");
+                    break;
+                }
+            }
+        });
+    }
+
+    // Inbound: daemon events → translate → push into the shared
+    // buffer and update active-agent tracker.
+    {
+        let events = events.clone();
+        let active_agent = active_agent.clone();
+        let client = client.clone();
+        tokio::spawn(async move {
+            while let Some(event) = client.next_event().await {
+                if event_session(&event) != Some(session_id) {
+                    continue;
+                }
+                update_active_agent(&event, &active_agent);
+                if let Some(translated) = proto_event_to_turn_event(event) {
+                    events.lock().unwrap().push(translated);
+                }
+            }
+        });
+    }
 
     Ok(AgentRunner {
         input_tx,
@@ -101,14 +120,100 @@ pub fn try_spawn(cwd: &Path) -> Result<AgentRunner, String> {
     })
 }
 
-fn load_providers(cwd: &Path) -> Result<ProvidersConfig, String> {
-    let dirs = discover_config_dirs(cwd);
-    let Some(dir) = dirs.first() else {
-        return Err("no cockpit config — run /settings to create one".into());
-    };
-    let path = dir.path.join("config.json");
-    let doc = ConfigDoc::load(&path).map_err(|e| format!("config load: {e}"))?;
-    Ok(doc.providers())
+fn update_active_agent(event: &proto::Event, slot: &Arc<Mutex<String>>) {
+    match event {
+        proto::Event::SubagentSpawned { child, .. } => {
+            *slot.lock().unwrap() = child.clone();
+        }
+        proto::Event::SubagentReport { .. } => {
+            // Pop back to the root. v1 supports a depth-1 stack
+            // (orchestrator-build → coder | explore); deeper trees
+            // need a proper stack to track properly.
+            *slot.lock().unwrap() = "orchestrator-build".to_string();
+        }
+        _ => {}
+    }
+}
+
+fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
+    use proto::Event::*;
+    Some(match event {
+        ThinkingStarted { session_id, .. }
+        | AssistantTextDelta { session_id, .. }
+        | ReasoningDelta { session_id, .. }
+        | AssistantText { session_id, .. }
+        | ToolStart { session_id, .. }
+        | ToolEnd { session_id, .. }
+        | ToolError { session_id, .. }
+        | SubagentSpawned { session_id, .. }
+        | SubagentReport { session_id, .. }
+        | InterruptRaised { session_id, .. }
+        | InterruptResolved { session_id, .. }
+        | SessionEnded { session_id, .. } => *session_id,
+    })
+}
+
+fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
+    use proto::Event::*;
+    Some(match event {
+        ThinkingStarted { agent, .. } => TurnEvent::ThinkingStarted { agent },
+        AssistantTextDelta { agent, delta, .. } => TurnEvent::AssistantTextDelta { agent, delta },
+        ReasoningDelta { agent, delta, .. } => TurnEvent::ReasoningDelta { agent, delta },
+        AssistantText { agent, text, .. } => TurnEvent::AssistantText { agent, text },
+        ToolStart {
+            agent,
+            call_id,
+            tool,
+            args,
+            ..
+        } => TurnEvent::ToolStart {
+            agent,
+            call_id,
+            tool,
+            args,
+        },
+        ToolEnd {
+            agent,
+            call_id,
+            tool,
+            output,
+            truncated,
+            ..
+        } => TurnEvent::ToolEnd {
+            agent,
+            call_id,
+            tool,
+            output,
+            truncated,
+        },
+        ToolError {
+            agent,
+            call_id,
+            tool,
+            error,
+            ..
+        } => TurnEvent::ToolError {
+            agent,
+            call_id,
+            tool,
+            error,
+        },
+        SubagentSpawned {
+            parent,
+            child,
+            prompt,
+            ..
+        } => TurnEvent::SubagentSpawned {
+            parent,
+            child,
+            prompt,
+        },
+        SubagentReport { agent, report, .. } => TurnEvent::SubagentReport { agent, report },
+        // Interrupts and SessionEnded don't have TurnEvent analogues
+        // yet — the TUI's needs-attention surface lands with the
+        // approval router.
+        InterruptRaised { .. } | InterruptResolved { .. } | SessionEnded { .. } => return None,
+    })
 }
 
 /// One-line summary of a tool call's args for the `→ tool(...)`

@@ -83,7 +83,7 @@ pub(crate) fn read_impl(args: Value, ctx: &ToolCtx, was_locked: bool) -> Result<
             ));
         }
         // Always track the read attempt so a subsequent write is allowed.
-        ctx.locks.note_read(&path, &ctx.agent_id);
+        ctx.locks.note_read(&path, &ctx.agent_id, ctx.session.id);
         return Ok(ToolOutput::text(out));
     }
     let mut start_idx = offset - 1;
@@ -127,11 +127,11 @@ pub(crate) fn read_impl(args: Value, ctx: &ToolCtx, was_locked: bool) -> Result<
         tail.push('\n');
         start_idx = 0; // silence unused
         let _ = start_idx;
-        ctx.locks.note_read(&path, &ctx.agent_id);
+        ctx.locks.note_read(&path, &ctx.agent_id, ctx.session.id);
         return Ok(ToolOutput::truncated_text(format!("{prelude}{tail}")));
     }
 
-    ctx.locks.note_read(&path, &ctx.agent_id);
+    ctx.locks.note_read(&path, &ctx.agent_id, ctx.session.id);
     Ok(ToolOutput::text(format!("{prelude}{numbered}")))
 }
 

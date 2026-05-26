@@ -42,6 +42,11 @@ rig-core = { version = "0.36", features = ["image"] }
 # Storage
 rusqlite = { version = "0.39", features = ["bundled"] }
 
+# Codec helpers for the NDJSON daemon wire protocol (GOALS §8c).
+# `Framed<UnixStream, LinesCodec>` lifts a byte stream into a
+# `Sink<String> + Stream<Item = String>` we can layer serde on top of.
+tokio-util = { version = "0.7", features = ["codec"] }
+
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -72,7 +77,7 @@ which = "8"
 
 # Time / IDs
 chrono = { version = "0.4", default-features = false, features = ["serde", "clock", "std"] }
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "serde"] }
 
 # Errors / logging
 anyhow = "1"

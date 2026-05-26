@@ -75,7 +75,8 @@ impl Tool for EditunlockTool {
             .unwrap_or(false);
 
         let path = resolve(path_arg, &ctx.cwd);
-        ctx.locks.check_write_permitted(&path, &ctx.agent_id)?;
+        ctx.locks
+            .check_write_permitted(&path, &ctx.agent_id, ctx.session.id)?;
 
         let existing = std::fs::read(&path)
             .map_err(|e| anyhow::anyhow!("read `{}`: {e}", path.display()))?;
@@ -116,7 +117,7 @@ impl Tool for EditunlockTool {
         std::fs::write(&path, &normalized)
             .map_err(|e| anyhow::anyhow!("write `{}`: {e}", path.display()))?;
         ctx.locks.release(&path, &ctx.agent_id)?;
-        ctx.locks.note_read(&path, &ctx.agent_id);
+        ctx.locks.note_read(&path, &ctx.agent_id, ctx.session.id);
 
         Ok(ToolOutput::text(format!(
             "edited `{}` ({}; {} bytes)",

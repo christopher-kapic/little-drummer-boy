@@ -15,6 +15,7 @@ mod commands;
 mod config;
 mod credentials;
 mod daemon;
+mod db;
 mod engine;
 mod envref;
 mod git;

@@ -18,6 +18,7 @@ use tokio::sync::mpsc;
 
 use crate::engine::agent::{Agent, TurnEvent, TurnOutcome, turn};
 use crate::engine::message::Message;
+use crate::redact::RedactionTable;
 use crate::session::Session;
 
 /// Maximum number of queued user messages to fold into a single
@@ -46,6 +47,7 @@ pub struct PendingTaskCall {
 pub struct Driver {
     pub session: Arc<Session>,
     pub locks: Arc<crate::locks::LockManager>,
+    pub redact: Arc<RedactionTable>,
     pub cwd: std::path::PathBuf,
     pub stack: Vec<AgentSession>,
 }
@@ -54,12 +56,14 @@ impl Driver {
     pub fn new(
         session: Arc<Session>,
         locks: Arc<crate::locks::LockManager>,
+        redact: Arc<RedactionTable>,
         cwd: std::path::PathBuf,
         root: Arc<Agent>,
     ) -> Self {
         Self {
             session,
             locks,
+            redact,
             cwd,
             stack: vec![AgentSession {
                 agent: root,
@@ -98,7 +102,7 @@ impl Driver {
             // first message (rare but harmless).
             let mut batch = vec![text];
             drain_queue(&mut input_rx, &mut batch);
-            let folded = fold_messages(batch);
+            let folded = self.redact.scrub(&fold_messages(batch));
             self.run_user_input(folded, &mut input_rx, tx).await?;
         }
         Ok(())
@@ -129,6 +133,7 @@ impl Driver {
                     next_prompt,
                     self.session.clone(),
                     self.locks.clone(),
+                    self.redact.clone(),
                     self.cwd.clone(),
                     tx,
                 )
@@ -153,7 +158,7 @@ impl Driver {
                         next_prompt = last_tool_result;
                     } else {
                         top.history.push(last_tool_result);
-                        next_prompt = Message::user(fold_messages(queued));
+                        next_prompt = Message::user(self.redact.scrub(&fold_messages(queued)));
                     }
                     continue;
                 }
@@ -187,7 +192,7 @@ impl Driver {
                     let mut queued: Vec<String> = Vec::new();
                     drain_queue(input_rx, &mut queued);
                     if !queued.is_empty() {
-                        next_prompt = Message::user(fold_messages(queued));
+                        next_prompt = Message::user(self.redact.scrub(&fold_messages(queued)));
                         continue;
                     }
                     return Ok(());
@@ -207,7 +212,7 @@ impl Driver {
                             function_call_id: task_function_call_id,
                         }),
                     });
-                    next_prompt = Message::user(brief);
+                    next_prompt = Message::user(self.redact.scrub(&brief));
                     continue;
                 }
                 TurnOutcome::SpawnNoninteractive {
@@ -232,8 +237,16 @@ impl Driver {
                         })
                         .await;
                     let child = crate::engine::builtin::load(&child_agent, &self.spawn_args())?;
-                    let report =
-                        match run_noninteractive(child, brief, self.session.clone(), self.locks.clone(), self.cwd.clone()).await {
+                    let report = match run_noninteractive(
+                        child,
+                        self.redact.scrub(&brief),
+                        self.session.clone(),
+                        self.locks.clone(),
+                        self.redact.clone(),
+                        self.cwd.clone(),
+                    )
+                    .await
+                    {
                             Ok(text) => text,
                             Err(e) => format!("Error: {e:#}"),
                         };
@@ -297,6 +310,7 @@ async fn run_noninteractive(
     brief: String,
     session: Arc<Session>,
     locks: Arc<crate::locks::LockManager>,
+    redact: Arc<RedactionTable>,
     cwd: std::path::PathBuf,
 ) -> Result<String> {
     use crate::engine::agent::turn;
@@ -316,6 +330,7 @@ async fn run_noninteractive(
             next_prompt,
             session.clone(),
             locks.clone(),
+            redact.clone(),
             cwd.clone(),
             &sink_tx,
         )

@@ -1,18 +1,32 @@
-//! Minimal daemon process + client.
+//! Daemon process + client. cockpit's daemon owns the session DB, the
+//! lock manager, the redaction table, the provider clients, and the
+//! configuration resolver (GOALS §8). The TUI is a *client* of the
+//! daemon, not the process that does the work.
 //!
-//! v1 scope (per [[daemon_and_ipc]]): the daemon is a long-running
-//! background process that the TUI connects to as a client. Real IPC —
-//! session ownership, agent fan-out, the websocket relay — is the v2
-//! follow-up. For now the daemon owns:
+//! Process layout:
 //!
-//!   - A PID file at `$XDG_STATE_HOME/cockpit/daemon.pid`.
-//!   - A Unix socket at `$XDG_RUNTIME_DIR/cockpit.sock` (fall back to
-//!     `$XDG_STATE_HOME/cockpit/daemon.sock` when runtime dir isn't set).
-//!   - A trivial accept loop that responds `ok\n` to any line. Enough
-//!     for the TUI to verify the daemon is reachable.
+//! - [`proto`] — NDJSON wire schema. Same envelope shape for in-process
+//!   channels, the Unix-socket transport, and (later) the WebSocket
+//!   relay (`cockpit connect`, GOALS §8d).
+//! - `server` (P2) — accept loop + per-client task + per-session worker.
+//! - `client` (P3) — typed client over the proto.
 //!
-//! Lifecycle commands: `cockpit daemon {start, stop, status}`. The TUI
-//! uses [`probe`] on launch.
+//! Lifecycle:
+//!
+//! - PID file at `$XDG_STATE_HOME/cockpit/daemon.pid`.
+//! - Unix socket at `$XDG_RUNTIME_DIR/cockpit/cockpit.sock`, fallback
+//!   to `$XDG_STATE_HOME/cockpit/daemon.sock`. Socket file mode is
+//!   0600.
+//! - First `cockpit` invocation auto-promotes via setsid + double-fork
+//!   (GOALS §8b); the foreground terminal becomes a TUI client attached
+//!   to the freshly spawned daemon. `cockpit daemon {start, stop,
+//!   status}` lets the user manage the lifecycle explicitly.
+
+pub mod client;
+pub mod proto;
+pub mod registry;
+pub mod server;
+pub mod session_worker;
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
@@ -22,6 +36,12 @@ use anyhow::{Context, Result};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 
+/// Legacy line greeting sent by the v0 daemon when it had no real
+/// protocol. Preserved through the P2 server cut-over so that
+/// [`probe_blocking`] and any tooling that issued the early `"ok\n"`
+/// probe still treats the daemon as reachable while the proto-based
+/// handshake is being wired in. This constant goes away once the
+/// proto handshake is the only path.
 const SOCKET_GREETING: &str = "ok\n";
 
 #[derive(Debug, Clone)]
@@ -74,8 +94,10 @@ pub enum DaemonStatus {
     NotRunning,
 }
 
-/// Cheap probe: try to connect to the socket and read a line. Returns
-/// `Running` only when both the socket exists AND the daemon replies.
+/// Cheap probe: try to connect and read the daemon's "hello"
+/// envelope. The server emits one immediately on accept (see
+/// [`server::handle_client`]), so any successful read of a non-empty
+/// line confirms the daemon is alive — no client-side write needed.
 pub async fn probe(paths: &DaemonPaths) -> DaemonStatus {
     if !paths.socket.exists() {
         return if paths.pid_file.exists() {
@@ -91,7 +113,6 @@ pub async fn probe(paths: &DaemonPaths) -> DaemonStatus {
     .await
     {
         Ok(Ok(mut stream)) => {
-            let _ = stream.write_all(b"ping\n").await;
             let mut reader = tokio::io::BufReader::new(&mut stream);
             let mut line = String::new();
             match tokio::time::timeout(Duration::from_millis(500), reader.read_line(&mut line))
@@ -116,9 +137,8 @@ pub fn probe_blocking(paths: &DaemonPaths) -> DaemonStatus {
         };
     }
     match StdUnixStream::connect(&paths.socket) {
-        Ok(mut s) => {
+        Ok(s) => {
             let _ = s.set_read_timeout(Some(Duration::from_millis(500)));
-            let _ = s.write_all(b"ping\n");
             let mut buf = String::new();
             let mut r = BufReader::new(&s);
             match r.read_line(&mut buf) {
@@ -148,7 +168,8 @@ pub fn spawn_detached() -> Result<u32> {
 }
 
 /// Run the daemon's accept loop in the current process. Blocks until
-/// SIGINT/SIGTERM or until the pid-file is removed externally.
+/// SIGINT/SIGTERM. Boots the DB + lock manager, registers a shutdown
+/// watcher, and runs the [`server::run_accept_loop`].
 pub async fn run_foreground(paths: DaemonPaths) -> Result<()> {
     if matches!(probe(&paths).await, DaemonStatus::Running) {
         anyhow::bail!(
@@ -164,10 +185,18 @@ pub async fn run_foreground(paths: DaemonPaths) -> Result<()> {
     let listener = UnixListener::bind(&paths.socket)
         .with_context(|| format!("binding {}", paths.socket.display()))?;
 
-    let cleanup = {
+    let ctx = std::sync::Arc::new(server::boot(paths.clone())?);
+
+    // `shutdown` is a watch channel: every long-running task (accept
+    // loop, per-client tasks via the registry's broadcast) can observe
+    // and stop cleanly.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel::<bool>(false);
+
+    let signal_task = {
         let paths = paths.clone();
-        async move {
-            // Wait for either SIGINT or SIGTERM.
+        let shutdown_tx = shutdown_tx.clone();
+        let ctx = ctx.clone();
+        tokio::spawn(async move {
             #[cfg(unix)]
             {
                 use tokio::signal::unix::{SignalKind, signal};
@@ -182,27 +211,17 @@ pub async fn run_foreground(paths: DaemonPaths) -> Result<()> {
             {
                 tokio::signal::ctrl_c().await.ok();
             }
+            let _ = shutdown_tx.send(true);
+            ctx.registry.shutdown_all().await;
             let _ = std::fs::remove_file(&paths.socket);
             let _ = std::fs::remove_file(&paths.pid_file);
-        }
+        })
     };
 
-    tokio::select! {
-        _ = cleanup => Ok(()),
-        r = accept_loop(listener) => r,
-    }
-}
-
-async fn accept_loop(listener: UnixListener) -> Result<()> {
-    loop {
-        let (mut stream, _) = listener.accept().await?;
-        tokio::spawn(async move {
-            let _ = stream.write_all(SOCKET_GREETING.as_bytes()).await;
-            // Read & discard any single line, then close.
-            let mut buf = [0u8; 256];
-            let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
-        });
-    }
+    let accept = server::run_accept_loop(ctx, listener, shutdown_rx);
+    let result = accept.await;
+    let _ = signal_task.await;
+    result
 }
 
 /// Kill the running daemon (if any) and clean up its pid + socket files.

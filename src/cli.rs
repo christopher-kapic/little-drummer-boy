@@ -162,6 +162,12 @@ pub struct RunArgs {
     /// Show thinking blocks.
     #[arg(long)]
     pub thinking: bool,
+
+    /// Force a fresh ephemeral daemon for this run instead of
+    /// attaching to a long-running one. The daemon stops as soon as
+    /// the run completes. Useful for CI and clean-state scripts.
+    #[arg(long)]
+    pub ephemeral: bool,
 }
 
 // ---- agent subcommands ----

@@ -84,6 +84,13 @@ pub struct ToolCtx {
     pub locks: Arc<crate::locks::LockManager>,
     pub session: Arc<crate::session::Session>,
     pub cwd: std::path::PathBuf,
+    /// The redaction chokepoint (GOALS §7). Tools that return strings
+    /// destined for the model context don't have to call this
+    /// themselves — `engine::agent::turn` scrubs every tool result
+    /// before it lands in history. Threaded here too for tools that
+    /// want to scrub *before* a long output is even allocated (e.g.
+    /// `bash` capping output and only scrubbing what fits).
+    pub redact: Arc<crate::redact::RedactionTable>,
 }
 
 /// Project the `Tool` trait into a `ToolDefinition` rig understands.

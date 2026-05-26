@@ -30,6 +30,7 @@ use crate::engine::message::{
 use crate::engine::model::{Model, ModelParams};
 use crate::engine::repair::{Recovery, repair};
 use crate::engine::tool::{ToolBox, ToolCtx, ToolOutput};
+use crate::redact::RedactionTable;
 use crate::session::{Session, ToolCallRow};
 
 /// One built-in or user-defined agent.
@@ -147,12 +148,19 @@ pub enum TurnOutcome {
 /// `history` buffer is mutated in place: the user message (if any) was
 /// pushed by the caller; this function appends the assistant turn and
 /// every tool-result message in order.
+///
+/// `redact` is the §7 chokepoint — tool outputs are scrubbed before
+/// they enter history so a leaked secret from bash / read / edit never
+/// becomes part of the next inference call. The model also never sees
+/// the raw form via the user transcript: `tool_call_events.output` is
+/// the scrubbed text.
 pub async fn turn(
     agent: &Agent,
     history: &mut Vec<Message>,
     prompt: Message,
     session: Arc<Session>,
     locks: Arc<crate::locks::LockManager>,
+    redact: Arc<RedactionTable>,
     cwd: std::path::PathBuf,
     tx: &mpsc::Sender<TurnEvent>,
 ) -> Result<TurnOutcome> {
@@ -211,6 +219,7 @@ pub async fn turn(
         locks,
         session: session.clone(),
         cwd,
+        redact: redact.clone(),
     };
 
     for tc in &calls {
@@ -277,24 +286,32 @@ pub async fn turn(
 
         let result = dispatch_one(&agent.tools, &tc.function.name, args.clone(), &ctx).await;
 
-        let (output_str, hard_fail) = match &result {
+        let (raw_output, hard_fail) = match &result {
             Ok(ToolOutput { content, .. }) => (content.clone(), false),
             Err(e) => {
                 let msg = format!("Error: {e}");
-                let _ = tx
-                    .send(TurnEvent::ToolError {
-                        agent: agent.name.clone(),
-                        call_id: tc.id.clone(),
-                        tool: tc.function.name.clone(),
-                        error: msg.clone(),
-                    })
-                    .await;
                 (msg, true)
             }
         };
 
-        let truncated = matches!(&result, Ok(ToolOutput { truncated: true, .. }));
-        if !hard_fail {
+        // Scrub tool output through the §7 chokepoint before it enters
+        // history or the audit row. The model only ever sees the
+        // redacted form; the user transcript shows the same (audit
+        // expansion of `original_input` does not apply to tool *outputs*,
+        // only to tool *inputs* — see §14e).
+        let output_str = redact.scrub(&raw_output);
+
+        if hard_fail {
+            let _ = tx
+                .send(TurnEvent::ToolError {
+                    agent: agent.name.clone(),
+                    call_id: tc.id.clone(),
+                    tool: tc.function.name.clone(),
+                    error: output_str.clone(),
+                })
+                .await;
+        } else {
+            let truncated = matches!(&result, Ok(ToolOutput { truncated: true, .. }));
             let _ = tx
                 .send(TurnEvent::ToolEnd {
                     agent: agent.name.clone(),
@@ -306,13 +323,16 @@ pub async fn turn(
                 .await;
         }
 
+        let truncated = matches!(&result, Ok(ToolOutput { truncated: true, .. }));
+
         // Persist the audit row. v0 stores the original AND a wire form
         // that's equal to the original; §13c canonical-form rewrite
         // will diverge them when implemented.
-        session.record_tool_call(ToolCallRow {
-            event_id: Uuid::new_v4().to_string(),
+        if let Err(e) = session.record_tool_call(ToolCallRow {
+            event_id: Uuid::new_v4(),
             timestamp: Utc::now(),
             agent: agent.name.clone(),
+            call_id: tc.id.clone(),
             tool: tc.function.name.clone(),
             path: args
                 .get("path")
@@ -322,8 +342,14 @@ pub async fn turn(
             wire_input_json: args,
             recovery,
             hard_fail,
+            output: output_str.clone(),
+            truncated,
             duration_ms: start.elapsed().as_millis() as u64,
-        });
+        }) {
+            // Auditing must not break the live conversation. Log and
+            // continue — the model still sees the tool result.
+            tracing::warn!(error = %e, tool = %tc.function.name, "persisting tool_call_event failed");
+        }
 
         history.push(tool_result_message(tc, output_str));
     }
