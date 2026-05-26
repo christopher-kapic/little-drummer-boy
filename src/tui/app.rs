@@ -16,9 +16,9 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use crossterm::cursor::{self, SetCursorStyle};
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers, KeyboardEnhancementFlags, MouseButton, MouseEvent, MouseEventKind,
-    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
+    MouseButton, MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use crossterm::terminal::{Clear, ClearType, size as terminal_size};
 use ratatui::layout::{Constraint, Layout, Position, Rect};
@@ -111,6 +111,12 @@ pub struct App {
     /// because that event implies the daemon just drained the queue
     /// into the next inference round.
     queue: Vec<String>,
+    /// Submitted user messages (excluding queued ones). Used for Up/Down
+    /// shell-style history navigation in the composer.
+    prompt_history: Vec<String>,
+    /// Index into `prompt_history` for history navigation. `0` means
+    /// "at the live buffer" (no history offset); `1` = most recent, etc.
+    prompt_history_cursor: usize,
     history: Vec<HistoryEntry>,
     /// In-flight assistant turn (between `ThinkingStarted` and the
     /// matching `AssistantText`/tool boundary). When `Some`, the
@@ -224,6 +230,8 @@ impl App {
             thinking_setting,
             markdown_opts,
             queue: Vec::new(),
+            prompt_history: Vec::new(),
+            prompt_history_cursor: 0,
             history: Vec::new(),
             pending: None,
             started_at: Instant::now(),
@@ -287,14 +295,14 @@ impl App {
         )
         .is_ok();
 
-        // Mouse capture is on so we can route clicks on a thinking
-        // chip to expand the reasoning block. Trade-off: when mouse
-        // capture is enabled, the terminal forwards scroll-wheel
-        // events to us instead of scrolling its own scrollback — so
-        // users lose native scroll-wheel through the terminal. We
-        // accept the trade because click-to-expand was an explicit
-        // user request; the prior `Ctrl+R` shortcut still works.
-        let mouse_enabled = crossterm::execute!(stdout(), EnableMouseCapture).is_ok();
+        // We *don't* enable mouse capture. Capturing mouse events lets
+        // us route chip clicks to expand reasoning, but it also steals
+        // scroll-wheel events from the terminal (no native scrollback
+        // scroll) and breaks native text selection / copy-on-release.
+        // Users care more about scroll + select than about click-to-
+        // expand, so we keep mouse off and rely on the `Ctrl+R`
+        // shortcut for expanding the most-recent reasoning block (see
+        // [`Self::toggle_recent_reasoning`]).
 
         let refresh_handle = spawn_git_refresh(self.launch.cwd.clone(), self.repo_status.clone());
 
@@ -315,9 +323,8 @@ impl App {
         // up after exit.
         self.clear_viewport_for_exit().ok();
 
-        if mouse_enabled {
-            let _ = crossterm::execute!(stdout(), DisableMouseCapture);
-        }
+        // Mouse capture was never enabled (see comment in run()); no
+        // need to disable it on the way out.
         if kbd_enhanced {
             let _ = crossterm::execute!(stdout(), PopKeyboardEnhancementFlags);
         }
@@ -377,9 +384,10 @@ impl App {
             self.sync_active_agent();
             self.dialog.tick();
             self.maybe_grow_pane(terminal)?;
-            if self.maybe_spill_history()? {
-                terminal.clear()?;
-            }
+            // `insert_before` handles the scroll region itself; we no
+            // longer need to follow it with `terminal.clear()` (the
+            // old hand-rolled spill path's flicker source).
+            self.maybe_spill_history(terminal)?;
             terminal.draw(|frame| self.render(frame))?;
             self.sync_cursor_shape();
 
@@ -442,10 +450,12 @@ impl App {
 
     /// Once the pane has grown to fill the terminal but history still
     /// wants more space, pop the oldest entries off `App.history` and
-    /// push them into terminal scrollback. Mouse-wheel scroll preserves
-    /// them. Returns true if anything spilled (caller must clear ratatui's
-    /// buffer to force a clean redraw).
-    fn maybe_spill_history(&mut self) -> Result<bool> {
+    /// push them into terminal scrollback via
+    /// [`ratatui::Terminal::insert_before`]. The terminal-side scroll
+    /// region avoids the flicker the previous hand-rolled implementation
+    /// produced (overwriting viewport rows, scrolling, then forcing a
+    /// full `terminal.clear()` — three repaints per spill).
+    fn maybe_spill_history(&mut self, terminal: &mut DefaultTerminal) -> Result<bool> {
         let (_, h) = terminal_size()?;
         let geom = self.geometry();
         let max_history = h
@@ -473,7 +483,16 @@ impl App {
             .iter()
             .flat_map(|e| entry_to_plain_lines(e))
             .collect();
-        insert_above_viewport(self.pane_height, &plain)?;
+        let n = plain.len() as u16;
+        if n > 0 {
+            terminal.insert_before(n, |buf| {
+                use ratatui::text::Line;
+                use ratatui::widgets::{Paragraph, Widget};
+                let lines: Vec<Line<'static>> =
+                    plain.iter().map(|s| Line::raw(s.clone())).collect();
+                Paragraph::new(lines).render(buf.area, buf);
+            })?;
+        }
         Ok(true)
     }
 
@@ -672,11 +691,11 @@ impl App {
                 false
             }
             KeyCode::Up => {
-                self.composer.move_up();
+                self.history_up();
                 false
             }
             KeyCode::Down => {
-                self.composer.move_down();
+                self.history_down();
                 false
             }
             KeyCode::Home => {
@@ -689,12 +708,70 @@ impl App {
             }
             KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.composer.insert_char(ch);
+                self.prompt_history_cursor = 0;
                 self.refresh_at_dismiss();
                 self.at_selected = 0;
                 false
             }
             _ => false,
         }
+    }
+
+    /// Shell-style "go back through prompt history" — the Up key.
+    ///
+    /// State machine:
+    /// - Already navigating history (`prompt_history_cursor > 0`):
+    ///   step one entry older, if any.
+    /// - Buffer empty *and* queue non-empty: unqueue (matches the
+    ///   existing pop-from-queue behavior).
+    /// - Cursor at top of buffer (first line, column 0): enter history
+    ///   mode and load the most-recent prior message.
+    /// - Otherwise: move cursor up within the buffer.
+    ///
+    /// Once in history mode, we *don't* fall back to cursor-move
+    /// behavior even if `set()` placed the cursor at end-of-buffer —
+    /// the loaded message replaces the live edit, and the user expects
+    /// the next Up to keep going back, not to position within the
+    /// recalled message. That was the previous bug.
+    fn history_up(&mut self) {
+        if self.prompt_history_cursor > 0 {
+            if self.prompt_history_cursor < self.prompt_history.len() {
+                self.prompt_history_cursor += 1;
+                let idx = self.prompt_history.len() - self.prompt_history_cursor;
+                self.composer.set(self.prompt_history[idx].clone());
+            }
+            return;
+        }
+        if self.composer.is_empty() && !self.queue.is_empty() {
+            self.composer.set(self.queue.pop().unwrap());
+            return;
+        }
+        if cursor_on_first_line(self.composer.text(), self.composer.cursor())
+            && !self.prompt_history.is_empty()
+        {
+            self.prompt_history_cursor = 1;
+            let idx = self.prompt_history.len() - 1;
+            self.composer.set(self.prompt_history[idx].clone());
+            return;
+        }
+        self.composer.move_up();
+    }
+
+    /// Counterpart to [`Self::history_up`]. When in history mode, step
+    /// toward newer entries; at the newest, clear back to an empty
+    /// composer. Otherwise just move the cursor down within the buffer.
+    fn history_down(&mut self) {
+        if self.prompt_history_cursor > 0 {
+            self.prompt_history_cursor -= 1;
+            if self.prompt_history_cursor == 0 {
+                self.composer.clear();
+            } else {
+                let idx = self.prompt_history.len() - self.prompt_history_cursor;
+                self.composer.set(self.prompt_history[idx].clone());
+            }
+            return;
+        }
+        self.composer.move_down();
     }
 
     /// If the composer no longer has an active `@partial` token, clear
@@ -756,12 +833,12 @@ impl App {
                 false
             }
             KeyCode::Up => {
-                self.composer.move_up();
+                self.history_up();
                 self.composer.set_pending_g(false);
                 false
             }
             KeyCode::Down => {
-                self.composer.move_down();
+                self.history_down();
                 self.composer.set_pending_g(false);
                 false
             }
@@ -773,8 +850,8 @@ impl App {
                 match ch {
                     'h' => self.composer.move_left(),
                     'l' => self.composer.move_right(),
-                    'k' => self.composer.move_up(),
-                    'j' => self.composer.move_down(),
+                    'k' => self.history_up(),
+                    'j' => self.history_down(),
                     'w' => self.composer.move_word_forward(false),
                     'W' => self.composer.move_word_forward(true),
                     'b' => self.composer.move_word_backward(false),
@@ -949,6 +1026,10 @@ impl App {
                 text: submitted.clone(),
                 timestamp: chrono::Local::now(),
             });
+
+            // Track for Up/Down history navigation.
+            self.prompt_history.push(submitted.clone());
+            self.prompt_history_cursor = 0;
         }
 
         self.ensure_agent_runner();
@@ -2183,6 +2264,14 @@ fn load_tui_config(cwd: &Path) -> crate::config::extended::TuiConfig {
         }
     }
     crate::config::extended::TuiConfig::default()
+}
+
+/// True when `cursor` falls on the first line of `text` (i.e. there's
+/// no `\n` in `text[..cursor]`). Used by history navigation to decide
+/// "is the user at the top of the buffer?" — only then does Up step
+/// into prompt history, otherwise it moves the cursor up one line.
+fn cursor_on_first_line(text: &str, cursor: usize) -> bool {
+    !text[..cursor.min(text.len())].contains('\n')
 }
 
 /// Background task that polls `git status` every `GIT_REFRESH_INTERVAL`

@@ -216,7 +216,9 @@ pub fn render_entry(
 pub fn render_pending(msg: &PendingMsg, dots: &str, width: u16) -> Vec<Line<'static>> {
     if msg.text.trim().is_empty() {
         // Pure "thinking" state — animated placeholder, no agent name.
-        let mut spans: Vec<Span<'static>> = Vec::new();
+        // Matches the horizontal padding of agent body text so the
+        // placeholder doesn't jump when the first text delta arrives.
+        let mut spans: Vec<Span<'static>> = vec![Span::raw(" ".repeat(AGENT_INDENT))];
         if !AGENT_BULLET.is_empty() {
             spans.push(Span::styled(
                 format!("{AGENT_BULLET} "),
@@ -435,18 +437,30 @@ fn render_agent(
         };
 
         if expanded {
-            // Chip alone on row 1; reasoning lines under it (indented
-            // four spaces, dimmed); then the agent's text. The user
-            // reads the reasoning *before* the conclusion.
+            // Chip alone on row 1; reasoning lines under it, nested
+            // under the chip's text (column ≈ AGENT_INDENT + 2 to land
+            // right after "▼ "); then the agent's text. The user reads
+            // the reasoning *before* the conclusion. Long reasoning
+            // lines wrap explicitly so the continuation keeps the same
+            // left indent — otherwise ratatui's auto-wrap drops them
+            // to column 0 and the block looks ragged.
             out.push(render_first_line_timestamped(chip_spans, timestamp, width, false));
+            let reasoning_indent = AGENT_INDENT + 2;
+            let reasoning_w = (width as usize)
+                .saturating_sub(reasoning_indent)
+                .max(1);
             for raw_line in reasoning.lines() {
-                out.push(Line::from(vec![
-                    Span::raw(" ".repeat(AGENT_INDENT + 4)),
-                    Span::styled(
-                        raw_line.to_string(),
-                        Style::default().fg(REASONING_FG),
-                    ),
-                ]));
+                let chunks = if raw_line.is_empty() {
+                    vec![String::new()]
+                } else {
+                    wrap_with_reserved_first_line_and_prefix(raw_line, reasoning_w, 0, 0)
+                };
+                for chunk in chunks {
+                    out.push(Line::from(vec![
+                        Span::raw(" ".repeat(reasoning_indent)),
+                        Span::styled(chunk, Style::default().fg(REASONING_FG)),
+                    ]));
+                }
             }
             out.extend(body_lines);
         } else if markdown {

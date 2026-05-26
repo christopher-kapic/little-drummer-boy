@@ -111,6 +111,12 @@ impl Composer {
         self.cursor = 0;
     }
 
+    /// Replace the entire buffer content, resetting cursor to end.
+    pub fn set(&mut self, text: impl Into<String>) {
+        self.buffer = text.into();
+        self.cursor = self.buffer.len();
+    }
+
     pub fn insert_char(&mut self, ch: char) {
         self.buffer.insert(self.cursor, ch);
         self.cursor += ch.len_utf8();
