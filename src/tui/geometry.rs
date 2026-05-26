@@ -76,12 +76,18 @@ impl PaneGeometry {
                 history: history_lines.max(MIN_HISTORY_HEIGHT),
             }
         } else {
-            // Queue is just inset side rails (no top/bottom border)
-            // sitting directly above the input box, so its height is
-            // exactly the message count. Input always renders its
-            // full rounded box.
+            // Queue (when present) owns its top border, N message
+            // rows, and a shared bottom row that doubles as the
+            // input's top edge. So input drops its own top border
+            // when the queue is up — net: one fewer row goes to
+            // input.
+            let input = if queue_height > 0 {
+                input_height.saturating_sub(1)
+            } else {
+                input_height
+            };
             Self {
-                input: input_height,
+                input,
                 queue: queue_height,
                 popup: popup_height,
                 status: STATUS_HEIGHT,

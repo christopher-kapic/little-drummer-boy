@@ -153,8 +153,11 @@ pub struct App {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CursorShape {
-    /// User's default (matches Insert mode).
-    Default,
+    /// Steady vertical bar — used in Insert mode (and when vim is
+    /// disabled). Explicit rather than `DefaultUserShape` because many
+    /// modern terminals default to a block cursor; without an explicit
+    /// bar, Insert mode would visually match Normal.
+    Bar,
     /// Solid block — used in Normal / Operator-pending mode.
     Block,
 }
@@ -1079,14 +1082,14 @@ impl App {
         {
             CursorShape::Block
         } else {
-            CursorShape::Default
+            CursorShape::Bar
         };
         if self.last_cursor_shape == Some(desired) {
             return;
         }
         let style = match desired {
             CursorShape::Block => SetCursorStyle::SteadyBlock,
-            CursorShape::Default => SetCursorStyle::DefaultUserShape,
+            CursorShape::Bar => SetCursorStyle::SteadyBar,
         };
         let _ = crossterm::execute!(stdout(), style);
         self.last_cursor_shape = Some(desired);
@@ -1312,10 +1315,16 @@ impl App {
     }
 
     /// Height of the queued-messages strip above the input box. Zero
-    /// when nothing's queued; otherwise one row per queued message
-    /// (the strip is inset side rails only — no top/bottom border).
+    /// when nothing's queued; otherwise top border (1) + N messages +
+    /// shared bottom (1). The shared bottom is the queue's bottom AND
+    /// the input's top, with T-joins where the inset side rails meet
+    /// the input's wider top edge.
     fn queue_lines(&self) -> u16 {
-        self.queue.len() as u16
+        if self.queue.is_empty() {
+            0
+        } else {
+            2 + self.queue.len() as u16
+        }
     }
 
     fn input_height(&self) -> u16 {
@@ -1407,7 +1416,7 @@ impl App {
             if geom.queue > 0 {
                 self.render_queue(frame, rects.queue);
             }
-            let cursor_pos = self.render_input(frame, rects.input);
+            let cursor_pos = self.render_input(frame, rects.input, geom.queue > 0);
             if geom.popup > 0 {
                 self.render_popup(frame, rects.popup);
             }
@@ -1416,41 +1425,76 @@ impl App {
         self.render_status(frame, rects.status);
     }
 
-    /// Queued-messages strip. Just inset side rails — one column of
-    /// padding on each side compared to the input box below, no
-    /// top/bottom border. One row per queued message; rails are light
-    /// grey, content is dimmed white.
+    /// Queued-messages box. Inset one column from each side of the
+    /// input box; rounded top corners (`╭ ╮`); white border throughout;
+    /// shared bottom row with the input box rendered as `╭┴────┴╮`
+    /// (input's rounded top corners with `┴` T-joins where the queue's
+    /// inset side rails terminate). The shared row counts as the
+    /// queue's bottom border AND the input's top border.
     fn render_queue(&self, frame: &mut ratatui::Frame, area: Rect) {
-        if area.height == 0 || area.width < 5 || self.queue.is_empty() {
+        if area.height < 2 || area.width < 5 || self.queue.is_empty() {
             return;
         }
-        let grey = Color::Indexed(245);
+        let white = Color::White;
         let dim_white = Color::Indexed(250);
-        // Inset 1 column on each side compared to the input box. Then
-        // 1 col rail + 1 col padding on each side, leaving the rest
-        // for content.
-        let inset = 1usize;
-        let rail_pad = 1usize;
         let outer_w = area.width as usize;
-        let inner_w = outer_w
-            .saturating_sub((inset + 1 + rail_pad) * 2) // outside-inset + rail + inside-pad, x2
-            .max(1);
+        // Queue is inset 1 col on each side; inside the inset, 1 col
+        // is the rail and 1 col is padding before/after the text.
+        let inset = 1usize;
+        let queue_w = outer_w.saturating_sub(inset * 2);
+        let inner_w = queue_w.saturating_sub(4); // 1 rail + 1 pad on each side
+        let inner_w = inner_w.max(1);
         let mut lines: Vec<Line<'static>> = Vec::with_capacity(area.height as usize);
+
+        // Top row: `  ╭─────────╮  ` — rounded corners, inset.
+        let top_bar = "─".repeat(queue_w.saturating_sub(2));
+        lines.push(Line::from(vec![
+            Span::raw(" ".repeat(inset)),
+            Span::styled(format!("╭{top_bar}╮"), Style::default().fg(white)),
+            Span::raw(" ".repeat(inset)),
+        ]));
+
+        // Content rows: `  │ message │  `.
         for msg in &self.queue {
             let body = first_line_truncated(msg, inner_w);
             let body_w = body.chars().count();
             let trailing = inner_w.saturating_sub(body_w);
             lines.push(Line::from(vec![
                 Span::raw(" ".repeat(inset)),
-                Span::styled("│", Style::default().fg(grey)),
-                Span::raw(" ".repeat(rail_pad)),
+                Span::styled("│", Style::default().fg(white)),
+                Span::raw(" "),
                 Span::styled(body, Style::default().fg(dim_white)),
                 Span::raw(" ".repeat(trailing)),
-                Span::raw(" ".repeat(rail_pad)),
-                Span::styled("│", Style::default().fg(grey)),
+                Span::raw(" "),
+                Span::styled("│", Style::default().fg(white)),
                 Span::raw(" ".repeat(inset)),
             ]));
         }
+
+        // Shared bottom row: `╭┴────────┴╮`. Spans the full input
+        // width — `╭` and `╮` at the corners (these are the input's
+        // rounded top), and `┴` where the queue's inset side rails
+        // terminate. The horizontal fills between use `─`.
+        let mut shared: String = String::with_capacity(outer_w * 3);
+        for col in 0..outer_w {
+            let ch = if col == 0 {
+                '╭'
+            } else if col == outer_w - 1 {
+                '╮'
+            } else if col == inset {
+                '┴'
+            } else if col == outer_w - 1 - inset {
+                '┴'
+            } else {
+                '─'
+            };
+            shared.push(ch);
+        }
+        lines.push(Line::from(vec![Span::styled(
+            shared,
+            Style::default().fg(white),
+        )]));
+
         frame.render_widget(Paragraph::new(lines), area);
     }
 
@@ -1519,9 +1563,21 @@ impl App {
         frame.render_widget(Paragraph::new(visible).wrap(Wrap { trim: false }), area);
     }
 
-    fn render_input(&self, frame: &mut ratatui::Frame, area: Rect) -> Position {
+    fn render_input(
+        &self,
+        frame: &mut ratatui::Frame,
+        area: Rect,
+        queue_above: bool,
+    ) -> Position {
+        // When the queue strip is above, its shared bottom row IS our
+        // top border — render only sides + bottom here.
+        let borders = if queue_above {
+            Borders::LEFT | Borders::RIGHT | Borders::BOTTOM
+        } else {
+            Borders::ALL
+        };
         let input_block = Block::default()
-            .borders(Borders::ALL)
+            .borders(borders)
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(Color::White));
         let input_inner = input_block.inner(area);

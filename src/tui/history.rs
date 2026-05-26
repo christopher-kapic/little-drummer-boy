@@ -119,11 +119,12 @@ const USER_GUTTER: usize = 1;
 /// Inner padding between the bubble's vertical border and the text.
 const USER_INNER_PAD: usize = 1;
 
-/// Character used as the agent-message prefix. Replaces the previous
-/// `name: ` style — the active-agent indicator in the chrome already
-/// tells the user *who* is talking; in-history we just need a marker
-/// that this is a new agent message.
-const AGENT_BULLET: &str = "•";
+/// Agent messages render with no leading marker — the active-agent
+/// indicator in the chrome and the thinking-chip (when present)
+/// already signal who's talking, and the bullet was visual noise that
+/// accumulated as the conversation grew. Kept as an empty constant so
+/// callers don't sprinkle string literals.
+const AGENT_BULLET: &str = "";
 
 /// One rendered history entry. The chrome assembles a flat list of
 /// `Rendered` for the chat pane, then uses each entry's `chip_row` to
@@ -176,22 +177,20 @@ pub fn render_entry(entry: &HistoryEntry, width: u16) -> Rendered {
 pub fn render_pending(msg: &PendingMsg, dots: &str, width: u16) -> Vec<Line<'static>> {
     if msg.text.trim().is_empty() {
         // Pure "thinking" state — animated placeholder, no agent name.
-        let line = render_with_timestamp(
-            vec![
-                Span::styled(
-                    format!("{AGENT_BULLET} "),
-                    Style::default().fg(agent_color(&msg.name)),
-                ),
-                Span::styled(
-                    format!("Thinking{dots}"),
-                    Style::default()
-                        .fg(THINKING_FG)
-                        .add_modifier(Modifier::ITALIC),
-                ),
-            ],
-            msg.timestamp,
-            width,
-        );
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        if !AGENT_BULLET.is_empty() {
+            spans.push(Span::styled(
+                format!("{AGENT_BULLET} "),
+                Style::default().fg(agent_color(&msg.name)),
+            ));
+        }
+        spans.push(Span::styled(
+            format!("Thinking{dots}"),
+            Style::default()
+                .fg(THINKING_FG)
+                .add_modifier(Modifier::ITALIC),
+        ));
+        let line = render_with_timestamp(spans, msg.timestamp, width);
         return line;
     }
     // Text streaming in — same rendering as Agent (no expansion in
@@ -280,8 +279,12 @@ fn render_agent(
     think_duration: Option<Duration>,
     width: u16,
 ) -> Rendered {
-    let bullet_color = agent_color(name);
-    let bullet_width = AGENT_BULLET.chars().count() + 1; // bullet + space
+    let _ = name;
+    let bullet_width: usize = if AGENT_BULLET.is_empty() {
+        0
+    } else {
+        AGENT_BULLET.chars().count() + 1 // bullet + space
+    };
     let has_reasoning = !reasoning.trim().is_empty();
     let reserve_first = TIMESTAMP_WIDTH + 1;
 
@@ -315,18 +318,19 @@ fn render_agent(
             .flat_map(|raw_line| wrap_with_reserved_first_line(raw_line, text_width, 0))
             .collect();
 
-        let chip_spans = vec![
-            Span::styled(
+        let mut chip_spans: Vec<Span<'static>> = Vec::new();
+        if !AGENT_BULLET.is_empty() {
+            chip_spans.push(Span::styled(
                 format!("{AGENT_BULLET} "),
-                Style::default().fg(bullet_color),
-            ),
-            Span::styled(
-                label,
-                Style::default()
-                    .fg(THINKING_FG)
-                    .add_modifier(Modifier::DIM | Modifier::UNDERLINED),
-            ),
-        ];
+                Style::default().fg(agent_color(name)),
+            ));
+        }
+        chip_spans.push(Span::styled(
+            label,
+            Style::default()
+                .fg(THINKING_FG)
+                .add_modifier(Modifier::DIM | Modifier::UNDERLINED),
+        ));
 
         if expanded {
             // Chip alone on row 1; reasoning lines under it (indented
@@ -359,8 +363,8 @@ fn render_agent(
             }
         }
     } else {
-        // No reasoning — standard bullet + text layout, timestamp on
-        // the first line of the text.
+        // No reasoning — text starts at col 0 (no bullet), timestamp
+        // right-aligned on the first wrapped line.
         let chunks = wrap_with_reserved_first_line_and_prefix(
             text,
             width as usize,
@@ -368,24 +372,18 @@ fn render_agent(
             bullet_width,
         );
         if chunks.is_empty() {
-            out.extend(render_with_timestamp(
-                vec![Span::styled(
-                    format!("{AGENT_BULLET} "),
-                    Style::default().fg(bullet_color),
-                )],
-                timestamp,
-                width,
-            ));
+            out.extend(render_with_timestamp(vec![], timestamp, width));
         } else {
             for (i, chunk) in chunks.iter().enumerate() {
                 if i == 0 {
-                    let spans = vec![
-                        Span::styled(
+                    let mut spans: Vec<Span<'static>> = Vec::new();
+                    if !AGENT_BULLET.is_empty() {
+                        spans.push(Span::styled(
                             format!("{AGENT_BULLET} "),
-                            Style::default().fg(bullet_color),
-                        ),
-                        Span::raw(chunk.clone()),
-                    ];
+                            Style::default().fg(agent_color(name)),
+                        ));
+                    }
+                    spans.push(Span::raw(chunk.clone()));
                     out.push(render_first_line_with_timestamp(spans, timestamp, width));
                 } else {
                     let indent = " ".repeat(bullet_width);

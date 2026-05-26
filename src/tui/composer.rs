@@ -326,20 +326,31 @@ impl Composer {
     }
 
     /// `dd` — delete the line under the cursor (including its trailing
-    /// `\n`, so a subsequent paste behaves linewise).
+    /// `\n`, so a subsequent paste behaves linewise). On the *last*
+    /// line — which has no trailing `\n` to swallow — we delete the
+    /// preceding `\n` instead so the buffer doesn't end up with a
+    /// dangling empty trailing line. Matches vim's `dd` semantics:
+    /// the cursor lands on the start of the previous line.
     pub fn delete_current_line(&mut self) {
         let line_start = self.buffer[..self.cursor]
             .rfind('\n')
             .map(|i| i + 1)
             .unwrap_or(0);
-        let line_end = self.buffer[self.cursor..]
-            .find('\n')
-            .map(|i| self.cursor + i + 1)
-            .unwrap_or(self.buffer.len());
-        self.buffer.drain(line_start..line_end);
-        // After deleting the last line of a buffer with no trailing
-        // newline, line_start can land past the end — clamp.
-        self.cursor = line_start.min(self.buffer.len());
+        let trailing_nl = self.buffer[self.cursor..].find('\n');
+        let (start, end) = match trailing_nl {
+            Some(i) => (line_start, self.cursor + i + 1),
+            None if line_start > 0 => {
+                // Last line of a multi-line buffer — swallow the
+                // newline that precedes us.
+                (line_start - 1, self.buffer.len())
+            }
+            None => {
+                // Single-line buffer — just delete the whole thing.
+                (0, self.buffer.len())
+            }
+        };
+        self.buffer.drain(start..end);
+        self.cursor = start.min(self.buffer.len());
         // Snap to start of the (now-)current line for vim parity.
         let line_start = self.buffer[..self.cursor]
             .rfind('\n')
@@ -468,6 +479,27 @@ mod tests {
         // Cursor should land at start of the (now-)current line.
         let (line, col) = c.cursor_line_col();
         assert_eq!((line, col), (1, 0));
+    }
+
+    #[test]
+    fn dd_on_last_line_removes_preceding_newline() {
+        let mut c = at("a\nb\nc", 4); // cursor on 'c'
+        c.delete_current_line();
+        assert_eq!(c.text(), "a\nb");
+        // Cursor lands at the start of "b" (the new last line).
+        let (line, col) = c.cursor_line_col();
+        assert_eq!((line, col), (1, 0));
+    }
+
+    #[test]
+    fn dd_on_trailing_empty_line_drops_dangling_newline() {
+        // "a\nb\n" with cursor at byte 4 = after the final \n (the
+        // empty position vim would place you on if you'd just typed
+        // `<CR>` at the end). dd removes the empty trailing line by
+        // dropping the dangling newline.
+        let mut c = at("a\nb\n", 4);
+        c.delete_current_line();
+        assert_eq!(c.text(), "a\nb");
     }
 
     #[test]
