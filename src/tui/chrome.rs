@@ -20,13 +20,21 @@ pub fn status_line_spans(info: &LaunchInfo) -> Vec<Span<'static>> {
     let mut spans = vec![Span::styled(info.cwd_display.clone(), muted)];
 
     if let Some(repo) = &info.repo_status {
+        // Pill-shaped badge: `▐ branch counts ▌` where the edge
+        // glyphs (▐ ▌) are yellow-on-terminal-default and the body is
+        // black-on-yellow. The half-block edges produce a "rounded"
+        // visual without needing Nerd Fonts (which a true Powerline
+        // semicircle would require).
         let badge = Style::default().fg(Color::Black).bg(Color::Indexed(220));
+        let edge = Style::default().fg(Color::Indexed(220));
         spans.push(Span::raw(" "));
+        spans.push(Span::styled("▐", edge));
         spans.push(Span::styled(format!(" {} ", repo.branch), badge));
         let counts = repo_counts(repo);
         if !counts.is_empty() {
             spans.push(Span::styled(format!("{counts} "), badge));
         }
+        spans.push(Span::styled("▌", edge));
     }
 
     spans

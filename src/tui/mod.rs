@@ -19,6 +19,7 @@ pub mod chrome;
 pub mod composer;
 pub mod daemon_prompt;
 pub mod geometry;
+pub mod history;
 pub mod model_picker;
 pub mod settings;
 pub mod slash;

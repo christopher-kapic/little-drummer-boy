@@ -27,6 +27,13 @@ const RESET: &str = "\x1b[0m";
 const BOLD: &str = "\x1b[1m";
 const GREY: &str = "\x1b[38;5;250m";
 const BRANCH_BADGE: &str = "\x1b[30;48;5;220m";
+/// Right half-block (▐) in yellow-220 foreground on terminal default.
+/// Painted as the left edge of the branch pill so the badge fades from
+/// the surrounding terminal background instead of slamming into it.
+const BADGE_LEFT_EDGE: &str = "\x1b[38;5;220m▐\x1b[0m";
+/// Left half-block (▌) in yellow-220 foreground — right edge of the
+/// pill, same fade behavior as `BADGE_LEFT_EDGE`.
+const BADGE_RIGHT_EDGE: &str = "\x1b[38;5;220m▌\x1b[0m";
 
 #[derive(Debug, Clone)]
 pub struct LaunchInfo {
@@ -37,6 +44,10 @@ pub struct LaunchInfo {
     pub active_model: Option<(String, String)>,
     /// True when the active model has `favorite: true` in config.
     pub active_model_is_favorite: bool,
+    /// Max context window of the active model, in tokens, when the
+    /// config carries it. Drives the `(max Nk)` part of the chrome's
+    /// context indicator.
+    pub active_model_max_context: Option<u32>,
     pub cwd: PathBuf,
     pub cwd_display: String,
     pub repo_status: Option<RepoStatus>,
@@ -54,6 +65,9 @@ pub fn load(project: Option<&Path>) -> LaunchInfo {
         .as_ref()
         .map(|(p, m)| is_favorite_model(&cwd, p, m))
         .unwrap_or(false);
+    let active_model_max_context = active_model
+        .as_ref()
+        .and_then(|(p, m)| lookup_model_context(&cwd, p, m));
     let repo_status = git::repo_status(&cwd).ok().flatten();
 
     LaunchInfo {
@@ -61,11 +75,34 @@ pub fn load(project: Option<&Path>) -> LaunchInfo {
         provider_line,
         active_model,
         active_model_is_favorite,
+        active_model_max_context,
         cwd_display: display_path(&cwd),
         cwd,
         repo_status,
         agent_name: DEFAULT_AGENT.to_string(),
     }
+}
+
+/// Walk the discovered config layers looking for the active model's
+/// `context_length`. Returns `None` if it isn't recorded — the chrome
+/// then omits the `(max Nk)` suffix.
+fn lookup_model_context(cwd: &Path, provider_id: &str, model_id: &str) -> Option<u32> {
+    use crate::config::dirs::discover_config_dirs;
+    use crate::config::providers::ConfigDoc;
+    for dir in discover_config_dirs(cwd) {
+        let path = dir.path.join("config.json");
+        let Ok(doc) = ConfigDoc::load(&path) else {
+            continue;
+        };
+        let cfg = doc.providers();
+        if let Some(entry) = cfg.providers.get(provider_id)
+            && let Some(model) = entry.models.iter().find(|m| m.id == model_id)
+            && let Some(n) = model.context_length
+        {
+            return Some(n);
+        }
+    }
+    None
 }
 
 /// Look up `<provider>/<model>` in the first config.json on the
@@ -143,6 +180,7 @@ fn path_line_ansi(info: &LaunchInfo) -> String {
     let mut line = format!("{GREY}{}{RESET}", info.cwd_display);
     if let Some(repo) = &info.repo_status {
         line.push(' ');
+        line.push_str(BADGE_LEFT_EDGE);
         line.push_str(BRANCH_BADGE);
         line.push(' ');
         line.push_str(&repo.branch);
@@ -153,6 +191,7 @@ fn path_line_ansi(info: &LaunchInfo) -> String {
         }
         line.push(' ');
         line.push_str(RESET);
+        line.push_str(BADGE_RIGHT_EDGE);
     }
     line
 }

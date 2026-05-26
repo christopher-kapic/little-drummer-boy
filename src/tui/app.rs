@@ -11,26 +11,32 @@
 use std::io::{Write, stdout};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::cursor;
 use crossterm::event::{
-    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, KeyboardEnhancementFlags, MouseButton, MouseEvent, MouseEventKind,
     PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::terminal::{Clear, ClearType, size as terminal_size};
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::{DefaultTerminal, TerminalOptions, Viewport};
 
+use crate::engine::TurnEvent;
 use crate::git::{self, RepoStatus};
 use crate::tui::agent_runner::{self, AgentRunner};
 use crate::tui::chrome;
 use crate::tui::composer::{Composer, INPUT_PREFIX, VimMode, input_prefix_width};
 use crate::tui::geometry::PaneGeometry;
+use crate::tui::history::{
+    HistoryEntry, PendingMsg, Rendered, render_entry, render_pending, route_text_delta,
+    thinking_dots,
+};
 use crate::tui::settings::{self, Dialog};
 use crate::tui::theme::MUTED_COLOR_INDEX;
 use crate::welcome::{self, LaunchInfo};
@@ -81,7 +87,16 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
 pub struct App {
     launch: LaunchInfo,
     composer: Composer,
-    history: Vec<String>,
+    history: Vec<HistoryEntry>,
+    /// In-flight assistant turn (between `ThinkingStarted` and the
+    /// matching `AssistantText`/tool boundary). When `Some`, the
+    /// renderer appends a live entry to the bottom of the history
+    /// pane.
+    pending: Option<PendingMsg>,
+    /// Reference point for the animated `Thinking…` dots. Set once at
+    /// `App::new` time; the renderer derives the dot count from the
+    /// elapsed time so the animation advances each tick.
+    started_at: Instant,
     /// Live git status; updated by a background tokio task spawned in
     /// `run`. The event loop syncs this into `launch.repo_status` once
     /// per tick.
@@ -109,6 +124,15 @@ pub struct App {
     /// `Result<AgentRunner, String>` so a failed init keeps the error
     /// around for next-time visibility.
     agent_runner: Option<Result<AgentRunner, String>>,
+    /// Last-rendered chat area `Rect`. Used to translate absolute
+    /// terminal mouse coordinates into chat-relative coordinates so
+    /// click-to-expand works on thinking blocks.
+    chat_area: Option<Rect>,
+    /// Click hit map: for each *visible* row in `chat_area`, the index
+    /// (within `self.history`) of the agent entry whose thinking chip
+    /// lives there — or `None` for non-clickable rows. Refreshed every
+    /// render.
+    clickable_rows: Vec<Option<usize>>,
 }
 
 impl App {
@@ -138,6 +162,8 @@ impl App {
             launch,
             composer,
             history: Vec::new(),
+            pending: None,
+            started_at: Instant::now(),
             repo_status,
             pane_height: 0,
             dialog: Dialog::None,
@@ -146,6 +172,8 @@ impl App {
             daemon_connected,
             fetch_models_progress: Arc::new(Mutex::new(Vec::new())),
             agent_runner: None,
+            chat_area: None,
+            clickable_rows: Vec::new(),
         };
         app.pane_height = app.geometry().desired_pane_height();
         app
@@ -192,11 +220,27 @@ impl App {
         )
         .is_ok();
 
+        // Mouse capture is on so we can route clicks on a thinking
+        // chip to expand the reasoning block. Trade-off: when mouse
+        // capture is enabled, the terminal forwards scroll-wheel
+        // events to us instead of scrolling its own scrollback — so
+        // users lose native scroll-wheel through the terminal. We
+        // accept the trade because click-to-expand was an explicit
+        // user request; the prior `Ctrl+R` shortcut still works.
+        let mouse_enabled = crossterm::execute!(stdout(), EnableMouseCapture).is_ok();
+
         let refresh_handle = spawn_git_refresh(self.launch.cwd.clone(), self.repo_status.clone());
 
         let result = self.event_loop(&mut terminal);
 
         refresh_handle.abort();
+
+        // Spill any remaining in-viewport chat into terminal scrollback
+        // before we tear down, so the user can scroll up and copy
+        // commands or paths the agent produced (GOALS §1d). We pass
+        // *all* history — once the viewport is gone, those rows are
+        // the only place this content survives.
+        self.spill_remaining_history_for_exit();
 
         // Wipe the viewport rows before we hand the terminal back. Without
         // this, the input box / popup / status sit forever in the user's
@@ -204,11 +248,42 @@ impl App {
         // up after exit.
         self.clear_viewport_for_exit().ok();
 
+        if mouse_enabled {
+            let _ = crossterm::execute!(stdout(), DisableMouseCapture);
+        }
         if kbd_enhanced {
             let _ = crossterm::execute!(stdout(), PopKeyboardEnhancementFlags);
         }
         ratatui::try_restore()?;
         result
+    }
+
+    /// Flush every remaining history entry into the terminal area
+    /// *above* the viewport so it lands in scrollback. Called once at
+    /// shutdown — by the time this runs we don't care about ratatui's
+    /// double-buffer because we're about to restore the terminal.
+    fn spill_remaining_history_for_exit(&mut self) {
+        // Finalize any in-flight pending turn first so its text shows
+        // up in the dump.
+        self.finalize_pending();
+        if self.history.is_empty() {
+            return;
+        }
+        let plain: Vec<String> = self
+            .history
+            .iter()
+            .flat_map(|entry| {
+                let mut lines = entry_to_plain_lines(entry);
+                // Match the chat-area visual: one blank row after
+                // each user/agent block.
+                if matches!(entry, HistoryEntry::User { .. } | HistoryEntry::Agent { .. }) {
+                    lines.push(String::new());
+                }
+                lines
+            })
+            .collect();
+        let _ = insert_above_viewport(self.pane_height, &plain);
+        self.history.clear();
     }
 
     fn clear_viewport_for_exit(&self) -> Result<()> {
@@ -239,6 +314,9 @@ impl App {
             if event::poll(EVENT_TICK)? {
                 match event::read()? {
                     Event::Key(key) if accepts_key(&key) && self.handle_key(key) => break,
+                    Event::Mouse(mouse) => {
+                        self.handle_mouse(mouse);
+                    }
                     Event::Resize(width, height) => {
                         terminal.resize(viewport_rect(self.pane_height, width, height))?;
                     }
@@ -259,7 +337,7 @@ impl App {
             .iter()
             .any(|l| l.contains("model(s)") || l.ends_with(": done"));
         for line in drained {
-            self.history.push(line);
+            self.history.push(HistoryEntry::Plain { line });
         }
         if touches_config {
             self.reload_launch_info();
@@ -312,10 +390,18 @@ impl App {
         let mut items = Vec::new();
         while spilled < to_spill && !self.history.is_empty() {
             let entry = self.history.remove(0);
-            spilled += entry_line_count(&entry);
+            spilled = spilled.saturating_add(entry_rendered_rows(&entry));
             items.push(entry);
         }
-        insert_above_viewport(self.pane_height, &items)?;
+        // Render each spilled entry to plain text (drop styling) for
+        // the scrollback area. We lose bg color in scrollback — that's
+        // acceptable; the alternative is dumping ANSI escape sequences
+        // into the user's terminal scrollback, which is messier.
+        let plain: Vec<String> = items
+            .iter()
+            .flat_map(|e| entry_to_plain_lines(e))
+            .collect();
+        insert_above_viewport(self.pane_height, &plain)?;
         Ok(true)
     }
 
@@ -348,9 +434,11 @@ impl App {
                         .and_then(|_| crate::daemon::spawn_detached())
                     {
                         Ok(pid) => {
-                            self.history.push(format!(
-                                "daemon: spawned (pid {pid}); stop later with `cockpit daemon stop`"
-                            ));
+                            self.history.push(HistoryEntry::Plain {
+                                line: format!(
+                                    "daemon: spawned (pid {pid}); stop later with `cockpit daemon stop`"
+                                ),
+                            });
                             self.daemon_connected = true;
                             self.daemon_prompt = None;
                         }
@@ -362,10 +450,11 @@ impl App {
                     }
                 }
                 Some(crate::tui::daemon_prompt::DaemonChoice::ContinueWithout) => {
-                    self.history.push(
-                        "daemon: continuing without — features that need the daemon will be limited"
-                            .to_string(),
-                    );
+                    self.history.push(HistoryEntry::Plain {
+                        line:
+                            "daemon: continuing without — features that need the daemon will be limited"
+                                .to_string(),
+                    });
                     self.daemon_prompt = None;
                 }
                 Some(crate::tui::daemon_prompt::DaemonChoice::Exit) | None => {
@@ -391,21 +480,34 @@ impl App {
             if should_close {
                 self.model_picker = None;
                 self.reload_launch_info();
-                self.history.push(self.model_summary_history_line());
+                let line = self.model_summary_history_line();
+                self.history.push(HistoryEntry::Plain { line });
             }
             // See the "modal dialog rule" comment above — always
             // consume the key while the picker is open.
             return false;
         }
 
+        // Ctrl+R toggles the most-recent agent message's reasoning
+        // block expand/collapse. (See the doc comment on
+        // `toggle_recent_reasoning` for why this is a keybind rather
+        // than a click handler.)
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('r'))
+        {
+            self.toggle_recent_reasoning();
+            return false;
+        }
+
         match key.code {
             KeyCode::Esc => {
+                // Esc never exits — too easy to hit accidentally. It
+                // cancels an in-progress slash command; otherwise no-op.
+                // Exit paths: `/exit`, Ctrl+C, Ctrl+D.
                 if self.slash_query().is_some() {
                     self.composer.clear();
-                    false
-                } else {
-                    true
                 }
+                false
             }
             KeyCode::Enter => {
                 if key.modifiers.contains(KeyModifiers::SHIFT)
@@ -483,40 +585,35 @@ impl App {
             return false;
         }
 
-        let prefix_width = input_prefix_width();
-        let indent: String = " ".repeat(prefix_width);
-        for (i, line) in submitted.split('\n').enumerate() {
-            let prefix = if i == 0 {
-                INPUT_PREFIX
-            } else {
-                indent.as_str()
-            };
-            self.history.push(format!("{prefix}{line}"));
-        }
+        // Persist the user's text as a styled history entry — the
+        // renderer applies bg color + padding rows.
+        self.history.push(HistoryEntry::User {
+            text: submitted.clone(),
+            timestamp: chrono::Local::now(),
+        });
 
-        // Lazy-init the agent runner on first submit so a session that
-        // never sends a message doesn't pay the rig+provider setup cost.
-        // On init failure, surface the error once and skip the send.
         self.ensure_agent_runner();
         match self.agent_runner.as_ref() {
             Some(Ok(runner)) => match runner.input_tx.try_send(submitted) {
                 Ok(()) => {}
                 Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                    self.history.push(
-                        "engine: input queue full — wait for the current turn to finish".to_string(),
-                    );
+                    self.history.push(HistoryEntry::Plain {
+                        line: "engine: input queue full — wait for the current turn to finish"
+                            .to_string(),
+                    });
                 }
                 Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                    self.history
-                        .push("engine: driver task has exited".to_string());
+                    self.history.push(HistoryEntry::Plain {
+                        line: "engine: driver task has exited".to_string(),
+                    });
                 }
             },
             Some(Err(e)) => {
-                self.history.push(format!("engine: {e}"));
+                self.history.push(HistoryEntry::Plain {
+                    line: format!("engine: {e}"),
+                });
             }
-            None => {
-                // ensure_agent_runner always populates Some(_); this arm is unreachable.
-            }
+            None => {}
         }
         self.composer.clear();
         false
@@ -529,8 +626,8 @@ impl App {
         self.agent_runner = Some(agent_runner::try_spawn(&self.launch.cwd));
     }
 
-    /// Drain any [`TurnEvent`](crate::engine::TurnEvent)s the engine has
-    /// produced into the history pane. Runs each tick.
+    /// Drain any [`TurnEvent`]s the engine has produced into the
+    /// pending+history state machine. Runs each tick.
     fn drain_agent_events(&mut self) {
         let Some(Ok(runner)) = self.agent_runner.as_ref() else {
             return;
@@ -540,9 +637,167 @@ impl App {
             std::mem::take(&mut *guard)
         };
         for event in drained {
-            for line in agent_runner::format_event(&event) {
-                self.history.push(line);
+            self.apply_event(event);
+        }
+    }
+
+    fn apply_event(&mut self, event: TurnEvent) {
+        match event {
+            TurnEvent::ThinkingStarted { agent } => {
+                self.finalize_pending();
+                self.pending = Some(new_pending(agent));
             }
+            TurnEvent::AssistantTextDelta { agent, delta } => {
+                let p = self
+                    .pending
+                    .get_or_insert_with(|| new_pending(agent));
+                let wrote = route_text_delta(
+                    &delta,
+                    &mut p.text,
+                    &mut p.reasoning,
+                    &mut p.inside_think,
+                    &mut p.tag_partial,
+                );
+                if wrote && p.text_started_at.is_none() {
+                    p.text_started_at = Some(Instant::now());
+                }
+            }
+            TurnEvent::ReasoningDelta { agent, delta } => {
+                let p = self
+                    .pending
+                    .get_or_insert_with(|| new_pending(agent));
+                p.reasoning.push_str(&delta);
+            }
+            TurnEvent::AssistantText { .. } => {
+                // Mark text-start (non-streaming providers land here
+                // without ever emitting a Delta).
+                if let Some(p) = &mut self.pending
+                    && p.text_started_at.is_none()
+                {
+                    p.text_started_at = Some(Instant::now());
+                }
+                self.finalize_pending();
+            }
+            TurnEvent::ToolStart { tool, args, .. } => {
+                self.finalize_pending();
+                let short = agent_runner::short_args(&args);
+                self.history.push(HistoryEntry::Plain {
+                    line: format!("  → {tool}({short})"),
+                });
+            }
+            TurnEvent::ToolEnd {
+                tool,
+                output,
+                truncated,
+                ..
+            } => {
+                let snippet = agent_runner::first_line(&output, 200);
+                let mark = if truncated { " (truncated)" } else { "" };
+                self.history.push(HistoryEntry::Plain {
+                    line: format!("  ✓ {tool}: {snippet}{mark}"),
+                });
+            }
+            TurnEvent::ToolError { tool, error, .. } => {
+                self.finalize_pending();
+                self.history.push(HistoryEntry::Plain {
+                    line: format!("  ✗ {tool}: {error}"),
+                });
+            }
+            TurnEvent::SubagentSpawned {
+                parent,
+                child,
+                prompt,
+            } => {
+                self.finalize_pending();
+                let short = agent_runner::first_line(&prompt, 100);
+                self.history.push(HistoryEntry::Plain {
+                    line: format!("[{parent} → {child}]: {short}"),
+                });
+            }
+            TurnEvent::SubagentReport { agent, .. } => {
+                self.history.push(HistoryEntry::Plain {
+                    line: format!("{agent} returned to caller."),
+                });
+            }
+        }
+    }
+
+    /// Move the in-flight assistant turn (if any) into permanent history.
+    /// Computes `think_duration` from the gap between `started_at` and
+    /// the first text delta — that's the *reasoning* time, not the
+    /// total turn time.
+    fn finalize_pending(&mut self) {
+        let Some(mut p) = self.pending.take() else {
+            return;
+        };
+        // Flush any buffered partial tag — it can't be a real tag
+        // because we're done streaming.
+        if !p.tag_partial.is_empty() {
+            let buf = std::mem::take(&mut p.tag_partial);
+            if p.inside_think {
+                p.reasoning.push_str(&buf);
+            } else {
+                p.text.push_str(&buf);
+            }
+        }
+        if !p.text.trim().is_empty() {
+            let think_duration = p
+                .text_started_at
+                .map(|ts| ts.saturating_duration_since(p.started_at));
+            self.history.push(HistoryEntry::Agent {
+                name: p.name,
+                text: p.text,
+                reasoning: p.reasoning,
+                timestamp: p.timestamp,
+                expanded: false,
+                think_duration,
+            });
+        }
+        // If only reasoning landed (no text), drop it — most-recent
+        // streams produce text after reasoning anyway. Adding a
+        // ThinkingOnly variant later is cheap.
+    }
+
+    /// Toggle the most-recent agent message's `expanded` flag. The
+    /// equivalent of clicking the chip; bound to `Ctrl+R` for
+    /// keyboard-only use.
+    fn toggle_recent_reasoning(&mut self) {
+        for entry in self.history.iter_mut().rev() {
+            if let HistoryEntry::Agent {
+                expanded, reasoning, ..
+            } = entry
+                && !reasoning.trim().is_empty()
+            {
+                *expanded = !*expanded;
+                return;
+            }
+        }
+    }
+
+    /// Handle a mouse event. Left-click on a thinking chip toggles
+    /// expansion; other events are ignored (we don't implement chat
+    /// scrolling yet, so scroll-wheel input is a no-op).
+    fn handle_mouse(&mut self, mouse: MouseEvent) {
+        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            return;
+        }
+        let Some(area) = self.chat_area else {
+            return;
+        };
+        // crossterm reports row/column as 0-indexed absolute terminal
+        // coordinates. Translate to chat-area relative.
+        if mouse.row < area.y || mouse.row >= area.y + area.height {
+            return;
+        }
+        if mouse.column < area.x || mouse.column >= area.x + area.width {
+            return;
+        }
+        let rel = (mouse.row - area.y) as usize;
+        let Some(Some(entry_idx)) = self.clickable_rows.get(rel).copied() else {
+            return;
+        };
+        if let Some(HistoryEntry::Agent { expanded, .. }) = self.history.get_mut(entry_idx) {
+            *expanded = !*expanded;
         }
     }
 
@@ -574,7 +829,9 @@ impl App {
                         self.model_picker = Some(picker);
                     }
                     Err(e) => {
-                        self.history.push(format!("/model: {e}"));
+                        self.history.push(HistoryEntry::Plain {
+                            line: format!("/model: {e}"),
+                        });
                     }
                 }
                 return false;
@@ -583,12 +840,15 @@ impl App {
                 match crate::tui::model_picker::toggle_active_favorite(&self.launch.cwd) {
                     Ok((new, p, m)) => {
                         let verb = if new { "marked" } else { "unmarked" };
-                        self.history
-                            .push(format!("/favorite: {verb} {p}/{m} as favorite"));
+                        self.history.push(HistoryEntry::Plain {
+                            line: format!("/favorite: {verb} {p}/{m} as favorite"),
+                        });
                         self.reload_launch_info();
                     }
                     Err(e) => {
-                        self.history.push(format!("/favorite: {e}"));
+                        self.history.push(HistoryEntry::Plain {
+                            line: format!("/favorite: {e}"),
+                        });
                     }
                 }
                 return false;
@@ -597,7 +857,9 @@ impl App {
             "prune" => "/prune: stub — history pruning not wired yet.",
             _ => return false,
         };
-        self.history.push(msg.to_string());
+        self.history.push(HistoryEntry::Plain {
+            line: msg.to_string(),
+        });
         false
     }
 
@@ -622,7 +884,9 @@ impl App {
 
         let cwd = self.launch.cwd.clone();
         let progress = Arc::clone(&self.fetch_models_progress);
-        self.history.push("/fetch-models: starting…".to_string());
+        self.history.push(HistoryEntry::Plain {
+            line: "/fetch-models: starting…".to_string(),
+        });
 
         tokio::spawn(async move {
             let push = |lines: &Arc<Mutex<Vec<String>>>, s: String| {
@@ -751,10 +1015,44 @@ impl App {
     }
 
     fn total_history_lines(&self) -> u16 {
-        self.history.iter().map(|s| entry_line_count(s)).sum()
+        // We can't perfectly compute the rendered line count without
+        // the area width, but the history geometry caller doesn't have
+        // that yet either. Approximate: 1 row per Plain, 3 rows per
+        // User (padding + body + padding; multi-line bodies cost more
+        // but for sizing this is fine), 2 rows per Agent, plus pending.
+        let mut total: u16 = 0;
+        for entry in &self.history {
+            total = total.saturating_add(match entry {
+                HistoryEntry::Plain { .. } => 1,
+                HistoryEntry::User { text, .. } => {
+                    let body = text.matches('\n').count() as u16 + 1;
+                    body.saturating_add(2)
+                }
+                HistoryEntry::Agent {
+                    text,
+                    reasoning,
+                    expanded,
+                    ..
+                } => {
+                    let body = text.matches('\n').count() as u16 + 1;
+                    let mut rows = body;
+                    if !reasoning.trim().is_empty() {
+                        rows = rows.saturating_add(1);
+                        if *expanded {
+                            rows = rows.saturating_add(reasoning.lines().count() as u16);
+                        }
+                    }
+                    rows
+                }
+            });
+        }
+        if self.pending.is_some() {
+            total = total.saturating_add(1);
+        }
+        total
     }
 
-    fn render(&self, frame: &mut ratatui::Frame) {
+    fn render(&mut self, frame: &mut ratatui::Frame) {
         let geom = self.geometry();
         let rects = geom.layout(frame.area());
 
@@ -775,26 +1073,60 @@ impl App {
         self.render_status(frame, rects.status);
     }
 
-    fn render_history(&self, frame: &mut ratatui::Frame, area: Rect) {
+    fn render_history(&mut self, frame: &mut ratatui::Frame, area: Rect) {
+        self.chat_area = Some(area);
         let area_h = area.height as usize;
+
         let mut all: Vec<Line<'static>> = Vec::new();
-        for entry in &self.history {
-            for l in entry.split('\n') {
-                all.push(Line::from(l.to_string()));
+        // `targets[i]` carries the history-entry index whose thinking
+        // chip occupies row `i` of `all`, or `None` otherwise.
+        let mut targets: Vec<Option<usize>> = Vec::new();
+        for (idx, entry) in self.history.iter().enumerate() {
+            let Rendered { lines, chip_row } = render_entry(entry, area.width);
+            let chip_abs = chip_row.map(|cr| all.len() + cr);
+            for i in 0..lines.len() {
+                targets.push(if Some(all.len() + i) == chip_abs {
+                    Some(idx)
+                } else {
+                    None
+                });
+            }
+            all.extend(lines);
+            // Insert a one-line gap between user/agent messages so the
+            // chat breathes. Plain entries (tool calls, errors) belong
+            // to the surrounding agent turn and don't get a gap.
+            if matches!(entry, HistoryEntry::User { .. } | HistoryEntry::Agent { .. }) {
+                all.push(Line::default());
+                targets.push(None);
             }
         }
-        // Bottom-align: newest content sits just above the input box,
-        // blank padding above when sparse.
-        let visible: Vec<Line<'static>> = if all.len() < area_h {
-            let pad = area_h - all.len();
-            let mut v: Vec<Line<'static>> = (0..pad).map(|_| Line::default()).collect();
-            v.extend(all);
-            v
-        } else {
-            let drop = all.len() - area_h;
-            all.split_off(drop)
-        };
-        frame.render_widget(Paragraph::new(visible).wrap(Wrap { trim: false }), area);
+        if let Some(pending) = &self.pending {
+            let dots = thinking_dots(self.started_at.elapsed().as_millis());
+            let pending_lines = render_pending(pending, dots, area.width);
+            for _ in 0..pending_lines.len() {
+                targets.push(None);
+            }
+            all.extend(pending_lines);
+        }
+
+        // Bottom-align the visible window over `all`.
+        let (visible, visible_targets): (Vec<Line<'static>>, Vec<Option<usize>>) =
+            if all.len() < area_h {
+                let pad = area_h - all.len();
+                let mut v: Vec<Line<'static>> = (0..pad).map(|_| Line::default()).collect();
+                let mut t: Vec<Option<usize>> = (0..pad).map(|_| None).collect();
+                v.extend(all);
+                t.extend(targets);
+                (v, t)
+            } else {
+                let drop = all.len() - area_h;
+                let v: Vec<Line<'static>> = all.into_iter().skip(drop).collect();
+                let t: Vec<Option<usize>> = targets.into_iter().skip(drop).collect();
+                (v, t)
+            };
+        self.clickable_rows = visible_targets;
+
+        frame.render_widget(Paragraph::new(visible), area);
     }
 
     fn render_input(&self, frame: &mut ratatui::Frame, area: Rect) -> Position {
@@ -838,10 +1170,71 @@ impl App {
             .scroll((scroll_y, 0));
         frame.render_widget(para, area);
 
+        // Context indicator on the top-right of the input box. Only
+        // shown when the composer is empty so it doesn't fight with
+        // the text the user is typing. Light grey, right-aligned to
+        // the inner edge.
+        if self.composer.text().is_empty() {
+            let label = self.context_indicator_text();
+            let label_w = label.chars().count() as u16;
+            if label_w + 1 < input_inner.width {
+                let x = input_inner.x + input_inner.width.saturating_sub(label_w);
+                let chip_area = Rect::new(x, input_inner.y, label_w, 1);
+                let chip = Paragraph::new(Line::from(vec![Span::styled(
+                    label,
+                    Style::default().fg(Color::Indexed(250)),
+                )]));
+                frame.render_widget(chip, chip_area);
+            }
+        }
+
         Position::new(
             input_inner.x + prefix_width as u16 + cursor_col,
             input_inner.y + cursor_line.saturating_sub(scroll_y),
         )
+    }
+
+    /// Build the chrome's context indicator. Format:
+    /// - With known max:   `12% context (max 192k), 0% prunable`
+    /// - Without:          `1.2k tokens, 0% prunable`
+    /// `prunable` is a placeholder zero until the pruning estimator
+    /// (plan §10) lands.
+    fn context_indicator_text(&self) -> String {
+        let tokens = self.estimate_context_tokens();
+        let prunable = 0u32; // placeholder
+        match self.launch.active_model_max_context {
+            Some(max) if max > 0 => {
+                let pct = ((tokens as u64 * 100) / max as u64).min(999) as u32;
+                let k = max / 1000;
+                format!("{pct}% context (max {k}k), {prunable}% prunable")
+            }
+            _ => format!(
+                "{} tokens, {prunable}% prunable",
+                format_token_count(tokens)
+            ),
+        }
+    }
+
+    /// Cheap chars-÷-4 token estimate over visible chat content. Tools
+    /// and system prompts aren't included — they live on the engine
+    /// side. For the chrome's "context usage" affordance this rough
+    /// number is fine; the engine will surface a real count once the
+    /// tokenizer is wired (GOALS §10 / plan §3h).
+    fn estimate_context_tokens(&self) -> u32 {
+        let mut chars: usize = 0;
+        for entry in &self.history {
+            chars += match entry {
+                HistoryEntry::User { text, .. } => text.chars().count(),
+                HistoryEntry::Plain { line } => line.chars().count(),
+                HistoryEntry::Agent {
+                    text, reasoning, ..
+                } => text.chars().count() + reasoning.chars().count(),
+            };
+        }
+        if let Some(p) = &self.pending {
+            chars += p.text.chars().count() + p.reasoning.chars().count();
+        }
+        (chars / 4).min(u32::MAX as usize) as u32
     }
 
     fn render_popup(&self, frame: &mut ratatui::Frame, area: Rect) {
@@ -895,8 +1288,97 @@ impl App {
     }
 }
 
-fn entry_line_count(entry: &str) -> u16 {
-    (entry.split('\n').count() as u16).max(1)
+/// Rough row count for a history entry. Mirrors the breakdown in
+/// `total_history_lines` so the spill math is consistent.
+fn entry_rendered_rows(entry: &HistoryEntry) -> u16 {
+    match entry {
+        HistoryEntry::Plain { .. } => 1,
+        HistoryEntry::User { text, .. } => (text.matches('\n').count() as u16 + 1) + 2,
+        HistoryEntry::Agent {
+            text,
+            reasoning,
+            expanded,
+            ..
+        } => {
+            let mut rows = text.matches('\n').count() as u16 + 1;
+            if !reasoning.trim().is_empty() {
+                rows = rows.saturating_add(1);
+                if *expanded {
+                    rows = rows.saturating_add(reasoning.lines().count() as u16);
+                }
+            }
+            rows
+        }
+    }
+}
+
+/// Plain-text projection of an entry, one string per logical row.
+/// Used when spilling into terminal scrollback.
+/// `1234 → "1.2k"`, `820 → "820"`. For the context indicator when no
+/// max-context is known.
+fn format_token_count(n: u32) -> String {
+    if n >= 1_000 {
+        format!("{:.1}k", n as f64 / 1000.0)
+    } else {
+        n.to_string()
+    }
+}
+
+fn new_pending(name: String) -> PendingMsg {
+    PendingMsg {
+        name,
+        text: String::new(),
+        reasoning: String::new(),
+        timestamp: chrono::Local::now(),
+        started_at: Instant::now(),
+        text_started_at: None,
+        inside_think: false,
+        tag_partial: String::new(),
+    }
+}
+
+fn entry_to_plain_lines(entry: &HistoryEntry) -> Vec<String> {
+    match entry {
+        HistoryEntry::Plain { line } => vec![line.clone()],
+        HistoryEntry::User { text, timestamp } => {
+            let ts = timestamp.format("%H:%M").to_string();
+            let mut out: Vec<String> = Vec::new();
+            for (i, line) in text.split('\n').enumerate() {
+                if i == 0 {
+                    out.push(format!("{line}  [{ts}]"));
+                } else {
+                    out.push(line.to_string());
+                }
+            }
+            out
+        }
+        HistoryEntry::Agent {
+            name,
+            text,
+            reasoning,
+            timestamp,
+            expanded,
+            ..
+        } => {
+            let ts = timestamp.format("%H:%M").to_string();
+            let mut out = Vec::new();
+            for (i, line) in text.split('\n').enumerate() {
+                if i == 0 {
+                    out.push(format!("{name}: {line}  [{ts}]"));
+                } else {
+                    let pad = " ".repeat(name.chars().count() + 2);
+                    out.push(format!("{pad}{line}"));
+                }
+            }
+            if !reasoning.trim().is_empty() && *expanded {
+                out.push("  thinking:".to_string());
+                for raw in reasoning.lines() {
+                    out.push(format!("    {raw}"));
+                }
+            }
+            out
+        }
+    }
 }
 
 fn slash_matches(query: &str) -> Vec<&'static SlashCommand> {

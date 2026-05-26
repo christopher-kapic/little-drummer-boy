@@ -129,6 +129,13 @@ pub struct ModelEntry {
     pub thinking_modes: Vec<ThinkingMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inputs: Option<Inputs>,
+    /// Maximum tokens this model accepts in a request (context window).
+    /// Optional because providers vary on whether `/models` reports it
+    /// — populated by `/fetch-models` when the upstream includes it
+    /// (OpenRouter, llamafile), set manually otherwise. Drives the
+    /// chrome's `N% context (max Mk)` indicator (omitted when `None`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_length: Option<u32>,
     /// Toggled by `/favorite`. The `/model` picker pins favorites at
     /// the top of the list.
     #[serde(default, skip_serializing_if = "is_false")]
@@ -309,6 +316,7 @@ mod tests {
                     id: "claude-opus-4-7".into(),
                     name: Some("Claude Opus 4.7".into()),
                     thinking_modes: vec![ThinkingMode::Off, ThinkingMode::High],
+                    context_length: None,
                     favorite: false,
                     inputs: Some(Inputs {
                         images: Some(true),

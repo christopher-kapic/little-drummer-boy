@@ -38,6 +38,14 @@ pub struct Cli {
     #[arg(long, global = true, hide = true)]
     pub pure: bool,
 
+    /// **Debugging:** write each outbound inference request (system
+    /// prompt, tool definitions, history, new prompt, params) as
+    /// pretty-printed JSON to `<cwd>/.lastmessage`. Overwritten on
+    /// every turn. The file is the *content* we hand to rig, not the
+    /// exact serialized HTTP body — rig wraps it on the wire.
+    #[arg(long, global = true)]
+    pub debug_last_message: bool,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 }

@@ -2177,6 +2177,7 @@ mod tests {
                     name: None,
                     thinking_modes: vec![],
                     inputs: None,
+                    context_length: None,
                     favorite: false,
                     extra: Default::default(),
                 })
@@ -2204,6 +2205,7 @@ mod tests {
                 name: None,
                 thinking_modes: vec![],
                 inputs: None,
+                context_length: None,
                 favorite: false,
                 extra: Default::default(),
             },
@@ -2212,6 +2214,7 @@ mod tests {
                 name: None,
                 thinking_modes: vec![],
                 inputs: None,
+                context_length: None,
                 favorite: false,
                 extra: Default::default(),
             },

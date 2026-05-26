@@ -39,6 +39,18 @@ async fn main() -> Result<()> {
 
     init_tracing(cli.log_level.as_deref(), cli.print_logs);
 
+    if cli.debug_last_message {
+        // Resolve `<cwd>/.lastmessage` once at startup so the engine
+        // task doesn't depend on `current_dir()` from inside a tokio
+        // worker. If cwd resolution fails (rare — chdir to a deleted
+        // directory), the flag is a silent no-op and a warning lands
+        // in the log.
+        match std::env::current_dir() {
+            Ok(cwd) => engine::model::enable_debug_last_message(cwd.join(".lastmessage")),
+            Err(e) => tracing::warn!(error = %e, "--debug-last-message: cwd unavailable"),
+        }
+    }
+
     match cli.command {
         // Bare `cockpit` (no subcommand) launches the TUI in cwd. Mirrors
         // opencode's default behavior.

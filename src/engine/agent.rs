@@ -51,8 +51,25 @@ pub struct Agent {
 /// same channel.
 #[derive(Debug, Clone)]
 pub enum TurnEvent {
-    /// Agent emitted prose. v0 sends one event per turn (non-streaming);
-    /// the field will become per-token when streaming lands.
+    /// Model inference started; nothing has been emitted yet. The TUI
+    /// shows a "Thinking…" placeholder until the first text delta
+    /// arrives. Fires once per round-trip; also fires before reasoning-
+    /// mode models start emitting their reasoning chunks (which we
+    /// currently drop — see [`crate::engine::model::Model::complete`]).
+    ThinkingStarted { agent: String },
+    /// One streaming chunk of the assistant's text response. The TUI
+    /// accumulates these in a live-rendered line.
+    AssistantTextDelta { agent: String, delta: String },
+    /// One streaming chunk of the model's *reasoning* (thinking-mode
+    /// models only). The TUI hides this by default — the
+    /// "Thinking…" placeholder is the visible affordance — but
+    /// captures it so the user can expand a thinking block later to
+    /// inspect the chain of thought.
+    ReasoningDelta { agent: String, delta: String },
+    /// Assistant turn's text is complete. Emitted right after the
+    /// stream finishes (or, in non-streaming mode, after the response
+    /// returns). `text` is the full accumulated text; the TUI uses
+    /// this as a "finalize the streaming entry" signal.
     AssistantText { agent: String, text: String },
     /// A tool call started. `args` are post-repair.
     ToolStart {
@@ -97,17 +114,30 @@ pub enum TurnOutcome {
     /// Agent produced one or more tool calls; the loop must run another
     /// turn so the model can react to the results.
     Continue,
-    /// Agent invoked `task`; the driver must push a subagent.
+    /// Agent invoked `task` for an *interactive* subagent (e.g.
+    /// `coder` from `orchestrator-build`). The driver pushes a fresh
+    /// session onto the stack and the subagent takes over the
+    /// conversation until it produces final text.
     SpawnSubagent {
-        /// Which built-in agent name to spawn.
         child_agent: String,
-        /// The brief to give it.
         prompt: String,
         /// Outstanding tool-call id the driver must answer when the
         /// subagent finishes. `ToolCall.id` is `String`; `ToolCall.call_id`
         /// is `Option<String>` because some providers don't surface a
         /// distinct id and rig's `tool_result_with_call_id` accepts the
         /// pair shape.
+        task_call_id: String,
+        task_function_call_id: Option<String>,
+    },
+    /// Agent invoked `task` for a *noninteractive* subagent (e.g.
+    /// `explore` from `orchestrator-build`). The driver runs the
+    /// child's full conversation loop to completion synchronously
+    /// and delivers its final text back as the parent's tool result —
+    /// the user sees the spawn rendered like a single tool call,
+    /// not a primary handoff.
+    SpawnNoninteractive {
+        child_agent: String,
+        prompt: String,
         task_call_id: String,
         task_function_call_id: Option<String>,
     },
@@ -127,9 +157,26 @@ pub async fn turn(
     tx: &mpsc::Sender<TurnEvent>,
 ) -> Result<TurnOutcome> {
     let tools = agent.tools.definitions();
+
+    // Tell the TUI we've called the model — `Thinking…` shows until the
+    // first AssistantTextDelta arrives.
+    let _ = tx
+        .send(TurnEvent::ThinkingStarted {
+            agent: agent.name.clone(),
+        })
+        .await;
+
     let (msg_id, choice) = agent
         .model
-        .complete(&agent.system, history, prompt.clone(), &tools, agent.params.clone())
+        .complete(
+            &agent.system,
+            history,
+            prompt.clone(),
+            &tools,
+            agent.params.clone(),
+            &agent.name,
+            tx,
+        )
         .await
         .with_context(|| format!("completion call for agent `{}`", agent.name))?;
 
@@ -140,6 +187,9 @@ pub async fn turn(
         content: choice.clone(),
     });
 
+    // Even with streaming, emit a final AssistantText so the TUI knows
+    // to freeze the live-streaming entry into a static history row.
+    // Non-streaming paths land here directly.
     let text = extract_text(&choice);
     if !text.trim().is_empty() {
         let _ = tx
@@ -164,13 +214,14 @@ pub async fn turn(
     };
 
     for tc in &calls {
-        // `task` is special — it's a structural tool the driver, not
-        // this loop, has to handle. We return early so the driver can
-        // push a subagent before the rest of the calls fire. Any tool
-        // calls the model emitted after `task` in the same turn are
-        // dropped — the model will re-emit them after the subagent
-        // returns, which keeps the conversation cleaner than queuing
-        // them across a subagent boundary.
+        // `task` is special — it's a structural tool the driver
+        // handles. For interactive subagents (coder) the driver
+        // performs a primary handoff via [`TurnOutcome::SpawnSubagent`];
+        // for noninteractive ones (explore) it runs the child inline
+        // and returns the result as this task call's tool_result via
+        // [`TurnOutcome::SpawnNoninteractive`]. Other tool calls in
+        // the same assistant turn are dropped — the model will re-
+        // emit them on the next turn once it has the task result.
         if tc.function.name == "task" {
             let prompt = tc
                 .function
@@ -186,14 +237,23 @@ pub async fn turn(
                 .and_then(Value::as_str)
                 .unwrap_or("coder")
                 .to_string();
-            let _ = tx
-                .send(TurnEvent::SubagentSpawned {
-                    parent: agent.name.clone(),
-                    child: child.clone(),
-                    prompt: prompt.clone(),
-                })
-                .await;
-            return Ok(TurnOutcome::SpawnSubagent {
+            let noninteractive = crate::engine::builtin::is_noninteractive(&child);
+            if !noninteractive {
+                let _ = tx
+                    .send(TurnEvent::SubagentSpawned {
+                        parent: agent.name.clone(),
+                        child: child.clone(),
+                        prompt: prompt.clone(),
+                    })
+                    .await;
+                return Ok(TurnOutcome::SpawnSubagent {
+                    child_agent: child,
+                    prompt,
+                    task_call_id: tc.id.clone(),
+                    task_function_call_id: tc.call_id.clone(),
+                });
+            }
+            return Ok(TurnOutcome::SpawnNoninteractive {
                 child_agent: child,
                 prompt,
                 task_call_id: tc.id.clone(),

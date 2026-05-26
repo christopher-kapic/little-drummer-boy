@@ -20,6 +20,13 @@ use crate::engine::agent::{Agent, TurnEvent, TurnOutcome, turn};
 use crate::engine::message::Message;
 use crate::session::Session;
 
+/// Maximum number of queued user messages to fold into a single
+/// follow-up prompt. Generous because the worst case is a user
+/// hammering Enter — concat-joining a dozen short messages is fine;
+/// concat-joining a hundred would bloat the next inference. If we
+/// hit this cap, extras stay in the channel for the *next* fold.
+const MAX_FOLD: usize = 16;
+
 /// One agent's slice of state on the driver stack.
 pub struct AgentSession {
     pub agent: Arc<Agent>,
@@ -68,24 +75,42 @@ impl Driver {
         self.stack.last().map(|a| a.agent.name.as_str()).unwrap_or("")
     }
 
-    /// Drive one user message through the stack. Runs as many model
-    /// turns as needed; suspends only when (a) the active agent's turn
-    /// ends with prose and no tool calls (waiting for the next user
-    /// message), or (b) an error propagates.
+    /// Long-running main loop: pulls user input from `input_rx` and
+    /// drives it through the agent stack, **folding queued user
+    /// messages** (GOALS §1c) at every inference boundary. The fold
+    /// runs `try_recv` until the channel is empty, joins the
+    /// collected texts with a blank line, and uses that as the next
+    /// inference's user content.
     ///
-    /// The `tx` channel emits granular [`TurnEvent`]s; the caller
-    /// (TUI) drains it for display.
-    ///
-    /// Loop invariant: `next_prompt` is what rig's `agent.completion(
-    /// prompt, history)` should carry as its `prompt`. Per the
-    /// `manual_tool_calls.rs` example, after a `Continue` outcome we
-    /// pop the last message from history (the latest tool result) so
-    /// the *new* request's prompt is the tool result and history ends
-    /// at the assistant turn that called the tool. This avoids
-    /// duplicating messages between `prompt` and `history`.
+    /// Per GOALS §1c, the queue is delivered at the *next inference
+    /// call* — not the next user turn. Mid-tool-loop: the next
+    /// tool-result → inference round-trip carries the queue alongside
+    /// the tool result. End-of-turn: the queue is delivered as the
+    /// first content of the next request. Empty queue: standard
+    /// behavior.
+    pub async fn run_main_loop(
+        &mut self,
+        mut input_rx: mpsc::Receiver<String>,
+        tx: &mpsc::Sender<TurnEvent>,
+    ) -> Result<()> {
+        while let Some(text) = input_rx.recv().await {
+            // Fold anything else that's already queued behind the
+            // first message (rare but harmless).
+            let mut batch = vec![text];
+            drain_queue(&mut input_rx, &mut batch);
+            let folded = fold_messages(batch);
+            self.run_user_input(folded, &mut input_rx, tx).await?;
+        }
+        Ok(())
+    }
+
+    /// Drive one user message through the stack. Between inference
+    /// rounds we drain any queued messages and fold them — see
+    /// [`Self::run_main_loop`] for the contract.
     pub async fn run_user_input(
         &mut self,
         user_text: String,
+        input_rx: &mut mpsc::Receiver<String>,
         tx: &mpsc::Sender<TurnEvent>,
     ) -> Result<()> {
         let mut next_prompt = Message::user(user_text);
@@ -112,15 +137,24 @@ impl Driver {
 
             match outcome {
                 TurnOutcome::Continue => {
-                    // turn() pushed prompt + assistant + N tool results;
-                    // the next inference call wants the latest result as
-                    // its `prompt`, with history ending at the assistant
-                    // turn. Pop the last from history.
                     let top = self.stack.last_mut().expect("stack never empty");
-                    next_prompt = top
+                    let last_tool_result = top
                         .history
                         .pop()
                         .expect("Continue with empty history is unreachable");
+
+                    // Fold any queued user messages onto the upcoming
+                    // inference. The tool result still has to be
+                    // delivered, so push it back onto history and use
+                    // the queued user content as the next prompt.
+                    let mut queued: Vec<String> = Vec::new();
+                    drain_queue(input_rx, &mut queued);
+                    if queued.is_empty() {
+                        next_prompt = last_tool_result;
+                    } else {
+                        top.history.push(last_tool_result);
+                        next_prompt = Message::user(fold_messages(queued));
+                    }
                     continue;
                 }
                 TurnOutcome::Done => {
@@ -146,6 +180,16 @@ impl Driver {
                             continue;
                         }
                     }
+                    // Root agent is done with this user message. Before
+                    // we wait for the next user input, check if more
+                    // landed in the queue while we were busy — fold
+                    // them and start a new run with the combined text.
+                    let mut queued: Vec<String> = Vec::new();
+                    drain_queue(input_rx, &mut queued);
+                    if !queued.is_empty() {
+                        next_prompt = Message::user(fold_messages(queued));
+                        continue;
+                    }
                     return Ok(());
                 }
                 TurnOutcome::SpawnSubagent {
@@ -166,6 +210,50 @@ impl Driver {
                     next_prompt = Message::user(brief);
                     continue;
                 }
+                TurnOutcome::SpawnNoninteractive {
+                    child_agent,
+                    prompt: brief,
+                    task_call_id,
+                    task_function_call_id,
+                } => {
+                    // Emit a single ToolStart/ToolEnd pair so the
+                    // user sees one row in the orchestrator's history
+                    // — never a separate agent stream.
+                    let args_json = serde_json::json!({
+                        "agent": child_agent,
+                        "prompt": brief.clone(),
+                    });
+                    let _ = tx
+                        .send(TurnEvent::ToolStart {
+                            agent: self.stack.last().unwrap().agent.name.clone(),
+                            call_id: task_call_id.clone(),
+                            tool: format!("task→{child_agent}"),
+                            args: args_json,
+                        })
+                        .await;
+                    let child = crate::engine::builtin::load(&child_agent, &self.spawn_args())?;
+                    let report =
+                        match run_noninteractive(child, brief, self.session.clone(), self.locks.clone(), self.cwd.clone()).await {
+                            Ok(text) => text,
+                            Err(e) => format!("Error: {e:#}"),
+                        };
+                    let _ = tx
+                        .send(TurnEvent::ToolEnd {
+                            agent: self.stack.last().unwrap().agent.name.clone(),
+                            call_id: task_call_id.clone(),
+                            tool: format!("task→{child_agent}"),
+                            output: report.clone(),
+                            truncated: false,
+                        })
+                        .await;
+                    // Deliver the result as the parent's next prompt.
+                    next_prompt = Message::tool_result_with_call_id(
+                        task_call_id,
+                        task_function_call_id,
+                        report,
+                    );
+                    continue;
+                }
             }
         }
     }
@@ -176,6 +264,86 @@ impl Driver {
             params: self.stack[0].agent.params.clone(),
         }
     }
+}
+
+/// Drain queued user messages from the channel without blocking. Stops
+/// at the [`MAX_FOLD`] cap; anything beyond stays for a later fold.
+fn drain_queue(rx: &mut mpsc::Receiver<String>, into: &mut Vec<String>) {
+    while into.len() < MAX_FOLD {
+        match rx.try_recv() {
+            Ok(s) => into.push(s),
+            Err(_) => break,
+        }
+    }
+}
+
+/// Concatenate multiple user messages into a single inference payload
+/// per GOALS §1c: blank-line separator, no special framing or
+/// numbering. The user composed them as separate thoughts; the model
+/// sees one coherent message.
+fn fold_messages(messages: Vec<String>) -> String {
+    messages.join("\n\n")
+}
+
+/// Run a child agent's loop to completion synchronously. Used for
+/// noninteractive subagents — explore primarily. Drops the child's
+/// per-turn events on the floor (the parent's history already has a
+/// ToolStart/End representing this call); only the final text comes
+/// back. Limited to `MAX_NONINTERACTIVE_TURNS` to bound runaway loops.
+const MAX_NONINTERACTIVE_TURNS: usize = 12;
+
+async fn run_noninteractive(
+    child: Agent,
+    brief: String,
+    session: Arc<Session>,
+    locks: Arc<crate::locks::LockManager>,
+    cwd: std::path::PathBuf,
+) -> Result<String> {
+    use crate::engine::agent::turn;
+
+    // The child needs an event channel; we drain and discard.
+    let (sink_tx, mut sink_rx) = mpsc::channel::<TurnEvent>(64);
+    let drain = tokio::spawn(async move { while sink_rx.recv().await.is_some() {} });
+
+    let agent = Arc::new(child);
+    let mut history: Vec<Message> = Vec::new();
+    let mut next_prompt = Message::user(brief);
+
+    for _ in 0..MAX_NONINTERACTIVE_TURNS {
+        let outcome = turn(
+            &agent,
+            &mut history,
+            next_prompt,
+            session.clone(),
+            locks.clone(),
+            cwd.clone(),
+            &sink_tx,
+        )
+        .await?;
+        match outcome {
+            TurnOutcome::Continue => {
+                next_prompt = history
+                    .pop()
+                    .expect("Continue with empty history is unreachable");
+            }
+            TurnOutcome::Done => {
+                drop(sink_tx);
+                let _ = drain.await;
+                return Ok(collect_final_text(&history));
+            }
+            TurnOutcome::SpawnSubagent { .. } | TurnOutcome::SpawnNoninteractive { .. } => {
+                // explore is a leaf; this shouldn't happen, but if it
+                // does we treat it as a turn boundary so the loop
+                // doesn't spin.
+                drop(sink_tx);
+                let _ = drain.await;
+                anyhow::bail!("noninteractive agent `{}` attempted to delegate via task", agent.name);
+            }
+        }
+    }
+    drop(sink_tx);
+    let _ = drain.await;
+    anyhow::bail!("noninteractive agent `{}` exceeded {MAX_NONINTERACTIVE_TURNS} turns", agent.name)
 }
 
 fn collect_final_text(history: &[Message]) -> String {

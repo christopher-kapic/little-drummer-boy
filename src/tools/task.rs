@@ -17,7 +17,38 @@ use serde_json::Value;
 
 use crate::engine::tool::{Tool, ToolCtx, ToolOutput};
 
-pub struct TaskTool;
+pub struct TaskTool {
+    description: String,
+    parameters: Value,
+}
+
+impl TaskTool {
+    /// Build the tool with the agent enum populated from the caller's
+    /// available subagents — keeps the schema honest so the model
+    /// can't ask to delegate to an agent that doesn't exist.
+    pub fn with_subagents(agents: &[&str]) -> Self {
+        let list = agents.join("/");
+        let description = format!(
+            "Delegate a scoped piece of work to a subagent ({list}); coder takes over the conversation, explore runs noninteractively"
+        );
+        let parameters = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "agent":  {
+                    "type": "string",
+                    "description": "Subagent name",
+                    "enum": agents
+                },
+                "prompt": {
+                    "type": "string",
+                    "description": "Self-contained brief: goal, constraints, files, what \"done\" looks like"
+                }
+            },
+            "required": ["agent", "prompt"]
+        });
+        Self { description, parameters }
+    }
+}
 
 #[async_trait]
 impl Tool for TaskTool {
@@ -26,25 +57,11 @@ impl Tool for TaskTool {
     }
 
     fn description(&self) -> &str {
-        "Delegate a scoped piece of work to a subagent (currently: coder); user sees the subagent's actions"
+        &self.description
     }
 
     fn parameters(&self) -> Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "agent":  {
-                    "type": "string",
-                    "description": "Subagent to spawn (only `coder` is available in v0)",
-                    "enum": ["coder"]
-                },
-                "prompt": {
-                    "type": "string",
-                    "description": "Self-contained brief: goal, constraints, files, what \"done\" looks like"
-                }
-            },
-            "required": ["agent", "prompt"]
-        })
+        self.parameters.clone()
     }
 
     async fn call(&self, _args: Value, _ctx: &ToolCtx) -> Result<ToolOutput> {

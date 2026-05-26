@@ -153,18 +153,35 @@ pub fn parse_models_body(body: &str) -> Result<Vec<ModelEntry>> {
             for (k, v) in obj {
                 if matches!(
                     k.as_str(),
-                    "id" | "name" | "display_name" | "thinking_modes" | "inputs"
+                    "id"
+                        | "name"
+                        | "display_name"
+                        | "thinking_modes"
+                        | "inputs"
+                        | "context_length"
+                        | "max_tokens"
                 ) {
                     continue;
                 }
                 extra.insert(k.clone(), v.clone());
             }
 
+            // Several OpenAI-compat providers (OpenRouter, llamafile,
+            // some self-hosted shims) include `context_length`. Pick
+            // it up here so `/fetch-models` populates the field
+            // automatically. `max_tokens` is the alt name a few use.
+            let context_length = obj
+                .get("context_length")
+                .or_else(|| obj.get("max_tokens"))
+                .and_then(Value::as_u64)
+                .and_then(|n| u32::try_from(n).ok());
+
             Some(ModelEntry {
                 id,
                 name,
                 thinking_modes,
                 inputs,
+                context_length,
                 favorite: false,
                 extra,
             })

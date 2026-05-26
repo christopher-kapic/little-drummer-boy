@@ -15,11 +15,20 @@
 //! provider-specific headers like `OpenAI-Beta` or `anthropic-version`
 //! get added when we wire the Anthropic variant).
 
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+
 use anyhow::{Context, Result, bail};
+use futures::StreamExt;
 use rig::client::CompletionClient;
 use rig::completion::Completion;
-use rig::message::{Message, ToolChoice};
+use rig::message::{Message, Reasoning, ReasoningContent, ToolChoice};
 use rig::providers::openai;
+use rig::streaming::StreamedAssistantContent;
+use serde_json::json;
+use tokio::sync::mpsc;
+
+use crate::engine::agent::TurnEvent;
 
 // `openai::Client` is rig's *Responses API* client (POSTs `/responses`).
 // Every OpenAI-compatible provider in `src/providers/mod.rs` (z.ai,
@@ -28,6 +37,26 @@ use rig::providers::openai;
 // the `CompletionsClient` variant instead, or every non-OpenAI-proper
 // endpoint 404s on the wrong path.
 type OpenAiCompatClient = openai::CompletionsClient;
+
+/// When set (by `--debug-last-message`), every call to [`Model::complete`]
+/// writes a pretty-printed JSON dump of the outbound request to this
+/// path before invoking rig. The file is overwritten each turn.
+///
+/// Holds the *target file path*, not just a flag — the resolver does
+/// the `cwd/.lastmessage` join once at startup so we don't depend on
+/// `std::env::current_dir()` from inside the agent task.
+static DEBUG_LAST_MESSAGE_PATH: OnceLock<PathBuf> = OnceLock::new();
+
+/// Plumb `--debug-last-message` into the engine. Idempotent — second
+/// calls are no-ops because `OnceLock::set` returns `Err` once set.
+/// Called from `main.rs` before any agent loop starts.
+pub fn enable_debug_last_message(path: PathBuf) {
+    let _ = DEBUG_LAST_MESSAGE_PATH.set(path);
+}
+
+fn debug_last_message_path() -> Option<&'static Path> {
+    DEBUG_LAST_MESSAGE_PATH.get().map(PathBuf::as_path)
+}
 
 use crate::config::providers::{ActiveModelRef, ProvidersConfig};
 use crate::envref;
@@ -107,13 +136,16 @@ impl Model {
         })
     }
 
-    /// Build a one-shot request and send it. Tools, the system prompt,
-    /// the prior conversation history, and the new user message all go
-    /// in here. Returns the model's `OneOrMany<AssistantContent>` plus
-    /// the `message_id` rig surfaced (used as the assistant turn's id
-    /// in history).
+    /// Build a streaming completion request and aggregate it.
     ///
-    /// Non-streaming for v0 — see [`crate::engine::agent`].
+    /// Streaming is on for every provider variant — rig's
+    /// `StreamingCompletionResponse` aggregates `choice` and
+    /// `message_id` internally as the stream advances, so by the time
+    /// we exhaust the stream we have the same shape the non-streaming
+    /// `send()` path would have produced. We emit a
+    /// [`TurnEvent::AssistantTextDelta`] for every `Message(...)`
+    /// chunk (and drop `Reasoning`/`ReasoningDelta` — the TUI shows
+    /// `Thinking…` instead per user spec).
     pub async fn complete(
         &self,
         system: &str,
@@ -121,18 +153,76 @@ impl Model {
         prompt: Message,
         tools: &[ToolDefinition],
         params: ModelParams,
+        agent_name: &str,
+        event_tx: &mpsc::Sender<TurnEvent>,
     ) -> Result<(Option<String>, OneOrMany<AssistantContent>)> {
+        // Strip reasoning content from every prior assistant turn
+        // before sending it back to the model. Past thinking blocks
+        // bloat the prompt without informing the next turn's output
+        // — the user already saw them via the expandable chip; the
+        // model doesn't need its own scratch work re-fed for the
+        // next inference.
+        let history: Vec<Message> = history.iter().map(strip_reasoning).collect();
+
+        if let Some(path) = debug_last_message_path() {
+            dump_request(path, self.model_id(), system, &history, &prompt, tools, &params);
+        }
+
         match self {
             Model::OpenAi { client, model_id } => {
                 let agent = build_agent(client, model_id, system, tools, &params);
 
-                let mut req = agent.completion(prompt, history.to_vec()).await?;
+                let mut req = agent.completion(prompt, history).await?;
                 if params.tools_required && !tools.is_empty() {
                     req = req.tool_choice(ToolChoice::Required);
                 }
-                let resp = req.send().await?;
-                Ok((resp.message_id, resp.choice))
+                let mut stream = req.stream().await?;
+                while let Some(item) = stream.next().await {
+                    match item? {
+                        StreamedAssistantContent::Text(text) if !text.text.is_empty() => {
+                            let _ = event_tx
+                                .send(TurnEvent::AssistantTextDelta {
+                                    agent: agent_name.to_string(),
+                                    delta: text.text,
+                                })
+                                .await;
+                        }
+                        StreamedAssistantContent::ReasoningDelta { reasoning, .. } => {
+                            // Capture for the "expand thinking block"
+                            // feature; the TUI hides this by default.
+                            let _ = event_tx
+                                .send(TurnEvent::ReasoningDelta {
+                                    agent: agent_name.to_string(),
+                                    delta: reasoning,
+                                })
+                                .await;
+                        }
+                        StreamedAssistantContent::Reasoning(r) => {
+                            let combined = collect_reasoning_text(&r);
+                            if !combined.is_empty() {
+                                let _ = event_tx
+                                    .send(TurnEvent::ReasoningDelta {
+                                        agent: agent_name.to_string(),
+                                        delta: combined,
+                                    })
+                                    .await;
+                            }
+                        }
+                        // ToolCallDelta / ToolCall / Final are
+                        // aggregated into `stream.choice` /
+                        // `stream.message_id` internally; the
+                        // post-loop reads pick them up.
+                        _ => {}
+                    }
+                }
+                Ok((stream.message_id.clone(), stream.choice.clone()))
             }
+        }
+    }
+
+    fn model_id(&self) -> &str {
+        match self {
+            Model::OpenAi { model_id, .. } => model_id,
         }
     }
 }
@@ -177,6 +267,83 @@ fn build_agent<C: CompletionClient>(
         b = b.max_tokens(m);
     }
     b.build()
+}
+
+/// Remove `AssistantContent::Reasoning` items from a message's
+/// content vector. Used to scrub past thinking blocks from the
+/// history before each outbound request.
+fn strip_reasoning(msg: &Message) -> Message {
+    match msg {
+        Message::Assistant { id, content } => {
+            let kept: Vec<AssistantContent> = content
+                .iter()
+                .filter(|c| !matches!(c, AssistantContent::Reasoning(_)))
+                .cloned()
+                .collect();
+            // `OneOrMany::one_or_many` errors on empty input; preserve
+            // the original message verbatim in that pathological case
+            // (an assistant turn that contained only reasoning).
+            match OneOrMany::many(kept) {
+                Ok(new_content) => Message::Assistant {
+                    id: id.clone(),
+                    content: new_content,
+                },
+                Err(_) => msg.clone(),
+            }
+        }
+        other => other.clone(),
+    }
+}
+
+/// Pull every `ReasoningContent::Text` chunk out of a complete
+/// `Reasoning` block, joined with newlines. Empty for non-text
+/// reasoning content (which rig models internally but we don't
+/// display).
+fn collect_reasoning_text(r: &Reasoning) -> String {
+    r.content
+        .iter()
+        .filter_map(|c| match c {
+            ReasoningContent::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Write the outbound request to `path` for debugging. Best-effort —
+/// any error is traced but never propagated, because losing a debug
+/// dump must not break a live turn.
+fn dump_request(
+    path: &Path,
+    model_id: &str,
+    system: &str,
+    history: &[Message],
+    prompt: &Message,
+    tools: &[ToolDefinition],
+    params: &ModelParams,
+) {
+    let body = json!({
+        "model": model_id,
+        "system": system,
+        "tools": tools,
+        "params": {
+            "temperature": params.temperature,
+            "max_tokens": params.max_tokens,
+            "tools_required": params.tools_required,
+        },
+        "history": history,
+        "prompt": prompt,
+    });
+    let pretty = match serde_json::to_string_pretty(&body) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e, "debug-last-message: serialization failed");
+            return;
+        }
+    };
+    if let Err(e) = std::fs::write(path, format!("{pretty}\n")) {
+        tracing::warn!(path = %path.display(), error = %e, "debug-last-message: write failed");
+    }
 }
 
 /// A `rig::tool::Tool` that exists only to advertise a `ToolDefinition`

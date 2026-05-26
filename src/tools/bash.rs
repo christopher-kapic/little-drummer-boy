@@ -4,13 +4,19 @@
 //! and Shift+Tab approval-mode cycling will land alongside the rest of
 //! plan §3e.
 //!
+//! Per the tool-availability-policy memory: at startup we probe
+//! `$PATH` for `rg`/`fd` and (on macOS) `gsed`. The tool description
+//! advertises which of these are available so the model picks the
+//! right binary, and on macOS-with-gsed we prepend a small `sed()`
+//! shell function so `sed` invocations use the GNU implementation —
+//! BSD `sed` differs enough that scripts written for Linux fail
+//! silently on macOS.
+//!
 //! Safety:
 //!   - Output is capped at [`crate::tools::common::OUTPUT_BYTE_CAP`].
 //!   - The env scrub list from plan §3c removes the well-known
 //!     injection-vector vars (`BASH_ENV`, `PROMPT_COMMAND`, …) and
 //!     anything matching the `*_KEY` / `*_SECRET` / `*_TOKEN` patterns.
-//!     Secrets the model needs come back through the API layer, not
-//!     subprocess env.
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -22,7 +28,68 @@ use crate::tools::common::OUTPUT_BYTE_CAP;
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 const MAX_TIMEOUT_MS: u64 = 600_000;
 
-pub struct BashTool;
+/// Configured at construction time from a `$PATH` probe. `description`
+/// is the cached string returned by [`Tool::description`]; `prelude`
+/// is prepended to every shell command (currently used only for the
+/// macOS `sed → gsed` alias).
+pub struct BashTool {
+    description: String,
+    prelude: String,
+}
+
+impl Default for BashTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BashTool {
+    pub fn new() -> Self {
+        let has_rg = which::which("rg").is_ok();
+        let has_fd = which::which("fd").is_ok();
+        let has_gsed = which::which("gsed").is_ok();
+        let alias_sed = cfg!(target_os = "macos") && has_gsed;
+
+        // Build the description. GOALS §10 says: one sentence,
+        // terse. We append a short suffix listing the search binaries
+        // that are actually on PATH — saves the model a probe step.
+        let mut hints: Vec<&str> = Vec::new();
+        if has_rg {
+            hints.push("rg");
+        }
+        if has_fd {
+            hints.push("fd");
+        }
+        let search_hint = if hints.is_empty() {
+            String::new()
+        } else {
+            format!("; prefer {} over grep/find for searches", hints.join("/"))
+        };
+        let sed_hint = if alias_sed {
+            "; `sed` is wired to gsed (GNU)".to_string()
+        } else {
+            String::new()
+        };
+        let description = format!(
+            "Execute a shell command; returns stdout/stderr/exit (8 KB cap, 120s default timeout){search_hint}{sed_hint}"
+        );
+
+        // Prepend a `sed` shell function on macOS so the model can use
+        // its standard Linux-style flags without having to remember to
+        // type `gsed` itself. `command gsed` bypasses the function on
+        // recursion (no infinite-loop hazard).
+        let prelude = if alias_sed {
+            "sed() { command gsed \"$@\"; }; ".to_string()
+        } else {
+            String::new()
+        };
+
+        Self {
+            description,
+            prelude,
+        }
+    }
+}
 
 #[async_trait]
 impl Tool for BashTool {
@@ -31,7 +98,7 @@ impl Tool for BashTool {
     }
 
     fn description(&self) -> &str {
-        "Execute a shell command; returns stdout/stderr/exit code (8 KB cap, 120 s default timeout)"
+        &self.description
     }
 
     fn parameters(&self) -> Value {
@@ -64,8 +131,13 @@ impl Tool for BashTool {
 
         tracing::debug!(command, timeout_ms, "bash: spawning");
 
+        let prefixed = if self.prelude.is_empty() {
+            command.to_string()
+        } else {
+            format!("{}{command}", self.prelude)
+        };
         let mut cmd = tokio::process::Command::new("sh");
-        cmd.arg("-c").arg(command).current_dir(&cwd);
+        cmd.arg("-c").arg(&prefixed).current_dir(&cwd);
         scrub_env(&mut cmd);
 
         let child = cmd
