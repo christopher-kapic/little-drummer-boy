@@ -8,14 +8,13 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use ratatui::style::{Color, Style};
-use ratatui::text::{Line, Span};
+use ratatui::text::Span;
 use serde_json::Value;
 
 use crate::git::{self, RepoStatus};
 
 pub const APP_NAME: &str = "Cockpit CLI";
 pub const DEFAULT_AGENT: &str = "orchestrator-build";
-pub const ICON_WIDTH: u16 = 11;
 pub const MUTED_COLOR_INDEX: u8 = 250;
 pub const INPUT_PREFIX: &str = "❯ ";
 const P51_ANSI_LINES: [&str; 4] = [
@@ -59,59 +58,26 @@ pub fn load(project: Option<&Path>) -> LaunchInfo {
 
 pub fn print(project: Option<&Path>) {
     let info = load(project);
-    let title = format!("{BOLD}{APP_NAME}{RESET} {GREY}v{}{RESET}", info.version);
-
-    println!("{}  {}", P51_ANSI_LINES[0], title);
-    println!("{}  {GREY}{}{RESET}", P51_ANSI_LINES[1], info.provider_line);
-    println!("{}  {}", P51_ANSI_LINES[2], path_line_ansi(&info));
-    println!("{}", P51_ANSI_LINES[3]);
+    print_header(&info);
     println!();
     println!("{INPUT_PREFIX}");
     println!("{}", info.agent_name);
 }
 
-pub fn p51_lines() -> Vec<Line<'static>> {
-    vec![
-        Line::from(vec![
-            Span::raw("    "),
-            fg("█", 255),
-            Span::raw("   "),
-            fg_bg("▖", 196, 16),
-            fg_bg("▖", 250, 244),
-        ]),
-        Line::from(vec![
-            Span::raw("    "),
-            fg("▐", 255),
-            fg_bg("▌", 255, 250),
-            fg("▄", 250),
-            fg_bg("▛", 250, 244),
-            fg_bg("▘", 250, 244),
-            Span::raw(" "),
-        ]),
-        Line::from(vec![
-            Span::raw("    "),
-            fg_bg("▖", 33, 45),
-            fg_bg("▛", 250, 255),
-            fg_bg("▀", 250, 255),
-            Span::raw("   "),
-        ]),
-        Line::from(vec![
-            Span::raw("  "),
-            fg_bg("▖", 220, 208),
-            fg_bg("▘", 220, 208),
-            fg_bg("▘", 208, 250),
-            fg("▘", 244),
-            fg("▜", 255),
-            fg("▖", 255),
-            Span::raw("  "),
-        ]),
-    ]
-}
-
-pub fn path_line_spans(info: &LaunchInfo) -> Vec<Span<'static>> {
-    let mut spans = vec![Span::raw("  ")];
-    spans.extend(git_segment_spans(info));
-    spans
+/// Print just the launch header (4 lines: logo + title, logo + provider,
+/// logo + path, logo bottom). Used by the TUI at startup so the header
+/// lands in normal terminal output — it scrolls naturally with the chat
+/// and ends up in scrollback once enough messages arrive.
+///
+/// Spacing: P51 art renders 10 columns wide; the 3-space separator lines
+/// content up at column 13, matching the TUI's 11-wide icon column +
+/// 2-space text indent.
+pub fn print_header(info: &LaunchInfo) {
+    let title = format!("{BOLD}{APP_NAME}{RESET} {GREY}v{}{RESET}", info.version);
+    println!("{}   {}", P51_ANSI_LINES[0], title);
+    println!("{}   {GREY}{}{RESET}", P51_ANSI_LINES[1], info.provider_line);
+    println!("{}   {}", P51_ANSI_LINES[2], path_line_ansi(info));
+    println!("{}", P51_ANSI_LINES[3]);
 }
 
 pub fn status_line_spans(info: &LaunchInfo) -> Vec<Span<'static>> {
@@ -133,19 +99,6 @@ fn git_segment_spans(info: &LaunchInfo) -> Vec<Span<'static>> {
     }
 
     spans
-}
-
-fn fg(text: &'static str, color: u8) -> Span<'static> {
-    Span::styled(text, Style::default().fg(Color::Indexed(color)))
-}
-
-fn fg_bg(text: &'static str, fg_color: u8, bg_color: u8) -> Span<'static> {
-    Span::styled(
-        text,
-        Style::default()
-            .fg(Color::Indexed(fg_color))
-            .bg(Color::Indexed(bg_color)),
-    )
 }
 
 fn resolve_launch_dir(project: Option<&Path>) -> PathBuf {
@@ -200,6 +153,103 @@ fn repo_counts(repo: &RepoStatus) -> String {
         parts.push(format!("^{}", repo.unpushed));
     }
     parts.join(" ")
+}
+
+/// Where a cockpit config directory was discovered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigDirKind {
+    /// `~/.config/cockpit/`
+    HomeXdg,
+    /// `~/.cockpit/`
+    HomeDot,
+    /// An ancestor of cwd containing `.cockpit/` (project-scoped layer).
+    Project,
+}
+
+#[derive(Debug, Clone)]
+pub struct ConfigDir {
+    pub kind: ConfigDirKind,
+    pub path: PathBuf,
+}
+
+/// All cockpit config directories that exist on disk and apply to `cwd`.
+///
+/// Walk order: home-scoped first (XDG, then dotfile), then every ancestor
+/// of `cwd` containing `.cockpit/`, walking from `cwd` upward and stopping
+/// at the `{$HOME, /srv, /opt}` stop set (matches the layered-config plan).
+pub fn discover_config_dirs(cwd: &Path) -> Vec<ConfigDir> {
+    let mut out = Vec::new();
+
+    if let Some(home) = dirs::home_dir() {
+        let xdg = home.join(".config/cockpit");
+        if xdg.is_dir() {
+            out.push(ConfigDir {
+                kind: ConfigDirKind::HomeXdg,
+                path: xdg,
+            });
+        }
+        let dot = home.join(".cockpit");
+        if dot.is_dir() {
+            out.push(ConfigDir {
+                kind: ConfigDirKind::HomeDot,
+                path: dot,
+            });
+        }
+    }
+
+    let stops: Vec<PathBuf> = [
+        dirs::home_dir(),
+        Some(PathBuf::from("/srv")),
+        Some(PathBuf::from("/opt")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+
+    let mut cursor = Some(cwd);
+    while let Some(dir) = cursor {
+        if stops.iter().any(|s| dir == s) {
+            break;
+        }
+        let candidate = dir.join(".cockpit");
+        if candidate.is_dir() {
+            out.push(ConfigDir {
+                kind: ConfigDirKind::Project,
+                path: candidate,
+            });
+        }
+        cursor = dir.parent();
+    }
+
+    out
+}
+
+/// Default places `/settings` will offer when no config exists yet.
+pub fn creatable_config_dirs() -> Vec<ConfigDir> {
+    let mut out = Vec::new();
+    if let Some(home) = dirs::home_dir() {
+        out.push(ConfigDir {
+            kind: ConfigDirKind::HomeXdg,
+            path: home.join(".config/cockpit"),
+        });
+        out.push(ConfigDir {
+            kind: ConfigDirKind::HomeDot,
+            path: home.join(".cockpit"),
+        });
+    }
+    out
+}
+
+/// Create `dir` (and parents) and write a minimal `config.json` if one
+/// isn't already present. Returns the path of the config file.
+pub fn scaffold_config_dir(dir: &Path) -> std::io::Result<PathBuf> {
+    std::fs::create_dir_all(dir)?;
+    let config_path = dir.join("config.json");
+    if !config_path.exists() {
+        let default = "{\n  \"providers\": {},\n  \"agents\": {},\n  \"tools\": {}\n}\n";
+        std::fs::write(&config_path, default)?;
+    }
+    Ok(config_path)
 }
 
 fn detect_provider_model(cwd: &Path) -> Option<(String, String)> {

@@ -16,5 +16,6 @@ pub mod app;
 pub mod chat;
 pub mod chrome;
 pub mod composer;
+pub mod settings;
 pub mod slash;
 pub mod theme;

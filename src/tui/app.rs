@@ -1,4 +1,12 @@
 //! Top-level TUI state and event loop.
+//!
+//! Mouse capture is intentionally **not** enabled: leaving it off lets
+//! the terminal/tmux handle the scroll wheel natively, so the user can
+//! scroll up through chat history and the launch header even after they
+//! spill into terminal scrollback. When we eventually need mouse-driven
+//! interactions (clicking buttons, drag-to-select, etc.) we'll switch on
+//! `EnableMouseCapture` and route `MouseEvent`s in the event loop —
+//! revisit the scroll path when that happens.
 
 use std::io::{Write, stdout};
 use std::path::Path;
@@ -10,22 +18,22 @@ use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
     PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
-use crossterm::terminal::size as terminal_size;
+use crossterm::terminal::{Clear, ClearType, size as terminal_size};
 use ratatui::layout::{Constraint, Layout, Position, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::{DefaultTerminal, TerminalOptions, Viewport};
 
 use crate::git;
 use crate::tui::composer::{Composer, VimMode};
+use crate::tui::settings::{self, Dialog};
 use crate::welcome::{self, LaunchInfo};
 
-const HEADER_HEIGHT: u16 = 4;
 const STATUS_HEIGHT: u16 = 1;
 const MIN_HISTORY_HEIGHT: u16 = 1;
 const MIN_INPUT_CONTENT: u16 = 1;
-const MAX_INPUT_CONTENT: u16 = 4;
+const MAX_INPUT_CONTENT: u16 = 6;
 const INPUT_BORDER: u16 = 2;
 const GIT_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const EVENT_TICK: Duration = Duration::from_millis(100);
@@ -53,6 +61,10 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
         name: "prune",
         description: "Drop the oldest messages",
     },
+    SlashCommand {
+        name: "settings",
+        description: "Open the settings dialog",
+    },
 ];
 
 pub struct App {
@@ -60,11 +72,12 @@ pub struct App {
     composer: Composer,
     history: Vec<String>,
     last_git_refresh: Instant,
-    /// Current pane height. Monotonically non-decreasing while the session
-    /// runs: when the composer/popup needs more space we grow the pane (and
-    /// push terminal scrollback up to keep prior output visible), but we
-    /// never shrink it back. Freed space gets absorbed by the history area.
+    /// Current pane height. Monotonically non-decreasing: when the chat
+    /// or composer needs more room we grow the pane (and scroll prior
+    /// terminal content up into scrollback so it stays mouse-reachable),
+    /// but we never shrink it.
     pane_height: u16,
+    dialog: Dialog,
 }
 
 impl App {
@@ -78,12 +91,18 @@ impl App {
             history: Vec::new(),
             last_git_refresh: Instant::now(),
             pane_height: 0,
+            dialog: Dialog::None,
         };
-        app.pane_height = app.desired_pane_height();
+        app.pane_height = app.desired_pane_height_uncapped();
         app
     }
 
     pub async fn run(&mut self) -> Result<()> {
+        // Print the header to normal terminal output. It lives in scrollback
+        // from this point on — once enough messages arrive it scrolls up
+        // off the top of the terminal, recoverable with the mouse wheel.
+        welcome::print_header(&self.launch);
+
         reserve_fixed_pane_space(self.pane_height)?;
 
         let (width, height) = terminal_size()?;
@@ -103,6 +122,12 @@ impl App {
 
         let result = self.event_loop(&mut terminal);
 
+        // Wipe the viewport rows before we hand the terminal back. Without
+        // this, the input box / popup / status sit forever in the user's
+        // scrollback under the last chat line — distracting when scrolling
+        // up after exit.
+        self.clear_viewport_for_exit().ok();
+
         if kbd_enhanced {
             let _ = crossterm::execute!(stdout(), PopKeyboardEnhancementFlags);
         }
@@ -110,9 +135,24 @@ impl App {
         result
     }
 
+    fn clear_viewport_for_exit(&self) -> Result<()> {
+        let (_, h) = terminal_size()?;
+        let viewport_top = h.saturating_sub(self.pane_height);
+        let mut out = stdout();
+        for row in viewport_top..h {
+            crossterm::execute!(out, cursor::MoveTo(0, row), Clear(ClearType::CurrentLine))?;
+        }
+        crossterm::execute!(out, cursor::MoveTo(0, viewport_top))?;
+        out.flush()?;
+        Ok(())
+    }
+
     fn event_loop(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         loop {
             self.maybe_grow_pane(terminal)?;
+            if self.maybe_spill_history()? {
+                terminal.clear()?;
+            }
             terminal.draw(|frame| self.render(frame))?;
 
             if event::poll(EVENT_TICK)? {
@@ -133,12 +173,13 @@ impl App {
         Ok(())
     }
 
-    /// Grow the pane (and the terminal viewport) if the composer or popup
-    /// now needs more space than we've previously reserved. We never shrink:
-    /// freed lines become blank slots that the history area absorbs.
+    /// Grow the pane (and the terminal viewport) if more space is now
+    /// needed than we've previously reserved. We scroll the terminal up
+    /// by the deficit so prior output moves into scrollback rather than
+    /// being clipped.
     fn maybe_grow_pane(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         let (w, h) = terminal_size()?;
-        let desired = self.desired_pane_height().min(h);
+        let desired = self.desired_pane_height_uncapped().min(h);
         if desired > self.pane_height {
             let extra = desired - self.pane_height;
             push_terminal_content_up(extra, h)?;
@@ -146,6 +187,33 @@ impl App {
             terminal.resize(viewport_rect(self.pane_height, w, h))?;
         }
         Ok(())
+    }
+
+    /// Once the pane has grown to fill the terminal but history still
+    /// wants more space, pop the oldest entries off `App.history` and
+    /// push them into terminal scrollback. Mouse-wheel scroll preserves
+    /// them. Returns true if anything spilled (caller must clear ratatui's
+    /// buffer to force a clean redraw).
+    fn maybe_spill_history(&mut self) -> Result<bool> {
+        let (_, h) = terminal_size()?;
+        let chrome = self.input_height() + self.popup_lines() + STATUS_HEIGHT;
+        let max_history = h.saturating_sub(chrome).max(MIN_HISTORY_HEIGHT);
+
+        let total = self.total_history_lines();
+        if total <= max_history {
+            return Ok(false);
+        }
+
+        let to_spill = total - max_history;
+        let mut spilled = 0u16;
+        let mut items = Vec::new();
+        while spilled < to_spill && !self.history.is_empty() {
+            let entry = self.history.remove(0);
+            spilled += entry_line_count(&entry);
+            items.push(entry);
+        }
+        insert_above_viewport(self.pane_height, &items)?;
+        Ok(true)
     }
 
     fn refresh_git(&mut self) {
@@ -158,6 +226,15 @@ impl App {
             && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('d'))
         {
             return true;
+        }
+
+        if self.dialog.is_active() {
+            if self.dialog.handle_key(key) {
+                // TODO: when the settings pages actually mutate config,
+                // reload and re-apply to the running session here.
+                self.dialog = Dialog::None;
+            }
+            return false;
         }
 
         match key.code {
@@ -258,25 +335,19 @@ impl App {
     fn execute_slash(&mut self, cmd: SlashCommand) -> bool {
         self.composer.buffer.clear();
         self.composer.cursor = 0;
-        match cmd.name {
-            "exit" => true,
-            "compact" => {
-                self.history
-                    .push("/compact: stub — context compaction not wired yet.".to_string());
-                false
+        let msg = match cmd.name {
+            "exit" => return true,
+            "settings" => {
+                self.dialog = Dialog::open(&self.launch.cwd);
+                return false;
             }
-            "prune" => {
-                self.history
-                    .push("/prune: stub — history pruning not wired yet.".to_string());
-                false
-            }
-            "model" => {
-                self.history
-                    .push("/model: stub — model picker not wired yet.".to_string());
-                false
-            }
-            _ => false,
-        }
+            "compact" => "/compact: stub — context compaction not wired yet.",
+            "prune" => "/prune: stub — history pruning not wired yet.",
+            "model" => "/model: stub — model picker not wired yet.",
+            _ => return false,
+        };
+        self.history.push(msg.to_string());
+        false
     }
 
     fn slash_query(&self) -> Option<&str> {
@@ -309,21 +380,30 @@ impl App {
         self.input_content_height() + INPUT_BORDER
     }
 
-    /// Minimum pane height the current state needs to fit cleanly: header,
-    /// a single-line gap for history, the input box, the popup (when
-    /// active), and the status line. Used to decide when to grow the pane.
-    fn desired_pane_height(&self) -> u16 {
-        HEADER_HEIGHT
-            + MIN_HISTORY_HEIGHT
-            + self.input_height()
-            + self.popup_lines()
-            + STATUS_HEIGHT
+    fn total_history_lines(&self) -> u16 {
+        self.history.iter().map(|s| entry_line_count(s)).sum()
+    }
+
+    /// Pane height the current state would prefer (before any cap). The
+    /// pane shrinks to this only on growth — see `maybe_grow_pane`.
+    fn desired_pane_height_uncapped(&self) -> u16 {
+        if self.dialog.is_active() {
+            return settings::DIALOG_HEIGHT;
+        }
+        let chrome = self.input_height() + self.popup_lines() + STATUS_HEIGHT;
+        chrome + self.total_history_lines().max(MIN_HISTORY_HEIGHT)
     }
 
     fn render(&self, frame: &mut ratatui::Frame) {
+        if self.dialog.is_active() {
+            self.dialog.render(frame, frame.area());
+            // No cursor in dialog mode — ratatui hides it when we skip
+            // set_cursor_position during this draw.
+            return;
+        }
+
         let popup_h = self.popup_lines();
         let layout = Layout::vertical([
-            Constraint::Length(HEADER_HEIGHT),
             Constraint::Min(0),
             Constraint::Length(self.input_height()),
             Constraint::Length(popup_h),
@@ -331,48 +411,14 @@ impl App {
         ])
         .split(frame.area());
 
-        self.render_header(frame, layout[0]);
-        self.render_history(frame, layout[1]);
-        let cursor_pos = self.render_input(frame, layout[2]);
+        self.render_history(frame, layout[0]);
+        let cursor_pos = self.render_input(frame, layout[1]);
         if popup_h > 0 {
-            self.render_popup(frame, layout[3]);
+            self.render_popup(frame, layout[2]);
         }
-        self.render_status(frame, layout[4]);
+        self.render_status(frame, layout[3]);
 
         frame.set_cursor_position(cursor_pos);
-    }
-
-    fn render_header(&self, frame: &mut ratatui::Frame, area: Rect) {
-        let header_layout = Layout::horizontal([
-            Constraint::Length(welcome::ICON_WIDTH),
-            Constraint::Min(0),
-        ])
-        .split(area);
-        let muted = Style::default().fg(Color::Indexed(welcome::MUTED_COLOR_INDEX));
-
-        frame.render_widget(Paragraph::new(welcome::p51_lines()), header_layout[0]);
-
-        let header = vec![
-            Line::from(vec![
-                Span::raw("  "),
-                Span::styled(
-                    welcome::APP_NAME,
-                    Style::default().add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(" "),
-                Span::styled(format!("v{}", self.launch.version), muted),
-            ]),
-            Line::from(vec![
-                Span::raw("  "),
-                Span::styled(self.launch.provider_line.clone(), muted),
-            ]),
-            Line::from(welcome::path_line_spans(&self.launch)),
-            Line::default(),
-        ];
-        frame.render_widget(
-            Paragraph::new(header).wrap(Wrap { trim: false }),
-            header_layout[1],
-        );
     }
 
     fn render_history(&self, frame: &mut ratatui::Frame, area: Rect) {
@@ -383,8 +429,8 @@ impl App {
                 all.push(Line::from(l.to_string()));
             }
         }
-        // Bottom-align: pad with blank lines at the top so newest content sits
-        // adjacent to the input box.
+        // Bottom-align: newest content sits just above the input box,
+        // blank padding above when sparse.
         let visible: Vec<Line<'static>> = if all.len() < area_h {
             let pad = area_h - all.len();
             let mut v: Vec<Line<'static>> = (0..pad).map(|_| Line::default()).collect();
@@ -603,6 +649,10 @@ impl App {
     }
 }
 
+fn entry_line_count(entry: &str) -> u16 {
+    (entry.split('\n').count() as u16).max(1)
+}
+
 fn slash_matches(query: &str) -> Vec<&'static SlashCommand> {
     SLASH_COMMANDS
         .iter()
@@ -625,10 +675,10 @@ fn reserve_fixed_pane_space(height: u16) -> Result<()> {
 }
 
 /// Scroll the terminal up by `extra` rows by walking the cursor to the
-/// bottom row and emitting linefeeds. In raw mode `\n` is plain LF, so each
-/// one at the last row makes the terminal scroll: prior output moves into
-/// scrollback (so the user can still find it) and `extra` blank rows open
-/// up at the bottom for the enlarged viewport.
+/// bottom row and emitting linefeeds. In raw mode `\n` is plain LF, so
+/// each one at the last row makes the terminal scroll: prior output
+/// moves into scrollback (recoverable with the mouse wheel) and `extra`
+/// blank rows open up at the bottom for the enlarged viewport.
 fn push_terminal_content_up(extra: u16, term_h: u16) -> Result<()> {
     if extra == 0 {
         return Ok(());
@@ -636,6 +686,44 @@ fn push_terminal_content_up(extra: u16, term_h: u16) -> Result<()> {
     let mut out = stdout();
     crossterm::execute!(out, cursor::MoveTo(0, term_h.saturating_sub(1)))?;
     for _ in 0..extra {
+        out.write_all(b"\n")?;
+    }
+    out.flush()?;
+    Ok(())
+}
+
+/// Push `lines` into terminal scrollback just above the viewport.
+///
+/// Approach: write the lines at the top of the viewport (overwriting
+/// the top rows of whatever is currently rendered there), then scroll
+/// the terminal up by `lines.len()` rows. The just-written lines slide
+/// up into the area above the viewport — visible if pane_height < term_h,
+/// or pushed into actual terminal scrollback if pane_height == term_h.
+/// Either way the mouse wheel can scroll back to them.
+///
+/// After calling this, the caller must invoke `terminal.clear()` so
+/// ratatui forces a full redraw — otherwise its diff-based renderer
+/// will not realize the terminal state has changed underneath it.
+fn insert_above_viewport(pane_height: u16, lines: &[String]) -> Result<()> {
+    let n = lines.len() as u16;
+    if n == 0 {
+        return Ok(());
+    }
+    let (_, h) = terminal_size()?;
+    let viewport_top = h.saturating_sub(pane_height);
+    let mut out = stdout();
+
+    crossterm::execute!(out, cursor::MoveTo(0, viewport_top))?;
+    for (i, line) in lines.iter().enumerate() {
+        out.write_all(line.as_bytes())?;
+        crossterm::execute!(out, Clear(ClearType::UntilNewLine))?;
+        if i + 1 < lines.len() {
+            out.write_all(b"\r\n")?;
+        }
+    }
+
+    crossterm::execute!(out, cursor::MoveTo(0, h.saturating_sub(1)))?;
+    for _ in 0..n {
         out.write_all(b"\n")?;
     }
     out.flush()?;
