@@ -11,5 +11,7 @@ pub async fn run(_args: RunArgs) -> Result<()> {
     // 5. Pass through `redact::scrub()`.
     // 6. Send to provider (streaming).
     // 7. Render per --format.
-    todo!("cockpit run — see GOALS.md §2 and opencode-features-review.md §1")
+    anyhow::bail!(
+        "cockpit run is not implemented yet (planned, see GOALS.md §2 and opencode-features-review.md §1)"
+    )
 }

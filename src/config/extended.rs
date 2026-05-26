@@ -1,7 +1,8 @@
 //! Loader for `extended-config.json` — the cockpit-only config layer.
 //!
-//! Schema reference: `GOALS.md` §4. All fields are optional; a missing
-//! file is fine (defaults apply).
+//! Lives alongside `config.json` in each discovered `.cockpit/` directory
+//! (see `config::dirs`). Schema reference: `GOALS.md` §4. All fields are
+//! optional; a missing file is fine (defaults apply).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -15,7 +16,7 @@ pub struct ExtendedConfig {
 
     /// Ordered list of agent-guidance file names. The first file from this
     /// list that exists in the cwd (or its ancestors up to the git root)
-    /// is loaded. Default mirrors opencode: `["AGENTS.md", "CLAUDE.md"]`.
+    /// is loaded. Default: `["AGENTS.md", "CLAUDE.md"]`.
     #[serde(default = "default_agent_guidance_files")]
     pub agent_guidance_files: Vec<String>,
 
@@ -35,7 +36,7 @@ pub struct ExtendedConfig {
     #[serde(default)]
     pub tui: TuiConfig,
 
-    /// Opt-in to fetching remote `.well-known/opencode` configs.
+    /// Opt-in to fetching remote `.well-known/cockpit` configs.
     #[serde(default)]
     pub allow_remote_config: bool,
 }

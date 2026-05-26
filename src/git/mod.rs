@@ -9,7 +9,7 @@ use std::process::Command;
 
 use anyhow::Result;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepoStatus {
     pub branch: String,
     pub staged: u32,

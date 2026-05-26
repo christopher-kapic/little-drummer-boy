@@ -20,7 +20,10 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
-use crate::welcome::{self, ConfigDir, ConfigDirKind};
+use crate::config::dirs::{
+    ConfigDir, ConfigDirKind, creatable_config_dirs, discover_config_dirs, scaffold_config_dir,
+};
+use crate::tui::theme::MUTED_COLOR_INDEX;
 
 /// Height (in rows) the dialog wants when active. Pane grows to this
 /// on first open; grow-only policy means subsequent closes don't shrink.
@@ -51,10 +54,10 @@ impl Dialog {
     /// Open the dialog: pick the right variant based on what config
     /// directories already exist for `cwd`.
     pub fn open(cwd: &std::path::Path) -> Self {
-        let dirs = welcome::discover_config_dirs(cwd);
+        let dirs = discover_config_dirs(cwd);
         if dirs.is_empty() {
             Dialog::CreateConfig {
-                choices: welcome::creatable_config_dirs(),
+                choices: creatable_config_dirs(),
                 cursor: 0,
             }
         } else {
@@ -71,26 +74,24 @@ impl Dialog {
     pub fn handle_key(&mut self, key: KeyEvent) -> bool {
         match self {
             Dialog::None => false,
-            Dialog::PickConfig { dirs, cursor } => {
-                match list_key_action(key, cursor, dirs.len()) {
-                    ListAction::Stay => false,
-                    ListAction::Close => true,
-                    ListAction::Select(idx) => {
-                        let chosen = dirs[idx].path.join("config.json");
-                        *self = Dialog::Settings {
-                            config_path: chosen,
-                            path: Vec::new(),
-                            cursors: vec![0],
-                        };
-                        false
-                    }
+            Dialog::PickConfig { dirs, cursor } => match list_key_action(key, cursor, dirs.len()) {
+                ListAction::Stay => false,
+                ListAction::Close => true,
+                ListAction::Select(idx) => {
+                    let chosen = dirs[idx].path.join("config.json");
+                    *self = Dialog::Settings {
+                        config_path: chosen,
+                        path: Vec::new(),
+                        cursors: vec![0],
+                    };
+                    false
                 }
-            }
+            },
             Dialog::CreateConfig { choices, cursor } => {
                 match list_key_action(key, cursor, choices.len()) {
                     ListAction::Stay => false,
                     ListAction::Close => true,
-                    ListAction::Select(idx) => match welcome::scaffold_config_dir(&choices[idx].path) {
+                    ListAction::Select(idx) => match scaffold_config_dir(&choices[idx].path) {
                         Ok(config_path) => {
                             *self = Dialog::Settings {
                                 config_path,
@@ -253,7 +254,7 @@ fn render_picker(
     if entries.is_empty() {
         lines.push(Line::from(Span::styled(
             "  (no candidates)",
-            Style::default().fg(Color::Indexed(welcome::MUTED_COLOR_INDEX)),
+            Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
         )));
     } else {
         let path_w = entries
@@ -280,7 +281,7 @@ fn render_picker(
             spans.push(Span::raw("   "));
             spans.push(Span::styled(
                 kind_str.to_string(),
-                Style::default().fg(Color::Indexed(welcome::MUTED_COLOR_INDEX)),
+                Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
             ));
             lines.push(Line::from(spans));
         }
@@ -319,7 +320,8 @@ fn render_settings(
         );
     } else {
         let cursor = cursors.last().copied().unwrap_or(0).min(children.len() - 1);
-        let cols = Layout::horizontal([Constraint::Length(20), Constraint::Min(0)]).split(layout[0]);
+        let cols =
+            Layout::horizontal([Constraint::Length(20), Constraint::Min(0)]).split(layout[0]);
 
         let list_lines: Vec<Line<'static>> = children
             .iter()
@@ -345,7 +347,7 @@ fn render_settings(
         frame.render_widget(
             Paragraph::new(desc.to_string())
                 .wrap(Wrap { trim: false })
-                .style(Style::default().fg(Color::Indexed(welcome::MUTED_COLOR_INDEX))),
+                .style(Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX))),
             cols[1],
         );
 
@@ -359,9 +361,15 @@ fn render_settings(
 fn render_leaf_body(frame: &mut Frame, area: Rect, path: &[String]) {
     let title = path.last().map(String::as_str).unwrap_or("");
     let body = match title {
-        "Providers" => "(stub) Provider editor — list configured providers, add/remove, set the default model.",
-        "Agents" => "(stub) Agent editor — list agent definitions, edit their system prompts, tool grants, and model overrides.",
-        "Tools" => "(stub) Tool registry — toggle availability per tool and configure permission scopes.",
+        "Providers" => {
+            "(stub) Provider editor — list configured providers, add/remove, set the default model."
+        }
+        "Agents" => {
+            "(stub) Agent editor — list agent definitions, edit their system prompts, tool grants, and model overrides."
+        }
+        "Tools" => {
+            "(stub) Tool registry — toggle availability per tool and configure permission scopes."
+        }
         _ => "(stub) Page not yet implemented.",
     };
     let lines = vec![
@@ -372,7 +380,7 @@ fn render_leaf_body(frame: &mut Frame, area: Rect, path: &[String]) {
         Line::default(),
         Line::from(Span::styled(
             body.to_string(),
-            Style::default().fg(Color::Indexed(welcome::MUTED_COLOR_INDEX)),
+            Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
         )),
     ];
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
@@ -381,7 +389,7 @@ fn render_leaf_body(frame: &mut Frame, area: Rect, path: &[String]) {
 fn help_line(text: &str) -> Paragraph<'static> {
     Paragraph::new(Line::from(Span::styled(
         text.to_string(),
-        Style::default().fg(Color::Indexed(welcome::MUTED_COLOR_INDEX)),
+        Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
     )))
 }
 

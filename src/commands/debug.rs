@@ -11,5 +11,7 @@ pub async fn run(_cmd: DebugCommand) -> Result<()> {
     // exact prompt + tool descriptions + history that would be sent for
     // the next turn, with per-section token counts. Lets users audit
     // cockpit's context overhead.
-    todo!("cockpit debug — config / paths / skill / agent / file / redact / context / wait")
+    anyhow::bail!(
+        "cockpit debug is not implemented yet (planned: config / paths / skill / agent / file / redact / context / wait)"
+    )
 }

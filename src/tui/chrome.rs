@@ -8,17 +8,40 @@
 //! Other slots (active agent, model, token count, …) compose around
 //! these two.
 
-use std::path::Path;
+use ratatui::style::{Color, Style};
+use ratatui::text::Span;
 
-/// Render the cwd slot. Abbreviates middle path components if the
-/// rendered width would exceed `max_width`. Examples (max_width=20):
-///   `/home/christopher/projects/device-ai/cockpit-cli`
-///     -> `~/p/d/cockpit-cli`
-pub fn cwd_label(_cwd: &Path, _max_width: usize) -> String {
-    todo!()
+use crate::git::RepoStatus;
+use crate::tui::theme::MUTED_COLOR_INDEX;
+use crate::welcome::LaunchInfo;
+
+pub fn status_line_spans(info: &LaunchInfo) -> Vec<Span<'static>> {
+    let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+    let mut spans = vec![Span::styled(info.cwd_display.clone(), muted)];
+
+    if let Some(repo) = &info.repo_status {
+        let badge = Style::default().fg(Color::Black).bg(Color::Indexed(220));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(format!(" {} ", repo.branch), badge));
+        let counts = repo_counts(repo);
+        if !counts.is_empty() {
+            spans.push(Span::styled(format!("{counts} "), badge));
+        }
+    }
+
+    spans
 }
 
-/// Render the branch slot. Returns `None` when not in a repo.
-pub fn branch_label(_cwd: &Path) -> Option<String> {
-    todo!("call git::current_branch and prefix with `` symbol")
+pub fn repo_counts(repo: &RepoStatus) -> String {
+    let mut parts = Vec::new();
+    if repo.staged > 0 {
+        parts.push(format!("+{}", repo.staged));
+    }
+    if repo.unstaged > 0 {
+        parts.push(format!("~{}", repo.unstaged));
+    }
+    if repo.unpushed > 0 {
+        parts.push(format!("^{}", repo.unpushed));
+    }
+    parts.join(" ")
 }

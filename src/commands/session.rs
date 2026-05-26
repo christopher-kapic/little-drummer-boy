@@ -3,5 +3,7 @@ use anyhow::Result;
 use crate::cli::SessionCommand;
 
 pub async fn run(_cmd: SessionCommand) -> Result<()> {
-    todo!("cockpit session — list/delete; backed by ~/.local/share/cockpit/cockpit.db")
+    anyhow::bail!(
+        "cockpit session is not implemented yet (planned; backed by ~/.local/share/cockpit/cockpit.db)"
+    )
 }

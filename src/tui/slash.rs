@@ -2,13 +2,14 @@
 //!
 //! The set is the union of:
 //!   - Built-ins (see `opencode-features-review.md` §5 "Built-in slash
-//!     commands").
-//!   - User-defined commands from `~/.config/opencode/commands/*.md`
-//!     and `<project>/.opencode/commands/*.md`.
+//!     commands" for the design inspiration; cockpit ships its own subset).
+//!   - User-defined commands from `~/.config/cockpit/commands/*.md`
+//!     and any `.cockpit/commands/*.md` on the discovered config path.
 //!
-//! Built-ins that change in cockpit:
+//! cockpit-specific commands:
 //!   - `/vim` — toggle composer vim mode (default ON in cockpit).
-//!   - `/skills` — also includes `~/.claude/skills/`.
-//!   - `/redact` — cockpit-only; shows what would be substituted next request.
-//!   - `/mcp` — cockpit-only; prints the mcp2cli pointer and exits.
-//!   - `/share`, `/statusline`, `/terminaltitle` — omitted (see review).
+//!   - `/redact` — show what would be substituted in the next outbound prompt.
+//!   - `/mcp` — print the mcp2cli pointer and exit.
+//!
+//! Omitted from opencode's set: `/share`, `/statusline`, `/terminaltitle`
+//! (see `opencode-features-review.md`).

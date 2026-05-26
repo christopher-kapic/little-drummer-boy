@@ -1,22 +1,12 @@
-//! Path resolution for the layered config system.
+//! Well-known cockpit paths.
 //!
-//! Centralized so all callers (loader, debug commands, init) agree on
-//! where files live.
+//! Centralized so all callers (loaders, debug commands, init) agree on
+//! where files live. Directory discovery for layered configs lives in
+//! `config::dirs`; this module is only for the fixed system-level paths.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::Result;
-
-/// `~/.config/opencode/` (XDG-style on every platform; see
-/// `miscellaneous.md` §1b).
-pub fn opencode_global_config_dir() -> Result<PathBuf> {
-    todo!("dirs::config_dir().join(\"opencode\")")
-}
-
-/// `<project>/.opencode/`.
-pub fn opencode_project_dir(_project: &Path) -> PathBuf {
-    todo!()
-}
 
 /// `~/.local/share/cockpit/` (or platform equivalent).
 pub fn cockpit_data_dir() -> Result<PathBuf> {

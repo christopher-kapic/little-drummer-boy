@@ -1,10 +1,13 @@
-//! Skill discovery (Claude Code-compatible + opencode-compatible).
+//! Skill discovery.
 //!
 //! Walks the following locations:
 //!   - `<cwd>/.claude/skills/*/SKILL.md`, ancestors up to the git worktree.
-//!   - `<cwd>/.opencode/skills/*/SKILL.md`.
-//!   - `<cwd>/.agents/skills/*/SKILL.md`.
-//!   - `~/.claude/skills/`, `~/.config/opencode/skills/`, `~/.agents/skills/`.
+//!   - `<cwd>/.cockpit/skills/*/SKILL.md`, ancestors up to the git worktree.
+//!   - `~/.claude/skills/`, `~/.cockpit/skills/`, `~/.config/cockpit/skills/`.
+//!
+//! The `.claude/skills/` locations are intentional: a project may already
+//! have Claude Code skills checked in, and cockpit picks them up
+//! transparently (the SKILL.md format is shared).
 //!
 //! Each `SKILL.md` is YAML frontmatter (`name`, `description`, optional
 //! `model`/trigger fields) plus a markdown body that is loaded on-demand

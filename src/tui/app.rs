@@ -10,7 +10,8 @@
 
 use std::io::{Write, stdout};
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::Result;
 use crossterm::cursor;
@@ -25,13 +26,14 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::{DefaultTerminal, TerminalOptions, Viewport};
 
-use crate::git;
-use crate::tui::composer::{Composer, VimMode};
+use crate::git::{self, RepoStatus};
+use crate::tui::chrome;
+use crate::tui::composer::{Composer, INPUT_PREFIX, VimMode, input_prefix_width};
+use crate::tui::geometry::PaneGeometry;
 use crate::tui::settings::{self, Dialog};
+use crate::tui::theme::MUTED_COLOR_INDEX;
 use crate::welcome::{self, LaunchInfo};
 
-const STATUS_HEIGHT: u16 = 1;
-const MIN_HISTORY_HEIGHT: u16 = 1;
 const MIN_INPUT_CONTENT: u16 = 1;
 const MAX_INPUT_CONTENT: u16 = 6;
 const INPUT_BORDER: u16 = 2;
@@ -71,7 +73,10 @@ pub struct App {
     launch: LaunchInfo,
     composer: Composer,
     history: Vec<String>,
-    last_git_refresh: Instant,
+    /// Live git status; updated by a background tokio task spawned in
+    /// `run`. The event loop syncs this into `launch.repo_status` once
+    /// per tick.
+    repo_status: Arc<Mutex<Option<RepoStatus>>>,
     /// Current pane height. Monotonically non-decreasing: when the chat
     /// or composer needs more room we grow the pane (and scroll prior
     /// terminal content up into scrollback so it stays mouse-reachable),
@@ -83,18 +88,35 @@ pub struct App {
 impl App {
     pub fn new(project: Option<&Path>) -> Self {
         let mut composer = Composer::new(true);
-        composer.vim_mode = VimMode::Insert;
+        composer.set_vim_mode(VimMode::Insert);
+
+        let launch = welcome::load(project);
+        let repo_status = Arc::new(Mutex::new(launch.repo_status.clone()));
 
         let mut app = Self {
-            launch: welcome::load(project),
+            launch,
             composer,
             history: Vec::new(),
-            last_git_refresh: Instant::now(),
+            repo_status,
             pane_height: 0,
             dialog: Dialog::None,
         };
-        app.pane_height = app.desired_pane_height_uncapped();
+        app.pane_height = app.geometry().desired_pane_height();
         app
+    }
+
+    fn geometry(&self) -> PaneGeometry {
+        let dialog = if self.dialog.is_active() {
+            settings::DIALOG_HEIGHT
+        } else {
+            0
+        };
+        PaneGeometry::compute(
+            self.input_height(),
+            self.popup_lines(),
+            self.total_history_lines(),
+            dialog,
+        )
     }
 
     pub async fn run(&mut self) -> Result<()> {
@@ -120,7 +142,11 @@ impl App {
         )
         .is_ok();
 
+        let refresh_handle = spawn_git_refresh(self.launch.cwd.clone(), self.repo_status.clone());
+
         let result = self.event_loop(&mut terminal);
+
+        refresh_handle.abort();
 
         // Wipe the viewport rows before we hand the terminal back. Without
         // this, the input box / popup / status sit forever in the user's
@@ -149,6 +175,7 @@ impl App {
 
     fn event_loop(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         loop {
+            self.sync_repo_status();
             self.maybe_grow_pane(terminal)?;
             if self.maybe_spill_history()? {
                 terminal.clear()?;
@@ -164,13 +191,17 @@ impl App {
                     _ => {}
                 }
             }
-
-            if self.last_git_refresh.elapsed() >= GIT_REFRESH_INTERVAL {
-                self.refresh_git();
-            }
         }
 
         Ok(())
+    }
+
+    fn sync_repo_status(&mut self) {
+        if let Ok(guard) = self.repo_status.lock()
+            && self.launch.repo_status != *guard
+        {
+            self.launch.repo_status = guard.clone();
+        }
     }
 
     /// Grow the pane (and the terminal viewport) if more space is now
@@ -179,7 +210,7 @@ impl App {
     /// being clipped.
     fn maybe_grow_pane(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         let (w, h) = terminal_size()?;
-        let desired = self.desired_pane_height_uncapped().min(h);
+        let desired = self.geometry().desired_pane_height().min(h);
         if desired > self.pane_height {
             let extra = desired - self.pane_height;
             push_terminal_content_up(extra, h)?;
@@ -196,8 +227,10 @@ impl App {
     /// buffer to force a clean redraw).
     fn maybe_spill_history(&mut self) -> Result<bool> {
         let (_, h) = terminal_size()?;
-        let chrome = self.input_height() + self.popup_lines() + STATUS_HEIGHT;
-        let max_history = h.saturating_sub(chrome).max(MIN_HISTORY_HEIGHT);
+        let geom = self.geometry();
+        let max_history = h
+            .saturating_sub(geom.chrome_height())
+            .max(crate::tui::geometry::MIN_HISTORY_HEIGHT);
 
         let total = self.total_history_lines();
         if total <= max_history {
@@ -214,11 +247,6 @@ impl App {
         }
         insert_above_viewport(self.pane_height, &items)?;
         Ok(true)
-    }
-
-    fn refresh_git(&mut self) {
-        self.launch.repo_status = git::repo_status(&self.launch.cwd).ok().flatten();
-        self.last_git_refresh = Instant::now();
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> bool {
@@ -240,8 +268,7 @@ impl App {
         match key.code {
             KeyCode::Esc => {
                 if self.slash_query().is_some() {
-                    self.composer.buffer.clear();
-                    self.composer.cursor = 0;
+                    self.composer.clear();
                     false
                 } else {
                     true
@@ -251,46 +278,46 @@ impl App {
                 if key.modifiers.contains(KeyModifiers::SHIFT)
                     || key.modifiers.contains(KeyModifiers::ALT)
                 {
-                    self.insert_char('\n');
+                    self.composer.insert_char('\n');
                     false
                 } else {
                     self.complete_or_submit()
                 }
             }
             KeyCode::Backspace => {
-                self.delete_left();
+                self.composer.delete_left();
                 false
             }
             KeyCode::Delete => {
-                self.delete_right();
+                self.composer.delete_right();
                 false
             }
             KeyCode::Left => {
-                self.move_left();
+                self.composer.move_left();
                 false
             }
             KeyCode::Right => {
-                self.move_right();
+                self.composer.move_right();
                 false
             }
             KeyCode::Up => {
-                self.move_up();
+                self.composer.move_up();
                 false
             }
             KeyCode::Down => {
-                self.move_down();
+                self.composer.move_down();
                 false
             }
             KeyCode::Home => {
-                self.move_line_start();
+                self.composer.move_line_start();
                 false
             }
             KeyCode::End => {
-                self.move_line_end();
+                self.composer.move_line_end();
                 false
             }
             KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.insert_char(ch);
+                self.composer.insert_char(ch);
                 false
             }
             _ => false,
@@ -308,16 +335,16 @@ impl App {
     }
 
     fn submit_input(&mut self) -> bool {
-        let submitted = self.composer.buffer.trim().to_string();
+        let submitted = self.composer.text().trim().to_string();
         if submitted.is_empty() {
             return false;
         }
 
-        let prefix_width = welcome::INPUT_PREFIX.chars().count();
+        let prefix_width = input_prefix_width();
         let indent: String = " ".repeat(prefix_width);
         for (i, line) in submitted.split('\n').enumerate() {
             let prefix = if i == 0 {
-                welcome::INPUT_PREFIX
+                INPUT_PREFIX
             } else {
                 indent.as_str()
             };
@@ -327,14 +354,12 @@ impl App {
             "{}: input captured; provider loop is not wired yet.",
             self.launch.agent_name
         ));
-        self.composer.buffer.clear();
-        self.composer.cursor = 0;
+        self.composer.clear();
         false
     }
 
     fn execute_slash(&mut self, cmd: SlashCommand) -> bool {
-        self.composer.buffer.clear();
-        self.composer.cursor = 0;
+        self.composer.clear();
         let msg = match cmd.name {
             "exit" => return true,
             "settings" => {
@@ -351,7 +376,7 @@ impl App {
     }
 
     fn slash_query(&self) -> Option<&str> {
-        let rest = self.composer.buffer.strip_prefix('/')?;
+        let rest = self.composer.text().strip_prefix('/')?;
         let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
         Some(&rest[..end])
     }
@@ -363,62 +388,30 @@ impl App {
         }
     }
 
-    fn buffer_line_count(&self) -> u16 {
-        if self.composer.buffer.is_empty() {
-            1
-        } else {
-            self.composer.buffer.split('\n').count() as u16
-        }
-    }
-
-    fn input_content_height(&self) -> u16 {
-        self.buffer_line_count()
-            .clamp(MIN_INPUT_CONTENT, MAX_INPUT_CONTENT)
-    }
-
     fn input_height(&self) -> u16 {
-        self.input_content_height() + INPUT_BORDER
+        (self.composer.line_count() as u16).clamp(MIN_INPUT_CONTENT, MAX_INPUT_CONTENT)
+            + INPUT_BORDER
     }
 
     fn total_history_lines(&self) -> u16 {
         self.history.iter().map(|s| entry_line_count(s)).sum()
     }
 
-    /// Pane height the current state would prefer (before any cap). The
-    /// pane shrinks to this only on growth — see `maybe_grow_pane`.
-    fn desired_pane_height_uncapped(&self) -> u16 {
-        if self.dialog.is_active() {
-            return settings::DIALOG_HEIGHT;
-        }
-        let chrome = self.input_height() + self.popup_lines() + STATUS_HEIGHT;
-        chrome + self.total_history_lines().max(MIN_HISTORY_HEIGHT)
-    }
-
     fn render(&self, frame: &mut ratatui::Frame) {
+        let geom = self.geometry();
+        let rects = geom.layout(frame.area());
+
         if self.dialog.is_active() {
-            self.dialog.render(frame, frame.area());
-            // No cursor in dialog mode — ratatui hides it when we skip
-            // set_cursor_position during this draw.
-            return;
+            self.dialog.render(frame, rects.body);
+        } else {
+            self.render_history(frame, rects.body);
+            let cursor_pos = self.render_input(frame, rects.input);
+            if geom.popup > 0 {
+                self.render_popup(frame, rects.popup);
+            }
+            frame.set_cursor_position(cursor_pos);
         }
-
-        let popup_h = self.popup_lines();
-        let layout = Layout::vertical([
-            Constraint::Min(0),
-            Constraint::Length(self.input_height()),
-            Constraint::Length(popup_h),
-            Constraint::Length(STATUS_HEIGHT),
-        ])
-        .split(frame.area());
-
-        self.render_history(frame, layout[0]);
-        let cursor_pos = self.render_input(frame, layout[1]);
-        if popup_h > 0 {
-            self.render_popup(frame, layout[2]);
-        }
-        self.render_status(frame, layout[3]);
-
-        frame.set_cursor_position(cursor_pos);
+        self.render_status(frame, rects.status);
     }
 
     fn render_history(&self, frame: &mut ratatui::Frame, area: Rect) {
@@ -449,19 +442,20 @@ impl App {
             .border_style(Style::default().fg(Color::White));
         let input_inner = input_block.inner(area);
 
-        let prefix_width = welcome::INPUT_PREFIX.chars().count();
+        let prefix_width = input_prefix_width();
         let indent: String = " ".repeat(prefix_width);
-        let buf_lines: Vec<&str> = if self.composer.buffer.is_empty() {
+        let text = self.composer.text();
+        let buf_lines: Vec<&str> = if text.is_empty() {
             vec![""]
         } else {
-            self.composer.buffer.split('\n').collect()
+            text.split('\n').collect()
         };
         let lines: Vec<Line<'static>> = buf_lines
             .iter()
             .enumerate()
             .map(|(i, l)| {
                 let prefix = if i == 0 {
-                    welcome::INPUT_PREFIX
+                    INPUT_PREFIX
                 } else {
                     indent.as_str()
                 };
@@ -472,14 +466,15 @@ impl App {
             })
             .collect();
 
-        let before = &self.composer.buffer[..self.composer.cursor];
-        let cursor_line = before.matches('\n').count() as u16;
-        let line_start = before.rfind('\n').map(|i| i + 1).unwrap_or(0);
-        let cursor_col = before[line_start..].chars().count() as u16;
+        let (cursor_line, cursor_col) = self.composer.cursor_line_col();
+        let cursor_line = cursor_line as u16;
+        let cursor_col = cursor_col as u16;
 
         let visible_rows = input_inner.height;
         let scroll_y = cursor_line.saturating_sub(visible_rows.saturating_sub(1));
-        let para = Paragraph::new(lines).block(input_block).scroll((scroll_y, 0));
+        let para = Paragraph::new(lines)
+            .block(input_block)
+            .scroll((scroll_y, 0));
         frame.render_widget(para, area);
 
         Position::new(
@@ -491,7 +486,7 @@ impl App {
     fn render_popup(&self, frame: &mut ratatui::Frame, area: Rect) {
         let query = self.slash_query().unwrap_or("");
         let matches = slash_matches(query);
-        let muted = Style::default().fg(Color::Indexed(welcome::MUTED_COLOR_INDEX));
+        let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
 
         let lines: Vec<Line<'static>> = if matches.is_empty() {
             vec![Line::from(vec![
@@ -519,133 +514,16 @@ impl App {
     }
 
     fn render_status(&self, frame: &mut ratatui::Frame, area: Rect) {
-        let status_spans = welcome::status_line_spans(&self.launch);
+        let status_spans = chrome::status_line_spans(&self.launch);
         let status_width: u16 = status_spans
             .iter()
             .map(|s| s.width() as u16)
             .sum::<u16>()
             .min(area.width);
-        let bottom = Layout::horizontal([
-            Constraint::Min(0),
-            Constraint::Length(status_width),
-        ])
-        .split(area);
+        let bottom =
+            Layout::horizontal([Constraint::Min(0), Constraint::Length(status_width)]).split(area);
         frame.render_widget(Paragraph::new(self.launch.agent_name.as_str()), bottom[0]);
         frame.render_widget(Paragraph::new(Line::from(status_spans)), bottom[1]);
-    }
-
-    fn insert_char(&mut self, ch: char) {
-        self.composer.buffer.insert(self.composer.cursor, ch);
-        self.composer.cursor += ch.len_utf8();
-    }
-
-    fn delete_left(&mut self) {
-        if self.composer.cursor == 0 {
-            return;
-        }
-        let previous = self.composer.buffer[..self.composer.cursor]
-            .char_indices()
-            .last()
-            .map(|(idx, _)| idx)
-            .unwrap_or(0);
-        self.composer.buffer.drain(previous..self.composer.cursor);
-        self.composer.cursor = previous;
-    }
-
-    fn delete_right(&mut self) {
-        if self.composer.cursor >= self.composer.buffer.len() {
-            return;
-        }
-        let next_len = self.composer.buffer[self.composer.cursor..]
-            .chars()
-            .next()
-            .map(char::len_utf8)
-            .unwrap_or(0);
-        self.composer
-            .buffer
-            .drain(self.composer.cursor..self.composer.cursor + next_len);
-    }
-
-    fn move_left(&mut self) {
-        if self.composer.cursor == 0 {
-            return;
-        }
-        self.composer.cursor = self.composer.buffer[..self.composer.cursor]
-            .char_indices()
-            .last()
-            .map(|(idx, _)| idx)
-            .unwrap_or(0);
-    }
-
-    fn move_right(&mut self) {
-        if self.composer.cursor >= self.composer.buffer.len() {
-            return;
-        }
-        if let Some(next) = self.composer.buffer[self.composer.cursor..].chars().next() {
-            self.composer.cursor += next.len_utf8();
-        }
-    }
-
-    fn move_up(&mut self) {
-        let before = &self.composer.buffer[..self.composer.cursor];
-        let Some(prev_nl) = before.rfind('\n') else {
-            return;
-        };
-        let curr_line_start = prev_nl + 1;
-        let col = before[curr_line_start..].chars().count();
-        let prev_line_end = prev_nl;
-        let prev_line_start = self.composer.buffer[..prev_line_end]
-            .rfind('\n')
-            .map(|i| i + 1)
-            .unwrap_or(0);
-        let prev_line = &self.composer.buffer[prev_line_start..prev_line_end];
-        let target_chars = col.min(prev_line.chars().count());
-        let target_byte = prev_line
-            .char_indices()
-            .nth(target_chars)
-            .map(|(i, _)| i)
-            .unwrap_or(prev_line.len());
-        self.composer.cursor = prev_line_start + target_byte;
-    }
-
-    fn move_down(&mut self) {
-        let buf = &self.composer.buffer;
-        let cursor = self.composer.cursor;
-        let line_start = buf[..cursor].rfind('\n').map(|i| i + 1).unwrap_or(0);
-        let col = buf[line_start..cursor].chars().count();
-        let Some(rel_nl) = buf[cursor..].find('\n') else {
-            return;
-        };
-        let next_line_start = cursor + rel_nl + 1;
-        let next_line_end = buf[next_line_start..]
-            .find('\n')
-            .map(|i| next_line_start + i)
-            .unwrap_or(buf.len());
-        let next_line = &buf[next_line_start..next_line_end];
-        let target_chars = col.min(next_line.chars().count());
-        let target_byte = next_line
-            .char_indices()
-            .nth(target_chars)
-            .map(|(i, _)| i)
-            .unwrap_or(next_line.len());
-        self.composer.cursor = next_line_start + target_byte;
-    }
-
-    fn move_line_start(&mut self) {
-        let line_start = self.composer.buffer[..self.composer.cursor]
-            .rfind('\n')
-            .map(|i| i + 1)
-            .unwrap_or(0);
-        self.composer.cursor = line_start;
-    }
-
-    fn move_line_end(&mut self) {
-        let buf = &self.composer.buffer;
-        let line_end = buf[self.composer.cursor..]
-            .find('\n')
-            .map(|i| self.composer.cursor + i)
-            .unwrap_or(buf.len());
-        self.composer.cursor = line_end;
     }
 }
 
@@ -732,4 +610,29 @@ fn insert_above_viewport(pane_height: u16, lines: &[String]) -> Result<()> {
 
 fn accepts_key(key: &KeyEvent) -> bool {
     matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+}
+
+/// Background task that polls `git status` every `GIT_REFRESH_INTERVAL`
+/// without blocking the event-loop thread. The result lands in `shared`;
+/// the event loop reads it on the next tick.
+fn spawn_git_refresh(
+    cwd: std::path::PathBuf,
+    shared: Arc<Mutex<Option<RepoStatus>>>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(GIT_REFRESH_INTERVAL);
+        // Skip the immediate first tick — `App::new` already populated
+        // the initial status synchronously.
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            let cwd = cwd.clone();
+            let status = tokio::task::spawn_blocking(move || git::repo_status(&cwd).ok().flatten())
+                .await
+                .unwrap_or(None);
+            if let Ok(mut guard) = shared.lock() {
+                *guard = status;
+            }
+        }
+    })
 }

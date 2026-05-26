@@ -66,19 +66,45 @@ fn init_tracing(level: Option<&str>, print_logs: bool) {
     use tracing_subscriber::{EnvFilter, fmt};
 
     let filter = match level {
-        Some(l) => EnvFilter::new(l.to_lowercase()),
+        Some(l) => EnvFilter::try_new(l).unwrap_or_else(|_| EnvFilter::new("warn")),
         None => EnvFilter::try_from_env("COCKPIT_LOG").unwrap_or_else(|_| EnvFilter::new("warn")),
     };
 
-    let builder = fmt().with_env_filter(filter).with_writer(std::io::stderr);
-
     if print_logs {
-        builder.init();
-    } else {
-        // Tracing is silently dropped in interactive mode unless the user
-        // asked for `--print-logs`. Per miscellaneous.md §5 we will also
-        // mirror to a rotating file in `~/.local/state/cockpit/logs/` once
-        // implemented; that wiring goes here.
-        builder.with_writer(std::io::sink).init();
+        fmt()
+            .with_env_filter(filter)
+            .with_writer(std::io::stderr)
+            .init();
+        return;
     }
+
+    // Interactive mode: capture warnings and panics in a file the user
+    // can read after closing the TUI. Per `miscellaneous.md` §5 this will
+    // grow into a rotating logger under `~/.local/state/cockpit/logs/`;
+    // for now a single appended file under the cache dir is enough.
+    match open_log_file() {
+        Some(file) => {
+            fmt()
+                .with_env_filter(filter)
+                .with_ansi(false)
+                .with_writer(std::sync::Mutex::new(file))
+                .init();
+        }
+        None => {
+            fmt()
+                .with_env_filter(filter)
+                .with_writer(std::io::sink)
+                .init();
+        }
+    }
+}
+
+fn open_log_file() -> Option<std::fs::File> {
+    let dir = dirs::cache_dir()?.join("cockpit");
+    std::fs::create_dir_all(&dir).ok()?;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("cockpit.log"))
+        .ok()
 }

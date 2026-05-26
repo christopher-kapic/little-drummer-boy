@@ -9,5 +9,5 @@ pub async fn run(_args: MetaArgs) -> Result<()> {
     //   - ralph_list / ralph_show / ralph_run / ralph_resume / ralph_cancel
     //   - cockpit_subagent(prompt, agent?)
     // See GOALS.md §6.
-    todo!("cockpit meta — meta-harness over other CLIs and ralph loops")
+    anyhow::bail!("cockpit meta is not implemented yet (planned, see GOALS.md §6)")
 }

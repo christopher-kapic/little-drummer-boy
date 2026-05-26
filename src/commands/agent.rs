@@ -3,7 +3,9 @@ use anyhow::Result;
 use crate::cli::AgentCommand;
 
 pub async fn run(_cmd: AgentCommand) -> Result<()> {
-    // `cockpit agent create` and `cockpit agent list`. List walks opencode's
+    // `cockpit agent create` and `cockpit agent list`. List walks cockpit's
     // standard locations plus extended-config `agent_dirs`.
-    todo!("cockpit agent — see opencode-features-review.md §4")
+    anyhow::bail!(
+        "cockpit agent is not implemented yet (planned, see opencode-features-review.md §4)"
+    )
 }

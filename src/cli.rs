@@ -8,6 +8,8 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 
+use crate::agents::AgentMode;
+
 #[derive(Debug, Parser)]
 #[command(
     name = "cockpit",
@@ -167,13 +169,6 @@ pub enum AgentCommand {
     },
     /// List all available agents (project + global + extended `agent_dirs`).
     List,
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-pub enum AgentMode {
-    All,
-    Primary,
-    Subagent,
 }
 
 // ---- providers / models ----

@@ -10,8 +10,8 @@ use crate::cli::InitArgs;
 /// providers. Extended config is created lazily by the cockpit-specific
 /// commands that need it (`cockpit harness add`, `cockpit redact disable`, …).
 pub async fn run(_args: InitArgs) -> Result<()> {
-    todo!(
-        "cockpit init — run an agent to write AGENTS.md (matches opencode /init); \
-         do NOT write extended-config.json here"
+    anyhow::bail!(
+        "cockpit init is not implemented yet (planned: run an agent to write AGENTS.md; \
+         do NOT write extended-config.json here)"
     )
 }

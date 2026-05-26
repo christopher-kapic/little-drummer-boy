@@ -1,5 +1,9 @@
 //! Theme palette + JSON theme loader.
 //!
-//! Mirrors opencode's theme directory layout
-//! (`~/.config/opencode/themes/*.json` + `<project>/.opencode/themes/`).
-//! Built-ins to ship initially: `system`, `tokyonight`, `gruvbox`.
+//! Themes live in `~/.config/cockpit/themes/*.json` plus any
+//! `.cockpit/themes/` on the discovered config path. Built-ins to ship
+//! initially: `system`, `tokyonight`, `gruvbox`.
+
+/// Foreground color index used for muted/secondary text across the TUI
+/// (status line, popup descriptions, help text).
+pub const MUTED_COLOR_INDEX: u8 = 250;
