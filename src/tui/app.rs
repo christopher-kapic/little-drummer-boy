@@ -27,6 +27,7 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::{DefaultTerminal, TerminalOptions, Viewport};
 
 use crate::git::{self, RepoStatus};
+use crate::tui::agent_runner::{self, AgentRunner};
 use crate::tui::chrome;
 use crate::tui::composer::{Composer, INPUT_PREFIX, VimMode, input_prefix_width};
 use crate::tui::geometry::PaneGeometry;
@@ -103,6 +104,11 @@ pub struct App {
     /// Lines emitted by an in-flight `/fetch-models` task. The event
     /// loop drains this each tick and appends to history.
     fetch_models_progress: Arc<Mutex<Vec<String>>>,
+    /// Lazily-initialized agent runner. None until the first user
+    /// submit; populated by [`Self::ensure_agent_runner`]. Stored as
+    /// `Result<AgentRunner, String>` so a failed init keeps the error
+    /// around for next-time visibility.
+    agent_runner: Option<Result<AgentRunner, String>>,
 }
 
 impl App {
@@ -139,6 +145,7 @@ impl App {
             daemon_prompt,
             daemon_connected,
             fetch_models_progress: Arc::new(Mutex::new(Vec::new())),
+            agent_runner: None,
         };
         app.pane_height = app.geometry().desired_pane_height();
         app
@@ -220,6 +227,8 @@ impl App {
         loop {
             self.sync_repo_status();
             self.drain_fetch_progress();
+            self.drain_agent_events();
+            self.sync_active_agent();
             self.dialog.tick();
             self.maybe_grow_pane(terminal)?;
             if self.maybe_spill_history()? {
@@ -484,12 +493,67 @@ impl App {
             };
             self.history.push(format!("{prefix}{line}"));
         }
-        self.history.push(format!(
-            "{}: input captured; provider loop is not wired yet.",
-            self.launch.agent_name
-        ));
+
+        // Lazy-init the agent runner on first submit so a session that
+        // never sends a message doesn't pay the rig+provider setup cost.
+        // On init failure, surface the error once and skip the send.
+        self.ensure_agent_runner();
+        match self.agent_runner.as_ref() {
+            Some(Ok(runner)) => match runner.input_tx.try_send(submitted) {
+                Ok(()) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    self.history.push(
+                        "engine: input queue full — wait for the current turn to finish".to_string(),
+                    );
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    self.history
+                        .push("engine: driver task has exited".to_string());
+                }
+            },
+            Some(Err(e)) => {
+                self.history.push(format!("engine: {e}"));
+            }
+            None => {
+                // ensure_agent_runner always populates Some(_); this arm is unreachable.
+            }
+        }
         self.composer.clear();
         false
+    }
+
+    fn ensure_agent_runner(&mut self) {
+        if self.agent_runner.is_some() {
+            return;
+        }
+        self.agent_runner = Some(agent_runner::try_spawn(&self.launch.cwd));
+    }
+
+    /// Drain any [`TurnEvent`](crate::engine::TurnEvent)s the engine has
+    /// produced into the history pane. Runs each tick.
+    fn drain_agent_events(&mut self) {
+        let Some(Ok(runner)) = self.agent_runner.as_ref() else {
+            return;
+        };
+        let drained = {
+            let mut guard = runner.events.lock().unwrap();
+            std::mem::take(&mut *guard)
+        };
+        for event in drained {
+            for line in agent_runner::format_event(&event) {
+                self.history.push(line);
+            }
+        }
+    }
+
+    fn sync_active_agent(&mut self) {
+        let Some(Ok(runner)) = self.agent_runner.as_ref() else {
+            return;
+        };
+        let name = runner.active_agent.lock().unwrap().clone();
+        if name != self.launch.agent_name {
+            self.launch.agent_name = name;
+        }
     }
 
     fn execute_slash(&mut self, cmd: SlashCommand) -> bool {

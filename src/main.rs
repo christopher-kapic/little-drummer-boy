@@ -15,12 +15,16 @@ mod commands;
 mod config;
 mod credentials;
 mod daemon;
+mod engine;
 mod envref;
 mod git;
 mod harness;
+mod locks;
 mod providers;
 mod redact;
+mod session;
 mod skills;
+mod tools;
 mod tui;
 mod welcome;
 

@@ -12,6 +12,7 @@
 //! battle-tested vim state machine — port the structure rather than
 //! reinventing it.
 
+pub mod agent_runner;
 pub mod app;
 pub mod chat;
 pub mod chrome;
