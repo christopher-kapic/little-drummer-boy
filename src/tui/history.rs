@@ -14,6 +14,17 @@ use chrono::{DateTime, Local};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
+use crate::config::extended::ThinkingDisplay;
+use crate::tui::markdown;
+
+/// Markdown render preferences, threaded from `App` to each
+/// per-entry renderer. Cheap to copy, so we pass by value.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MarkdownOpts {
+    pub agent: bool,
+    pub user: bool,
+}
+
 /// The user's own message and the assistant's response carry
 /// timestamps; engine events (tool calls, errors, subagent
 /// spawn/report) don't — they're scoped within the surrounding
@@ -141,10 +152,20 @@ pub struct Rendered {
 /// Render one history entry. The renderer receives the area's `width`
 /// so it can right-align timestamps and pad the user-message
 /// background to the full width.
-pub fn render_entry(entry: &HistoryEntry, width: u16) -> Rendered {
+///
+/// `thinking` controls how reasoning is surfaced:
+/// - [`ThinkingDisplay::Condensed`] (default) — clickable chip, expands on click
+/// - [`ThinkingDisplay::Hidden`] — drop the chip and reasoning entirely
+/// - [`ThinkingDisplay::Verbose`] — force expanded regardless of the stored flag
+pub fn render_entry(
+    entry: &HistoryEntry,
+    width: u16,
+    thinking: ThinkingDisplay,
+    md: MarkdownOpts,
+) -> Rendered {
     match entry {
         HistoryEntry::User { text, timestamp } => Rendered {
-            lines: render_user(text, *timestamp, width),
+            lines: render_user(text, *timestamp, width, md.user),
             chip_row: None,
         },
         HistoryEntry::Plain { line } => Rendered {
@@ -158,15 +179,27 @@ pub fn render_entry(entry: &HistoryEntry, width: u16) -> Rendered {
             timestamp,
             expanded,
             think_duration,
-        } => render_agent(
-            name,
-            text,
-            reasoning,
-            *timestamp,
-            *expanded,
-            *think_duration,
-            width,
-        ),
+        } => {
+            let effective_reasoning: &str = match thinking {
+                ThinkingDisplay::Hidden => "",
+                ThinkingDisplay::Condensed | ThinkingDisplay::Verbose => reasoning,
+            };
+            let effective_expanded = match thinking {
+                ThinkingDisplay::Verbose => true,
+                ThinkingDisplay::Condensed => *expanded,
+                ThinkingDisplay::Hidden => false,
+            };
+            render_agent(
+                name,
+                text,
+                effective_reasoning,
+                *timestamp,
+                effective_expanded,
+                *think_duration,
+                width,
+                md.agent,
+            )
+        }
     }
 }
 
@@ -194,7 +227,10 @@ pub fn render_pending(msg: &PendingMsg, dots: &str, width: u16) -> Vec<Line<'sta
         return line;
     }
     // Text streaming in — same rendering as Agent (no expansion in
-    // live state; reasoning shown after finalization).
+    // live state; reasoning shown after finalization). Markdown is
+    // disabled mid-stream: partial markdown (`**` without its closer)
+    // emboldens the rest of the buffer until the next chunk arrives —
+    // the visual jitter isn't worth the partial-render win.
     render_agent(
         &msg.name,
         &msg.text,
@@ -203,6 +239,7 @@ pub fn render_pending(msg: &PendingMsg, dots: &str, width: u16) -> Vec<Line<'sta
         false,
         None,
         width,
+        false,
     )
     .lines
 }
@@ -212,7 +249,20 @@ pub fn render_pending(msg: &PendingMsg, dots: &str, width: u16) -> Vec<Line<'sta
 /// border characters carry color. Padding cells inside the box are
 /// kept (so text doesn't slam into the border) but render as plain
 /// spaces.
-fn render_user(text: &str, timestamp: DateTime<Local>, width: u16) -> Vec<Line<'static>> {
+///
+/// When `markdown` is on, the bubble is dropped and we render the text
+/// through the markdown emitter with a left-edge `│` marker — wrapping
+/// styled markdown spans inside a bubble is more trouble than it's
+/// worth for the small visual win.
+fn render_user(
+    text: &str,
+    timestamp: DateTime<Local>,
+    width: u16,
+    markdown: bool,
+) -> Vec<Line<'static>> {
+    if markdown {
+        return render_user_markdown(text, timestamp, width);
+    }
     let area = width as usize;
     let bubble_w = area.saturating_sub(USER_GUTTER * 2).max(4);
     let interior_w = bubble_w.saturating_sub(2);
@@ -265,6 +315,40 @@ fn render_user(text: &str, timestamp: DateTime<Local>, width: u16) -> Vec<Line<'
     out
 }
 
+/// Markdown-styled user message: no bubble, left-edge `│` marker in
+/// the user-message border color, timestamp right-aligned on row 1.
+fn render_user_markdown(text: &str, timestamp: DateTime<Local>, width: u16) -> Vec<Line<'static>> {
+    let bar_style = Style::default().fg(USER_BORDER_FG);
+    let body = markdown::render(text);
+    let ts = format_timestamp(timestamp);
+    let area = width as usize;
+
+    let mut out: Vec<Line<'static>> = Vec::with_capacity(body.len());
+    for (i, line) in body.into_iter().enumerate() {
+        let mut spans: Vec<Span<'static>> = Vec::with_capacity(line.spans.len() + 2);
+        spans.push(Span::styled("│ ".to_string(), bar_style));
+        let body_width: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
+        spans.extend(line.spans);
+        if i == 0 {
+            let used = 2 + body_width;
+            let pad = area
+                .saturating_sub(used + TIMESTAMP_WIDTH + 1)
+                .saturating_add(1);
+            spans.push(Span::raw(" ".repeat(pad)));
+            spans.push(Span::styled(ts.clone(), Style::default().fg(TIMESTAMP_FG)));
+        }
+        out.push(Line::from(spans));
+    }
+    if out.is_empty() {
+        let mut spans: Vec<Span<'static>> = vec![Span::styled("│ ".to_string(), bar_style)];
+        let pad = area.saturating_sub(2 + TIMESTAMP_WIDTH + 1).saturating_add(1);
+        spans.push(Span::raw(" ".repeat(pad)));
+        spans.push(Span::styled(ts, Style::default().fg(TIMESTAMP_FG)));
+        out.push(Line::from(spans));
+    }
+    out
+}
+
 /// Agent reply: `• text...` with timestamp right-aligned, optional
 /// indented reasoning trailing when expanded. The agent name is *not*
 /// rendered per-line — the active-agent indicator in the chrome is the
@@ -278,6 +362,7 @@ fn render_agent(
     expanded: bool,
     think_duration: Option<Duration>,
     width: u16,
+    markdown: bool,
 ) -> Rendered {
     let _ = name;
     let bullet_width: usize = if AGENT_BULLET.is_empty() {
@@ -332,6 +417,15 @@ fn render_agent(
                 .add_modifier(Modifier::DIM | Modifier::UNDERLINED),
         ));
 
+        let body_lines: Vec<Line<'static>> = if markdown {
+            markdown::render(text)
+        } else {
+            wrapped
+                .iter()
+                .map(|chunk| Line::from(vec![Span::raw(format!("{indent}{chunk}"))]))
+                .collect()
+        };
+
         if expanded {
             // Chip alone on row 1; reasoning lines under it (indented
             // four spaces, dimmed); then the agent's text. The user
@@ -346,9 +440,13 @@ fn render_agent(
                     ),
                 ]));
             }
-            for chunk in &wrapped {
-                out.push(Line::from(vec![Span::raw(format!("{indent}{chunk}"))]));
-            }
+            out.extend(body_lines);
+        } else if markdown {
+            // Collapsed + markdown: chip on its own row (folding
+            // markdown spans onto the chip line is more visual jank than
+            // it's worth), body markdown lines follow.
+            out.push(render_first_line_timestamped(chip_spans, timestamp, width, false));
+            out.extend(body_lines);
         } else {
             // Collapsed: chip + first text chunk on the same line so
             // there's no visual blank between the chip and the answer.
@@ -360,6 +458,21 @@ fn render_agent(
             out.push(render_first_line_timestamped(first_line_spans, timestamp, width, false));
             for chunk in wrapped.iter().skip(1) {
                 out.push(Line::from(vec![Span::raw(format!("{indent}{chunk}"))]));
+            }
+        }
+    } else if markdown {
+        // No reasoning + markdown: emit markdown lines, attaching the
+        // timestamp to the first line via right-edge padding.
+        let body = markdown::render(text);
+        if body.is_empty() {
+            out.extend(render_with_timestamp(vec![], timestamp, width));
+        } else {
+            for (i, line) in body.into_iter().enumerate() {
+                if i == 0 {
+                    out.push(render_first_line_with_timestamp(line.spans, timestamp, width));
+                } else {
+                    out.push(line);
+                }
             }
         }
     } else {

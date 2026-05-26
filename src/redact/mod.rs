@@ -33,18 +33,9 @@ const ENV_ALLOWLIST: &[&str] = &[
     "SHELL",
     "TERM",
     "TERM_PROGRAM",
-    "LANG",
-    "LC_ALL",
-    "LC_CTYPE",
     "PWD",
     "OLDPWD",
     "DISPLAY",
-    "XDG_DATA_HOME",
-    "XDG_CONFIG_HOME",
-    "XDG_STATE_HOME",
-    "XDG_CACHE_HOME",
-    "XDG_RUNTIME_DIR",
-    "XDG_SESSION_TYPE",
     "DBUS_SESSION_BUS_ADDRESS",
     "HOSTNAME",
     "LOGNAME",
@@ -59,6 +50,26 @@ const ENV_ALLOWLIST: &[&str] = &[
     "OS",
     "OSTYPE",
 ];
+
+/// Prefix-matched allowlist entries — any env var whose name starts
+/// with one of these is skipped. Covers the `LC_*`, `LANG*`, and `XDG_*`
+/// families called out in the spec.
+const ENV_ALLOWLIST_PREFIXES: &[&str] = &["LC_", "LANG", "XDG_"];
+
+/// `true` when `name` is in the built-in allowlist (exact match or any
+/// prefix family) or in the user's per-config `allowlist`.
+fn is_allowlisted(name: &str, user_allowlist: &[String]) -> bool {
+    if ENV_ALLOWLIST.contains(&name) {
+        return true;
+    }
+    if ENV_ALLOWLIST_PREFIXES
+        .iter()
+        .any(|p| name.starts_with(p))
+    {
+        return true;
+    }
+    user_allowlist.iter().any(|a| a == name)
+}
 
 /// A built lookup of `value → origin-name` pairs the next outbound
 /// request must be scrubbed against. Hold one per session (cheap to
@@ -98,7 +109,7 @@ impl RedactionTable {
 
         if cfg.scan_environment {
             for (name, value) in std::env::vars() {
-                if ENV_ALLOWLIST.contains(&name.as_str()) {
+                if is_allowlisted(&name, &cfg.allowlist) {
                     continue;
                 }
                 if value.len() < cfg.min_secret_length {
@@ -110,10 +121,20 @@ impl RedactionTable {
 
         if cfg.scan_dotenv {
             for path in collect_dotenv_paths(cwd, &cfg.extra_dotenv_paths) {
-                if let Ok(file_entries) = read_dotenv_file(&path, cfg.min_secret_length) {
+                if let Ok(file_entries) =
+                    read_dotenv_file(&path, cfg.min_secret_length, &cfg.allowlist)
+                {
                     entries.extend(file_entries);
                 }
             }
+        }
+
+        // Denylist: forced inclusion even for short / allowlisted values.
+        for v in &cfg.denylist {
+            if v.is_empty() {
+                continue;
+            }
+            entries.push((v.clone(), "$denylist".to_string()));
         }
 
         // Sort longest-first so that overlapping patterns prefer the
@@ -217,14 +238,21 @@ fn collect_dotenv_paths(cwd: &Path, extra: &[PathBuf]) -> Vec<PathBuf> {
 }
 
 /// Parse a `.env` file and yield `(value, "$VAR (file.env)")` pairs
-/// for every entry whose value is at least `min_len` chars.
-fn read_dotenv_file(path: &Path, min_len: usize) -> Result<Vec<(String, String)>> {
+/// for every entry whose value is at least `min_len` chars and whose
+/// name is not in the user's per-config allowlist. Tolerates missing
+/// files by virtue of being called from a guarded site.
+///
+/// We parse by hand rather than going through `dotenvy::from_path_iter`
+/// — that one calls `std::env::set_var` as a side effect on some
+/// versions, which is not what a secret-scan path should do.
+fn read_dotenv_file(
+    path: &Path,
+    min_len: usize,
+    user_allowlist: &[String],
+) -> Result<Vec<(String, String)>> {
     let bytes = std::fs::read(path)?;
     let text = String::from_utf8_lossy(&bytes);
     let mut out: Vec<(String, String)> = Vec::new();
-    // `dotenvy::from_path_iter` returns owned `(String, String)` pairs,
-    // but doing that hits `std::env::set_var` semantics in some
-    // versions; we parse by hand to be safe.
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -235,6 +263,9 @@ fn read_dotenv_file(path: &Path, min_len: usize) -> Result<Vec<(String, String)>
         let (name, value) = line.split_at(eq);
         let name = name.trim().to_string();
         if name.is_empty() {
+            continue;
+        }
+        if is_allowlisted(&name, user_allowlist) {
             continue;
         }
         let value = value[1..].trim();
@@ -272,6 +303,8 @@ mod tests {
             extra_dotenv_paths: vec![],
             min_secret_length: 8,
             placeholder: "***REDACT***".into(),
+            denylist: vec![],
+            allowlist: vec![],
         }
     }
 
@@ -342,6 +375,134 @@ mod tests {
     }
 
     #[test]
+    fn default_placeholder_is_the_explicit_string() {
+        // The user-visible placeholder is part of the spec; if anyone
+        // edits the default, this test fails on purpose.
+        let cfg = RedactConfig::default();
+        assert_eq!(
+            cfg.placeholder,
+            "**REDACTED BY COCKPIT - DO NOT TRY TO OBTAIN BY WORKAROUND**"
+        );
+    }
+
+    #[test]
+    fn env_var_value_redacted_with_default_placeholder() {
+        // Set a dedicated env var and confirm it lands in the table and
+        // gets scrubbed to the default placeholder. Use a value name
+        // unique enough that prior env state can't fight us.
+        let key = "COCKPIT_TEST_SECRET_TOKEN_XYZ";
+        let val = "supersecret-token-value-1234";
+        // SAFETY: tests run single-threaded enough that env mutation
+        // here is acceptable; the same pattern is used elsewhere in the
+        // test suite.
+        unsafe { std::env::set_var(key, val); }
+        let cfg = RedactConfig {
+            enabled: true,
+            scan_environment: true,
+            scan_dotenv: false,
+            extra_dotenv_paths: vec![],
+            min_secret_length: 8,
+            placeholder: RedactConfig::default().placeholder,
+            denylist: vec![],
+            allowlist: vec![],
+        };
+        let dir = TempDir::new().unwrap();
+        let t = RedactionTable::build(&cfg, dir.path()).unwrap();
+        let scrubbed = t.scrub(&format!("the token is {val} ok"));
+        assert!(scrubbed.contains("**REDACTED BY COCKPIT - DO NOT TRY TO OBTAIN BY WORKAROUND**"));
+        assert!(!scrubbed.contains(val));
+        unsafe { std::env::remove_var(key); }
+    }
+
+    #[test]
+    fn short_env_values_not_redacted() {
+        let key = "COCKPIT_TEST_SHORT_VALUE";
+        let val = "abc";
+        unsafe { std::env::set_var(key, val); }
+        let mut cfg = enabled_cfg();
+        cfg.scan_environment = true;
+        cfg.min_secret_length = 8;
+        let dir = TempDir::new().unwrap();
+        let t = RedactionTable::build(&cfg, dir.path()).unwrap();
+        // The 3-char value must not contribute a pattern.
+        assert_eq!(t.scrub("the value is abc here"), "the value is abc here");
+        unsafe { std::env::remove_var(key); }
+    }
+
+    #[test]
+    fn allowlisted_path_not_redacted_even_when_long() {
+        // PATH is almost always long enough to clear min_secret_length;
+        // confirm $PATH (and the LC_/LANG/XDG_ families) are never in
+        // the table even with min_secret_length lowered all the way.
+        // (Other env vars' values may still be substrings of PATH —
+        // that's an inherent property of substring redaction and is
+        // covered by `allowlisted_env_var_names_not_in_table`.)
+        let mut cfg = enabled_cfg();
+        cfg.scan_environment = true;
+        cfg.min_secret_length = 1;
+        let dir = TempDir::new().unwrap();
+        let t = RedactionTable::build(&cfg, dir.path()).unwrap();
+        let origins = t.entries_for_debug();
+        for skipped in ["$PATH", "$HOME", "$LANG", "$LC_ALL", "$XDG_RUNTIME_DIR"] {
+            assert!(
+                !origins.contains(&skipped),
+                "expected allowlisted origin `{skipped}` to be absent"
+            );
+        }
+        for name in ["LC_ALL", "LANG", "XDG_RUNTIME_DIR"] {
+            assert!(
+                is_allowlisted(name, &[]),
+                "expected `{name}` to be allowlisted by prefix"
+            );
+        }
+    }
+
+    #[test]
+    fn denylisted_value_always_redacted_including_short() {
+        let mut cfg = enabled_cfg();
+        cfg.scan_environment = false;
+        cfg.scan_dotenv = false;
+        cfg.min_secret_length = 16; // huge threshold so length can't help
+        cfg.denylist = vec!["sek".into()]; // 3 chars — would normally fail
+        let dir = TempDir::new().unwrap();
+        let t = RedactionTable::build(&cfg, dir.path()).unwrap();
+        let scrubbed = t.scrub("the keyword sek appears here");
+        assert!(scrubbed.contains("***REDACT***"));
+        assert!(!scrubbed.contains(" sek "));
+    }
+
+    #[test]
+    fn denylist_overrides_allowlisted_env_var() {
+        // Even if the user added FOO to the allowlist, putting its
+        // literal value on the denylist forces redaction.
+        let mut cfg = enabled_cfg();
+        cfg.scan_environment = false;
+        cfg.scan_dotenv = false;
+        cfg.denylist = vec!["my-allowlisted-value".into()];
+        cfg.allowlist = vec!["FOO".into()];
+        let dir = TempDir::new().unwrap();
+        let t = RedactionTable::build(&cfg, dir.path()).unwrap();
+        let scrubbed = t.scrub("got my-allowlisted-value back");
+        assert!(scrubbed.contains("***REDACT***"));
+        assert!(!scrubbed.contains("my-allowlisted-value"));
+    }
+
+    #[test]
+    fn user_allowlist_skips_dotenv_entry() {
+        let dir = TempDir::new().unwrap();
+        let env_path = dir.path().join(".env");
+        std::fs::write(&env_path, "USER_TOKEN=very-long-allowed-value\n").unwrap();
+        let mut cfg = enabled_cfg();
+        cfg.scan_dotenv = true;
+        cfg.allowlist = vec!["USER_TOKEN".into()];
+        let t = RedactionTable::build(&cfg, dir.path()).unwrap();
+        assert_eq!(
+            t.scrub("got very-long-allowed-value"),
+            "got very-long-allowed-value"
+        );
+    }
+
+    #[test]
     fn allowlisted_env_var_names_not_in_table() {
         // The allowlist works by *name*: even with scan_environment
         // on, `$PATH`/`$HOME`/`$SHELL` etc. must not contribute
@@ -356,6 +517,8 @@ mod tests {
             extra_dotenv_paths: vec![],
             min_secret_length: 1,
             placeholder: "***".into(),
+            denylist: vec![],
+            allowlist: vec![],
         };
         let dir = TempDir::new().unwrap();
         let t = RedactionTable::build(&cfg, dir.path()).unwrap();

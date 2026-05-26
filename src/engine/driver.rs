@@ -275,6 +275,7 @@ impl Driver {
         crate::engine::builtin::SpawnArgs {
             model: self.stack[0].agent.model.clone(),
             params: self.stack[0].agent.params.clone(),
+            cwd: self.cwd.clone(),
         }
     }
 }

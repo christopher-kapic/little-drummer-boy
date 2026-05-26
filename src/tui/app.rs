@@ -28,7 +28,7 @@ use ratatui::widgets::{Block, Borders, BorderType, Paragraph, Wrap};
 use ratatui::{DefaultTerminal, TerminalOptions, Viewport};
 
 use crate::config::dirs::discover_config_dirs;
-use crate::config::extended::{ExtendedConfig, VimModeSetting};
+use crate::config::extended::{ExtendedConfig, ThinkingDisplay, VimModeSetting};
 use crate::engine::TurnEvent;
 use crate::git::{self, RepoStatus};
 use crate::tui::agent_runner::{self, AgentRunner};
@@ -36,8 +36,8 @@ use crate::tui::chrome;
 use crate::tui::composer::{Composer, INPUT_PREFIX, Operator, VimMode, input_prefix_width};
 use crate::tui::geometry::PaneGeometry;
 use crate::tui::history::{
-    HistoryEntry, PendingMsg, Rendered, render_entry, render_pending, route_text_delta,
-    thinking_dots,
+    HistoryEntry, MarkdownOpts, PendingMsg, Rendered, render_entry, render_pending,
+    route_text_delta, thinking_dots,
 };
 use crate::tui::settings::{self, Dialog};
 use crate::tui::theme::MUTED_COLOR_INDEX;
@@ -48,6 +48,12 @@ const MAX_INPUT_CONTENT: u16 = 6;
 const INPUT_BORDER: u16 = 2;
 const GIT_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const EVENT_TICK: Duration = Duration::from_millis(100);
+
+/// Max suggestion rows the slash / @ autocomplete popup ever takes.
+/// When fewer matches exist, the popup pads with blank lines so the
+/// composer doesn't visibly shift as the user types and the candidate
+/// set narrows. Keeps layout pinned to a 6-row reservation.
+pub(crate) const AUTOCOMPLETE_ROWS: u16 = 6;
 
 #[derive(Clone, Copy)]
 struct SlashCommand {
@@ -92,6 +98,13 @@ pub struct App {
     /// User's vim_mode setting (hint/enabled/disabled). Drives whether
     /// the Normal-mode hint chip is shown.
     vim_setting: VimModeSetting,
+    /// User's thinking-display setting. Drives whether the chip is shown
+    /// and whether reasoning is rendered inline.
+    thinking_setting: ThinkingDisplay,
+    /// User's markdown-rendering preferences. Threaded into each
+    /// `render_entry` call so the renderer can pick the markdown path
+    /// per kind of entry.
+    markdown_opts: MarkdownOpts,
     /// Messages typed and submitted while an agent turn is in flight.
     /// Mirrors the daemon's queue (GOALS §1c) for display; the daemon
     /// is the source of truth — these get cleared on `ThinkingStarted`
@@ -149,6 +162,14 @@ pub struct App {
     /// terminals tolerate redundant `SetCursorStyle` writes but a few
     /// blink visibly).
     last_cursor_shape: Option<CursorShape>,
+    /// Highlighted index in the `@`-popup. Reset to 0 whenever the
+    /// composer's at-query changes; bumped by Up/Down while the popup
+    /// is open.
+    at_selected: usize,
+    /// True once the user dismissed the `@`-popup with `Esc`. Stays
+    /// suppressed until the active `@partial` token is dropped (e.g.
+    /// whitespace appears after `@` or the `@` is deleted).
+    at_dismissed: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -165,7 +186,13 @@ enum CursorShape {
 impl App {
     pub fn new(project: Option<&Path>) -> Self {
         let launch = welcome::load(project);
-        let vim_setting = load_tui_vim_setting(&launch.cwd);
+        let tui_cfg = load_tui_config(&launch.cwd);
+        let vim_setting = tui_cfg.vim_mode;
+        let thinking_setting = tui_cfg.thinking;
+        let markdown_opts = MarkdownOpts {
+            agent: tui_cfg.render_agent_markdown,
+            user: tui_cfg.render_user_markdown,
+        };
         let mut composer = Composer::new(vim_setting.vim_enabled());
         // We start in Insert mode regardless — landing in Normal on
         // first keystroke is jarring for users new to the TUI. The
@@ -194,6 +221,8 @@ impl App {
             launch,
             composer,
             vim_setting,
+            thinking_setting,
+            markdown_opts,
             queue: Vec::new(),
             history: Vec::new(),
             pending: None,
@@ -209,6 +238,8 @@ impl App {
             chat_area: None,
             clickable_rows: Vec::new(),
             last_cursor_shape: None,
+            at_selected: 0,
+            at_dismissed: false,
         };
         app.pane_height = app.geometry().desired_pane_height();
         app
@@ -554,6 +585,38 @@ impl App {
     }
 
     fn handle_key_insert(&mut self, key: KeyEvent) -> bool {
+        // `@`-popup intercepts navigation + accept keys when active.
+        if self.at_popup_active() {
+            match key.code {
+                KeyCode::Esc => {
+                    self.at_dismissed = true;
+                    self.at_selected = 0;
+                    return false;
+                }
+                KeyCode::Up => {
+                    let n = self.at_suggestions().len();
+                    if n > 0 {
+                        self.at_selected = (self.at_selected + n - 1) % n;
+                    }
+                    return false;
+                }
+                KeyCode::Down => {
+                    let n = self.at_suggestions().len();
+                    if n > 0 {
+                        self.at_selected = (self.at_selected + 1) % n;
+                    }
+                    return false;
+                }
+                KeyCode::Tab | KeyCode::Enter => {
+                    if self.accept_at_suggestion() {
+                        return false;
+                    }
+                    // Fall through to default Enter handling if accept
+                    // failed (e.g. no suggestions to take).
+                }
+                _ => {}
+            }
+        }
         match key.code {
             KeyCode::Esc => {
                 // Esc cancels an in-progress slash command. Otherwise:
@@ -574,6 +637,7 @@ impl App {
                     || key.modifiers.contains(KeyModifiers::ALT)
                 {
                     self.composer.insert_char('\n');
+                    self.refresh_at_dismiss();
                     false
                 } else {
                     self.complete_or_submit()
@@ -591,10 +655,12 @@ impl App {
             }
             KeyCode::Backspace => {
                 self.composer.delete_left();
+                self.refresh_at_dismiss();
                 false
             }
             KeyCode::Delete => {
                 self.composer.delete_right();
+                self.refresh_at_dismiss();
                 false
             }
             KeyCode::Left => {
@@ -623,10 +689,43 @@ impl App {
             }
             KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.composer.insert_char(ch);
+                self.refresh_at_dismiss();
+                self.at_selected = 0;
                 false
             }
             _ => false,
         }
+    }
+
+    /// If the composer no longer has an active `@partial` token, clear
+    /// the dismissal latch so the next `@` reopens the popup. Otherwise
+    /// (token still present) keep the existing state untouched.
+    fn refresh_at_dismiss(&mut self) {
+        if self.composer.at_query().is_none() {
+            self.at_dismissed = false;
+            self.at_selected = 0;
+        }
+    }
+
+    /// Accept the currently-highlighted `@`-suggestion: replace the
+    /// active `@partial` with the chosen path (trailing `/` for dirs).
+    /// Returns true if a replacement was applied.
+    fn accept_at_suggestion(&mut self) -> bool {
+        let suggestions = self.at_suggestions();
+        if suggestions.is_empty() {
+            return false;
+        }
+        let idx = self.at_selected.min(suggestions.len() - 1);
+        let sug = &suggestions[idx];
+        self.composer.replace_at_token(&sug.replacement);
+        self.at_selected = 0;
+        // If this was a file, the popup auto-closes (no further token to
+        // expand). For directories we leave the `@dir/` open so the user
+        // can keep narrowing — `at_query` will return the new partial.
+        if !sug.is_dir {
+            self.at_dismissed = true;
+        }
+        true
     }
 
     fn handle_key_normal(&mut self, key: KeyEvent) -> bool {
@@ -832,6 +931,11 @@ impl App {
             return false;
         }
 
+        // Expand any `@path[:range]` tags into fenced file/dir blocks
+        // before dispatch (GOALS §1e). The displayed user message keeps
+        // the original `@`-form; only the wire payload gets inlined.
+        let wire = crate::tui::file_tag::expand_tags(&submitted, &self.launch.cwd);
+
         // If a turn is in flight, the daemon will queue this message
         // and fold it into the next inference call (GOALS §1c). Track
         // it locally so the user sees what's pending; cleared when the
@@ -849,7 +953,7 @@ impl App {
 
         self.ensure_agent_runner();
         match self.agent_runner.as_ref() {
-            Some(Ok(runner)) => match runner.input_tx.try_send(submitted) {
+            Some(Ok(runner)) => match runner.input_tx.try_send(wire) {
                 Ok(()) => {}
                 Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                     self.history.push(HistoryEntry::Plain {
@@ -871,6 +975,8 @@ impl App {
             None => {}
         }
         self.composer.clear();
+        self.at_dismissed = false;
+        self.at_selected = 0;
         // Re-enter Normal mode on submit when vim is enabled, so the
         // composer is ready to be navigated without typing into it.
         // Mirror Insert otherwise.
@@ -1296,12 +1402,27 @@ impl App {
         Some(&rest[..end])
     }
 
-    fn popup_lines(&self) -> u16 {
-        match self.slash_query() {
-            Some(q) => slash_matches(q).len().max(1) as u16,
-            None if self.show_vim_hint() => 1,
-            None => 0,
+    /// True when the `@`-popup should be drawn: the composer reports an
+    /// active `@partial` token and the user hasn't dismissed it via Esc.
+    fn at_popup_active(&self) -> bool {
+        !self.at_dismissed && self.composer.at_query().is_some()
+    }
+
+    fn at_suggestions(&self) -> Vec<crate::tui::file_tag::Suggestion> {
+        match self.composer.at_query() {
+            Some(q) => crate::tui::file_tag::suggestions(&self.launch.cwd, q),
+            None => Vec::new(),
         }
+    }
+
+    fn popup_lines(&self) -> u16 {
+        if self.slash_query().is_some() || self.at_popup_active() {
+            // Always reserve `AUTOCOMPLETE_ROWS` while either popup is
+            // active; the renderer pads with blanks so the composer
+            // doesn't shift as the candidate set narrows.
+            return AUTOCOMPLETE_ROWS;
+        }
+        if self.show_vim_hint() { 1 } else { 0 }
     }
 
     /// True when the Normal-mode hint chip should occupy the popup
@@ -1507,7 +1628,8 @@ impl App {
         // chip occupies row `i` of `all`, or `None` otherwise.
         let mut targets: Vec<Option<usize>> = Vec::new();
         for (idx, entry) in self.history.iter().enumerate() {
-            let Rendered { lines, chip_row } = render_entry(entry, area.width);
+            let Rendered { lines, chip_row } =
+                render_entry(entry, area.width, self.thinking_setting, self.markdown_opts);
             let chip_abs = chip_row.map(|cr| all.len() + cr);
             for i in 0..lines.len() {
                 targets.push(if Some(all.len() + i) == chip_abs {
@@ -1697,6 +1819,11 @@ impl App {
     }
 
     fn render_popup(&self, frame: &mut ratatui::Frame, area: Rect) {
+        // `@`-popup takes precedence over the vim hint when active.
+        if self.at_popup_active() {
+            self.render_at_popup(frame, area);
+            return;
+        }
         // Vim hint preempts the popup when the composer is in Normal
         // mode and the user hasn't opted out via the vim_mode setting.
         if self.slash_query().is_none() {
@@ -1718,10 +1845,13 @@ impl App {
             return;
         }
         let query = self.slash_query().unwrap_or("");
-        let matches = slash_matches(query);
+        let mut matches = slash_matches(query);
+        // Cap to the autocomplete-rows budget; pad blanks below so the
+        // popup keeps a stable 6-row footprint regardless of match count.
+        matches.truncate(AUTOCOMPLETE_ROWS as usize);
         let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
 
-        let lines: Vec<Line<'static>> = if matches.is_empty() {
+        let mut lines: Vec<Line<'static>> = if matches.is_empty() {
             vec![Line::from(vec![
                 Span::raw("  "),
                 Span::styled("no matching command", Style::default().fg(Color::Red)),
@@ -1749,6 +1879,47 @@ impl App {
                 })
                 .collect()
         };
+        while (lines.len() as u16) < AUTOCOMPLETE_ROWS {
+            lines.push(Line::default());
+        }
+        frame.render_widget(Paragraph::new(lines), area);
+    }
+
+    fn render_at_popup(&self, frame: &mut ratatui::Frame, area: Rect) {
+        let suggestions = self.at_suggestions();
+        let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+        let mut lines: Vec<Line<'static>> = if suggestions.is_empty() {
+            vec![Line::from(vec![
+                Span::raw("  "),
+                Span::styled("no matching file", Style::default().fg(Color::Red)),
+            ])]
+        } else {
+            let selected = self.at_selected.min(suggestions.len().saturating_sub(1));
+            suggestions
+                .iter()
+                .take(AUTOCOMPLETE_ROWS as usize)
+                .enumerate()
+                .map(|(i, sug)| {
+                    let is_sel = i == selected;
+                    let marker = if is_sel { "▸ " } else { "  " };
+                    let name_style = if is_sel {
+                        Style::default().fg(Color::Yellow)
+                    } else {
+                        Style::default().fg(Color::White)
+                    };
+                    let kind = if sug.is_dir { "dir" } else { "file" };
+                    Line::from(vec![
+                        Span::raw(marker),
+                        Span::styled(format!("@{}", sug.display), name_style),
+                        Span::raw("  "),
+                        Span::styled(kind.to_string(), muted),
+                    ])
+                })
+                .collect()
+        };
+        while (lines.len() as u16) < AUTOCOMPLETE_ROWS {
+            lines.push(Line::default());
+        }
         frame.render_widget(Paragraph::new(lines), area);
     }
 
@@ -1997,20 +2168,21 @@ fn accepts_key(key: &KeyEvent) -> bool {
     matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
 }
 
-/// Walk the layered-config discovery and return the `tui.vim_mode`
-/// setting from the first `extended-config.json` we find. Defaults to
-/// `Hint` when no config exists or the file is unreadable / malformed
-/// (mirroring the rest of `extended.rs`'s tolerant loading).
-fn load_tui_vim_setting(cwd: &Path) -> VimModeSetting {
+/// Walk the layered-config discovery and return the `tui` slice from
+/// the first `extended-config.json` we find. Defaults to
+/// [`crate::config::extended::TuiConfig::default`] when no config
+/// exists or the file is unreadable / malformed (mirroring the rest of
+/// `extended.rs`'s tolerant loading).
+fn load_tui_config(cwd: &Path) -> crate::config::extended::TuiConfig {
     for dir in discover_config_dirs(cwd) {
         let path = dir.path.join("extended-config.json");
         if let Ok(bytes) = std::fs::read(&path)
             && let Ok(cfg) = serde_json::from_slice::<ExtendedConfig>(&bytes)
         {
-            return cfg.tui.vim_mode;
+            return cfg.tui;
         }
     }
-    VimModeSetting::default()
+    crate::config::extended::TuiConfig::default()
 }
 
 /// Background task that polls `git status` every `GIT_REFRESH_INTERVAL`

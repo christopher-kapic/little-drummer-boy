@@ -6,13 +6,17 @@
 //! agents go through [`crate::agents`] / `agent_dirs`; they're the
 //! extension path.
 
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Result, bail};
 
+use crate::config::dirs::discover_config_dirs;
+use crate::config::extended::{ExtendedConfigDoc, ToolCommandTemplate};
 use crate::engine::agent::Agent;
 use crate::engine::model::{Model, ModelParams};
 use crate::engine::tool::ToolBox;
+use crate::tools::custom::CustomBashTool;
 
 /// Embedded prompt for `orchestrator-build`. The frontmatter is
 /// authored opencode-style for forward-compat with [`crate::agents`]
@@ -27,6 +31,39 @@ const EXPLORE_PROMPT: &str = include_str!("explore.md");
 pub struct SpawnArgs {
     pub model: Arc<Model>,
     pub params: ModelParams,
+    /// Session cwd — used to discover the layered `extended-config.json`
+    /// so user-defined custom-bash tools (`webfetch`, `websearch`, …)
+    /// land on the toolbox for agents that should see them.
+    pub cwd: std::path::PathBuf,
+}
+
+/// Load user-defined custom-bash tools from the first `extended-config.json`
+/// on the layered-config path and append them to `tb`. Falls back to the
+/// shipped defaults for any built-in tool name the user hasn't configured.
+/// Disabled rows and empty commands are skipped.
+fn with_custom_tools(mut tb: ToolBox, cwd: &Path) -> ToolBox {
+    let cfg = discover_config_dirs(cwd)
+        .into_iter()
+        .find_map(|d| ExtendedConfigDoc::load(&d.path.join("extended-config.json")).ok())
+        .map(|d| d.config())
+        .unwrap_or_default();
+
+    for (name, tpl) in cfg.tools.iter() {
+        if !tpl.enabled || tpl.command.trim().is_empty() {
+            continue;
+        }
+        tb = tb.with(Arc::new(CustomBashTool::from_template(name, tpl)));
+    }
+    for name in crate::tui::settings::builtin_tool_names() {
+        if cfg.tools.contains_key(*name) {
+            continue;
+        }
+        let tpl: ToolCommandTemplate = crate::tui::settings::default_template_for(name);
+        if tpl.enabled && !tpl.command.trim().is_empty() {
+            tb = tb.with(Arc::new(CustomBashTool::from_template(name, &tpl)));
+        }
+    }
+    tb
 }
 
 /// Build a built-in agent by name. Returns `Err` for unknown names so
@@ -53,12 +90,15 @@ pub fn is_noninteractive(name: &str) -> bool {
 /// when the focus is *making the change* (GOALS §3a). Delegates writes
 /// to `coder` via `task`.
 pub fn orchestrator_build(args: &SpawnArgs) -> Agent {
-    let tools = ToolBox::new()
-        .with(Arc::new(crate::tools::read::ReadTool))
-        .with(Arc::new(crate::tools::bash::BashTool::new()))
-        .with(Arc::new(crate::tools::task::TaskTool::with_subagents(&[
-            "coder", "explore",
-        ])));
+    let tools = with_custom_tools(
+        ToolBox::new()
+            .with(Arc::new(crate::tools::read::ReadTool))
+            .with(Arc::new(crate::tools::bash::BashTool::new()))
+            .with(Arc::new(crate::tools::task::TaskTool::with_subagents(&[
+                "coder", "explore",
+            ]))),
+        &args.cwd,
+    );
 
     Agent {
         name: "orchestrator-build".to_string(),
@@ -99,9 +139,12 @@ pub fn coder(args: &SpawnArgs) -> Agent {
 /// as the tool result. The user sees the call rendered like any other
 /// tool in the orchestrator's history.
 pub fn explore(args: &SpawnArgs) -> Agent {
-    let tools = ToolBox::new()
-        .with(Arc::new(crate::tools::read::ReadTool))
-        .with(Arc::new(crate::tools::bash::BashTool::new()));
+    let tools = with_custom_tools(
+        ToolBox::new()
+            .with(Arc::new(crate::tools::read::ReadTool))
+            .with(Arc::new(crate::tools::bash::BashTool::new())),
+        &args.cwd,
+    );
 
     Agent {
         name: "explore".to_string(),

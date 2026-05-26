@@ -52,6 +52,10 @@ pub struct LaunchInfo {
     pub cwd_display: String,
     pub repo_status: Option<RepoStatus>,
     pub agent_name: String,
+    /// User's configured display name from `extended-config.json`.
+    /// When `Some`, the splash renders `Welcome, {name}` between the
+    /// title and provider lines.
+    pub user_name: Option<String>,
 }
 
 pub fn load(project: Option<&Path>) -> LaunchInfo {
@@ -69,6 +73,7 @@ pub fn load(project: Option<&Path>) -> LaunchInfo {
         .as_ref()
         .and_then(|(p, m)| lookup_model_context(&cwd, p, m));
     let repo_status = git::repo_status(&cwd).ok().flatten();
+    let user_name = load_user_name(&cwd);
 
     LaunchInfo {
         version: env!("CARGO_PKG_VERSION"),
@@ -80,7 +85,28 @@ pub fn load(project: Option<&Path>) -> LaunchInfo {
         cwd,
         repo_status,
         agent_name: DEFAULT_AGENT.to_string(),
+        user_name,
     }
+}
+
+/// Walk the layered-config discovery and return the `name` field from
+/// the first `extended-config.json` we find with one set. `None` falls
+/// through to the splash omitting the welcome line.
+fn load_user_name(cwd: &Path) -> Option<String> {
+    use crate::config::dirs::discover_config_dirs;
+    use crate::config::extended::ExtendedConfigDoc;
+    for dir in discover_config_dirs(cwd) {
+        let path = dir.path.join("extended-config.json");
+        if let Ok(doc) = ExtendedConfigDoc::load(&path) {
+            let cfg = doc.config();
+            if let Some(name) = cfg.name.as_deref()
+                && !name.trim().is_empty()
+            {
+                return Some(name.trim().to_string());
+            }
+        }
+    }
+    None
 }
 
 /// Walk the discovered config layers looking for the active model's
@@ -145,13 +171,33 @@ pub fn print(project: Option<&Path>) {
 /// 2-space text indent.
 pub fn print_header(info: &LaunchInfo) {
     let title = format!("{BOLD}{APP_NAME}{RESET} {GREY}v{}{RESET}", info.version);
-    println!("{}   {}", P51_ANSI_LINES[0], title);
-    println!(
-        "{}   {GREY}{}{RESET}",
-        P51_ANSI_LINES[1], info.provider_line
-    );
-    println!("{}   {}", P51_ANSI_LINES[2], path_line_ansi(info));
-    println!("{}", P51_ANSI_LINES[3]);
+    match info.user_name.as_deref() {
+        Some(name) if !name.is_empty() => {
+            // Shift the existing content down by one row so the welcome
+            // line slots in between the title and the provider line.
+            // All four logo rows carry text; the trailing empty-art row
+            // is sacrificed since the logo is only four lines tall.
+            println!("{}   {}", P51_ANSI_LINES[0], title);
+            println!(
+                "{}   {GREY}Welcome, {BOLD}{name}{RESET}",
+                P51_ANSI_LINES[1]
+            );
+            println!(
+                "{}   {GREY}{}{RESET}",
+                P51_ANSI_LINES[2], info.provider_line
+            );
+            println!("{}   {}", P51_ANSI_LINES[3], path_line_ansi(info));
+        }
+        _ => {
+            println!("{}   {}", P51_ANSI_LINES[0], title);
+            println!(
+                "{}   {GREY}{}{RESET}",
+                P51_ANSI_LINES[1], info.provider_line
+            );
+            println!("{}   {}", P51_ANSI_LINES[2], path_line_ansi(info));
+            println!("{}", P51_ANSI_LINES[3]);
+        }
+    }
 }
 
 fn resolve_launch_dir(project: Option<&Path>) -> PathBuf {

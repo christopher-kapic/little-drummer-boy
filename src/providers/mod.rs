@@ -106,6 +106,19 @@ pub const TEMPLATES: &[ProviderTemplate] = &[
         ),
         use_id_as_default: true,
     },
+    ProviderTemplate {
+        id: "copilot",
+        display: "GitHub Copilot",
+        url: "https://api.githubcopilot.com",
+        auth: AuthKind::DeviceFlow,
+        default_env_var: None,
+        default_headers: &[],
+        supports_models_endpoint: true,
+        hint: Some(
+            "GitHub Copilot uses a GitHub device-code OAuth flow. You'll need an active Copilot subscription.",
+        ),
+        use_id_as_default: true,
+    },
 ];
 
 pub fn template_by_id(id: &str) -> Option<&'static ProviderTemplate> {

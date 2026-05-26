@@ -17,6 +17,7 @@
 //! - [`task`] — structural; the engine intercepts this name.
 
 pub mod bash;
+pub mod custom;
 pub mod editunlock;
 pub mod read;
 pub mod readlock;

@@ -38,6 +38,9 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use crate::config::dirs::{
     ConfigDir, ConfigDirKind, creatable_config_dirs, discover_config_dirs, scaffold_config_dir,
 };
+use crate::config::extended::{
+    ExtendedConfig, ExtendedConfigDoc, ThinkingDisplay, ToolCommandTemplate, VimModeSetting,
+};
 use crate::config::providers::{
     ConfigDoc, HeaderSpec, OnUnlistedModelsFetch, ProviderEntry, ProvidersConfig,
 };
@@ -69,17 +72,56 @@ pub enum Dialog {
 
 pub struct SettingsDialog {
     pub config_path: PathBuf,
+    /// Path to the sibling `extended-config.json`. Loaded lazily when
+    /// the UI / Tools pages open; saved on each edit there.
+    extended_path: PathBuf,
     page: Page,
     /// Cached config state; reloaded on entry into the Providers list
     /// and after each successful save.
     config: ProvidersConfig,
+    /// Cached `extended-config.json` state. Read by the UI page and the
+    /// Tools page; written back on each edit.
+    extended: ExtendedConfig,
 }
 
 enum Page {
     Root { cursor: usize },
     Agents,
-    Tools,
+    Tools(ToolsPage),
     Providers(ProvidersPage),
+    Ui(UiPage),
+}
+
+/// `/settings → UI` state.
+struct UiPage {
+    cursor: usize,
+    /// `Some(field)` when the user is inline-editing a text field.
+    editing: Option<UiField>,
+    buf: TextField,
+    status: Option<String>,
+}
+
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum UiField {
+    Name,
+    PackagesDir,
+}
+
+/// `/settings → Tools` state. Edits the user-defined bash-command
+/// templates under `extended-config.tools`.
+struct ToolsPage {
+    cursor: usize,
+    editing: Option<ToolField>,
+    buf: TextField,
+    /// Which tool's row is being edited, when `editing` is `Some`.
+    edit_target: Option<String>,
+    status: Option<String>,
+}
+
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum ToolField {
+    Command,
+    Description,
 }
 
 enum ProvidersPage {
@@ -104,8 +146,11 @@ struct AddState {
     headers: HeaderEditor,
     /// Active OAuth device-flow attempt, when the picked template uses
     /// `AuthKind::DeviceFlow`. Replaces the URL/Headers steps for
-    /// those templates.
+    /// those templates. Exactly one of `codex_login` / `copilot_login`
+    /// is `Some(_)` during the [`AddStep::CodexLogin`] step, selected
+    /// by the template's `id`.
     codex_login: Option<CodexLoginState>,
+    copilot_login: Option<CopilotLoginState>,
     error: Option<String>,
     fetch: Option<FetchHandle>,
     saved_provider_id: Option<String>,
@@ -121,7 +166,8 @@ enum AddStep {
     EditUrl,
     /// Add/remove HTTP headers (`Authorization: Bearer $TOKEN`, etc.).
     EditHeaders,
-    /// Run the codex device-code OAuth flow. Lives in `s.codex_login`.
+    /// Run a device-code OAuth flow (codex or copilot, dispatched on
+    /// template id). Lives in `s.codex_login` or `s.copilot_login`.
     /// Reached directly after EditId when the template's auth is
     /// `DeviceFlow`.
     CodexLogin,
@@ -461,6 +507,82 @@ fn set(shared: &Arc<Mutex<CodexLoginProgress>>, value: CodexLoginProgress) {
     }
 }
 
+/// Copilot device-code OAuth login state. Mirrors [`CodexLoginState`];
+/// kept as a sibling rather than a single generic type so each flow can
+/// evolve independently (the copilot flow has an extra internal-token
+/// swap step that may grow its own progress messages).
+pub struct CopilotLoginState {
+    shared: Arc<Mutex<CopilotLoginProgress>>,
+}
+
+#[derive(Clone)]
+pub enum CopilotLoginProgress {
+    /// POSTing to the device-code endpoint.
+    Requesting,
+    /// Server returned a user code; waiting for the user to authorize
+    /// and for the poll + token-swap to complete.
+    AwaitingUser {
+        verification_url: String,
+        user_code: String,
+    },
+    /// Persisted; the dialog can finalize the ProviderEntry.
+    Success {
+        saved_at: chrono::DateTime<chrono::Utc>,
+    },
+    /// Flow failed at any step. The dialog should show the message
+    /// and let the user retry.
+    Error(String),
+}
+
+impl CopilotLoginState {
+    pub fn spawn() -> Self {
+        let cfg = crate::auth::copilot::LoginConfig::default();
+        Self::spawn_with(cfg)
+    }
+
+    pub fn spawn_with(cfg: crate::auth::copilot::LoginConfig) -> Self {
+        let shared = Arc::new(Mutex::new(CopilotLoginProgress::Requesting));
+        let w = Arc::clone(&shared);
+        tokio::spawn(async move {
+            match crate::auth::copilot::request_device_code(&cfg).await {
+                Err(e) => set_copilot(&w, CopilotLoginProgress::Error(e.to_string())),
+                Ok(device) => {
+                    set_copilot(
+                        &w,
+                        CopilotLoginProgress::AwaitingUser {
+                            verification_url: device.verification_url.clone(),
+                            user_code: device.user_code.clone(),
+                        },
+                    );
+                    match crate::auth::copilot::complete_login(&cfg, &device).await {
+                        Err(e) => set_copilot(&w, CopilotLoginProgress::Error(e.to_string())),
+                        Ok(stored) => set_copilot(
+                            &w,
+                            CopilotLoginProgress::Success {
+                                saved_at: stored.saved_at,
+                            },
+                        ),
+                    }
+                }
+            }
+        });
+        Self { shared }
+    }
+
+    pub fn snapshot(&self) -> CopilotLoginProgress {
+        self.shared
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or(CopilotLoginProgress::Error("poisoned login state".into()))
+    }
+}
+
+fn set_copilot(shared: &Arc<Mutex<CopilotLoginProgress>>, value: CopilotLoginProgress) {
+    if let Ok(mut g) = shared.lock() {
+        *g = value;
+    }
+}
+
 /// Shared cell for an in-flight `/models` fetch. The background task
 /// writes the result; the event loop polls it on each tick.
 #[derive(Clone)]
@@ -602,11 +724,35 @@ impl SettingsDialog {
         let config = ConfigDoc::load(&config_path)
             .map(|d| d.providers())
             .unwrap_or_default();
+        let extended_path = config_path
+            .parent()
+            .map(|p| p.join("extended-config.json"))
+            .unwrap_or_else(|| PathBuf::from("extended-config.json"));
+        let extended = ExtendedConfigDoc::load(&extended_path)
+            .map(|d| d.config())
+            .unwrap_or_default();
         Self {
             config_path,
+            extended_path,
             page: Page::Root { cursor: 0 },
             config,
+            extended,
         }
+    }
+
+    /// Reload extended-config from disk. Used after saving so the
+    /// cached view stays in sync.
+    fn reload_extended(&mut self) {
+        if let Ok(doc) = ExtendedConfigDoc::load(&self.extended_path) {
+            self.extended = doc.config();
+        }
+    }
+
+    /// Persist the cached extended-config to disk.
+    fn save_extended(&mut self) -> Result<(), String> {
+        let mut doc = ExtendedConfigDoc::load(&self.extended_path).map_err(|e| e.to_string())?;
+        doc.write(&self.extended).map_err(|e| e.to_string())?;
+        Ok(())
     }
 
     fn enter_providers(&mut self) {
@@ -648,6 +794,8 @@ impl SettingsDialog {
 
     /// If the Add wizard is on the CodexLogin step and the device-flow
     /// background task has finished, finalize the provider entry.
+    /// Dispatches on whichever login state is `Some(_)` (codex or
+    /// copilot).
     fn advance_codex_login(&mut self) {
         let Page::Providers(ProvidersPage::Add(s)) = &mut self.page else {
             return;
@@ -655,6 +803,17 @@ impl SettingsDialog {
         if !matches!(s.step, AddStep::CodexLogin) {
             return;
         }
+        if s.copilot_login.is_some() {
+            self.advance_copilot_login();
+        } else {
+            self.advance_codex_login_inner();
+        }
+    }
+
+    fn advance_codex_login_inner(&mut self) {
+        let Page::Providers(ProvidersPage::Add(s)) = &mut self.page else {
+            return;
+        };
         let snap = match &s.codex_login {
             Some(c) => c.snapshot(),
             None => return,
@@ -693,6 +852,48 @@ impl SettingsDialog {
                 // Nothing to advance yet; the renderer reads the
                 // snapshot on its own.
             }
+        }
+    }
+
+    fn advance_copilot_login(&mut self) {
+        let Page::Providers(ProvidersPage::Add(s)) = &mut self.page else {
+            return;
+        };
+        let snap = match &s.copilot_login {
+            Some(c) => c.snapshot(),
+            None => return,
+        };
+        match snap {
+            CopilotLoginProgress::Success { saved_at } => {
+                let template = s.template.expect("template chosen");
+                let id = s.id_field.text().trim().to_string();
+                let entry = ProviderEntry {
+                    name: Some(template.display.to_string()),
+                    url: template.url.trim_end_matches('/').to_string(),
+                    headers: Vec::new(),
+                    models_fetched_at: None,
+                    favorite: None,
+                    credential_ref: Some("copilot".to_string()),
+                    auth: Some(crate::config::providers::AuthKind::DeviceFlow),
+                    models: Vec::new(),
+                };
+                self.config.providers.insert(id.clone(), entry);
+                let msg = match self.save_config() {
+                    Ok(()) => format!(
+                        "copilot: logged in (saved {}); provider `{id}` added",
+                        saved_at.format("%Y-%m-%d %H:%M UTC")
+                    ),
+                    Err(e) => format!("copilot: logged in but config write failed: {e}"),
+                };
+                if let Page::Providers(ProvidersPage::Add(s)) = &mut self.page {
+                    s.error = Some(msg);
+                    s.copilot_login = None;
+                    s.step = AddStep::Done;
+                }
+            }
+            CopilotLoginProgress::Error(_)
+            | CopilotLoginProgress::Requesting
+            | CopilotLoginProgress::AwaitingUser { .. } => {}
         }
     }
 
@@ -744,7 +945,7 @@ impl SettingsDialog {
             return self.handle_root_key(key, cursor);
         }
         match &self.page {
-            Page::Agents | Page::Tools => {
+            Page::Agents => {
                 if matches!(
                     key.code,
                     KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') | KeyCode::Backspace
@@ -757,6 +958,8 @@ impl SettingsDialog {
                     false
                 }
             }
+            Page::Tools(_) => self.handle_tools_key(key),
+            Page::Ui(_) => self.handle_ui_key(key),
             Page::Providers(_) => self.handle_providers_key(key),
             Page::Root { .. } => unreachable!("handled above"),
         }
@@ -777,7 +980,25 @@ impl SettingsDialog {
                 match chosen {
                     "Providers" => self.enter_providers(),
                     "Agents" => self.page = Page::Agents,
-                    "Tools" => self.page = Page::Tools,
+                    "Tools" => {
+                        self.reload_extended();
+                        self.page = Page::Tools(ToolsPage {
+                            cursor: 0,
+                            editing: None,
+                            buf: TextField::default(),
+                            edit_target: None,
+                            status: None,
+                        });
+                    }
+                    "UI" => {
+                        self.reload_extended();
+                        self.page = Page::Ui(UiPage {
+                            cursor: 0,
+                            editing: None,
+                            buf: TextField::default(),
+                            status: None,
+                        });
+                    }
                     _ => {}
                 }
                 return false;
@@ -901,12 +1122,20 @@ impl SettingsDialog {
                     } else {
                         s.error = None;
                         // Device-flow templates skip URL/Headers — the
-                        // OAuth login itself is the configuration.
+                        // OAuth login itself is the configuration. Pick
+                        // which flow on the template id.
                         if matches!(
                             s.template.map(|t| t.auth),
                             Some(crate::config::providers::AuthKind::DeviceFlow)
                         ) {
-                            s.codex_login = Some(CodexLoginState::spawn());
+                            match s.template.map(|t| t.id) {
+                                Some("copilot") => {
+                                    s.copilot_login = Some(CopilotLoginState::spawn());
+                                }
+                                _ => {
+                                    s.codex_login = Some(CodexLoginState::spawn());
+                                }
+                            }
                             s.step = AddStep::CodexLogin;
                         } else {
                             s.step = AddStep::EditUrl;
@@ -991,17 +1220,26 @@ impl SettingsDialog {
                 // Input handling for the device-code screen. Most
                 // movement is automatic (driven by the background
                 // task via `tick`); the user can press `r` to retry
-                // after an error.
-                let snap = s
-                    .codex_login
-                    .as_ref()
-                    .map(|c| c.snapshot())
-                    .unwrap_or(CodexLoginProgress::Error("no login state".into()));
-                match key.code {
-                    KeyCode::Char('r') if matches!(snap, CodexLoginProgress::Error(_)) => {
+                // after an error. Dispatch on which login state is
+                // active (codex vs copilot).
+                if let Some(c) = &s.copilot_login {
+                    let snap = c.snapshot();
+                    if matches!(key.code, KeyCode::Char('r'))
+                        && matches!(snap, CopilotLoginProgress::Error(_))
+                    {
+                        s.copilot_login = Some(CopilotLoginState::spawn());
+                    }
+                } else {
+                    let snap = s
+                        .codex_login
+                        .as_ref()
+                        .map(|c| c.snapshot())
+                        .unwrap_or(CodexLoginProgress::Error("no login state".into()));
+                    if matches!(key.code, KeyCode::Char('r'))
+                        && matches!(snap, CodexLoginProgress::Error(_))
+                    {
                         s.codex_login = Some(CodexLoginState::spawn());
                     }
-                    _ => {}
                 }
             }
             AddStep::Saving | AddStep::Fetching => {
@@ -1282,9 +1520,8 @@ impl SettingsDialog {
             Page::Agents => {
                 render_stub(frame, layout[0], "Agents", AGENTS_STUB);
             }
-            Page::Tools => {
-                render_stub(frame, layout[0], "Tools", TOOLS_STUB);
-            }
+            Page::Tools(p) => self.render_tools_page(frame, layout[0], p),
+            Page::Ui(p) => self.render_ui_page(frame, layout[0], p),
             Page::Providers(p) => self.render_providers_page(frame, layout[0], p),
         }
         frame.render_widget(help_line(self.help_text()), layout[1]);
@@ -1294,7 +1531,8 @@ impl SettingsDialog {
         let crumbs = match &self.page {
             Page::Root { .. } => String::new(),
             Page::Agents => " › Agents".into(),
-            Page::Tools => " › Tools".into(),
+            Page::Tools(_) => " › Tools".into(),
+            Page::Ui(_) => " › UI".into(),
             Page::Providers(ProvidersPage::List { .. }) => " › Providers".into(),
             Page::Providers(ProvidersPage::Add(_)) => " › Providers › Add".into(),
             Page::Providers(ProvidersPage::Edit(s)) => {
@@ -1308,7 +1546,21 @@ impl SettingsDialog {
     fn help_text(&self) -> &'static str {
         match &self.page {
             Page::Root { .. } => "↑/↓  enter: open  esc: close",
-            Page::Agents | Page::Tools => "←/h/backspace: back  esc: close",
+            Page::Agents => "←/h/backspace: back  esc: close",
+            Page::Tools(p) => {
+                if p.editing.is_some() {
+                    "type to edit  enter: apply  esc: cancel"
+                } else {
+                    "↑/↓  enter: edit  t: toggle  r: reset to default  ←: back"
+                }
+            }
+            Page::Ui(p) => {
+                if p.editing.is_some() {
+                    "type to edit  enter: apply  esc: cancel"
+                } else {
+                    "↑/↓  enter: edit / cycle  ←: back  esc: close"
+                }
+            }
             Page::Providers(ProvidersPage::List { .. }) => {
                 "↑/↓  enter: edit  c: add new  ←: back  esc: close"
             }
@@ -1483,73 +1735,153 @@ impl SettingsDialog {
                 }
             }
             AddStep::CodexLogin => {
-                let snap = s
-                    .codex_login
-                    .as_ref()
-                    .map(|c| c.snapshot())
-                    .unwrap_or(CodexLoginProgress::Error("no login state".into()));
-                lines.push(Line::from(Span::styled(
-                    "Codex device-code login".to_string(),
-                    Style::default().add_modifier(Modifier::BOLD),
-                )));
-                lines.push(Line::default());
-                match snap {
-                    CodexLoginProgress::Requesting => {
-                        lines.push(Line::from(Span::styled(
-                            "Requesting a device code from auth.openai.com…".to_string(),
-                            yellow,
-                        )));
+                // Two parallel device-flow renderers — share the same
+                // visual layout but differ in title + "requesting" line.
+                if s.copilot_login.is_some() {
+                    let snap = s
+                        .copilot_login
+                        .as_ref()
+                        .map(|c| c.snapshot())
+                        .unwrap_or(CopilotLoginProgress::Error("no login state".into()));
+                    lines.push(Line::from(Span::styled(
+                        "GitHub Copilot device-code login".to_string(),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    )));
+                    lines.push(Line::default());
+                    match snap {
+                        CopilotLoginProgress::Requesting => {
+                            lines.push(Line::from(Span::styled(
+                                "Requesting a device code from github.com…".to_string(),
+                                yellow,
+                            )));
+                        }
+                        CopilotLoginProgress::AwaitingUser {
+                            verification_url,
+                            user_code,
+                        } => {
+                            lines.push(Line::from(vec![Span::styled(
+                                "1. Open this URL in a browser:".to_string(),
+                                muted,
+                            )]));
+                            lines.push(Line::from(vec![
+                                Span::raw("     "),
+                                Span::styled(
+                                    verification_url,
+                                    Style::default()
+                                        .fg(Color::Cyan)
+                                        .add_modifier(Modifier::UNDERLINED),
+                                ),
+                            ]));
+                            lines.push(Line::default());
+                            lines.push(Line::from(Span::styled(
+                                "2. Enter this code (expires in 15 minutes):".to_string(),
+                                muted,
+                            )));
+                            lines.push(Line::from(vec![
+                                Span::raw("     "),
+                                Span::styled(
+                                    user_code,
+                                    Style::default()
+                                        .fg(Color::Yellow)
+                                        .add_modifier(Modifier::BOLD),
+                                ),
+                            ]));
+                            lines.push(Line::default());
+                            lines.push(Line::from(Span::styled(
+                                "Waiting for authorization…".to_string(),
+                                muted,
+                            )));
+                        }
+                        CopilotLoginProgress::Success { saved_at } => {
+                            lines.push(Line::from(Span::styled(
+                                format!("Logged in. Tokens saved at {saved_at}."),
+                                Style::default().fg(Color::Green),
+                            )));
+                        }
+                        CopilotLoginProgress::Error(e) => {
+                            lines.push(Line::from(Span::styled(
+                                format!("Login failed: {e}"),
+                                red,
+                            )));
+                            lines.push(Line::default());
+                            lines.push(Line::from(Span::styled(
+                                "Press r to retry, esc to cancel.".to_string(),
+                                muted,
+                            )));
+                        }
                     }
-                    CodexLoginProgress::AwaitingUser {
-                        verification_url,
-                        user_code,
-                    } => {
-                        lines.push(Line::from(vec![Span::styled(
-                            "1. Open this URL in a browser:".to_string(),
-                            muted,
-                        )]));
-                        lines.push(Line::from(vec![
-                            Span::raw("     "),
-                            Span::styled(
-                                verification_url,
-                                Style::default()
-                                    .fg(Color::Cyan)
-                                    .add_modifier(Modifier::UNDERLINED),
-                            ),
-                        ]));
-                        lines.push(Line::default());
-                        lines.push(Line::from(Span::styled(
-                            "2. Enter this code (expires in 15 minutes):".to_string(),
-                            muted,
-                        )));
-                        lines.push(Line::from(vec![
-                            Span::raw("     "),
-                            Span::styled(
-                                user_code,
-                                Style::default()
-                                    .fg(Color::Yellow)
-                                    .add_modifier(Modifier::BOLD),
-                            ),
-                        ]));
-                        lines.push(Line::default());
-                        lines.push(Line::from(Span::styled(
-                            "Waiting for authorization…".to_string(),
-                            muted,
-                        )));
-                    }
-                    CodexLoginProgress::Success { saved_at } => {
-                        lines.push(Line::from(Span::styled(
-                            format!("Logged in. Tokens saved at {saved_at}."),
-                            Style::default().fg(Color::Green),
-                        )));
-                    }
-                    CodexLoginProgress::Error(e) => {
-                        lines.push(Line::from(Span::styled(format!("Login failed: {e}"), red)));
-                        lines.push(Line::default());
-                        lines.push(Line::from(Span::styled(
-                            "Press r to retry, esc to cancel.".to_string(),
-                            muted,
-                        )));
+                } else {
+                    let snap = s
+                        .codex_login
+                        .as_ref()
+                        .map(|c| c.snapshot())
+                        .unwrap_or(CodexLoginProgress::Error("no login state".into()));
+                    lines.push(Line::from(Span::styled(
+                        "Codex device-code login".to_string(),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    )));
+                    lines.push(Line::default());
+                    match snap {
+                        CodexLoginProgress::Requesting => {
+                            lines.push(Line::from(Span::styled(
+                                "Requesting a device code from auth.openai.com…".to_string(),
+                                yellow,
+                            )));
+                        }
+                        CodexLoginProgress::AwaitingUser {
+                            verification_url,
+                            user_code,
+                        } => {
+                            lines.push(Line::from(vec![Span::styled(
+                                "1. Open this URL in a browser:".to_string(),
+                                muted,
+                            )]));
+                            lines.push(Line::from(vec![
+                                Span::raw("     "),
+                                Span::styled(
+                                    verification_url,
+                                    Style::default()
+                                        .fg(Color::Cyan)
+                                        .add_modifier(Modifier::UNDERLINED),
+                                ),
+                            ]));
+                            lines.push(Line::default());
+                            lines.push(Line::from(Span::styled(
+                                "2. Enter this code (expires in 15 minutes):".to_string(),
+                                muted,
+                            )));
+                            lines.push(Line::from(vec![
+                                Span::raw("     "),
+                                Span::styled(
+                                    user_code,
+                                    Style::default()
+                                        .fg(Color::Yellow)
+                                        .add_modifier(Modifier::BOLD),
+                                ),
+                            ]));
+                            lines.push(Line::default());
+                            lines.push(Line::from(Span::styled(
+                                "Waiting for authorization…".to_string(),
+                                muted,
+                            )));
+                        }
+                        CodexLoginProgress::Success { saved_at } => {
+                            lines.push(Line::from(Span::styled(
+                                format!("Logged in. Tokens saved at {saved_at}."),
+                                Style::default().fg(Color::Green),
+                            )));
+                        }
+                        CodexLoginProgress::Error(e) => {
+                            lines.push(Line::from(Span::styled(
+                                format!("Login failed: {e}"),
+                                red,
+                            )));
+                            lines.push(Line::default());
+                            lines.push(Line::from(Span::styled(
+                                "Press r to retry, esc to cancel.".to_string(),
+                                muted,
+                            )));
+                        }
                     }
                 }
             }
@@ -1751,15 +2083,414 @@ impl SettingsDialog {
         ]));
         frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
     }
+
+    // ── UI page ──────────────────────────────────────────────────────────
+
+    fn handle_ui_key(&mut self, key: KeyEvent) -> bool {
+        // Detach + swap pattern (same rationale as handle_providers_key).
+        let placeholder = Page::Ui(UiPage {
+            cursor: 0,
+            editing: None,
+            buf: TextField::default(),
+            status: None,
+        });
+        let mut page = std::mem::replace(&mut self.page, placeholder);
+        let close = if let Page::Ui(p) = &mut page {
+            self.handle_ui_page_key(key, p)
+        } else {
+            false
+        };
+        self.page = page;
+        close
+    }
+
+    fn handle_ui_page_key(&mut self, key: KeyEvent, p: &mut UiPage) -> bool {
+        if let Some(field) = p.editing {
+            match key.code {
+                KeyCode::Enter => {
+                    let new = p.buf.text().trim().to_string();
+                    match field {
+                        UiField::Name => {
+                            self.extended.name = if new.is_empty() { None } else { Some(new) };
+                        }
+                        UiField::PackagesDir => {
+                            self.extended.packages_directory =
+                                if new.is_empty() { None } else { Some(PathBuf::from(new)) };
+                        }
+                    }
+                    p.editing = None;
+                    p.status = match self.save_extended() {
+                        Ok(()) => Some("saved".into()),
+                        Err(e) => Some(format!("save failed: {e}")),
+                    };
+                }
+                KeyCode::Esc => {
+                    p.editing = None;
+                    p.status = None;
+                }
+                _ => {
+                    p.buf.handle_key(key);
+                }
+            }
+            return false;
+        }
+
+        let rows = UI_ROWS;
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => return true,
+            KeyCode::Left | KeyCode::Backspace | KeyCode::Char('h') => {
+                self.page = Page::Root { cursor: 0 };
+                return false;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                p.cursor = p.cursor.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                p.cursor = (p.cursor + 1).min(rows - 1);
+            }
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => match p.cursor {
+                0 => {
+                    self.extended.tui.vim_mode = cycle_vim(self.extended.tui.vim_mode);
+                    p.status = save_status(self.save_extended());
+                }
+                1 => {
+                    self.extended.tui.thinking = cycle_thinking(self.extended.tui.thinking);
+                    p.status = save_status(self.save_extended());
+                }
+                2 => {
+                    self.extended.tui.render_agent_markdown =
+                        !self.extended.tui.render_agent_markdown;
+                    p.status = save_status(self.save_extended());
+                }
+                3 => {
+                    self.extended.tui.render_user_markdown =
+                        !self.extended.tui.render_user_markdown;
+                    p.status = save_status(self.save_extended());
+                }
+                4 => {
+                    p.buf = TextField::new(self.extended.name.clone().unwrap_or_default());
+                    p.editing = Some(UiField::Name);
+                }
+                5 => {
+                    let cur = self
+                        .extended
+                        .packages_directory
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default();
+                    p.buf = TextField::new(cur);
+                    p.editing = Some(UiField::PackagesDir);
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+        false
+    }
+
+    fn render_ui_page(&self, frame: &mut Frame, area: Rect, p: &UiPage) {
+        let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+        let yellow = Style::default().fg(Color::Yellow);
+        let mut lines: Vec<Line<'static>> = Vec::new();
+
+        lines.push(Line::from(Span::styled(
+            "User-interface preferences".to_string(),
+            Style::default().add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::default());
+
+        let rows: [(&str, String); 6] = [
+            ("vim mode", vim_label(self.extended.tui.vim_mode).to_string()),
+            (
+                "thinking",
+                thinking_label(self.extended.tui.thinking).to_string(),
+            ),
+            (
+                "render agent markdown",
+                bool_label(self.extended.tui.render_agent_markdown, "on (default)", "off"),
+            ),
+            (
+                "render user markdown",
+                bool_label(self.extended.tui.render_user_markdown, "on", "off (default)"),
+            ),
+            (
+                "name",
+                self.extended
+                    .name
+                    .clone()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "(unset)".to_string()),
+            ),
+            (
+                "packages dir",
+                self.extended
+                    .packages_directory
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "(unset)".to_string()),
+            ),
+        ];
+
+        let label_w = rows.iter().map(|(l, _)| l.chars().count()).max().unwrap_or(0);
+
+        for (i, (label, value)) in rows.iter().enumerate() {
+            let marker = if i == p.cursor { "▸ " } else { "  " };
+            let label_style = if i == p.cursor {
+                yellow.add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            lines.push(Line::from(vec![
+                Span::raw(marker),
+                Span::styled(format!("{:<width$}", label, width = label_w), label_style),
+                Span::raw("  "),
+                Span::styled(value.clone(), muted),
+            ]));
+        }
+
+        if let Some(field) = p.editing {
+            let prompt = match field {
+                UiField::Name => "name: ",
+                UiField::PackagesDir => "packages dir: ",
+            };
+            lines.push(Line::default());
+            lines.push(Line::from(vec![
+                Span::styled(prompt.to_string(), muted),
+                Span::styled(
+                    p.buf.text().to_string(),
+                    Style::default().fg(Color::White),
+                ),
+                Span::styled("▎".to_string(), Style::default().fg(Color::Yellow)),
+            ]));
+        }
+
+        if let Some(status) = &p.status {
+            lines.push(Line::default());
+            lines.push(Line::from(Span::styled(status.clone(), yellow)));
+        }
+
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+    }
+
+    // ── Tools page ───────────────────────────────────────────────────────
+
+    fn handle_tools_key(&mut self, key: KeyEvent) -> bool {
+        let placeholder = Page::Tools(ToolsPage {
+            cursor: 0,
+            editing: None,
+            buf: TextField::default(),
+            edit_target: None,
+            status: None,
+        });
+        let mut page = std::mem::replace(&mut self.page, placeholder);
+        let close = if let Page::Tools(p) = &mut page {
+            self.handle_tools_page_key(key, p)
+        } else {
+            false
+        };
+        self.page = page;
+        close
+    }
+
+    fn handle_tools_page_key(&mut self, key: KeyEvent, p: &mut ToolsPage) -> bool {
+        if let Some(field) = p.editing {
+            match key.code {
+                KeyCode::Enter => {
+                    let new = p.buf.text().to_string();
+                    if let Some(name) = p.edit_target.clone() {
+                        let entry = self
+                            .extended
+                            .tools
+                            .entry(name)
+                            .or_insert_with(|| ToolCommandTemplate {
+                                enabled: true,
+                                command: String::new(),
+                                description: None,
+                            });
+                        match field {
+                            ToolField::Command => entry.command = new,
+                            ToolField::Description => {
+                                entry.description = if new.is_empty() { None } else { Some(new) };
+                            }
+                        }
+                    }
+                    p.editing = None;
+                    p.edit_target = None;
+                    p.status = save_status(self.save_extended());
+                }
+                KeyCode::Esc => {
+                    p.editing = None;
+                    p.edit_target = None;
+                }
+                _ => {
+                    p.buf.handle_key(key);
+                }
+            }
+            return false;
+        }
+
+        // The tools page lays out a flat list:
+        //   for each known tool: [command, description, enabled] (3 rows)
+        // built-ins (webfetch, websearch) are always present; users can
+        // also add their own under arbitrary names but we don't surface
+        // an "add tool" affordance in v1 to keep the UI tight.
+        let builtins = builtin_tool_names();
+        let rows_per_tool = 3usize;
+        let total_rows = builtins.len() * rows_per_tool;
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => return true,
+            KeyCode::Left | KeyCode::Backspace | KeyCode::Char('h') => {
+                self.page = Page::Root { cursor: 0 };
+                return false;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                p.cursor = p.cursor.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                p.cursor = (p.cursor + 1).min(total_rows.saturating_sub(1));
+            }
+            KeyCode::Char('t') => {
+                let tool_idx = p.cursor / rows_per_tool;
+                if let Some(name) = builtins.get(tool_idx).copied() {
+                    let entry = self
+                        .extended
+                        .tools
+                        .entry(name.to_string())
+                        .or_insert_with(|| default_template_for(name));
+                    entry.enabled = !entry.enabled;
+                    p.status = save_status(self.save_extended());
+                }
+            }
+            KeyCode::Char('r') => {
+                let tool_idx = p.cursor / rows_per_tool;
+                if let Some(name) = builtins.get(tool_idx).copied() {
+                    self.extended
+                        .tools
+                        .insert(name.to_string(), default_template_for(name));
+                    p.status = save_status(self.save_extended());
+                }
+            }
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                let tool_idx = p.cursor / rows_per_tool;
+                let row_in_tool = p.cursor % rows_per_tool;
+                if let Some(name) = builtins.get(tool_idx).copied() {
+                    let entry = self
+                        .extended
+                        .tools
+                        .entry(name.to_string())
+                        .or_insert_with(|| default_template_for(name));
+                    match row_in_tool {
+                        0 => {
+                            p.buf = TextField::new(entry.command.clone());
+                            p.edit_target = Some(name.to_string());
+                            p.editing = Some(ToolField::Command);
+                        }
+                        1 => {
+                            p.buf = TextField::new(entry.description.clone().unwrap_or_default());
+                            p.edit_target = Some(name.to_string());
+                            p.editing = Some(ToolField::Description);
+                        }
+                        2 => {
+                            entry.enabled = !entry.enabled;
+                            p.status = save_status(self.save_extended());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+        false
+    }
+
+    fn render_tools_page(&self, frame: &mut Frame, area: Rect, p: &ToolsPage) {
+        let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+        let yellow = Style::default().fg(Color::Yellow);
+        let mut lines: Vec<Line<'static>> = Vec::new();
+
+        lines.push(Line::from(Span::styled(
+            "Custom bash-command tools".to_string(),
+            Style::default().add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::default());
+
+        let builtins = builtin_tool_names();
+        let mut row_idx = 0usize;
+        for name in builtins.iter() {
+            let entry = self.extended.tools.get(*name);
+            let default = default_template_for(name);
+            let cmd = entry.map(|e| e.command.as_str()).unwrap_or(&default.command);
+            let desc = entry
+                .and_then(|e| e.description.as_deref())
+                .or(default.description.as_deref())
+                .unwrap_or("");
+            let enabled = entry.map(|e| e.enabled).unwrap_or(default.enabled);
+
+            lines.push(Line::from(Span::styled(
+                format!("[{name}]"),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )));
+
+            let sub_rows: [(&str, String); 3] = [
+                ("  command", cmd.to_string()),
+                ("  description", desc.to_string()),
+                (
+                    "  enabled",
+                    if enabled { "yes".into() } else { "no".into() },
+                ),
+            ];
+            for (label, value) in &sub_rows {
+                let marker = if row_idx == p.cursor { "▸ " } else { "  " };
+                let label_style = if row_idx == p.cursor {
+                    yellow.add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                lines.push(Line::from(vec![
+                    Span::raw(marker),
+                    Span::styled(format!("{:<14}", label), label_style),
+                    Span::raw("  "),
+                    Span::styled(value.clone(), muted),
+                ]));
+                row_idx += 1;
+            }
+            lines.push(Line::default());
+        }
+
+        if let Some(field) = p.editing {
+            let prompt = match field {
+                ToolField::Command => "command: ",
+                ToolField::Description => "description: ",
+            };
+            lines.push(Line::from(vec![
+                Span::styled(prompt.to_string(), muted),
+                Span::styled(p.buf.text().to_string(), Style::default().fg(Color::White)),
+                Span::styled("▎".to_string(), Style::default().fg(Color::Yellow)),
+            ]));
+        }
+
+        if let Some(status) = &p.status {
+            lines.push(Line::default());
+            lines.push(Line::from(Span::styled(status.clone(), yellow)));
+        }
+
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+    }
 }
 
 // ── Helpers / freestanding renderers ─────────────────────────────────────
 
-fn root_nodes() -> [NavNode; 3] {
+fn root_nodes() -> [NavNode; 4] {
     [
         NavNode {
             title: "Providers",
             description: "Configure LLM providers, headers, and the default model.",
+        },
+        NavNode {
+            title: "UI",
+            description: "User-interface preferences: vim mode, thinking display, your name, and the docs-agent packages directory.",
         },
         NavNode {
             title: "Agents",
@@ -1767,7 +2498,7 @@ fn root_nodes() -> [NavNode; 3] {
         },
         NavNode {
             title: "Tools",
-            description: "Tune which tools are exposed to agents and their permission scopes.",
+            description: "Custom bash-command tools (webfetch, websearch, …) the agent can invoke.",
         },
     ]
 }
@@ -1778,8 +2509,89 @@ struct NavNode {
 }
 
 const AGENTS_STUB: &str = "(stub) Agent editor — list agent definitions, edit their system prompts, tool grants, and model overrides.";
-const TOOLS_STUB: &str =
-    "(stub) Tool registry — toggle availability per tool and configure permission scopes.";
+
+/// Rows on the UI page (vim mode, thinking, render-agent-markdown,
+/// render-user-markdown, name, packages dir).
+const UI_ROWS: usize = 6;
+
+fn bool_label(on: bool, on_label: &str, off_label: &str) -> String {
+    if on { on_label.to_string() } else { off_label.to_string() }
+}
+
+fn cycle_vim(v: VimModeSetting) -> VimModeSetting {
+    match v {
+        VimModeSetting::Hint => VimModeSetting::Enabled,
+        VimModeSetting::Enabled => VimModeSetting::Disabled,
+        VimModeSetting::Disabled => VimModeSetting::Hint,
+    }
+}
+
+fn vim_label(v: VimModeSetting) -> &'static str {
+    match v {
+        VimModeSetting::Hint => "hint (default — vim on, hint chip on Normal entry)",
+        VimModeSetting::Enabled => "enabled (vim on, no hint chip)",
+        VimModeSetting::Disabled => "disabled (vim off)",
+    }
+}
+
+fn cycle_thinking(t: ThinkingDisplay) -> ThinkingDisplay {
+    match t {
+        ThinkingDisplay::Condensed => ThinkingDisplay::Hidden,
+        ThinkingDisplay::Hidden => ThinkingDisplay::Verbose,
+        ThinkingDisplay::Verbose => ThinkingDisplay::Condensed,
+    }
+}
+
+fn thinking_label(t: ThinkingDisplay) -> &'static str {
+    match t {
+        ThinkingDisplay::Condensed => "condensed (default — clickable chip, expands on click)",
+        ThinkingDisplay::Hidden => "hidden (only `Thinking…` while in flight; nothing after)",
+        ThinkingDisplay::Verbose => "verbose (always show reasoning inline)",
+    }
+}
+
+fn save_status(r: Result<(), String>) -> Option<String> {
+    match r {
+        Ok(()) => Some("saved".into()),
+        Err(e) => Some(format!("save failed: {e}")),
+    }
+}
+
+/// Built-in custom-tool names surfaced on the Tools page. These are
+/// also registered as live tools by the agent runtime (see
+/// `src/tools/custom.rs`).
+pub fn builtin_tool_names() -> &'static [&'static str] {
+    &["webfetch", "websearch"]
+}
+
+/// Default bash command + description for a built-in tool. The defaults
+/// rely only on widely-available CLI utilities (curl, ddgr) so a user
+/// can land a working tool without configuring anything.
+pub fn default_template_for(name: &str) -> ToolCommandTemplate {
+    match name {
+        "webfetch" => ToolCommandTemplate {
+            enabled: true,
+            command:
+                "curl -sSL --max-time 20 --max-filesize 2000000 --user-agent 'cockpit-cli' {url}"
+                    .to_string(),
+            description: Some(
+                "Fetch a URL. Pass `url` (the target). Returns the response body.".to_string(),
+            ),
+        },
+        "websearch" => ToolCommandTemplate {
+            enabled: true,
+            command: "ddgr --json --num 8 -- {query}".to_string(),
+            description: Some(
+                "Search the web. Pass `query`. Returns JSON results from DuckDuckGo.".to_string(),
+            ),
+        },
+        _ => ToolCommandTemplate {
+            enabled: true,
+            command: String::new(),
+            description: None,
+        },
+    }
+}
 
 fn render_root(frame: &mut Frame, area: Rect, cursor: usize) {
     let children = root_nodes();
@@ -2108,6 +2920,7 @@ impl AddState {
             url_field: TextField::default(),
             headers: HeaderEditor::new(Vec::new(), true),
             codex_login: None,
+            copilot_login: None,
             error: None,
             fetch: None,
             saved_provider_id: None,

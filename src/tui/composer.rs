@@ -430,6 +430,51 @@ impl Composer {
         }
     }
 
+    /// Substring after the most-recent `@` if the cursor sits inside an
+    /// `@...` token (no whitespace between the `@` and the cursor). The
+    /// `@` must itself be at a word boundary (buffer start or after
+    /// whitespace) so emails like `user@example.com` don't trigger.
+    pub fn at_query(&self) -> Option<&str> {
+        let before = &self.buffer[..self.cursor];
+        let at_idx = before.rfind('@')?;
+        // Whitespace check on the byte preceding `@` (or buffer start).
+        if at_idx > 0 {
+            let prev = before[..at_idx].chars().next_back()?;
+            if !prev.is_whitespace() {
+                return None;
+            }
+        }
+        let body = &before[at_idx + 1..];
+        if body.chars().any(char::is_whitespace) {
+            return None;
+        }
+        Some(body)
+    }
+
+    /// Replace the `@partial` immediately left of the cursor with
+    /// `@{replacement}`. No-op if no `@` token is active.
+    pub fn replace_at_token(&mut self, replacement: &str) {
+        let Some(at_idx) = self.buffer[..self.cursor].rfind('@') else {
+            return;
+        };
+        // Confirm boundary — mirror at_query semantics.
+        if at_idx > 0 {
+            let prev = self.buffer[..at_idx].chars().next_back();
+            if !matches!(prev, Some(c) if c.is_whitespace()) {
+                return;
+            }
+        }
+        let body_end = self.cursor;
+        let mut new = String::with_capacity(self.buffer.len() + replacement.len());
+        new.push_str(&self.buffer[..at_idx]);
+        new.push('@');
+        new.push_str(replacement);
+        let new_cursor = new.len();
+        new.push_str(&self.buffer[body_end..]);
+        self.buffer = new;
+        self.cursor = new_cursor;
+    }
+
     /// Cursor's (line, column) measured in characters. The column is a
     /// char count, not a display width — callers that care about wide
     /// glyphs must convert.
@@ -567,6 +612,32 @@ mod tests {
         let mut c = at("a\nb\nc", 4);
         c.move_buffer_start();
         assert_eq!(c.cursor, 0);
+    }
+
+    #[test]
+    fn at_query_returns_partial_after_at_sign() {
+        let c = at("see @src/fo", 11);
+        assert_eq!(c.at_query(), Some("src/fo"));
+    }
+
+    #[test]
+    fn at_query_none_when_email_like() {
+        let c = at("ping user@example.com", 21);
+        assert_eq!(c.at_query(), None);
+    }
+
+    #[test]
+    fn at_query_none_when_whitespace_between_at_and_cursor() {
+        let c = at("@foo bar", 8);
+        assert_eq!(c.at_query(), None);
+    }
+
+    #[test]
+    fn replace_at_token_swaps_partial_for_full_path() {
+        let mut c = at("see @src/fo", 11);
+        c.replace_at_token("src/foo.rs");
+        assert_eq!(c.text(), "see @src/foo.rs");
+        assert_eq!(c.cursor(), c.text().len());
     }
 
     #[test]

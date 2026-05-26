@@ -5,9 +5,11 @@
 //! optional; a missing file is fine (defaults apply).
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ExtendedConfig {
@@ -35,6 +37,21 @@ pub struct ExtendedConfig {
 
     #[serde(default)]
     pub tui: TuiConfig,
+
+    /// User's display name. When set, the startup logo shows
+    /// `Welcome, {name}` between the title line and the provider line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+
+    /// Where the docs agent stores its package snapshots. Tilde-expanded
+    /// at read time. Absent means the agent picks its own default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub packages_directory: Option<PathBuf>,
+
+    /// User-defined bash-command templates surfaced as built-in tools
+    /// (webfetch, websearch, …). Keyed by tool name.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub tools: HashMap<String, ToolCommandTemplate>,
 
     /// Opt-in to fetching remote `.well-known/cockpit` configs.
     #[serde(default)]
@@ -85,6 +102,15 @@ pub struct RedactConfig {
     pub extra_dotenv_paths: Vec<PathBuf>,
     pub min_secret_length: usize,
     pub placeholder: String,
+    /// User-supplied literal values that must *always* be redacted, even
+    /// if shorter than `min_secret_length` or sourced from an
+    /// allowlisted env var. Per spec §2b merging.
+    #[serde(default)]
+    pub denylist: Vec<String>,
+    /// User-supplied env var names to *exclude* from the redaction
+    /// table on top of the built-in `ENV_ALLOWLIST` in `redact::mod`.
+    #[serde(default)]
+    pub allowlist: Vec<String>,
 }
 
 impl Default for RedactConfig {
@@ -95,7 +121,9 @@ impl Default for RedactConfig {
             scan_dotenv: true,
             extra_dotenv_paths: vec![],
             min_secret_length: 8,
-            placeholder: "***redacted-by-cockpit-cli***".to_string(),
+            placeholder: "**REDACTED BY COCKPIT - DO NOT TRY TO OBTAIN BY WORKAROUND**".to_string(),
+            denylist: vec![],
+            allowlist: vec![],
         }
     }
 }
@@ -104,8 +132,57 @@ impl Default for RedactConfig {
 pub struct TuiConfig {
     #[serde(default, deserialize_with = "deserialize_vim_mode_setting")]
     pub vim_mode: VimModeSetting,
+    #[serde(default)]
+    pub thinking: ThinkingDisplay,
+    /// Render assistant output through the markdown emitter. Default
+    /// on — chat models routinely emit fenced code, bullets, bold.
+    #[serde(default = "default_true")]
+    pub render_agent_markdown: bool,
+    /// Render the user's own message bubble through the markdown
+    /// emitter. Default off — most user prompts are plain prose; turning
+    /// this on is opt-in for users who paste markdown into the composer.
+    #[serde(default)]
+    pub render_user_markdown: bool,
     pub show_cwd: bool,
     pub show_branch: bool,
+}
+
+/// How reasoning/thinking is surfaced in the chat pane.
+///
+/// `Condensed` (default) — show a clickable "thought for Xs" chip that
+/// expands to the full reasoning on click.
+/// `Hidden` — show only the live "Thinking…" placeholder; once the turn
+/// finalizes, the chip and reasoning are not rendered at all.
+/// `Verbose` — always render the full reasoning text inline (as if every
+/// entry were pre-expanded).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ThinkingDisplay {
+    #[default]
+    Condensed,
+    Hidden,
+    Verbose,
+}
+
+/// One user-defined bash-command tool. Placeholder substitution uses
+/// `{name}` markers (matched against the tool's declared arg list at
+/// dispatch time). Stored under `tools.<tool-name>` in extended-config.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCommandTemplate {
+    /// Enable/disable this tool without deleting its config.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Bash command template with `{placeholder}` substitution.
+    /// E.g. `curl -sSL --max-time 15 {url}` for `webfetch`.
+    pub command: String,
+    /// One-sentence description shown to the model. Kept terse to
+    /// respect the token-economy rule (CLAUDE.md).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Tri-state vim mode: `hint` (default; vim enabled, hint shown on
@@ -159,6 +236,9 @@ impl Default for TuiConfig {
     fn default() -> Self {
         Self {
             vim_mode: VimModeSetting::default(),
+            thinking: ThinkingDisplay::default(),
+            render_agent_markdown: true,
+            render_user_markdown: false,
             show_cwd: true,
             show_branch: true,
         }
@@ -167,4 +247,117 @@ impl Default for TuiConfig {
 
 fn default_agent_guidance_files() -> Vec<String> {
     vec!["AGENTS.md".into(), "CLAUDE.md".into()]
+}
+
+/// Round-trip loader/saver for `extended-config.json` that preserves
+/// unknown fields. Same pattern as [`crate::config::providers::ConfigDoc`]:
+/// the raw `Value` is held alongside the typed view so writes don't
+/// destroy fields a future cockpit version added.
+pub struct ExtendedConfigDoc {
+    pub path: PathBuf,
+    raw: Value,
+}
+
+impl ExtendedConfigDoc {
+    pub fn load(path: &Path) -> Result<Self> {
+        let raw_str = if path.exists() {
+            std::fs::read_to_string(path).with_context(|| {
+                format!("reading extended-config.json at {}", path.display())
+            })?
+        } else {
+            "{}".to_string()
+        };
+        let raw: Value = if raw_str.trim().is_empty() {
+            Value::Object(Map::new())
+        } else {
+            serde_json::from_str(&raw_str).with_context(|| {
+                format!("parsing extended-config.json at {}", path.display())
+            })?
+        };
+        let raw = match raw {
+            Value::Object(_) => raw,
+            other => anyhow::bail!(
+                "expected extended-config.json root to be an object, found {other:?}"
+            ),
+        };
+        Ok(Self {
+            path: path.to_path_buf(),
+            raw,
+        })
+    }
+
+    /// Parse the raw object into the typed [`ExtendedConfig`]. Falls back
+    /// to `Default` on malformed input (mirroring the tolerant loading
+    /// done elsewhere in this module).
+    pub fn config(&self) -> ExtendedConfig {
+        serde_json::from_value(self.raw.clone()).unwrap_or_default()
+    }
+
+    /// Merge a typed [`ExtendedConfig`] back into the raw object and
+    /// persist. Only fields we know how to serialize get overwritten;
+    /// unknown keys at the root are preserved verbatim.
+    pub fn write(&mut self, cfg: &ExtendedConfig) -> Result<()> {
+        let obj = self
+            .raw
+            .as_object_mut()
+            .expect("extended-config root is an object");
+        let serialized = serde_json::to_value(cfg).context("serializing extended-config")?;
+        if let Value::Object(map) = serialized {
+            for (k, v) in map {
+                obj.insert(k, v);
+            }
+        }
+        let pretty = serde_json::to_string_pretty(&self.raw)
+            .context("serializing extended-config.json")?;
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&self.path, format!("{pretty}\n"))
+            .with_context(|| format!("writing {}", self.path.display()))?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn vim_mode_round_trips_through_extended_doc() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("extended-config.json");
+        std::fs::write(&path, "{}").unwrap();
+        let mut doc = ExtendedConfigDoc::load(&path).unwrap();
+        let mut cfg = doc.config();
+        cfg.tui.vim_mode = VimModeSetting::Enabled;
+        cfg.tui.thinking = ThinkingDisplay::Verbose;
+        cfg.name = Some("Christopher".into());
+        cfg.packages_directory = Some(PathBuf::from("/tmp/pkgs"));
+        doc.write(&cfg).unwrap();
+
+        let doc2 = ExtendedConfigDoc::load(&path).unwrap();
+        let cfg2 = doc2.config();
+        assert_eq!(cfg2.tui.vim_mode, VimModeSetting::Enabled);
+        assert_eq!(cfg2.tui.thinking, ThinkingDisplay::Verbose);
+        assert_eq!(cfg2.name.as_deref(), Some("Christopher"));
+        assert_eq!(cfg2.packages_directory, Some(PathBuf::from("/tmp/pkgs")));
+    }
+
+    #[test]
+    fn unknown_root_keys_survive_write() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("extended-config.json");
+        std::fs::write(&path, r#"{"future_feature":{"a":1}}"#).unwrap();
+        let mut doc = ExtendedConfigDoc::load(&path).unwrap();
+        let cfg = doc.config();
+        doc.write(&cfg).unwrap();
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(on_disk.contains("\"future_feature\""));
+    }
+
+    #[test]
+    fn thinking_default_is_condensed() {
+        assert_eq!(ThinkingDisplay::default(), ThinkingDisplay::Condensed);
+    }
 }
