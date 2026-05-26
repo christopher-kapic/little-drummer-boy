@@ -258,6 +258,12 @@ permission categories:
 - **New key `redact_bypass`** (deny by default) — disables §7
   redaction for a single tool call. We never want to allow this
   but we want to be able to deny it *explicitly*.
+- **TUI affordance note (future).** `Shift+Tab` in bash approval
+  dialogs will let the user cycle modes for the command on the fly
+  (in addition to the static allow/ask/deny patterns). Starts simple;
+  will be elaborated with the approval router and `exec_approval` flow
+  (see `plan.md` §3e, `TUI-design-philosophy.md` §6, `GOALS.md` §1).
+  Parallels the `Ctrl+G` composer handoff note.
 
 ### 6b. MCP servers
 
@@ -369,6 +375,7 @@ Compat-dropped: we do not share opencode's snapshot directory.
 | Leader-key system (`ctrl+x` default) | **DELIBERATE — Recommended: COPY** but make the leader configurable to `none` for users who want flat keybinds. |
 | Mouse support | **COPY** |
 | Vim composer | **COPY**, but **default ON** (deviation from opencode/codex). See `GOALS.md` §1b. |
+| External editor for long prompts (Ctrl+G with live hint "press ctrl+g to edit in <editor>", `$VISUAL`/`$EDITOR` handoff) | **COPY from Claude Code**. See `GOALS.md` §1f. Realizes the composer-overflow `$EDITOR` case in `TUI-design-philosophy.md` §8. |
 | Diff style (`unified` / `split`) | **COPY** |
 | `/statusline` & `/terminaltitle` (codex-isms) | **OMIT** — cockpit always shows cwd + branch (`GOALS.md` §1a). |
 | Image attachment in composer | **COPY** if the chosen provider supports it; otherwise gracefully degrade. |

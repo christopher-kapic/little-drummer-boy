@@ -36,7 +36,11 @@ impl Composer {
         Self {
             buffer: String::new(),
             cursor: 0,
-            vim_mode: if vim_enabled { VimMode::Normal } else { VimMode::Insert },
+            vim_mode: if vim_enabled {
+                VimMode::Normal
+            } else {
+                VimMode::Insert
+            },
             vim_enabled,
         }
     }

@@ -1233,6 +1233,13 @@ Separate flows: `exec_approval` (for `bash`) vs `patch_approval` (for
 applies if we ever wrap upstream harnesses that have their own trust
 gates.
 
+**TUI mode switching (future).** In the approval dialog for `bash`
+commands, `Shift+Tab` will cycle between approval modes for that
+invocation / pattern (e.g. once, session, auto-allow matching commands,
+always ask, etc.). This starts simple and will grow more sophisticated
+(combined with the allow/ask/deny permission schema and the router
+variants). The same affordance may apply to patch approvals.
+
 Deferred + cascade-cancel from opencode
 ([`features/opencode.md` §6](./features/opencode.md)): a reject
 cancels every in-flight approval for the session, not just the

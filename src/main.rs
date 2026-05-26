@@ -17,6 +17,7 @@ mod harness;
 mod redact;
 mod skills;
 mod tui;
+mod welcome;
 
 use anyhow::Result;
 use clap::Parser;
@@ -50,7 +51,12 @@ async fn main() -> Result<()> {
         Some(Command::Init(args)) => commands::init::run(args).await,
         Some(Command::Completion { shell }) => {
             use clap::CommandFactory;
-            clap_complete::generate(shell, &mut Cli::command(), "cockpit", &mut std::io::stdout());
+            clap_complete::generate(
+                shell,
+                &mut Cli::command(),
+                "cockpit",
+                &mut std::io::stdout(),
+            );
             Ok(())
         }
     }

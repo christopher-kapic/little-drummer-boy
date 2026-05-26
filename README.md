@@ -15,7 +15,7 @@ Opinionated bits:
   once at the scope they apply to (org level, project level, cwd).
 - Allows agent definition files at **arbitrary paths**, not just the
   default agent directory.
-- Vim keybinds in the prompt composer (default on).
+- Vim keybinds in the prompt composer (default on) plus `Ctrl+G` external-editor handoff (`$VISUAL` / `$EDITOR`) with live "press ctrl+g to edit in …" hint for long prompts (Claude Code style; see `GOALS.md` §1f).
 - Always shows the current working directory, git branch, and live
   context-usage indicator in the TUI chrome.
 - Supports Claude Code-style skills (`~/.claude/skills/`,

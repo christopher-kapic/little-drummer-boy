@@ -273,6 +273,12 @@ When a view supports selecting multiple items:
   default button.
 - Approval dialogs for harness actions (per `GOALS.md` §1) are
   the same primitive — same key bindings, same default semantics.
+- `Shift+Tab` in bash (`exec_approval`) dialogs cycles approval modes
+  for the command (once / session / pattern / etc.). Starts minimal;
+  will become more sophisticated later (ties into permission schema
+  and the approval router in `plan.md` §3e). Same primitive may extend
+  to patch approvals. (See also the `Ctrl+G` external-editor precedent
+  added in the same section for composer long prompts.)
 
 Don't add a "are you sure" dialog for reversible actions. `<esc>`
 is enough.
@@ -297,22 +303,30 @@ Rules:
 
 ## 8. Editor handoff
 
-Long-form editing — composer overflow, agent file editing, prompt
-editing — happens in `$EDITOR`, not in a ratatui textarea.
+Long-form editing — composer overflow (see `GOALS.md` §1f), agent
+file editing, slash-command authoring, plan text, etc. — happens in
+`$EDITOR` / `$VISUAL`, not inside a ratatui textarea.
 
-The handshake is the standard one: `LeaveAlternateScreen`
-+ `disable_raw_mode` → spawn `$EDITOR` (then `$VISUAL`) on a
-tempfile inheriting stdio → `EnterAlternateScreen`
-+ `enable_raw_mode` on exit. Editor non-zero exit = cancel,
-preserve original text.
+**Composer case (Claude Code style).** When the user starts typing a
+long prompt, a small hint appears in the composer chrome or footer:
+``press ctrl+g to edit in <editor>`` (the resolved binary name).
+`Ctrl+G` (default) triggers the handoff for the current buffer
+(fresh input, history recall, or queued message being edited).
 
-Tempfiles live under cockpit's data dir, namespaced by scope. Delete
-on successful save; leave on cancel so users can recover their
-work.
+The handshake (used uniformly for all long-form cases):
 
-If neither `$EDITOR` nor `$VISUAL` is set, toast a red error
-telling the user to set one. Don't fall back to a built-in editor
-silently.
+`LeaveAlternateScreen` + `disable_raw_mode` → write buffer to a
+namespaced tempfile under the data dir → spawn `$VISUAL` (falling
+back to `$EDITOR`) inheriting stdio → on exit:
+`EnterAlternateScreen` + `enable_raw_mode`. Non-zero exit or
+unchanged file on disk = cancel (original text preserved). Delete
+tempfile only on successful round-trip.
+
+If neither `$EDITOR` nor `$VISUAL` is set, a red toast tells the
+user to configure one. No silent built-in fallback.
+
+Tempfiles are namespaced by use-case (composer/, agents/, commands/,
+etc.) so recovery of abandoned edits is straightforward.
 
 ---
 

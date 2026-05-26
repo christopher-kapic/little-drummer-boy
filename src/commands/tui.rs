@@ -2,8 +2,15 @@ use std::path::Path;
 
 use anyhow::Result;
 
+use crate::welcome;
+
 pub async fn run(_project: Option<&Path>) -> Result<()> {
-    // Launches the codex-style TUI. See `tui/` for the ratatui app.
-    // Composer: vim mode default-on. Status line: cwd + git branch always.
-    todo!("cockpit TUI — see GOALS.md §1 and src/tui/")
+    // Welcome banner (P-51 by default; rooster when COCKPIT_MEME=1).
+    // This runs for the bare `cockpit` (interactive TUI) launch path only.
+    welcome::print();
+
+    // Real TUI not yet wired (see GOALS.md §1 and src/tui/).
+    // For now the banner is the entire behavior of bare `cockpit`.
+    eprintln!("(cockpit TUI stub — real interface coming soon)");
+    Ok(())
 }

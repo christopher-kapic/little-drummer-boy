@@ -62,7 +62,9 @@ The user-facing interaction loop is modeled on the **codex** TUI (built with
 - Slash commands (`/model`, `/agent`, `/skills`, `/help`, etc.) discoverable
   from a leader-less slash menu.
 - Streaming markdown rendering with syntax-highlighted code blocks.
-- Approval dialogs for sensitive actions.
+- Approval dialogs for sensitive actions (including `Shift+Tab` mode
+  cycling for bash `exec_approval` flows; see `plan.md` §3e and
+  `TUI-design-philosophy.md` §6 — will grow more sophisticated).
 - Configurable keymap.
 
 Use `kcl ask codex "<question>"` whenever you need to inspect codex's
@@ -280,6 +282,36 @@ Failure modes:
   refused. The gitignore check runs against the **target**
   path, not the link path — a symlink into a gitignored
   directory is still blocked.
+
+### 1f. External `$EDITOR` handoff for long prompts
+
+Long prompts are painful to edit inside even a vim-mode textarea.
+When the user starts typing (or the buffer grows long), the composer
+surfaces a small hint in the input chrome or footer:
+``press ctrl+g to edit in <editor>`` (showing the resolved name, e.g.
+"lvim", "nvim", or "code --wait").
+
+- Default binding: `Ctrl+G` (Claude Code convention; also used by
+  many other TUIs).
+- Resolves `$VISUAL`, then `$EDITOR`. If neither is set, a red toast
+  explains the requirement and points at docs — no silent fallback to
+  a built-in editor.
+- The handoff primitive (leave alternate screen + disable raw mode,
+  write buffer to a cockpit-namespaced tempfile, spawn, read back on
+  clean exit) is the one already sketched in
+  `TUI-design-philosophy.md` §8. Non-zero editor exit or no change on
+  disk = cancel (original composer text is preserved).
+- Always available; not gated behind a `tui.vim_mode`-style toggle.
+  The binding may later live under a configurable `tui.keymap` block.
+- Applies to new prompts, history recall (Up arrow), and queued
+  messages popped for editing.
+- The `?` help overlay and `/help` document the binding.
+
+This is a **COPY from Claude Code**. It directly fulfills the
+"composer overflow" / "prompt editing" case called out for `$EDITOR`
+handoff in the design philosophy. The same mechanism is reused for
+in-TUI editing of agent files, custom slash commands, and other
+multi-line text the user owns.
 
 ---
 
