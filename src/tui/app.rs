@@ -1,32 +1,33 @@
 //! Top-level TUI state and event loop.
 //!
-//! Mouse capture is intentionally **not** enabled: leaving it off lets
-//! the terminal/tmux handle the scroll wheel natively, so the user can
-//! scroll up through chat history and the launch header even after they
-//! spill into terminal scrollback. When we eventually need mouse-driven
-//! interactions (clicking buttons, drag-to-select, etc.) we'll switch on
-//! `EnableMouseCapture` and route `MouseEvent`s in the event loop —
-//! revisit the scroll path when that happens.
+//! Mouse capture is gated by `tui.mouse_capture` (default on, plan.md
+//! T8.c). With capture on: clickable chips, click-to-position-cursor
+//! in the composer, and drag-select in chat history (T8.f). Native
+//! terminal selection still works under capture if the user holds the
+//! terminal's bypass modifier (Shift on most Linux/Windows Terminal,
+//! Option on iTerm2, Fn on macOS Terminal). With capture off: the
+//! terminal handles wheel/select/copy natively and `MouseEvent`s
+//! never reach this loop — the user falls back to `Ctrl+J` to expand
+//! the most-recent reasoning block.
 
 use std::collections::HashMap;
-use std::io::{Write, stdout};
+use std::io::stdout;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use crossterm::cursor::{self, SetCursorStyle};
+use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{
-    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
-    MouseButton, MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags,
-    PushKeyboardEnhancementFlags,
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, KeyboardEnhancementFlags, MouseButton, MouseEvent, MouseEventKind,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
-use crossterm::terminal::{Clear, ClearType, size as terminal_size};
+use ratatui::DefaultTerminal;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
-use ratatui::{DefaultTerminal, TerminalOptions, Viewport};
 
 use crate::config::dirs::discover_config_dirs;
 use crate::config::extended::{DiffStyle, ExtendedConfig, ThinkingDisplay, VimModeSetting};
@@ -86,6 +87,10 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
     SlashCommand {
         name: "model",
         description: "Switch the active model",
+    },
+    SlashCommand {
+        name: "mouse",
+        description: "Toggle mouse capture (click-to-position, drag-select) on/off",
     },
     SlashCommand {
         name: "new",
@@ -149,6 +154,11 @@ pub struct App {
     /// Index into `prompt_history` for history navigation. `0` means
     /// "at the live buffer" (no history offset); `1` = most recent, etc.
     prompt_history_cursor: usize,
+    /// In-progress composer text saved when the user first pressed
+    /// Up to enter history mode. Restored when they walk back past
+    /// the newest entry (cursor going `1 → 0`). `None` when not in
+    /// history mode or when entry happened from an empty composer.
+    staged_draft: Option<String>,
     history: Vec<HistoryEntry>,
     /// In-flight assistant turn (between `ThinkingStarted` and the
     /// matching `AssistantText`/tool boundary). When `Some`, the
@@ -163,11 +173,6 @@ pub struct App {
     /// `run`. The event loop syncs this into `launch.repo_status` once
     /// per tick.
     repo_status: Arc<Mutex<Option<RepoStatus>>>,
-    /// Current pane height. Monotonically non-decreasing: when the chat
-    /// or composer needs more room we grow the pane (and scroll prior
-    /// terminal content up into scrollback so it stays mouse-reachable),
-    /// but we never shrink it.
-    pane_height: u16,
     dialog: Dialog,
     /// `/model` picker. Mutually exclusive with `dialog` (we never show
     /// both); kept separate so the picker doesn't clutter the settings
@@ -190,6 +195,44 @@ pub struct App {
     /// terminal mouse coordinates into chat-relative coordinates so
     /// click-to-expand works on thinking blocks.
     chat_area: Option<Rect>,
+    /// Last-rendered composer-input `Rect` (the outer rect — block
+    /// border included). Used by `handle_mouse` to route clicks into
+    /// click-to-position-cursor (plan.md T8.d).
+    input_area: Option<Rect>,
+    /// Logical-line scroll offset for the chat history pane. `0` =
+    /// pinned to the bottom (live). Higher = scrolled further back in
+    /// time. Bumped by mouse wheel when capture is on; clamped by
+    /// `render_history` so we never scroll past the top.
+    chat_scroll_offset: usize,
+    /// How tall (logical lines) the full chat content was at the last
+    /// render. Updated each `render_history` and consulted by the
+    /// mouse-wheel handler to clamp scroll-back to a valid maximum.
+    chat_total_lines: usize,
+    /// How many logical lines fit in the chat pane at the last render.
+    /// Same purpose — clamp scrollback so the bottom of the visible
+    /// window can't go below the top of the content.
+    chat_visible_lines: usize,
+    /// In-app drag-select state for chat content (plan.md T8.f). Set
+    /// when the user mouse-downs in the chat area; updated on drag;
+    /// committed on release. `Ctrl+Shift+C` copies the underlying
+    /// plaintext via `clipboard::copy_plain` (OSC52 → SSH-safe).
+    selection: Option<Selection>,
+    /// Snapshot of the chat area's rendered cells, one row per outer
+    /// element, one cell per inner element. Each cell's `String` is
+    /// the cell's `symbol()` — typically one char, but multi-byte for
+    /// non-ASCII and an empty marker for the continuation cell of a
+    /// wide glyph. Populated by `render_history` after the paragraph
+    /// widget writes to the buffer. Used by the copy path so we don't
+    /// have to redo ratatui's wrap math to extract the selected
+    /// plaintext.
+    chat_text_grid: Vec<Vec<String>>,
+    /// Parallel to `chat_text_grid`: `chat_cont_rows[i]` is `true`
+    /// when visible row `i` is a soft-wrap continuation of the
+    /// previous logical line. The copy path joins continuations with
+    /// a space, real line boundaries with a newline — so pasted
+    /// agent text reconstructs the original paragraphs rather than
+    /// preserving the screen-level wraps.
+    chat_cont_rows: Vec<bool>,
     /// Click hit map: for each *visible* row in `chat_area`, the index
     /// (within `self.history`) of the agent entry whose thinking chip
     /// lives there — or `None` for non-clickable rows. Refreshed every
@@ -221,7 +264,45 @@ pub struct App {
     /// `$EDITOR` against the composer text, then reloads the file back
     /// into the composer.
     pending_external_edit: bool,
+    /// Whether crossterm mouse capture is currently enabled. Tracks the
+    /// real terminal state so the settings toggle can push/pop the
+    /// escape sequence without double-enabling. Sourced from
+    /// `tui.mouse_capture` at startup; mutated when the user toggles
+    /// the setting mid-session.
+    mouse_capture: bool,
+    /// User's `tui.exit_tail_lines` setting (GOALS §1d). Cached at
+    /// startup so the exit-tail dump survives the dialog being closed.
+    exit_tail_lines: i32,
+    /// User's `tui.rich_text_copy` setting. Gates the `Ctrl+Shift+Y`
+    /// keybind that copies the last agent message as HTML to the
+    /// system clipboard (plan.md T8.g).
+    rich_text_copy: bool,
+    /// Active right-click context menu in the chat area. Modal while
+    /// `Some` — intercepts every key + mouse event.
+    context_menu: Option<crate::tui::context_menu::ContextMenu>,
+    /// Transient FYI message overlaid on the status line
+    /// (TUI-design-philosophy §7). 3-second TTL; dismissed early by
+    /// any user interaction (keystroke or mouse click/wheel).
+    toast: Option<Toast>,
 }
+
+/// Toast intent — drives the message's foreground color.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToastKind {
+    Success,
+    Error,
+    Info,
+}
+
+#[derive(Debug, Clone)]
+struct Toast {
+    text: String,
+    kind: ToastKind,
+    expires_at: Instant,
+}
+
+/// Default toast lifetime per TUI-design-philosophy §7.
+const TOAST_TTL: Duration = Duration::from_secs(3);
 
 /// Args cached at `ToolStart` for an `edit` / `editunlock` call so the
 /// matching `ToolEnd` can build a `HistoryEntry::Diff`. We don't keep
@@ -231,6 +312,36 @@ struct PendingEditArgs {
     path: String,
     old: String,
     new: String,
+}
+
+/// Drag-select state for the chat area (plan.md T8.f). Coordinates
+/// are absolute terminal cells; we re-derive chat-relative positions
+/// at render time so resize / scroll changes don't desync.
+#[derive(Debug, Clone, Copy)]
+struct Selection {
+    /// Where the drag started.
+    anchor: (u16, u16),
+    /// Where the drag is right now (or where it ended on mouse-up).
+    focus: (u16, u16),
+    /// True while the left button is still held. False once released
+    /// (selection persists for copy until Esc or a new selection).
+    active: bool,
+}
+
+impl Selection {
+    /// Normalize into reading-order `(start, end)` cells, both
+    /// inclusive. When the user drags right-to-left or bottom-to-top,
+    /// anchor > focus; this swaps them so callers can iterate the
+    /// selection in a single direction.
+    fn ordered(&self) -> ((u16, u16), (u16, u16)) {
+        let (a_col, a_row) = self.anchor;
+        let (f_col, f_row) = self.focus;
+        if (a_row, a_col) <= (f_row, f_col) {
+            (self.anchor, self.focus)
+        } else {
+            (self.focus, self.anchor)
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -279,6 +390,9 @@ impl App {
         };
 
         let diff_style = tui_cfg.diff_style;
+        let mouse_capture = tui_cfg.mouse_capture;
+        let exit_tail_lines = tui_cfg.exit_tail_lines;
+        let rich_text_copy = tui_cfg.rich_text_copy;
         let mut app = Self {
             launch,
             composer,
@@ -290,11 +404,11 @@ impl App {
             queue: Vec::new(),
             prompt_history: Vec::new(),
             prompt_history_cursor: 0,
+            staged_draft: None,
             history: Vec::new(),
             pending: None,
             started_at: Instant::now(),
             repo_status,
-            pane_height: 0,
             dialog: Dialog::None,
             model_picker: None,
             daemon_prompt,
@@ -302,6 +416,13 @@ impl App {
             fetch_models_progress: Arc::new(Mutex::new(Vec::new())),
             agent_runner: None,
             chat_area: None,
+            input_area: None,
+            chat_scroll_offset: 0,
+            chat_total_lines: 0,
+            chat_visible_lines: 0,
+            selection: None,
+            chat_text_grid: Vec::new(),
+            chat_cont_rows: Vec::new(),
             clickable_rows: Vec::new(),
             last_cursor_shape: None,
             at_selected: 0,
@@ -309,8 +430,12 @@ impl App {
             pending_new_session: false,
             last_usage: None,
             pending_external_edit: false,
+            mouse_capture,
+            exit_tail_lines,
+            rich_text_copy,
+            context_menu: None,
+            toast: None,
         };
-        app.pane_height = app.geometry().desired_pane_height();
         // First-run convenience: if the daemon prompt doesn't gate
         // startup, open the Add-Provider wizard immediately when no
         // providers are configured. The prompt-resolution branches
@@ -357,18 +482,17 @@ impl App {
     }
 
     pub async fn run(&mut self) -> Result<()> {
-        // Print the header to normal terminal output. It lives in scrollback
-        // from this point on — once enough messages arrive it scrolls up
-        // off the top of the terminal, recoverable with the mouse wheel.
+        // Print the welcome header to normal terminal output *before*
+        // we enter the alt screen. It lands in the regular terminal
+        // scrollback so the user can scroll back to see it after the
+        // TUI exits. During the session the alt screen overlays it.
         welcome::print_header(&self.launch);
 
-        reserve_fixed_pane_space(self.pane_height)?;
-
-        let (width, height) = terminal_size()?;
-        let options = TerminalOptions {
-            viewport: Viewport::Fixed(viewport_rect(self.pane_height, width, height)),
-        };
-        let mut terminal = ratatui::try_init_with_options(options)?;
+        // `try_init` enters the alternate screen and uses a full-
+        // terminal viewport by default. GOALS §1d: alt screen during
+        // the session for the clean full-screen experience; on exit
+        // we leave alt screen and print the tail to stdout.
+        let mut terminal = ratatui::try_init()?;
 
         let kbd_enhanced = crossterm::execute!(
             stdout(),
@@ -379,14 +503,15 @@ impl App {
         )
         .is_ok();
 
-        // We *don't* enable mouse capture. Capturing mouse events lets
-        // us route chip clicks to expand reasoning, but it also steals
-        // scroll-wheel events from the terminal (no native scrollback
-        // scroll) and breaks native text selection / copy-on-release.
-        // Users care more about scroll + select than about click-to-
-        // expand, so we keep mouse off and rely on the `Ctrl+J`
-        // shortcut for expanding the most-recent reasoning block (see
-        // [`Self::toggle_recent_reasoning`]).
+        // Mouse capture is configurable (tui.mouse_capture, GOALS §1
+        // T8.c). On: click-to-position in composer, clickable chips,
+        // drag-select in chat. Off: native terminal select + copy +
+        // scroll-wheel via alternate-scroll translation. Native
+        // selection still works under capture if the user holds the
+        // terminal's bypass modifier (Shift / Option / Fn).
+        if self.mouse_capture {
+            let _ = crossterm::execute!(stdout(), EnableMouseCapture);
+        }
 
         let refresh_handle = spawn_git_refresh(self.launch.cwd.clone(), self.repo_status.clone());
 
@@ -394,21 +519,14 @@ impl App {
 
         refresh_handle.abort();
 
-        // Spill any remaining in-viewport chat into terminal scrollback
-        // before we tear down, so the user can scroll up and copy
-        // commands or paths the agent produced (GOALS §1d). We pass
-        // *all* history — once the viewport is gone, those rows are
-        // the only place this content survives.
-        self.spill_remaining_history_for_exit();
+        // Build the exit-tail text while we still own the alt screen
+        // (history is in memory; rendering is irrelevant — we want
+        // the plaintext projection of recent entries).
+        let tail = self.build_exit_tail_lines();
 
-        // Wipe the viewport rows before we hand the terminal back. Without
-        // this, the input box / popup / status sit forever in the user's
-        // scrollback under the last chat line — distracting when scrolling
-        // up after exit.
-        self.clear_viewport_for_exit().ok();
-
-        // Mouse capture was never enabled (see comment in run()); no
-        // need to disable it on the way out.
+        if self.mouse_capture {
+            let _ = crossterm::execute!(stdout(), DisableMouseCapture);
+        }
         if kbd_enhanced {
             let _ = crossterm::execute!(stdout(), PopKeyboardEnhancementFlags);
         }
@@ -416,20 +534,29 @@ impl App {
         // otherwise we'd leak a steady-block cursor into their shell
         // if they quit while in Normal mode.
         let _ = crossterm::execute!(stdout(), SetCursorStyle::DefaultUserShape);
+        // `try_restore` disables raw mode and leaves the alternate
+        // screen — terminal scrollback is now visible again.
         ratatui::try_restore()?;
+        // Print the tail to normal stdout. Lands in regular terminal
+        // scrollback right after the welcome header that was printed
+        // pre-alt-screen, so the user can scroll back through both.
+        for line in tail {
+            println!("{line}");
+        }
         result
     }
 
-    /// Flush every remaining history entry into the terminal area
-    /// *above* the viewport so it lands in scrollback. Called once at
-    /// shutdown — by the time this runs we don't care about ratatui's
-    /// double-buffer because we're about to restore the terminal.
-    fn spill_remaining_history_for_exit(&mut self) {
+    /// Build the tail of history as plain text lines for the post-
+    /// alt-screen dump (GOALS §1d). Capped by `tui.exit_tail_lines`
+    /// (default 100). `0` disables the dump entirely; `-1` returns
+    /// the whole session. Returns an empty `Vec` when nothing should
+    /// be printed.
+    fn build_exit_tail_lines(&mut self) -> Vec<String> {
         // Finalize any in-flight pending turn first so its text shows
         // up in the dump.
         self.finalize_pending();
-        if self.history.is_empty() {
-            return;
+        if self.history.is_empty() || self.exit_tail_lines == 0 {
+            return Vec::new();
         }
         let plain: Vec<String> = self
             .history
@@ -447,20 +574,16 @@ impl App {
                 lines
             })
             .collect();
-        let _ = insert_above_viewport(self.pane_height, &plain);
-        self.history.clear();
-    }
-
-    fn clear_viewport_for_exit(&self) -> Result<()> {
-        let (_, h) = terminal_size()?;
-        let viewport_top = h.saturating_sub(self.pane_height);
-        let mut out = stdout();
-        for row in viewport_top..h {
-            crossterm::execute!(out, cursor::MoveTo(0, row), Clear(ClearType::CurrentLine))?;
+        if self.exit_tail_lines < 0 {
+            plain
+        } else {
+            let n = self.exit_tail_lines as usize;
+            if plain.len() > n {
+                plain[plain.len() - n..].to_vec()
+            } else {
+                plain
+            }
         }
-        crossterm::execute!(out, cursor::MoveTo(0, viewport_top))?;
-        out.flush()?;
-        Ok(())
     }
 
     fn event_loop(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
@@ -469,12 +592,13 @@ impl App {
             self.drain_fetch_progress();
             self.drain_agent_events();
             self.sync_active_agent();
+            self.sync_mouse_capture_from_dialog();
+            self.tick_toast();
             self.dialog.tick();
-            self.maybe_grow_pane(terminal)?;
-            // `insert_before` handles the scroll region itself; we no
-            // longer need to follow it with `terminal.clear()` (the
-            // old hand-rolled spill path's flicker source).
-            self.maybe_spill_history(terminal)?;
+            // In alt-screen mode the viewport is always the full
+            // terminal; no need to grow it or spill history into
+            // scrollback (alt screen doesn't have scrollback). The
+            // wheel-scroll path handles in-app scrollback instead.
             self.maybe_service_new_session(terminal)?;
             self.maybe_service_external_edit(terminal)?;
             terminal.draw(|frame| self.render(frame))?;
@@ -486,8 +610,10 @@ impl App {
                     Event::Mouse(mouse) => {
                         self.handle_mouse(mouse);
                     }
-                    Event::Resize(width, height) => {
-                        terminal.resize(viewport_rect(self.pane_height, width, height))?;
+                    Event::Resize(_, _) => {
+                        // Alt-screen viewport tracks the terminal
+                        // size automatically; the next draw picks up
+                        // the new dimensions via frame.area().
                     }
                     _ => {}
                 }
@@ -495,6 +621,83 @@ impl App {
         }
 
         Ok(())
+    }
+
+    /// Show a transient toast (TUI-design-philosophy §7). Replaces
+    /// any existing toast — newest wins, the older one is gone.
+    /// 3-second TTL; cleared early by any user interaction (see the
+    /// `dismiss_toast_on_interaction` hooks in handle_key and
+    /// handle_mouse).
+    fn show_toast(&mut self, text: impl Into<String>, kind: ToastKind) {
+        self.toast = Some(Toast {
+            text: text.into(),
+            kind,
+            expires_at: Instant::now() + TOAST_TTL,
+        });
+    }
+
+    /// Drop the toast if it has expired. Called once per event-loop
+    /// tick so a toast left untouched for 3 seconds cleans itself
+    /// up without needing a new event to fire.
+    fn tick_toast(&mut self) {
+        if let Some(toast) = &self.toast
+            && Instant::now() > toast.expires_at
+        {
+            self.toast = None;
+        }
+    }
+
+    /// Flip `tui.mouse_capture` on disk, push/pop the live terminal
+    /// state, and return a status line for the chat log. Used by the
+    /// `/mouse` slash command (T8.c). Save errors degrade gracefully:
+    /// we still flip the live state and report the error in the
+    /// status line so the user knows the change isn't persistent.
+    /// Toggle the *live* mouse-capture state and surface a toast.
+    /// `/mouse` is intentionally non-persistent — useful for "try
+    /// capture off for one operation" without affecting the
+    /// configured default for the next session. The persistent
+    /// toggle lives in `/settings → ui`.
+    fn toggle_mouse_capture_inline(&mut self) {
+        let new_value = !self.mouse_capture;
+        let exec_ok = if new_value {
+            crossterm::execute!(stdout(), EnableMouseCapture).is_ok()
+        } else {
+            crossterm::execute!(stdout(), DisableMouseCapture).is_ok()
+        };
+        if exec_ok {
+            self.mouse_capture = new_value;
+            let state = if new_value { "on" } else { "off" };
+            self.show_toast(
+                format!("/mouse: capture {state} (this session only)"),
+                ToastKind::Info,
+            );
+        } else {
+            self.show_toast(
+                "/mouse: terminal rejected the capture toggle",
+                ToastKind::Error,
+            );
+        }
+    }
+
+    /// Pick up a pending mouse-capture toggle from the settings dialog
+    /// (UI page) and push/pop the crossterm capture state to match.
+    /// The setting itself is persisted by the dialog's save path; this
+    /// just keeps the live terminal state in sync.
+    fn sync_mouse_capture_from_dialog(&mut self) {
+        let Some(want) = self.dialog.take_pending_mouse_capture() else {
+            return;
+        };
+        if want == self.mouse_capture {
+            return;
+        }
+        let res = if want {
+            crossterm::execute!(stdout(), EnableMouseCapture)
+        } else {
+            crossterm::execute!(stdout(), DisableMouseCapture)
+        };
+        if res.is_ok() {
+            self.mouse_capture = want;
+        }
     }
 
     fn drain_fetch_progress(&mut self) {
@@ -521,106 +724,21 @@ impl App {
         }
     }
 
-    /// Grow the pane (and the terminal viewport) if more space is now
-    /// needed than we've previously reserved. We scroll the terminal up
-    /// by the deficit so prior output moves into scrollback rather than
-    /// being clipped.
-    fn maybe_grow_pane(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
-        let (w, h) = terminal_size()?;
-        let desired = self.geometry().desired_pane_height().min(h);
-        if desired > self.pane_height {
-            let extra = desired - self.pane_height;
-            push_terminal_content_up(extra, h)?;
-            self.pane_height = desired;
-            terminal.resize(viewport_rect(self.pane_height, w, h))?;
-        }
-        Ok(())
-    }
-
-    /// Once the pane has grown to fill the terminal but history still
-    /// wants more space, pop the oldest entries off `App.history` and
-    /// push them into terminal scrollback via
-    /// [`ratatui::Terminal::insert_before`]. The terminal-side scroll
-    /// region avoids the flicker the previous hand-rolled implementation
-    /// produced (overwriting viewport rows, scrolling, then forcing a
-    /// full `terminal.clear()` — three repaints per spill).
-    fn maybe_spill_history(&mut self, terminal: &mut DefaultTerminal) -> Result<bool> {
-        let (_, h) = terminal_size()?;
-        let geom = self.geometry();
-        let max_history = h
-            .saturating_sub(geom.chrome_height())
-            .max(crate::tui::geometry::MIN_HISTORY_HEIGHT);
-
-        let total = self.total_history_lines();
-        if total <= max_history {
-            return Ok(false);
-        }
-
-        let to_spill = total - max_history;
-        let mut spilled = 0u16;
-        let mut items = Vec::new();
-        while spilled < to_spill && !self.history.is_empty() {
-            let entry = self.history.remove(0);
-            spilled = spilled.saturating_add(entry_rendered_rows(&entry));
-            items.push(entry);
-        }
-        // Render each spilled entry to plain text (drop styling) for
-        // the scrollback area. We lose bg color in scrollback — that's
-        // acceptable; the alternative is dumping ANSI escape sequences
-        // into the user's terminal scrollback, which is messier.
-        let plain: Vec<String> = items.iter().flat_map(|e| entry_to_plain_lines(e)).collect();
-        let n = plain.len() as u16;
-        if n > 0 {
-            terminal.insert_before(n, |buf| {
-                use ratatui::text::Line;
-                use ratatui::widgets::{Paragraph, Widget};
-                let lines: Vec<Line<'static>> =
-                    plain.iter().map(|s| Line::raw(s.clone())).collect();
-                Paragraph::new(lines).render(buf.area, buf);
-            })?;
-        }
-        Ok(true)
-    }
-
-    /// `/new` was invoked: spill the current chat into terminal
-    /// scrollback, reprint the welcome header above the viewport, and
-    /// drop the daemon-attached runner so the next user message creates
-    /// a fresh session.
+    /// `/new` was invoked: clear chat history and drop the daemon-
+    /// attached runner so the next user message opens a fresh session.
+    /// In alt-screen mode the chat pane is the whole canvas, so the
+    /// "fresh session" visual is simply an empty pane.
     fn maybe_service_new_session(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         if !self.pending_new_session {
             return Ok(());
         }
         self.pending_new_session = false;
 
-        // Spill the visible history first so the user can scroll up to
-        // see what was on screen before the reset.
+        // Alt-screen mode: the chat pane is the whole canvas, and
+        // there's no terminal scrollback to spill into. Clearing
+        // history makes the chat pane empty — that's the "new
+        // session" visual.
         self.finalize_pending();
-        if !self.history.is_empty() {
-            let plain: Vec<String> = self
-                .history
-                .iter()
-                .flat_map(|entry| {
-                    let mut lines = entry_to_plain_lines(entry);
-                    if matches!(
-                        entry,
-                        HistoryEntry::User { .. } | HistoryEntry::Agent { .. }
-                    ) {
-                        lines.push(String::new());
-                    }
-                    lines
-                })
-                .collect();
-            let n = plain.len() as u16;
-            if n > 0 {
-                terminal.insert_before(n, |buf| {
-                    use ratatui::text::Line;
-                    use ratatui::widgets::{Paragraph, Widget};
-                    let lines: Vec<Line<'static>> =
-                        plain.iter().map(|s| Line::raw(s.clone())).collect();
-                    Paragraph::new(lines).render(buf.area, buf);
-                })?;
-            }
-        }
 
         // Reset transcript state.
         self.history.clear();
@@ -628,20 +746,18 @@ impl App {
         self.pending = None;
         self.clickable_rows.clear();
         self.chat_area = None;
+        self.chat_text_grid.clear();
+        self.chat_cont_rows.clear();
+        self.chat_scroll_offset = 0;
+        self.selection = None;
         // prompt_history is shell-style across sessions — keep it.
         self.prompt_history_cursor = 0;
-        // Reload from disk in case settings changed and refresh the
-        // greeting.
+        self.staged_draft = None;
+        // Reload from disk in case settings changed.
         self.reload_launch_info();
         self.reload_tui_config();
 
-        // Reprint the welcome header into scrollback. Use raw stdout
-        // writes so the ANSI styling survives (ratatui's `Paragraph`
-        // would render the escapes as literal characters).
-        let header = welcome::header_lines(&self.launch);
-        insert_above_viewport(self.pane_height, &header)?;
-        // ratatui's buffer no longer reflects the actual terminal —
-        // force a full repaint of the viewport on the next draw.
+        // Repaint the cleared canvas on the next draw.
         terminal.clear()?;
 
         // Drop the runner so the next submit re-attaches the daemon
@@ -724,10 +840,66 @@ impl App {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> bool {
+        // Ctrl+C / Ctrl+D quit. Explicitly exclude Shift so that
+        // Ctrl+Shift+C (copy-selection, plan.md T8.f) doesn't trigger
+        // an exit on terminals that report the shift state in
+        // `modifiers` even when the key code is lowercase.
         if key.modifiers.contains(KeyModifiers::CONTROL)
+            && !key.modifiers.contains(KeyModifiers::SHIFT)
             && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('d'))
         {
             return true;
+        }
+
+        // Any meaningful keystroke dismisses the toast — the user has
+        // moved on. Pure-modifier presses (Shift, Ctrl, etc. alone)
+        // don't count.
+        if self.toast.is_some() && !is_modifier_only(&key) {
+            self.toast = None;
+        }
+
+        // Context menu intercepts keys while open. Arrows / j-k move
+        // the focus, Enter executes, Esc dismisses, any other
+        // printable key dismisses without executing (so the user can
+        // resume typing into the composer without a stray menu).
+        if let Some(menu) = self.context_menu.clone() {
+            match key.code {
+                KeyCode::Esc => {
+                    self.context_menu = None;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    if let Some(m) = self.context_menu.as_mut() {
+                        m.move_cursor(-1);
+                    }
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if let Some(m) = self.context_menu.as_mut() {
+                        m.move_cursor(1);
+                    }
+                }
+                KeyCode::Enter => {
+                    self.context_menu = None;
+                    if let Some(action) = menu.focused_action() {
+                        self.execute_context_menu_action(action, menu.clicked_chat_row);
+                    }
+                }
+                _ if !is_modifier_only(&key) => {
+                    // Any other typed key dismisses without action.
+                    self.context_menu = None;
+                }
+                _ => {}
+            }
+            return false;
+        }
+
+        // Escape with an active selection: clear the selection and
+        // swallow the key. Ordering: ahead of dialog routing because
+        // the selection lives on App-state and isn't visible to the
+        // dialog handlers; behind the Ctrl+C quit because the user
+        // expects Ctrl+C to always exit regardless of selection.
+        if matches!(key.code, KeyCode::Esc) && self.selection.is_some() {
+            self.selection = None;
+            return false;
         }
 
         // Modal dialog rule: whenever a modal is open we must
@@ -828,6 +1000,23 @@ impl App {
             return false;
         }
 
+        // Ctrl+Shift+Y — copy the most-recent agent message to the
+        // system clipboard as rich text (HTML + plain alt). Falls back
+        // to plain text over SSH. Gated by tui.rich_text_copy.
+        // (plan.md T8.g)
+        if self.is_ctrl_shift_y(&key) {
+            self.copy_last_agent_message_as_rich_text();
+            return false;
+        }
+
+        // Ctrl+Shift+C — copy the active drag-selection's plaintext
+        // through OSC52 (SSH-safe) + local clipboard. No-op when
+        // nothing is selected. (plan.md T8.f copy path)
+        if self.is_ctrl_shift_c(&key) {
+            self.copy_selection_plaintext();
+            return false;
+        }
+
         // Ctrl+G — pop the composer text out into `$EDITOR`. We can't
         // suspend ratatui from inside the key handler (the terminal
         // handle lives in `event_loop`), so just request the action;
@@ -841,6 +1030,17 @@ impl App {
                 self.pending_external_edit = true;
             }
             return false;
+        }
+
+        // Anything that gets this far is a composer-facing key — char
+        // input, arrow nav, vim-mode keys, etc. By design the user is
+        // engaging with the composer, so any active chat selection
+        // becomes stale and gets in the way. Drop it before the
+        // composer mutates. Modifier-only keys (Shift alone, etc.) are
+        // skipped so just *holding* Shift doesn't clear the selection
+        // mid-drag-extend-by-keyboard.
+        if self.selection.is_some() && !is_modifier_only(&key) {
+            self.selection = None;
         }
 
         // Vim-aware dispatch. Normal / Operator-pending intercept
@@ -961,7 +1161,12 @@ impl App {
             }
             KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.composer.insert_char(ch);
-                self.prompt_history_cursor = 0;
+                // Note: we deliberately do NOT reset
+                // `prompt_history_cursor` here. Edits made while in
+                // recall mode stay in the buffer, but pressing Down
+                // back to cursor 0 still restores the original
+                // staged draft — matching the user-visible spec for
+                // history navigation.
                 self.refresh_at_dismiss();
                 self.at_selected = 0;
                 false
@@ -972,59 +1177,69 @@ impl App {
 
     /// Shell-style "go back through prompt history" — the Up key.
     ///
-    /// State machine:
-    /// - Already navigating history (`prompt_history_cursor > 0`):
-    ///   step one entry older, if any.
-    /// - Buffer empty *and* queue non-empty: unqueue (matches the
-    ///   existing pop-from-queue behavior).
-    /// - Cursor at top of buffer (first line, column 0): enter history
-    ///   mode and load the most-recent prior message.
-    /// - Otherwise: move cursor up within the buffer.
-    ///
-    /// Once in history mode, we *don't* fall back to cursor-move
-    /// behavior even if `set()` placed the cursor at end-of-buffer —
-    /// the loaded message replaces the live edit, and the user expects
-    /// the next Up to keep going back, not to position within the
-    /// recalled message. That was the previous bug.
+    /// Rule (matches user spec): history only advances when the
+    /// composer cursor is on the *top* line of the current text.
+    /// Otherwise Up just moves the cursor up one line within the
+    /// buffer. The first transition into history mode snapshots the
+    /// live buffer into `staged_draft` so a later Down can restore
+    /// it.
     fn history_up(&mut self) {
-        if self.prompt_history_cursor > 0 {
-            if self.prompt_history_cursor < self.prompt_history.len() {
-                self.prompt_history_cursor += 1;
-                let idx = self.prompt_history.len() - self.prompt_history_cursor;
-                self.composer.set(self.prompt_history[idx].clone());
-            }
+        if !cursor_on_first_line(self.composer.text(), self.composer.cursor()) {
+            self.composer.move_up();
             return;
         }
-        if self.composer.is_empty() && !self.queue.is_empty() {
+        // Buffer empty + queue non-empty → unqueue first (keeps the
+        // existing pop-from-queue affordance the user already had).
+        if self.prompt_history_cursor == 0 && self.composer.is_empty() && !self.queue.is_empty() {
             self.composer.set(self.queue.pop().unwrap());
             return;
         }
-        if cursor_on_first_line(self.composer.text(), self.composer.cursor())
-            && !self.prompt_history.is_empty()
-        {
+        if self.prompt_history.is_empty() {
+            return;
+        }
+        if self.prompt_history_cursor == 0 {
+            // Entering history mode — save the live draft so we can
+            // restore it on the way back. `None` if the buffer was
+            // empty (nothing meaningful to restore).
+            let draft = self.composer.text().to_string();
+            self.staged_draft = if draft.is_empty() { None } else { Some(draft) };
             self.prompt_history_cursor = 1;
             let idx = self.prompt_history.len() - 1;
             self.composer.set(self.prompt_history[idx].clone());
-            return;
+        } else if self.prompt_history_cursor < self.prompt_history.len() {
+            self.prompt_history_cursor += 1;
+            let idx = self.prompt_history.len() - self.prompt_history_cursor;
+            self.composer.set(self.prompt_history[idx].clone());
         }
-        self.composer.move_up();
     }
 
-    /// Counterpart to [`Self::history_up`]. When in history mode, step
-    /// toward newer entries; at the newest, clear back to an empty
-    /// composer. Otherwise just move the cursor down within the buffer.
+    /// Counterpart to [`Self::history_up`]. Down only steps history
+    /// when the composer cursor is on the *bottom* line of the
+    /// current text. Otherwise it just moves the cursor down a line.
+    /// Stepping past the newest entry (`cursor 1 → 0`) restores the
+    /// `staged_draft` if there was one, else clears the composer.
     fn history_down(&mut self) {
-        if self.prompt_history_cursor > 0 {
-            self.prompt_history_cursor -= 1;
-            if self.prompt_history_cursor == 0 {
-                self.composer.clear();
-            } else {
-                let idx = self.prompt_history.len() - self.prompt_history_cursor;
-                self.composer.set(self.prompt_history[idx].clone());
-            }
+        if !cursor_on_last_line(self.composer.text(), self.composer.cursor()) {
+            self.composer.move_down();
             return;
         }
-        self.composer.move_down();
+        if self.prompt_history_cursor == 0 {
+            // Not in history mode and already on the bottom line —
+            // nothing to do (don't move_down because there's no row
+            // below to move to).
+            return;
+        }
+        self.prompt_history_cursor -= 1;
+        if self.prompt_history_cursor == 0 {
+            // Out of history — restore the saved draft, if any.
+            match self.staged_draft.take() {
+                Some(draft) => self.composer.set(draft),
+                None => self.composer.clear(),
+            }
+        } else {
+            let idx = self.prompt_history.len() - self.prompt_history_cursor;
+            self.composer.set(self.prompt_history[idx].clone());
+        }
     }
 
     /// If the composer no longer has an active `@partial` token, clear
@@ -1069,10 +1284,18 @@ impl App {
                 false
             }
             KeyCode::Enter => {
-                // Enter submits even from Normal mode — matches what
-                // most TUIs do, so users don't have to switch to
-                // Insert to send.
                 self.composer.set_pending_g(false);
+                // Shift+Enter / Alt+Enter inserts a newline regardless
+                // of mode — composer is a chat input, not a vim
+                // editor, and users expect newline-on-shift to work
+                // even if they forgot to switch modes. Plain Enter
+                // still submits (matches most TUIs).
+                if key.modifiers.contains(KeyModifiers::SHIFT)
+                    || key.modifiers.contains(KeyModifiers::ALT)
+                {
+                    self.composer.insert_char('\n');
+                    return false;
+                }
                 self.complete_or_submit()
             }
             KeyCode::Left => {
@@ -1273,6 +1496,10 @@ impl App {
             return false;
         }
 
+        // Submitting a new turn implies the user has finished reading
+        // history — jump back to the live tail so they see the reply.
+        self.chat_scroll_offset = 0;
+
         // Expand any `@path[:range]` tags into fenced file/dir blocks
         // before dispatch (GOALS §1e). The displayed user message keeps
         // the original `@`-form; only the wire payload gets inlined.
@@ -1295,6 +1522,7 @@ impl App {
             // Track for Up/Down history navigation.
             self.prompt_history.push(submitted.clone());
             self.prompt_history_cursor = 0;
+            self.staged_draft = None;
         }
 
         self.ensure_agent_runner();
@@ -1515,6 +1743,205 @@ impl App {
         // ThinkingOnly variant later is cheap.
     }
 
+    /// True when the key event represents `Ctrl+Shift+Y`. Matches both
+    /// terminal-protocol shapes (legacy `Char('Y')` with Ctrl; kitty
+    /// keyboard protocol `Char('y')` with both Ctrl and Shift bits).
+    fn is_ctrl_shift_y(&self, key: &KeyEvent) -> bool {
+        if !key.modifiers.contains(KeyModifiers::CONTROL) {
+            return false;
+        }
+        match key.code {
+            KeyCode::Char('Y') => true,
+            KeyCode::Char('y') => key.modifiers.contains(KeyModifiers::SHIFT),
+            _ => false,
+        }
+    }
+
+    /// True when the key event represents `Ctrl+Shift+C`. Same shape
+    /// dance as `is_ctrl_shift_y` (kitty protocol vs legacy).
+    fn is_ctrl_shift_c(&self, key: &KeyEvent) -> bool {
+        if !key.modifiers.contains(KeyModifiers::CONTROL) {
+            return false;
+        }
+        match key.code {
+            KeyCode::Char('C') => true,
+            KeyCode::Char('c') => key.modifiers.contains(KeyModifiers::SHIFT),
+            _ => false,
+        }
+    }
+
+    /// Execute one of the context-menu actions. Called both when the
+    /// user clicks an item and when they hit Enter on a focused item.
+    /// `clicked_chat_row` is the chat-relative row that was
+    /// right-clicked — used by "Copy as rich text" to find which
+    /// agent message was under the click; ignored by the other
+    /// actions.
+    fn execute_context_menu_action(
+        &mut self,
+        action: crate::tui::context_menu::ContextMenuAction,
+        clicked_chat_row: usize,
+    ) {
+        use crate::tui::context_menu::ContextMenuAction;
+        let Some((title, text)) = self.agent_message_at_or_before(clicked_chat_row) else {
+            self.show_toast("No agent message to copy yet.", ToastKind::Info);
+            return;
+        };
+        let (msg, kind) = match action {
+            ContextMenuAction::CopyAsRichText => {
+                let html = crate::clipboard::markdown_to_html(&text);
+                match crate::clipboard::copy_rich(&text, &html) {
+                    Ok(()) => (format!("Copied {title} as rich text."), ToastKind::Success),
+                    Err(crate::clipboard::CopyError::UnsupportedOverSsh) => {
+                        // Shouldn't normally happen because the menu
+                        // builder hides this option over SSH, but
+                        // guard anyway so a stale menu doesn't error.
+                        match crate::clipboard::copy_plain(&text) {
+                            Ok(()) => (
+                                format!(
+                                    "SSH — copied {title} as plain text \
+                                     (rich-text unavailable over SSH)."
+                                ),
+                                ToastKind::Success,
+                            ),
+                            Err(e) => (format!("Copy failed: {e}"), ToastKind::Error),
+                        }
+                    }
+                    Err(e) => (format!("Copy failed: {e}"), ToastKind::Error),
+                }
+            }
+            ContextMenuAction::CopyAsMarkdown => match crate::clipboard::copy_plain(&text) {
+                Ok(()) => (format!("Copied {title} as markdown."), ToastKind::Success),
+                Err(e) => (format!("Copy failed: {e}"), ToastKind::Error),
+            },
+            ContextMenuAction::CopyAsPlainText => {
+                let plain = crate::clipboard::markdown_to_plain(&text);
+                match crate::clipboard::copy_plain(&plain) {
+                    Ok(()) => (format!("Copied {title} as plain text."), ToastKind::Success),
+                    Err(e) => (format!("Copy failed: {e}"), ToastKind::Error),
+                }
+            }
+        };
+        self.show_toast(msg, kind);
+    }
+
+    /// Find the agent message whose chat row is at or before
+    /// `clicked_chat_row` (so a right-click in the middle of a
+    /// multi-line message still resolves to that message). Returns
+    /// `(title, full message text)` or `None` if no agent message
+    /// precedes the click.
+    fn agent_message_at_or_before(&self, clicked_chat_row: usize) -> Option<(String, String)> {
+        let Some(area) = self.chat_area else {
+            return None;
+        };
+        // Map the chat-relative click row back to an entry index via
+        // the cell-grid's owning entry. We don't have an explicit
+        // row→entry map (only `clickable_rows` for chips), so walk
+        // history with the same row-budget logic `render_history`
+        // uses. For "agent message under click", the simpler
+        // heuristic is: pick the most-recent agent message at or
+        // before the click row's absolute terminal y. We approximate
+        // by walking history bottom-up and returning the first agent
+        // entry, since multi-line agent blocks are the common case
+        // and pinpointing per-row is overkill for this UX.
+        // `clicked_chat_row` is used only to honor "at or before"
+        // — if it's past the last rendered row, return the last
+        // agent. We don't currently have an entry-precise hit map.
+        let _ = area;
+        let _ = clicked_chat_row;
+        self.history.iter().rev().find_map(|e| match e {
+            HistoryEntry::Agent { name, text, .. } if !text.trim().is_empty() => {
+                Some((format!("{name} message"), text.clone()))
+            }
+            _ => None,
+        })
+    }
+
+    /// Build the plaintext of the active drag-selection from the
+    /// cached chat grid and push it to the system clipboard via
+    /// `clipboard::copy_plain` (OSC52 + arboard locally). No-op when
+    /// the selection is empty or stale (chat_area moved between
+    /// selection and copy).
+    fn copy_selection_plaintext(&mut self) {
+        let Some(sel) = self.selection else {
+            return;
+        };
+        let Some(area) = self.chat_area else {
+            return;
+        };
+        let (start, end) = sel.ordered();
+        // Stale guard: if either selection endpoint is outside the
+        // current chat area, the snapshot we have no longer
+        // corresponds. Clear the selection and bail.
+        if start.1 < area.y
+            || end.1 >= area.y + area.height
+            || start.0 < area.x
+            || end.0 >= area.x + area.width
+        {
+            self.selection = None;
+            return;
+        }
+        let plain =
+            extract_selection_plaintext(&self.chat_text_grid, &self.chat_cont_rows, area, sel);
+        if plain.is_empty() {
+            return;
+        }
+        let (msg, kind) = match crate::clipboard::copy_plain(&plain) {
+            Ok(()) => (
+                format!("Copied {} chars to clipboard.", plain.chars().count()),
+                ToastKind::Success,
+            ),
+            Err(e) => (format!("Copy failed: {e}"), ToastKind::Error),
+        };
+        self.show_toast(msg, kind);
+        // Clear selection after a successful copy — the user got
+        // what they wanted; leaving it highlighted just gets in the
+        // way of the next interaction.
+        self.selection = None;
+    }
+
+    /// Copy the most recent agent message to the system clipboard as
+    /// rich text (HTML + plain alt). Surfaces feedback via a toast
+    /// (TUI-design-philosophy §7). No-op when `tui.rich_text_copy`
+    /// is off or no agent messages exist.
+    fn copy_last_agent_message_as_rich_text(&mut self) {
+        if !self.rich_text_copy {
+            self.show_toast(
+                "Rich-text copy is disabled (toggle in /settings → ui).",
+                ToastKind::Info,
+            );
+            return;
+        }
+        let last_agent_text = self.history.iter().rev().find_map(|e| match e {
+            HistoryEntry::Agent { text, .. } if !text.trim().is_empty() => Some(text.clone()),
+            _ => None,
+        });
+        let Some(text) = last_agent_text else {
+            self.show_toast("No agent message to copy yet.", ToastKind::Info);
+            return;
+        };
+        let html = crate::clipboard::markdown_to_html(&text);
+        let (msg, kind) = match crate::clipboard::copy_rich(&text, &html) {
+            Ok(()) => (
+                "Copied last agent message as rich text.".to_string(),
+                ToastKind::Success,
+            ),
+            Err(crate::clipboard::CopyError::UnsupportedOverSsh) => {
+                // SSH session — fall back to plain text via OSC52 so
+                // the user gets at least something on the local
+                // clipboard.
+                match crate::clipboard::copy_plain(&text) {
+                    Ok(()) => (
+                        "SSH — copied as plain text (rich-text unavailable over SSH).".to_string(),
+                        ToastKind::Success,
+                    ),
+                    Err(e) => (format!("Copy failed: {e}"), ToastKind::Error),
+                }
+            }
+            Err(e) => (format!("Copy failed: {e}"), ToastKind::Error),
+        };
+        self.show_toast(msg, kind);
+    }
+
     /// Toggle every agent message's `expanded` flag. Bound to `Ctrl+J`
     /// for keyboard-only use. If any entry is currently collapsed we
     /// expand them all; otherwise we collapse them all.
@@ -1537,31 +1964,257 @@ impl App {
         }
     }
 
-    /// Handle a mouse event. Left-click on a thinking chip toggles
-    /// expansion; other events are ignored (we don't implement chat
-    /// scrolling yet, so scroll-wheel input is a no-op).
+    /// Handle a mouse event. Routing:
+    /// - context menu open → route into the menu (click to select,
+    ///   click outside to dismiss);
+    /// - text popup open → any click dismisses;
+    /// - right-down in chat area → open the context menu (T8.f menu);
+    /// - wheel up/down inside the chat area → scroll chat history;
+    /// - left-down in composer input area → position the cursor (T8.d);
+    /// - left-down on a chat thinking-chip → toggle reasoning expansion;
+    /// - left-down on a non-chip chat row → start drag-select (T8.f);
+    /// - left-drag → extend the active drag-select;
+    /// - left-up → finalize drag-select (selection persists for copy).
     fn handle_mouse(&mut self, mouse: MouseEvent) {
+        // Toast dismissal on "meaningful" mouse events — clicks and
+        // wheels count, motion-only / drag-continuation / release
+        // don't (those are part of an in-flight gesture and the
+        // first event already dismissed).
+        if self.toast.is_some()
+            && matches!(
+                mouse.kind,
+                MouseEventKind::Down(_) | MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+            )
+        {
+            self.toast = None;
+        }
+        // Context menu is modal too — clicks either hit an item or
+        // dismiss. Wheel events while it's open are eaten so we don't
+        // accidentally scroll chat underneath.
+        if let Some(menu) = self.context_menu.clone() {
+            match mouse.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    let full = ratatui::layout::Rect::new(0, 0, u16::MAX, u16::MAX);
+                    if let Some(action) = menu.hit_test(mouse.column, mouse.row, full) {
+                        self.context_menu = None;
+                        self.execute_context_menu_action(action, menu.clicked_chat_row);
+                    } else {
+                        // Click outside the menu dismisses it without
+                        // executing anything.
+                        self.context_menu = None;
+                    }
+                }
+                MouseEventKind::Down(_) | MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                    self.context_menu = None;
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        // Right-click in chat area opens the context menu.
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right))
+            && self.mouse_in_chat_area(&mouse)
+        {
+            let chat_row = self
+                .chat_area
+                .map(|a| (mouse.row.saturating_sub(a.y)) as usize)
+                .unwrap_or(0);
+            let items =
+                crate::tui::context_menu::ContextMenu::build_items(crate::clipboard::is_ssh());
+            self.context_menu = Some(crate::tui::context_menu::ContextMenu {
+                preferred_origin: (mouse.column, mouse.row),
+                clicked_chat_row: chat_row,
+                cursor: 0,
+                items,
+            });
+            return;
+        }
+
+        // Wheel: scroll the chat history. Wheel also clears any
+        // active selection because the selection coords refer to
+        // specific terminal rows, and a scroll changes what's at
+        // each row.
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                if self.mouse_in_chat_area(&mouse) {
+                    self.selection = None;
+                    self.scroll_chat_up(3);
+                }
+                return;
+            }
+            MouseEventKind::ScrollDown => {
+                if self.mouse_in_chat_area(&mouse) {
+                    self.selection = None;
+                    self.scroll_chat_down(3);
+                }
+                return;
+            }
+            _ => {}
+        }
+
+        // Drag extends an in-flight selection. We only follow Left
+        // drags; other button drags are ignored.
+        if matches!(mouse.kind, MouseEventKind::Drag(MouseButton::Left)) {
+            let clamped = self.clamp_to_chat_area(mouse.column, mouse.row);
+            if let Some(sel) = self.selection.as_mut()
+                && sel.active
+            {
+                sel.focus = clamped;
+            }
+            return;
+        }
+
+        // Release finalizes the selection. It persists in
+        // `self.selection` until cleared (Esc, new click outside chat,
+        // wheel scroll).
+        if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left)) {
+            if let Some(sel) = self.selection.as_mut() {
+                sel.active = false;
+            }
+            return;
+        }
+
         if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
             return;
         }
+
+        // Composer first: clicks here position the cursor in the
+        // input buffer (T8.d). The input rect is the *outer* rect
+        // including the block border; we re-derive the inner rect
+        // (1-cell border on each side, top border absent when the
+        // queue is above) for hit-testing.
+        if let Some(area) = self.input_area
+            && let Some((line, col)) = self.composer_cursor_target_for_click(area, &mouse)
+        {
+            // Clicking into the composer dismisses any chat
+            // selection — the user has switched contexts.
+            self.selection = None;
+            self.composer.set_cursor_from_line_col(line, col);
+            // If the user is in Normal mode, drop into Insert — clicking
+            // to place the cursor implies they're about to type there.
+            if self.composer.vim_enabled() && matches!(self.composer.vim_mode(), VimMode::Normal) {
+                self.composer.set_vim_mode(VimMode::Insert);
+            }
+            return;
+        }
+
         let Some(area) = self.chat_area else {
+            self.selection = None;
             return;
         };
         // crossterm reports row/column as 0-indexed absolute terminal
         // coordinates. Translate to chat-area relative.
         if mouse.row < area.y || mouse.row >= area.y + area.height {
+            self.selection = None;
             return;
         }
         if mouse.column < area.x || mouse.column >= area.x + area.width {
+            self.selection = None;
             return;
         }
         let rel = (mouse.row - area.y) as usize;
-        let Some(Some(entry_idx)) = self.clickable_rows.get(rel).copied() else {
+        // Chip click wins over drag-select start: chip rows have a
+        // single owning entry whose `expanded` flag we toggle.
+        if let Some(Some(entry_idx)) = self.clickable_rows.get(rel).copied() {
+            self.selection = None;
+            if let Some(HistoryEntry::Agent { expanded, .. }) = self.history.get_mut(entry_idx) {
+                *expanded = !*expanded;
+            }
             return;
-        };
-        if let Some(HistoryEntry::Agent { expanded, .. }) = self.history.get_mut(entry_idx) {
-            *expanded = !*expanded;
         }
+        // Non-chip chat row + left-down: start a fresh drag-select.
+        // Anchor = focus = click point; mouse-drag will extend the
+        // focus from here.
+        self.selection = Some(Selection {
+            anchor: (mouse.column, mouse.row),
+            focus: (mouse.column, mouse.row),
+            active: true,
+        });
+    }
+
+    /// Clamp `(col, row)` into the current chat area. Used while
+    /// dragging — if the user drags past the edge of the pane we
+    /// pin the focus to the nearest edge cell instead of dropping
+    /// the event.
+    fn clamp_to_chat_area(&self, col: u16, row: u16) -> (u16, u16) {
+        let Some(area) = self.chat_area else {
+            return (col, row);
+        };
+        let clamped_col = col.max(area.x).min(area.x + area.width.saturating_sub(1));
+        let clamped_row = row.max(area.y).min(area.y + area.height.saturating_sub(1));
+        (clamped_col, clamped_row)
+    }
+
+    /// True when the mouse position is inside the chat area's last-
+    /// rendered rect. Returns false when the chat area hasn't been
+    /// rendered yet (e.g. a dialog is open).
+    fn mouse_in_chat_area(&self, mouse: &MouseEvent) -> bool {
+        let Some(area) = self.chat_area else {
+            return false;
+        };
+        mouse.row >= area.y
+            && mouse.row < area.y + area.height
+            && mouse.column >= area.x
+            && mouse.column < area.x + area.width
+    }
+
+    /// Scroll the chat history up (further back in time) by `n`
+    /// logical lines. Clamped to `chat_total_lines - chat_visible_lines`
+    /// so the top of the buffer can sit at the top of the pane but
+    /// no further.
+    fn scroll_chat_up(&mut self, n: usize) {
+        let max_offset = self
+            .chat_total_lines
+            .saturating_sub(self.chat_visible_lines);
+        self.chat_scroll_offset = (self.chat_scroll_offset + n).min(max_offset);
+    }
+
+    /// Scroll the chat history down (toward the live tail) by `n`
+    /// logical lines. Saturates at 0 (pinned to bottom = live).
+    fn scroll_chat_down(&mut self, n: usize) {
+        self.chat_scroll_offset = self.chat_scroll_offset.saturating_sub(n);
+    }
+
+    /// Translate an absolute mouse position into a `(line, col)` in
+    /// the composer's text buffer, or `None` if the click landed
+    /// outside the input area. The inner-rect calculation mirrors
+    /// the render path: a 1-cell border on left/right, and a 1-cell
+    /// border on top *unless* the queue strip is above, in which
+    /// case its bottom row is our top border (no top border of our
+    /// own). Continuation lines render with `prefix_width` spaces
+    /// of indent so the click-to-col math is uniform across lines.
+    fn composer_cursor_target_for_click(
+        &self,
+        outer: Rect,
+        mouse: &MouseEvent,
+    ) -> Option<(usize, usize)> {
+        if mouse.row < outer.y || mouse.row >= outer.y + outer.height {
+            return None;
+        }
+        if mouse.column < outer.x || mouse.column >= outer.x + outer.width {
+            return None;
+        }
+        let queue_above = !self.queue.is_empty();
+        let top_border: u16 = if queue_above { 0 } else { 1 };
+        let bottom_border: u16 = 1;
+        let inner_top = outer.y.saturating_add(top_border);
+        let inner_bottom = outer.y + outer.height.saturating_sub(bottom_border);
+        let inner_left = outer.x.saturating_add(1);
+        let inner_right = outer.x + outer.width.saturating_sub(1);
+        if mouse.row < inner_top || mouse.row >= inner_bottom {
+            return None;
+        }
+        if mouse.column < inner_left || mouse.column >= inner_right {
+            return None;
+        }
+        let row_rel = (mouse.row - inner_top) as usize;
+        let prefix_w = input_prefix_width();
+        // Every visible row (first or continuation) has the prefix /
+        // indent at the left edge of the inner rect.
+        let col_rel = (mouse.column - inner_left) as usize;
+        let buffer_col = col_rel.saturating_sub(prefix_w);
+        Some((row_rel, buffer_col))
     }
 
     /// Push the right cursor shape to the terminal based on vim mode.
@@ -1641,6 +2294,10 @@ impl App {
                 self.pending_new_session = true;
                 return false;
             }
+            "mouse" => {
+                self.toggle_mouse_capture_inline();
+                return false;
+            }
             "compact" => "/compact: stub — context compaction not wired yet.",
             "prune" => "/prune: stub — history pruning not wired yet.",
             "sessions" | "resume" => {
@@ -1686,6 +2343,13 @@ impl App {
             user: tui_cfg.render_user_markdown,
         };
         self.diff_style = tui_cfg.diff_style;
+        self.exit_tail_lines = tui_cfg.exit_tail_lines;
+        self.rich_text_copy = tui_cfg.rich_text_copy;
+        // Note: mouse_capture is *not* synced here. The live terminal
+        // state is reconciled via the dialog's pending-flag drain
+        // (see sync_mouse_capture_from_dialog) so we don't reapply
+        // EnableMouseCapture on every reload — only when the user
+        // actually toggled the setting.
         let vim_enabled = self.vim_setting.vim_enabled();
         if self.composer.vim_enabled() != vim_enabled {
             self.composer.set_vim_enabled(vim_enabled);
@@ -1962,6 +2626,21 @@ impl App {
             frame.set_cursor_position(cursor_pos);
         }
         self.render_status(frame, rects.status);
+
+        // Toast sits on top of the status line. Rendered before the
+        // context menu / text popup so those still cover it if both
+        // happen to be active at the same time.
+        if let Some(toast) = self.toast.clone() {
+            render_toast(frame, rects.status, &toast);
+        }
+
+        // Context menu overlay renders LAST so it sits on top of
+        // every other pane. The Clear widget inside the renderer
+        // wipes the cells under the overlay so the chat / status
+        // line don't bleed through.
+        if let Some(menu) = self.context_menu.as_ref() {
+            crate::tui::context_menu::render_context_menu(frame, frame.area(), menu);
+        }
     }
 
     /// Queued-messages box. Inset one column from each side of the
@@ -1974,7 +2653,15 @@ impl App {
         if area.height < 2 || area.width < 5 || self.queue.is_empty() {
             return;
         }
-        let white = Color::White;
+        // Border tracks the input box: dark grey while an agent turn
+        // is in flight (matches the "agent is working, hold off" cue
+        // on the input border), white when idle. Indexed(238) — same
+        // shade the input uses.
+        let border_color = if self.pending.is_some() {
+            Color::Indexed(238)
+        } else {
+            Color::White
+        };
         let dim_white = Color::Indexed(250);
         let outer_w = area.width as usize;
         // Queue is inset 1 col on each side; inside the inset, 1 col
@@ -1989,7 +2676,7 @@ impl App {
         let top_bar = "─".repeat(queue_w.saturating_sub(2));
         lines.push(Line::from(vec![
             Span::raw(" ".repeat(inset)),
-            Span::styled(format!("╭{top_bar}╮"), Style::default().fg(white)),
+            Span::styled(format!("╭{top_bar}╮"), Style::default().fg(border_color)),
             Span::raw(" ".repeat(inset)),
         ]));
 
@@ -2000,12 +2687,12 @@ impl App {
             let trailing = inner_w.saturating_sub(body_w);
             lines.push(Line::from(vec![
                 Span::raw(" ".repeat(inset)),
-                Span::styled("│", Style::default().fg(white)),
+                Span::styled("│", Style::default().fg(border_color)),
                 Span::raw(" "),
                 Span::styled(body, Style::default().fg(dim_white)),
                 Span::raw(" ".repeat(trailing)),
                 Span::raw(" "),
-                Span::styled("│", Style::default().fg(white)),
+                Span::styled("│", Style::default().fg(border_color)),
                 Span::raw(" ".repeat(inset)),
             ]));
         }
@@ -2031,7 +2718,7 @@ impl App {
         }
         lines.push(Line::from(vec![Span::styled(
             shared,
-            Style::default().fg(white),
+            Style::default().fg(border_color),
         )]));
 
         frame.render_widget(Paragraph::new(lines), area);
@@ -2043,10 +2730,19 @@ impl App {
 
         let mut all: Vec<Line<'static>> = Vec::new();
         // `targets[i]` carries the history-entry index whose thinking
-        // chip occupies row `i` of `all`, or `None` otherwise.
+        // chip occupies row `i` of `all`, or `None` otherwise. Only
+        // the chip row toggles on click — body rows stay open for
+        // drag-select.
         let mut targets: Vec<Option<usize>> = Vec::new();
+        // `conts[i]` is `true` when row `i` of `all` is a soft-wrap
+        // continuation of the prior logical line.
+        let mut conts: Vec<bool> = Vec::new();
         for (idx, entry) in self.history.iter().enumerate() {
-            let Rendered { lines, chip_row } = render_entry(
+            let Rendered {
+                lines,
+                chip_row,
+                continuations,
+            } = render_entry(
                 entry,
                 area.width,
                 self.thinking_setting,
@@ -2061,6 +2757,12 @@ impl App {
                     None
                 });
             }
+            // Each entry's renderer returns one bool per emitted line;
+            // pad if there's any mismatch (defensive — shouldn't
+            // happen but keeps the parallel arrays in lockstep).
+            let mut entry_conts = continuations;
+            entry_conts.resize(lines.len(), false);
+            conts.extend(entry_conts);
             all.extend(lines);
             // Insert a one-line gap after agent entries to separate from
             // the next user message or pending turn. Skip consecutive
@@ -2068,6 +2770,7 @@ impl App {
             if matches!(entry, HistoryEntry::User { .. }) {
                 all.push(Line::default());
                 targets.push(None);
+                conts.push(false);
             } else if matches!(entry, HistoryEntry::Agent { .. }) {
                 let prev_is_agent = idx
                     .checked_sub(1)
@@ -2076,6 +2779,7 @@ impl App {
                 if !prev_is_agent {
                     all.push(Line::default());
                     targets.push(None);
+                    conts.push(false);
                 }
             }
         }
@@ -2084,31 +2788,90 @@ impl App {
             let pending_lines = render_pending(pending, dots, area.width);
             for _ in 0..pending_lines.len() {
                 targets.push(None);
+                conts.push(false);
             }
             all.extend(pending_lines);
         }
 
-        // Bottom-align the visible window over `all`.
-        let (visible, visible_targets): (Vec<Line<'static>>, Vec<Option<usize>>) =
-            if all.len() < area_h {
-                let pad = area_h - all.len();
-                let mut v: Vec<Line<'static>> = (0..pad).map(|_| Line::default()).collect();
-                let mut t: Vec<Option<usize>> = (0..pad).map(|_| None).collect();
-                v.extend(all);
-                t.extend(targets);
-                (v, t)
-            } else {
-                let drop = all.len() - area_h;
-                let v: Vec<Line<'static>> = all.into_iter().skip(drop).collect();
-                let t: Vec<Option<usize>> = targets.into_iter().skip(drop).collect();
-                (v, t)
-            };
+        // Track totals so the mouse-wheel handler can clamp scrollback
+        // to a valid range.
+        self.chat_total_lines = all.len();
+        self.chat_visible_lines = area_h;
+        // Clamp the user's scroll offset to "can't scroll past the
+        // top of the buffer". Max offset = total - visible (so the
+        // top of the buffer can sit at the top of the pane).
+        let max_offset = all.len().saturating_sub(area_h);
+        if self.chat_scroll_offset > max_offset {
+            self.chat_scroll_offset = max_offset;
+        }
+
+        // Bottom-align the visible window over `all`, then walk back by
+        // `chat_scroll_offset` logical lines so the user can scroll up
+        // into history with the wheel (T8.f wheel-scroll path).
+        let (visible, visible_targets, visible_conts): (
+            Vec<Line<'static>>,
+            Vec<Option<usize>>,
+            Vec<bool>,
+        ) = if all.len() < area_h {
+            let pad = area_h - all.len();
+            let mut v: Vec<Line<'static>> = (0..pad).map(|_| Line::default()).collect();
+            let mut t: Vec<Option<usize>> = (0..pad).map(|_| None).collect();
+            let mut c: Vec<bool> = (0..pad).map(|_| false).collect();
+            v.extend(all);
+            t.extend(targets);
+            c.extend(conts);
+            (v, t, c)
+        } else {
+            let drop = all.len() - area_h - self.chat_scroll_offset;
+            let v: Vec<Line<'static>> = all.into_iter().skip(drop).take(area_h).collect();
+            let t: Vec<Option<usize>> = targets.into_iter().skip(drop).take(area_h).collect();
+            let c: Vec<bool> = conts.into_iter().skip(drop).take(area_h).collect();
+            (v, t, c)
+        };
         self.clickable_rows = visible_targets;
+        self.chat_cont_rows = visible_conts;
 
         frame.render_widget(Paragraph::new(visible).wrap(Wrap { trim: false }), area);
+
+        // Snapshot the rendered chat cells. We do this after the
+        // paragraph widget has written into the frame buffer; the
+        // grid we capture here is the source-of-truth for the copy
+        // path (plan.md T8.f) — it survives wrap, multi-cell glyphs,
+        // and the bottom-align padding because it reflects what the
+        // user actually sees on screen.
+        self.chat_text_grid = capture_grid(frame.buffer_mut(), area);
+
+        // Apply the in-app selection highlight, if any. We mutate
+        // cell styles on the same buffer the paragraph just wrote
+        // to — the inverted bg lands underneath the next frame's
+        // diff, exactly like a "real" selection.
+        if let Some(sel) = self.selection {
+            // Skip chip rows from highlight: visually, the
+            // "▶ thought for Xs (ctrl+j to expand)" line is a
+            // control affordance, not message content. Building
+            // the bool mask here so apply_selection_highlight stays
+            // a free function.
+            let chip_row_mask: Vec<bool> =
+                self.clickable_rows.iter().map(|t| t.is_some()).collect();
+            apply_selection_highlight(
+                frame.buffer_mut(),
+                area,
+                sel,
+                &chip_row_mask,
+                &self.chat_text_grid,
+            );
+        }
     }
 
-    fn render_input(&self, frame: &mut ratatui::Frame, area: Rect, queue_above: bool) -> Position {
+    fn render_input(
+        &mut self,
+        frame: &mut ratatui::Frame,
+        area: Rect,
+        queue_above: bool,
+    ) -> Position {
+        // Stash for the mouse handler so a click can route to
+        // click-to-position-cursor (plan.md T8.d).
+        self.input_area = Some(area);
         // When the queue strip is above, its shared bottom row IS our
         // top border — render only sides + bottom here.
         let borders = if queue_above {
@@ -2116,14 +2879,16 @@ impl App {
         } else {
             Borders::ALL
         };
-        // Light grey border while the agent loop is in flight; white
-        // when we're idle and waiting for the user. The signal is the
-        // same `pending` slot the renderer uses to drive the "Thinking…"
-        // placeholder, so the border stays grey across reasoning,
-        // streaming, and tool dispatch and flips back to white the
-        // moment the turn finalizes.
+        // Dark grey border while the agent loop is in flight; white
+        // when we're idle. The same `pending` slot the renderer uses
+        // to drive the "Thinking…" placeholder gates this, so the
+        // border stays dim across reasoning, streaming, and tool
+        // dispatch and flips back to white the moment the turn
+        // finalizes. We use a darker grey than MUTED_COLOR_INDEX so
+        // the "agent is working, hold off typing" signal reads at a
+        // glance against the surrounding chrome.
         let border_color = if self.pending.is_some() {
-            Color::Indexed(MUTED_COLOR_INDEX)
+            Color::Indexed(238)
         } else {
             Color::White
         };
@@ -2141,27 +2906,32 @@ impl App {
         } else {
             text.split('\n').collect()
         };
-        let lines: Vec<Line<'static>> = buf_lines
-            .iter()
-            .enumerate()
-            .map(|(i, l)| {
-                let prefix = if i == 0 {
+        // Pre-wrap the composer text ourselves so the rendered visual
+        // rows match what `cursor_visual_pos` assumes — `Paragraph::
+        // wrap`'s word-wrap algorithm doesn't have a clean way to
+        // report the cursor's position back to us, so the two sides
+        // would otherwise drift apart on wrapped input.
+        let inner_w = input_inner.width as usize;
+        let budget = inner_w.saturating_sub(prefix_width).max(1);
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        for (li, line) in buf_lines.iter().enumerate() {
+            let line_chars: Vec<char> = line.chars().collect();
+            let chunks = wrap_logical_line_chunks(line, budget);
+            for (ci, (start, end)) in chunks.iter().enumerate() {
+                let chunk_text: String = line_chars[*start..*end].iter().collect();
+                let pre = if li == 0 && ci == 0 {
                     INPUT_PREFIX
                 } else {
                     indent.as_str()
                 };
-                Line::from(vec![
-                    Span::styled(prefix.to_string(), Style::default().fg(Color::White)),
-                    Span::styled((*l).to_string(), Style::default().fg(Color::White)),
-                ])
-            })
-            .collect();
+                lines.push(Line::from(vec![
+                    Span::styled(pre.to_string(), Style::default().fg(Color::White)),
+                    Span::styled(chunk_text, Style::default().fg(Color::White)),
+                ]));
+            }
+        }
 
         let (cursor_line, cursor_col) = self.composer.cursor_line_col();
-        // Wrap-aware visual cursor position: a single logical line
-        // that's wider than the inner width spans multiple visible
-        // rows, and we need the cursor to follow.
-        let inner_w = input_inner.width as usize;
         let (vis_row, vis_col) = cursor_visual_pos(
             self.composer.text(),
             cursor_line,
@@ -2174,9 +2944,11 @@ impl App {
 
         let visible_rows = input_inner.height;
         let scroll_y = cursor_row.saturating_sub(visible_rows.saturating_sub(1));
+        // No `Wrap` modifier — the lines we just emitted are already
+        // visual rows. Letting Paragraph::wrap re-wrap them would
+        // desync the cursor again.
         let para = Paragraph::new(lines)
             .block(input_block)
-            .wrap(Wrap { trim: false })
             .scroll((scroll_y, 0));
         frame.render_widget(para, area);
 
@@ -2377,6 +3149,211 @@ impl App {
     }
 }
 
+/// True for keys that are pure-modifier (Shift, Ctrl, Alt, etc. being
+/// pressed in isolation). Used to skip selection-clear so that
+/// holding Shift to extend a future selection-by-keyboard motion
+/// doesn't drop the in-flight selection on the press alone.
+fn is_modifier_only(key: &KeyEvent) -> bool {
+    matches!(
+        key.code,
+        KeyCode::Modifier(_) | KeyCode::CapsLock | KeyCode::NumLock | KeyCode::ScrollLock
+    )
+}
+
+/// Render a toast over the status-line rect. Single line; left-padded
+/// one cell; foreground color encodes intent (green/red/grey).
+/// Uses `Clear` so the status text underneath doesn't bleed through.
+fn render_toast(frame: &mut ratatui::Frame, status_rect: Rect, toast: &Toast) {
+    use ratatui::widgets::Clear;
+    if status_rect.height == 0 || status_rect.width == 0 {
+        return;
+    }
+    let fg = match toast.kind {
+        ToastKind::Success => Color::Green,
+        ToastKind::Error => Color::Red,
+        ToastKind::Info => Color::Indexed(250),
+    };
+    let text = format!(" {} ", toast.text);
+    // Truncate to fit if the message is longer than the status row.
+    let max = status_rect.width as usize;
+    let display: String = if text.chars().count() > max {
+        let cap = max.saturating_sub(1);
+        let truncated: String = text.chars().take(cap).collect();
+        format!("{truncated}…")
+    } else {
+        text
+    };
+    frame.render_widget(Clear, status_rect);
+    let para = Paragraph::new(Line::from(Span::styled(
+        display,
+        Style::default().fg(fg).add_modifier(Modifier::BOLD),
+    )));
+    frame.render_widget(para, status_rect);
+}
+
+/// Snapshot the chat-area cells into a `(row, col) → symbol` grid so
+/// the copy path can reconstruct selected plaintext without redoing
+/// ratatui's wrap. Run after `frame.render_widget(...)` so the cells
+/// reflect what the user actually sees.
+fn capture_grid(buf: &ratatui::buffer::Buffer, area: Rect) -> Vec<Vec<String>> {
+    let mut grid = Vec::with_capacity(area.height as usize);
+    for y in 0..area.height {
+        let mut row = Vec::with_capacity(area.width as usize);
+        for x in 0..area.width {
+            let abs_x = area.x + x;
+            let abs_y = area.y + y;
+            if let Some(cell) = buf.cell((abs_x, abs_y)) {
+                row.push(cell.symbol().to_string());
+            } else {
+                row.push(String::new());
+            }
+        }
+        grid.push(row);
+    }
+    grid
+}
+
+/// Apply the drag-select highlight to the chat area. Invert each
+/// selected cell's fg/bg via the `REVERSED` modifier — same visual
+/// affordance terminal selection uses, and it survives any underlying
+/// color theme.
+///
+/// Highlights only the *content range* of each row: from the first
+/// non-whitespace cell to the last non-whitespace cell. Cells outside
+/// that range (left/right padding, end-of-line gap) stay un-inverted.
+/// In-content spaces (between words) are highlighted so the selection
+/// reads as a continuous bar rather than a gappy one. Chip rows
+/// (`chip_row_mask`) are skipped entirely.
+fn apply_selection_highlight(
+    buf: &mut ratatui::buffer::Buffer,
+    area: Rect,
+    sel: Selection,
+    chip_row_mask: &[bool],
+    chat_text_grid: &[Vec<String>],
+) {
+    let (start, end) = sel.ordered();
+    let left = area.x;
+    let right = area.x + area.width.saturating_sub(1);
+    let top = area.y;
+    let bottom = area.y + area.height.saturating_sub(1);
+    for row in start.1..=end.1 {
+        if row < top || row > bottom {
+            continue;
+        }
+        let chat_rel = row.saturating_sub(area.y) as usize;
+        if chip_row_mask.get(chat_rel).copied().unwrap_or(false) {
+            continue;
+        }
+        let Some(grid_row) = chat_text_grid.get(chat_rel) else {
+            continue;
+        };
+        let Some((content_first, content_last)) = content_bounds(grid_row) else {
+            // Row is entirely whitespace (bottom-align padding,
+            // blank gap) — nothing to highlight.
+            continue;
+        };
+        let sel_first = if row == start.1 { start.0 } else { left };
+        let sel_last = if row == end.1 { end.0 } else { right };
+        let content_first_abs = (area.x as usize + content_first) as u16;
+        let content_last_abs = (area.x as usize + content_last) as u16;
+        let highlight_first = sel_first.max(content_first_abs);
+        let highlight_last = sel_last.min(content_last_abs);
+        if highlight_first > highlight_last {
+            continue;
+        }
+        for col in highlight_first..=highlight_last {
+            if let Some(cell) = buf.cell_mut((col, row)) {
+                let mut style = cell.style();
+                style = style.add_modifier(ratatui::style::Modifier::REVERSED);
+                cell.set_style(style);
+            }
+        }
+    }
+}
+
+/// `(first_content_col, last_content_col)` for a row of the chat
+/// grid, or `None` if the row is entirely whitespace. Used by the
+/// highlight pass to draw the inversion only across content cells.
+fn content_bounds(row: &[String]) -> Option<(usize, usize)> {
+    let first = row
+        .iter()
+        .position(|c| !c.chars().all(|ch| ch.is_whitespace()))?;
+    let last = row
+        .iter()
+        .rposition(|c| !c.chars().all(|ch| ch.is_whitespace()))?;
+    Some((first, last))
+}
+
+/// Extract the plaintext under the active drag-selection from the
+/// cached chat grid. Walks the selection in reading order: first row
+/// from start.col to row-end, full intermediate rows, last row from
+/// row-start to end.col.
+///
+/// Two refinements on top of the cell-by-cell extraction:
+///
+/// 1. **Strip the agent-message left padding.** Each row gets at most
+///    `AGENT_INDENT` leading spaces removed, preserving any *extra*
+///    indent (code-block indentation, list nesting) above that base.
+///    `\u{a0}` (NBSP) is intentionally preserved because that's a
+///    user-meaningful character.
+/// 2. **Soft-wrap rejoin.** When a row is a continuation of the
+///    previous logical line (per `cont_rows`), join it with a space
+///    instead of a newline so a wrapped paragraph pastes as one
+///    paragraph, not a stack of short visual lines. Hard line breaks
+///    (paragraph boundaries) still produce newlines.
+fn extract_selection_plaintext(
+    grid: &[Vec<String>],
+    cont_rows: &[bool],
+    area: Rect,
+    sel: Selection,
+) -> String {
+    use crate::tui::history::AGENT_INDENT;
+    let (start, end) = sel.ordered();
+    let mut out = String::new();
+    let mut first_emitted = true;
+    for abs_row in start.1..=end.1 {
+        let grid_row = abs_row.saturating_sub(area.y) as usize;
+        let Some(row) = grid.get(grid_row) else {
+            continue;
+        };
+        let first_col = if abs_row == start.1 {
+            start.0.saturating_sub(area.x) as usize
+        } else {
+            0
+        };
+        let last_col = if abs_row == end.1 {
+            end.0.saturating_sub(area.x) as usize
+        } else {
+            row.len().saturating_sub(1)
+        };
+        let mut line = String::new();
+        for col in first_col..=last_col {
+            if let Some(symbol) = row.get(col) {
+                line.push_str(symbol);
+            }
+        }
+        // Drop trailing spaces — bottom-align padding and end-of-line
+        // gaps would otherwise turn into ugly trailing whitespace.
+        let trimmed = line.trim_end_matches(' ').to_string();
+        // Strip up to AGENT_INDENT leading spaces. Extra indent
+        // (code blocks, nested lists) survives.
+        let leading_spaces = trimmed.chars().take_while(|c| *c == ' ').count();
+        let strip = leading_spaces.min(AGENT_INDENT);
+        let stripped: String = trimmed.chars().skip(strip).collect();
+        // Join: space for soft-wrap continuations, newline for hard
+        // line boundaries. First emitted row never gets a leading
+        // separator.
+        if first_emitted {
+            first_emitted = false;
+        } else {
+            let is_continuation = cont_rows.get(grid_row).copied().unwrap_or(false);
+            out.push(if is_continuation { ' ' } else { '\n' });
+        }
+        out.push_str(&stripped);
+    }
+    out
+}
+
 /// Rough row count for a history entry. Mirrors the breakdown in
 /// `total_history_lines` so the spill math is consistent.
 fn entry_rendered_rows(entry: &HistoryEntry) -> u16 {
@@ -2435,6 +3412,10 @@ fn first_line_truncated(s: &str, width: usize) -> String {
 /// is the width of the leading `❯ ` on the first logical line (a
 /// matching indent is used on subsequent logical lines, so the wrap
 /// math is symmetric).
+/// Compute the cursor's visual `(row, col)` inside the composer's
+/// inner rect. Both the renderer and this function rely on
+/// [`wrap_logical_line_chunks`] for the wrap algorithm, so they're
+/// guaranteed to agree on where each character lands.
 fn cursor_visual_pos(
     text: &str,
     cursor_line: usize,
@@ -2445,29 +3426,77 @@ fn cursor_visual_pos(
     if wrap_width == 0 {
         return (0, 0);
     }
-    let mut visual_row: usize = 0;
+    let budget = wrap_width.saturating_sub(prefix).max(1);
     let lines: Vec<&str> = if text.is_empty() {
         vec![""]
     } else {
         text.split('\n').collect()
     };
-    for (i, line) in lines.iter().enumerate().take(cursor_line) {
-        // Every logical line carries the same `prefix` width because
-        // the renderer inserts the prefix-width indent on lines after
-        // the first too. Result: line wraps identically.
-        let visual_chars = prefix + line.chars().count();
-        let n = if visual_chars == 0 {
-            1
-        } else {
-            visual_chars.div_ceil(wrap_width)
-        };
-        visual_row += n.max(1);
-        let _ = i;
+    let mut visual_row: usize = 0;
+    for (li, line) in lines.iter().enumerate() {
+        let chunks = wrap_logical_line_chunks(line, budget);
+        if li < cursor_line {
+            visual_row += chunks.len();
+            continue;
+        }
+        // On the cursor's logical line — locate the chunk containing
+        // the cursor and return its visual position.
+        for (ci, (start, end)) in chunks.iter().enumerate() {
+            let is_last = ci + 1 == chunks.len();
+            let contains = if is_last {
+                cursor_col >= *start && cursor_col <= *end
+            } else {
+                cursor_col >= *start && cursor_col < *end
+            };
+            if contains {
+                let col_within = cursor_col - start;
+                return (visual_row + ci, prefix + col_within);
+            }
+        }
+        // Defensive fallback — cursor past the last chunk.
+        let (last_start, last_end) = *chunks.last().expect("chunks non-empty");
+        return (
+            visual_row + chunks.len().saturating_sub(1),
+            prefix + (last_end - last_start),
+        );
     }
-    let offset = prefix + cursor_col;
-    let row_within = offset / wrap_width;
-    let col_within = offset % wrap_width;
-    (visual_row + row_within, col_within)
+    (visual_row, prefix)
+}
+
+/// Greedy word-aware wrap of a single logical line into char-range
+/// chunks. Each `(start, end)` is a half-open range into the line's
+/// chars; the chunks tile the entire line (`end[i] == start[i+1]`)
+/// so cursor positions map back deterministically. Breaks at the
+/// last space inside `budget` if there is one; falls back to a
+/// hard cut at `budget` for unbreakable tokens.
+fn wrap_logical_line_chunks(line: &str, budget: usize) -> Vec<(usize, usize)> {
+    let chars: Vec<char> = line.chars().collect();
+    if chars.is_empty() {
+        return vec![(0, 0)];
+    }
+    if budget == 0 {
+        return vec![(0, chars.len())];
+    }
+    let mut out = Vec::new();
+    let mut idx = 0;
+    while idx < chars.len() {
+        let remaining = chars.len() - idx;
+        if remaining <= budget {
+            out.push((idx, chars.len()));
+            break;
+        }
+        let max_end = idx + budget;
+        let break_at = (idx + 1..=max_end)
+            .rev()
+            .find(|&i| i > 0 && chars[i - 1] == ' ')
+            .unwrap_or(max_end);
+        out.push((idx, break_at));
+        idx = break_at;
+    }
+    if out.is_empty() {
+        out.push((0, 0));
+    }
+    out
 }
 
 /// True for tools that take an `old_string` / `new_string` pair we
@@ -2588,76 +3617,6 @@ fn slash_matches(query: &str) -> Vec<&'static SlashCommand> {
         .collect()
 }
 
-fn viewport_rect(pane_height: u16, width: u16, height: u16) -> Rect {
-    let h = pane_height.min(height.max(1));
-    Rect::new(0, height.saturating_sub(h), width.max(1), h)
-}
-
-fn reserve_fixed_pane_space(height: u16) -> Result<()> {
-    let mut out = stdout();
-    for _ in 0..height {
-        writeln!(out)?;
-    }
-    out.flush()?;
-    Ok(())
-}
-
-/// Scroll the terminal up by `extra` rows by walking the cursor to the
-/// bottom row and emitting linefeeds. In raw mode `\n` is plain LF, so
-/// each one at the last row makes the terminal scroll: prior output
-/// moves into scrollback (recoverable with the mouse wheel) and `extra`
-/// blank rows open up at the bottom for the enlarged viewport.
-fn push_terminal_content_up(extra: u16, term_h: u16) -> Result<()> {
-    if extra == 0 {
-        return Ok(());
-    }
-    let mut out = stdout();
-    crossterm::execute!(out, cursor::MoveTo(0, term_h.saturating_sub(1)))?;
-    for _ in 0..extra {
-        out.write_all(b"\n")?;
-    }
-    out.flush()?;
-    Ok(())
-}
-
-/// Push `lines` into terminal scrollback just above the viewport.
-///
-/// Approach: write the lines at the top of the viewport (overwriting
-/// the top rows of whatever is currently rendered there), then scroll
-/// the terminal up by `lines.len()` rows. The just-written lines slide
-/// up into the area above the viewport — visible if pane_height < term_h,
-/// or pushed into actual terminal scrollback if pane_height == term_h.
-/// Either way the mouse wheel can scroll back to them.
-///
-/// After calling this, the caller must invoke `terminal.clear()` so
-/// ratatui forces a full redraw — otherwise its diff-based renderer
-/// will not realize the terminal state has changed underneath it.
-fn insert_above_viewport(pane_height: u16, lines: &[String]) -> Result<()> {
-    let n = lines.len() as u16;
-    if n == 0 {
-        return Ok(());
-    }
-    let (_, h) = terminal_size()?;
-    let viewport_top = h.saturating_sub(pane_height);
-    let mut out = stdout();
-
-    crossterm::execute!(out, cursor::MoveTo(0, viewport_top))?;
-    for (i, line) in lines.iter().enumerate() {
-        out.write_all(line.as_bytes())?;
-        crossterm::execute!(out, Clear(ClearType::UntilNewLine))?;
-        if i + 1 < lines.len() {
-            out.write_all(b"\r\n")?;
-        }
-    }
-
-    crossterm::execute!(out, cursor::MoveTo(0, h.saturating_sub(1)))?;
-    for _ in 0..n {
-        out.write_all(b"\n")?;
-    }
-    out.flush()?;
-    Ok(())
-}
-
 fn accepts_key(key: &KeyEvent) -> bool {
     matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
 }
@@ -2685,6 +3644,15 @@ fn load_tui_config(cwd: &Path) -> crate::config::extended::TuiConfig {
 /// into prompt history, otherwise it moves the cursor up one line.
 fn cursor_on_first_line(text: &str, cursor: usize) -> bool {
     !text[..cursor.min(text.len())].contains('\n')
+}
+
+/// True when `cursor` falls on the last line of `text` (no `\n` after
+/// it). Used by history navigation: Down only steps history when the
+/// cursor is at the bottom of the buffer; otherwise it moves the
+/// composer cursor down a line.
+fn cursor_on_last_line(text: &str, cursor: usize) -> bool {
+    let after = &text[cursor.min(text.len())..];
+    !after.contains('\n')
 }
 
 /// Background task that polls `git status` every `GIT_REFRESH_INTERVAL`

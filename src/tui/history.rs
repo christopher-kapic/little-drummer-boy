@@ -154,7 +154,9 @@ const AGENT_BULLET: &str = "";
 /// the text doesn't sit flush against the terminal edge now that the
 /// bullet is gone. Continuation lines inherit this indent; the first
 /// line gets it too, with the timestamp reserve on the right side.
-const AGENT_INDENT: usize = 2;
+/// Public so the copy path can strip exactly this much from each
+/// row of an agent-message selection.
+pub const AGENT_INDENT: usize = 2;
 
 /// One rendered history entry. The chrome assembles a flat list of
 /// `Rendered` for the chat pane, then uses each entry's `chip_row` to
@@ -166,6 +168,12 @@ pub struct Rendered {
     /// chip. `None` for entries without one (everything except a
     /// `HistoryEntry::Agent` with non-empty reasoning).
     pub chip_row: Option<usize>,
+    /// One bool per row in `lines`. `true` for rows that are a
+    /// soft-wrap continuation of the prior logical line — the copy
+    /// path joins these with a space instead of a newline so pasted
+    /// agent text reconstructs the original paragraph rather than
+    /// preserving the screen-level wraps.
+    pub continuations: Vec<bool>,
 }
 
 /// Render one history entry. The renderer receives the area's `width`
@@ -184,23 +192,34 @@ pub fn render_entry(
     diff_style: crate::config::extended::DiffStyle,
 ) -> Rendered {
     match entry {
-        HistoryEntry::User { text, timestamp } => Rendered {
-            lines: render_user(text, *timestamp, width, md.user),
-            chip_row: None,
-        },
+        HistoryEntry::User { text, timestamp } => {
+            let lines = render_user(text, *timestamp, width, md.user);
+            let continuations = vec![false; lines.len()];
+            Rendered {
+                lines,
+                chip_row: None,
+                continuations,
+            }
+        }
         HistoryEntry::Plain { line } => Rendered {
             lines: vec![Line::from(line.clone())],
             chip_row: None,
+            continuations: vec![false],
         },
         HistoryEntry::Diff {
             tool,
             path,
             old,
             new,
-        } => Rendered {
-            lines: crate::tui::diff::render_diff(tool, path, old, new, diff_style, width),
-            chip_row: None,
-        },
+        } => {
+            let lines = crate::tui::diff::render_diff(tool, path, old, new, diff_style, width);
+            let continuations = vec![false; lines.len()];
+            Rendered {
+                lines,
+                chip_row: None,
+                continuations,
+            }
+        }
         HistoryEntry::Agent {
             name,
             text,
@@ -405,6 +424,11 @@ fn render_agent(
     let reserve_first = TIMESTAMP_WIDTH + 1;
 
     let mut out: Vec<Line<'static>> = Vec::new();
+    // Parallel to `out`: `conts[i]` is `true` when row `i` is a
+    // soft-wrap continuation of the previous logical line. The copy
+    // path uses this to rejoin soft-wraps with a space instead of a
+    // newline.
+    let mut conts: Vec<bool> = Vec::new();
     let mut chip_row = None;
 
     // When the agent produced reasoning, the *first* row of this entry
@@ -428,7 +452,12 @@ fn render_agent(
         };
         chip_row = Some(out.len());
         let indent = " ".repeat(bullet_width);
-        let text_width = (width as usize).saturating_sub(bullet_width).max(1);
+        // Wrap to width minus left indent (bullet_width == AGENT_INDENT
+        // since the bullet is empty) minus a matching right pad
+        // (AGENT_INDENT) so body lines have symmetric breathing room.
+        let text_width = (width as usize)
+            .saturating_sub(bullet_width + AGENT_INDENT)
+            .max(1);
         let label_width = label.chars().count();
         // Default wrap (used for the expanded body and for wrapped[1..]
         // continuation lines in the collapsed case). The collapsed-no-
@@ -450,13 +479,27 @@ fn render_agent(
                 .add_modifier(Modifier::DIM | Modifier::UNDERLINED),
         ));
 
-        let body_lines: Vec<Line<'static>> = if markdown {
-            indent_lines(markdown::render(text), AGENT_INDENT)
+        // Body content target width: full width minus left indent
+        // (AGENT_INDENT) and a matching right pad (AGENT_INDENT) so
+        // wrapped continuations don't go all the way to the right
+        // edge.
+        let body_content_w = (width as usize).saturating_sub(2 * AGENT_INDENT).max(1);
+        let (body_lines, body_conts): (Vec<Line<'static>>, Vec<bool>) = if markdown {
+            // Pre-wrap the markdown lines ourselves so ratatui's
+            // Paragraph::wrap doesn't strip the indent on
+            // continuation rows.
+            let (wrapped_md, md_conts) =
+                wrap_lines_to_width(markdown::render(text), body_content_w);
+            (indent_lines(wrapped_md, AGENT_INDENT), md_conts)
         } else {
-            wrapped
+            let lines = wrapped
                 .iter()
                 .map(|chunk| Line::from(vec![Span::raw(format!("{indent}{chunk}"))]))
-                .collect()
+                .collect::<Vec<_>>();
+            // wrapped[0] starts a fresh logical line; the rest are
+            // soft-wrap continuations of the agent's text.
+            let conts = (0..lines.len()).map(|i| i > 0).collect();
+            (lines, conts)
         };
 
         if expanded {
@@ -470,6 +513,7 @@ fn render_agent(
             out.push(render_first_line_timestamped(
                 chip_spans, timestamp, width, true,
             ));
+            conts.push(false);
             let reasoning_indent = AGENT_INDENT + 2;
             let reasoning_w = (width as usize).saturating_sub(reasoning_indent).max(1);
             for raw_line in reasoning.lines() {
@@ -478,14 +522,16 @@ fn render_agent(
                 } else {
                     wrap_with_reserved_first_line_and_prefix(raw_line, reasoning_w, 0, 0)
                 };
-                for chunk in chunks {
+                for (i, chunk) in chunks.into_iter().enumerate() {
                     out.push(Line::from(vec![
                         Span::raw(" ".repeat(reasoning_indent)),
                         Span::styled(chunk, Style::default().fg(REASONING_FG)),
                     ]));
+                    conts.push(i > 0);
                 }
             }
             out.extend(body_lines);
+            conts.extend(body_conts);
         } else if markdown {
             // Collapsed + markdown: chip on its own row (folding
             // markdown spans onto the chip line is more visual jank than
@@ -493,7 +539,9 @@ fn render_agent(
             out.push(render_first_line_timestamped(
                 chip_spans, timestamp, width, true,
             ));
+            conts.push(false);
             out.extend(body_lines);
+            conts.extend(body_conts);
         } else {
             // Collapsed: chip + first text chunk on the same line so
             // there's no visual blank between the chip and the answer.
@@ -501,11 +549,8 @@ fn render_agent(
             // right-edge timestamp, so re-wrap with both reserved —
             // otherwise the chunk pushes the timestamp onto row 2.
             let collapsed_first_reserve = label_width + 1 + TIMESTAMP_WIDTH + 1;
-            let collapsed_wrapped: Vec<String> = wrap_with_reserved_first_line(
-                text,
-                text_width,
-                collapsed_first_reserve,
-            );
+            let collapsed_wrapped: Vec<String> =
+                wrap_with_reserved_first_line(text, text_width, collapsed_first_reserve);
             let mut first_line_spans = chip_spans;
             if !collapsed_wrapped.is_empty() {
                 first_line_spans.push(Span::raw(" "));
@@ -517,47 +562,68 @@ fn render_agent(
                 width,
                 true,
             ));
+            conts.push(false);
             for chunk in collapsed_wrapped.iter().skip(1) {
                 out.push(Line::from(vec![Span::raw(format!("{indent}{chunk}"))]));
+                conts.push(true);
             }
         }
     } else if markdown {
         // No reasoning + markdown: emit markdown lines, attaching the
         // timestamp to the first line via right-edge padding. Every
-        // line carries AGENT_INDENT on the left. If the first line's
-        // content would overlap the timestamp's reserved column, slice
-        // it (preserving span styles) so the timestamp stays anchored
-        // at the right edge of row 1 and the overflow flows to row 2.
-        let body = indent_lines(markdown::render(text), AGENT_INDENT);
+        // line carries AGENT_INDENT on the left AND a matching right
+        // pad. Pre-wrap with `wrap_lines_to_width` so ratatui's
+        // Paragraph::wrap can't strip the indent from continuation
+        // rows by re-wrapping at the full pane width.
+        let body_content_w = (width as usize).saturating_sub(2 * AGENT_INDENT).max(1);
+        let (wrapped_md, md_conts) = wrap_lines_to_width(markdown::render(text), body_content_w);
+        let body = indent_lines(wrapped_md, AGENT_INDENT);
         if body.is_empty() {
             out.extend(render_with_timestamp(vec![], timestamp, width));
+            conts.push(false);
         } else {
-            let first_line_budget = (width as usize)
-                .saturating_sub(TIMESTAMP_WIDTH + 1)
-                .max(1);
-            let mut iter = body.into_iter();
-            let first = iter.next().expect("body non-empty");
+            // First line additionally reserves TIMESTAMP_WIDTH+1 for
+            // the right-edge timestamp — already includes the left
+            // indent because `body` was indent_lines'd above. If the
+            // first line's content overlaps the timestamp column,
+            // slice it (preserving span styles) and flow the tail
+            // onto row 2 (which IS a soft-wrap continuation).
+            let first_line_budget = (width as usize).saturating_sub(TIMESTAMP_WIDTH + 1).max(1);
+            let mut iter = body.into_iter().zip(md_conts.into_iter());
+            let (first, first_cont) = iter.next().expect("body non-empty");
             let (head, tail) = slice_spans_at_width(first.spans, first_line_budget);
             out.push(render_first_line_with_timestamp(head, timestamp, width));
+            conts.push(first_cont);
             if let Some(tail_spans) = tail {
                 let mut spans = vec![Span::raw(" ".repeat(AGENT_INDENT))];
                 spans.extend(tail_spans);
                 out.push(Line::from(spans));
+                // Tail is a hard-wrap (from the timestamp slice) of
+                // the *same* logical line, so mark as continuation.
+                conts.push(true);
             }
-            out.extend(iter);
+            for (line, cont) in iter {
+                out.push(line);
+                conts.push(cont);
+            }
         }
     } else {
         // No reasoning, no markdown — text gets the standard left
-        // indent; the timestamp is right-aligned on the first wrapped
-        // line. The wrap is sized so `indent + chunk` fits in `width`.
+        // indent and a matching right pad; the timestamp is right-
+        // aligned on the first wrapped line. Wrap area is `width -
+        // 2*AGENT_INDENT` so continuations leave breathing room on
+        // both sides.
         let chunks = wrap_with_reserved_first_line_and_prefix(
             text,
-            (width as usize).saturating_sub(bullet_width).max(1),
+            (width as usize)
+                .saturating_sub(bullet_width + AGENT_INDENT)
+                .max(1),
             reserve_first,
             0,
         );
         if chunks.is_empty() {
             out.extend(render_with_timestamp(vec![], timestamp, width));
+            conts.push(false);
         } else {
             for (i, chunk) in chunks.iter().enumerate() {
                 if i == 0 {
@@ -570,9 +636,11 @@ fn render_agent(
                     }
                     spans.push(Span::raw(chunk.clone()));
                     out.push(render_first_line_with_timestamp(spans, timestamp, width));
+                    conts.push(false);
                 } else {
                     let indent = " ".repeat(bullet_width);
                     out.push(Line::from(vec![Span::raw(format!("{indent}{chunk}"))]));
+                    conts.push(true);
                 }
             }
         }
@@ -581,6 +649,7 @@ fn render_agent(
     Rendered {
         lines: out,
         chip_row,
+        continuations: conts,
     }
 }
 
@@ -620,6 +689,47 @@ fn render_first_line_with_timestamp(
     width: u16,
 ) -> Line<'static> {
     render_first_line_timestamped(spans, timestamp, width, true)
+}
+
+/// Re-wrap a `Vec<Line>` so every emitted line's content fits within
+/// `max_width` cells. Uses `slice_spans_at_width` repeatedly to split
+/// long lines on whitespace boundaries (or hard-cut for unbroken
+/// tokens), preserving each span's style across the splits.
+///
+/// Returns `(wrapped_lines, continuations)` — `continuations[i]` is
+/// `true` when row `i` is a soft-wrap continuation of the previous
+/// row (i.e., it came from the same input Line), `false` for rows
+/// that start a fresh input Line. The copy path uses this to join
+/// continuations with a space and starts-of-line with a newline.
+///
+/// Used to pre-wrap markdown-rendered agent bodies so ratatui's
+/// `Paragraph::wrap` doesn't drop continuation rows to column 0 and
+/// destroy the indent we added with [`indent_lines`].
+fn wrap_lines_to_width(
+    lines: Vec<Line<'static>>,
+    max_width: usize,
+) -> (Vec<Line<'static>>, Vec<bool>) {
+    if max_width == 0 {
+        let conts = vec![false; lines.len()];
+        return (lines, conts);
+    }
+    let mut out = Vec::with_capacity(lines.len());
+    let mut conts = Vec::with_capacity(lines.len());
+    for line in lines {
+        let mut remaining = line.spans;
+        let mut first = true;
+        loop {
+            let (head, tail) = slice_spans_at_width(remaining, max_width);
+            out.push(Line::from(head));
+            conts.push(!first);
+            first = false;
+            match tail {
+                Some(t) => remaining = t,
+                None => break,
+            }
+        }
+    }
+    (out, conts)
 }
 
 /// Prepend `n` cells of left padding to every line. Used to apply
@@ -989,16 +1099,7 @@ mod tests {
         // that so the first row never exceeds the area width.
         let text = "x".repeat(200);
         let width: u16 = 60;
-        let rendered = render_agent(
-            "coder",
-            &text,
-            "",
-            fixed_ts(),
-            false,
-            None,
-            width,
-            false,
-        );
+        let rendered = render_agent("coder", &text, "", fixed_ts(), false, None, width, false);
         assert!(!rendered.lines.is_empty());
         // The first line carries the timestamp and must fit in `width`
         // so ratatui's auto-wrap can't push the timestamp to row 2.

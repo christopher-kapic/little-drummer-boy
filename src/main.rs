@@ -13,6 +13,7 @@ mod auth;
 mod auto_title;
 mod banner;
 mod cli;
+mod clipboard;
 mod commands;
 mod config;
 mod credentials;

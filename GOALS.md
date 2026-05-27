@@ -192,11 +192,15 @@ floating slash menu, approval dialogs), then on exit it leaves
 the alt screen and prints the last N turns to stdout before
 returning control to the shell.
 
-- **Default:** the last 3 turns (or everything since the last
-  `/clear`, whichever is fewer).
-- **Configurable:** `tui.exit_tail_turns` in `config.json`. Set to
+- **Default:** the last 100 rendered lines (or everything since the
+  last `/clear`, whichever is fewer).
+- **Configurable:** `tui.exit_tail_lines` in `config.json`. Set to
   `0` to disable (clean exit, no tail); set to `-1` for the whole
-  session.
+  session. Line-counted rather than turn-counted because turn sizes
+  vary by orders of magnitude (a one-line "yes" vs a 2000-line tool
+  dump), and the user's interest is in "a screenful or two of
+  recent context I can copy from," which lines track better than
+  turns.
 - **Formatting:** transcript is rendered in a copy-friendly form —
   no box characters, no color codes (or stripped via `NO_COLOR`
   semantics), agent names prefixed (`orchestrator-build:`,

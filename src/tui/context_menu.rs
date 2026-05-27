@@ -1,0 +1,194 @@
+//! Right-click context menu for the chat area.
+//!
+//! Triggered by `MouseEventKind::Down(MouseButton::Right)` in the chat
+//! area when `tui.mouse_capture` is on. Offers per-message copy
+//! actions in three formats: rich text (HTML), markdown source, and
+//! markdown rendered to plain text.
+//!
+//! The "Copy as rich text" option is omitted over SSH — `arboard`
+//! can't reach the local clipboard through an SSH pipe, so there's
+//! no useful path for multi-format clipboard data in that case. The
+//! markdown and plain-text variants go through OSC52 (plus `arboard`
+//! locally as a parallel backend) and work over SSH so long as the
+//! terminal honors OSC52.
+//!
+//! Layout follows the same visual language as the queue / input box:
+//! rounded borders, white outline, yellow highlight on the focused
+//! row. Plays nicely with the dialog/modal stack — the menu
+//! intercepts every key and mouse event while open.
+//!
+//! See `plan.md` T8 for the broader feature plan.
+
+use ratatui::Frame;
+use ratatui::layout::Rect;
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
+
+/// Actions the user can pick from the context menu. Resolved by the
+/// App in [`crate::tui::app::App::execute_context_menu_action`]. All
+/// three operate on the agent message under (or most recently
+/// before) the right-click point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextMenuAction {
+    /// Copy the agent message under the right-click as rich text
+    /// (HTML to clipboard, plain alt). Only offered when not on SSH
+    /// — `arboard` can't reach the local clipboard over SSH.
+    CopyAsRichText,
+    /// Copy the agent message's raw markdown source verbatim. Lands
+    /// on the clipboard as plain text — paste into Slack / GitHub /
+    /// anywhere that re-renders markdown.
+    CopyAsMarkdown,
+    /// Copy the agent message rendered to plain text (formatting
+    /// markers stripped, list items prefixed with `- `, paragraphs
+    /// separated by blank lines). Best for pasting into an editor
+    /// or plain-text email.
+    CopyAsPlainText,
+}
+
+impl ContextMenuAction {
+    fn label(self) -> &'static str {
+        match self {
+            Self::CopyAsRichText => "Copy as rich text",
+            Self::CopyAsMarkdown => "Copy as markdown",
+            Self::CopyAsPlainText => "Copy as plain text",
+        }
+    }
+}
+
+/// Active right-click context menu state.
+#[derive(Debug, Clone)]
+pub struct ContextMenu {
+    /// Absolute terminal position the menu's top-left corner would
+    /// prefer. The render function clamps this so the menu fits on
+    /// screen.
+    pub preferred_origin: (u16, u16),
+    /// Which row of the chat area (chat-relative) the user
+    /// right-clicked on. Each copy action uses this to find the
+    /// agent message under the click.
+    pub clicked_chat_row: usize,
+    /// Item the keyboard focus is on.
+    pub cursor: usize,
+    /// Item list — composed at menu-open time based on whether
+    /// rich-text copy is available (i.e., not on SSH). Fixed for
+    /// the lifetime of this menu open.
+    pub items: Vec<ContextMenuAction>,
+}
+
+impl ContextMenu {
+    /// Build the items list for the current session. Includes rich
+    /// text only when the local OS clipboard is reachable (i.e.,
+    /// `!is_ssh`). Markdown + plain text always available.
+    pub fn build_items(is_ssh: bool) -> Vec<ContextMenuAction> {
+        let mut items = Vec::with_capacity(3);
+        if !is_ssh {
+            items.push(ContextMenuAction::CopyAsRichText);
+        }
+        items.push(ContextMenuAction::CopyAsMarkdown);
+        items.push(ContextMenuAction::CopyAsPlainText);
+        items
+    }
+
+    pub fn move_cursor(&mut self, delta: i32) {
+        let len = self.items.len() as i32;
+        if len == 0 {
+            return;
+        }
+        let mut idx = self.cursor as i32 + delta;
+        // Clamp rather than wrap. The menu is short enough that
+        // wrap is more confusing than helpful.
+        if idx < 0 {
+            idx = 0;
+        }
+        if idx >= len {
+            idx = len - 1;
+        }
+        self.cursor = idx as usize;
+    }
+
+    pub fn focused_action(&self) -> Option<ContextMenuAction> {
+        self.items.get(self.cursor).copied()
+    }
+
+    /// Hit-test a mouse click against the rendered menu. Returns the
+    /// action under `(col, row)` if any.
+    pub fn hit_test(&self, col: u16, row: u16, full_area: Rect) -> Option<ContextMenuAction> {
+        let menu_rect = self.placement(full_area);
+        if col < menu_rect.x || col >= menu_rect.x + menu_rect.width {
+            return None;
+        }
+        if row < menu_rect.y || row >= menu_rect.y + menu_rect.height {
+            return None;
+        }
+        // First and last row are borders; items occupy the inner rows.
+        let item_row = row.saturating_sub(menu_rect.y + 1) as usize;
+        self.items.get(item_row).copied()
+    }
+
+    /// Compute the on-screen rect for the menu, clamping so it always
+    /// fits inside `full_area`. Width is fixed; height = items + 2 for
+    /// borders.
+    pub fn placement(&self, full_area: Rect) -> Rect {
+        let width = self.render_width();
+        let height = self.items.len() as u16 + 2;
+        let mut x = self.preferred_origin.0;
+        let mut y = self.preferred_origin.1;
+        if x + width > full_area.x + full_area.width {
+            x = (full_area.x + full_area.width).saturating_sub(width);
+        }
+        if x < full_area.x {
+            x = full_area.x;
+        }
+        if y + height > full_area.y + full_area.height {
+            // Flip above the click if there's no room below.
+            y = y.saturating_sub(height);
+        }
+        if y < full_area.y {
+            y = full_area.y;
+        }
+        Rect::new(x, y, width, height)
+    }
+
+    fn render_width(&self) -> u16 {
+        // Widest label + 4 (left pad + right pad + 2 border cells).
+        let widest = self
+            .items
+            .iter()
+            .map(|a| a.label().chars().count())
+            .max()
+            .unwrap_or(0) as u16;
+        widest + 4
+    }
+}
+
+/// Render the context menu over the given full area (typically the
+/// frame's whole rect).
+pub fn render_context_menu(frame: &mut Frame, full_area: Rect, menu: &ContextMenu) {
+    let rect = menu.placement(full_area);
+    // Wipe whatever was rendered underneath so the menu reads cleanly.
+    frame.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::White));
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for (i, action) in menu.items.iter().enumerate() {
+        let focused = i == menu.cursor;
+        let marker = if focused { "▸ " } else { "  " };
+        let style = if focused {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        lines.push(Line::from(vec![
+            Span::raw(marker),
+            Span::styled(action.label().to_string(), style),
+        ]));
+    }
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}

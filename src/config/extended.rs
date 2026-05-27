@@ -215,6 +215,28 @@ pub struct TuiConfig {
     /// narrower than 80 columns.
     #[serde(default)]
     pub diff_style: DiffStyle,
+    /// Capture mouse events. With capture on we get click-to-position
+    /// in the composer, drag-select in chat history, and clickable
+    /// chips. Native terminal selection requires holding the
+    /// terminal's bypass modifier (Shift / Option / Fn) while
+    /// capture is on; we provide in-app drag-select + Ctrl+Shift+C
+    /// for the common path.
+    #[serde(default = "default_true")]
+    pub mouse_capture: bool,
+    /// Allow `Ctrl+Shift+Y` to copy the focused agent message as
+    /// rich text (HTML to the system clipboard via the local OS
+    /// clipboard layer; falls back to plain text over SSH).
+    #[serde(default = "default_true")]
+    pub rich_text_copy: bool,
+    /// Lines of conversation tail to dump back into terminal
+    /// scrollback at TUI exit (GOALS §1d). Default 100. `0` disables
+    /// the dump entirely; `-1` dumps the whole session.
+    #[serde(default = "default_exit_tail_lines")]
+    pub exit_tail_lines: i32,
+}
+
+fn default_exit_tail_lines() -> i32 {
+    100
 }
 
 /// Diff rendering mode for edit/write tool calls.
@@ -361,6 +383,9 @@ impl Default for TuiConfig {
             show_branch: true,
             banner: BannerConfig::default(),
             diff_style: DiffStyle::default(),
+            mouse_capture: true,
+            rich_text_copy: true,
+            exit_tail_lines: default_exit_tail_lines(),
         }
     }
 }

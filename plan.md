@@ -3227,6 +3227,120 @@ step's dependencies cheap.
 
 ---
 
+### T8. Fullscreen TUI, mouse capture, and first-class clipboard
+
+The v1 TUI currently renders inline (`Viewport::Fixed` in
+`src/tui/app.rs`), which keeps native terminal scrollback + click-
+drag-select working, but at the cost of the floating chrome and
+clean full-screen feel that opencode/codex have. GOALS §1d already
+calls for alt-screen *during* the session with a transcript-tail
+spill at exit — T8 graduates that intent into concrete tasks and
+adds the clipboard story.
+
+The cheap-model relevance (T7): mouse capture and clipboard have
+nothing to do with cheap-model viability, but the alt-screen flip
+unblocks structured UI elements (a dedicated approval pane, a
+diff-preview slot, a permanent context-budget gauge) that cheap-
+model operating loops benefit from. The 100-line exit tail
+(GOALS §1d) is sized for `cockpit` -> agent loops that produce
+long tool dumps — turn count is meaningless when one turn is a
+4000-line `bash` output.
+
+**T8.a — Alt-screen flip + in-app scroll.** Switch the run loop
+from `try_init_with_options(Viewport::Fixed(...))` to
+`try_init()` (full alt screen). Bind `Up`/`Down`/`PageUp`/
+`PageDown` for chat history scrolling inside the app. Modern
+terminals (iTerm2, Windows Terminal, kitty, wezterm, Alacritty,
+xterm with `alternateScroll`) translate mouse wheel to arrow-key
+events under alt-screen-without-mouse-capture, so wheel scroll
+"just works" through that pathway on every common modern terminal
+without the app needing to capture mouse. Tmux users need
+`set -g mouse on`; document this.
+
+**T8.b — 100-line exit tail.** Replace the "all history" dump in
+`spill_remaining_history_for_exit` with a tail of the last
+`tui.exit_tail_lines` rendered lines (default 100). Per GOALS
+§1d: 0 disables, -1 means whole session.
+
+**T8.c — `tui.mouse_capture` setting (default: On).** New field
+on `ExtendedConfig`. New row in `/settings → ui` page with a
+toggle. At app startup, if On, push `EnableMouseCapture` (and pop
+on teardown). Setting changes mid-session take effect immediately
+(push/pop the capture state from the settings handler). When
+capture is on, users get a "hold Shift / Option / Fn for native
+select" affordance via a one-time toast on first capture session
+per the discoverability concern.
+
+**T8.d — Click-to-position-cursor in composer.** When capture is
+on and a left-click lands in the composer's input rect, translate
+the (row, col) into a position in the composer's text buffer,
+accounting for the input prefix and wrapped lines. Existing
+`handle_mouse` plumbing in `app.rs:1543` (chip-expand) is the
+hook point; composer needs to expose its rect.
+
+**T8.e — Clipboard layer (`src/clipboard/`).** New module. Two
+public entry points: `copy_plain(text)` and `copy_rich(plain,
+html)`. Implementation: prefer `arboard` (helix-style native OS
+clipboard, multi-format) when local; fall back to OSC52 (plain
+text only) when SSH is detected (`$SSH_CONNECTION` or
+`$SSH_TTY`). OSC52 is the cross-terminal escape that works
+through SSH; arboard is the multi-format OS-native path. Add
+`arboard` to `Cargo.toml`.
+
+**T8.f — Drag-select in chat with render-time highlight.**
+Selection state on `App`: `Selection { start: (row, col),
+end: (row, col), origin: (row, col) }`. On `MouseEventKind::
+Down(Left)` inside the chat area: begin selection. On
+`MouseEventKind::Drag(Left)`: extend. On `Up(Left)`: commit.
+Maintain a `cell → source-char` reverse map per render so we can
+(1) highlight cells inside the selection by mutating Span styles
+at render time and (2) reconstruct the selected plaintext on
+copy. `Ctrl+Shift+C` copies via `clipboard::copy_plain`. `Esc`
+clears. New selection clears the old. Plays nicely with vim
+mode — `y` in normal mode while there's an active selection also
+copies.
+
+**T8.g — `Ctrl+Shift+Y` "copy message as rich text".** Operates
+on the focused (or most recent) agent message, not the
+selection. Pulls the message's stored markdown source through
+`pulldown_cmark::html::push_html` → HTML string. Calls
+`clipboard::copy_rich(plain, html)`. Over SSH, falls back to
+plain text with a toast: "rich-text copy unavailable over SSH".
+The killer-feature use case is "agent gave me a paragraph + code
+block, paste into Gmail formatted." Gated by a `tui.rich_text_
+copy` setting (default On when mouse capture is On; the keybind
+is dead otherwise).
+
+**T8.h — Settings UI surface.** Adds two rows to `/settings →
+ui`: "mouse" (off / on) and "rich-text copy" (off / on, only
+toggle-able when mouse is on).
+
+Tracking:
+
+- M1: T8.a, T8.b, T8.c, T8.d, T8.e, T8.g, T8.h (Tier 1 + Tier 2 +
+  rich-text + settings UI — foundation lands as one milestone).
+- M2: T8.f (Tier 3 — selection rendering is its own milestone
+  because it touches the chat render pipeline).
+
+Risks:
+
+- **Selection rendering interacts with markdown rendering.** The
+  cell→char map has to survive `pulldown-cmark` + `similar` diff
+  rendering. Build it as a side output of the render pass, not a
+  separate scan, so it stays consistent.
+- **Bracketed paste must keep working.** Verify `Event::Paste`
+  still fires through the new event loop and routes to the
+  composer regardless of mouse capture state.
+- **arboard + Wayland.** `arboard` requires either `xclip`/
+  `xsel` on Wayland-via-XWayland or libwayland-client on pure
+  Wayland. Document the dependency footprint; arboard handles
+  the picking, but pure-Wayland sessions without
+  `wl-clipboard` installed degrade to error.
+- **Tmux clipboard pass-through.** OSC52 inside tmux requires
+  `set -g set-clipboard on` (or `external`). Document.
+
+---
+
 ## What this plan deliberately leaves out
 
 - **LSP integration** — v2. See [`features/pi.md` §13](./features/pi.md)

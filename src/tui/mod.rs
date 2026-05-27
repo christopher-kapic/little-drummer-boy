@@ -17,6 +17,7 @@ pub mod app;
 pub mod chat;
 pub mod chrome;
 pub mod composer;
+pub mod context_menu;
 pub mod daemon_prompt;
 pub mod diff;
 pub mod file_tag;

@@ -144,6 +144,46 @@ impl Composer {
         self.cursor
     }
 
+    /// Position the cursor at `(line, col)` measured in characters from
+    /// the start of each line. Out-of-range coordinates clamp to the
+    /// nearest valid position (past-end-of-line lands on the line's
+    /// trailing position; past-end-of-buffer lands at buffer end).
+    /// Used by mouse click-to-position (plan.md T8.d).
+    pub fn set_cursor_from_line_col(&mut self, line: usize, col: usize) {
+        let mut byte = 0;
+        let mut current_line = 0;
+        let mut chars_consumed = 0;
+        let mut line_start = 0;
+        for (i, ch) in self.buffer.char_indices() {
+            if current_line == line {
+                if chars_consumed == col {
+                    self.cursor = i;
+                    return;
+                }
+                if ch == '\n' {
+                    // Clicked past end of this line — land at line end
+                    // (just before the newline).
+                    self.cursor = i;
+                    return;
+                }
+                chars_consumed += 1;
+            } else if ch == '\n' {
+                current_line += 1;
+                chars_consumed = 0;
+                line_start = i + ch.len_utf8();
+            }
+            byte = i + ch.len_utf8();
+        }
+        // Past end of buffer — land at buffer end.
+        if current_line < line {
+            self.cursor = self.buffer.len();
+        } else if current_line == line {
+            // We're on the target line but ran off the end (no trailing
+            // newline); land at buffer end.
+            self.cursor = byte.max(line_start);
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.buffer.is_empty()
     }

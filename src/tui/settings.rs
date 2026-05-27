@@ -151,12 +151,16 @@ struct GrabState {
 }
 
 /// `/settings → UI` state.
-struct UiPage {
+pub(crate) struct UiPage {
     cursor: usize,
     /// `Some(field)` when the user is inline-editing a text field.
     editing: Option<UiField>,
     buf: TextField,
     status: Option<String>,
+    /// Last value the user toggled the `mouse` setting to. The App
+    /// reads this on dialog close to decide whether to push or pop
+    /// crossterm's `EnableMouseCapture`. None = user didn't touch it.
+    pub(crate) pending_mouse_capture: Option<bool>,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq)]
@@ -763,6 +767,21 @@ impl Dialog {
         }
     }
 
+    /// Drain the UI page's pending `mouse` toggle, if any. Returns
+    /// `Some(new_value)` exactly once per user toggle so the App can
+    /// push/pop crossterm's `EnableMouseCapture` to match. None when
+    /// the dialog isn't on the UI page or the user hasn't touched the
+    /// setting since the last drain.
+    pub fn take_pending_mouse_capture(&mut self) -> Option<bool> {
+        let Dialog::Settings(s) = self else {
+            return None;
+        };
+        let Page::Ui(p) = &mut s.page else {
+            return None;
+        };
+        p.pending_mouse_capture.take()
+    }
+
     /// Called by the event loop each tick so async fetches can apply
     /// their results.
     pub fn tick(&mut self) {
@@ -1170,6 +1189,7 @@ impl SettingsDialog {
                             editing: None,
                             buf: TextField::default(),
                             status: None,
+                            pending_mouse_capture: None,
                         });
                     }
                     _ => {}
@@ -2616,6 +2636,7 @@ impl SettingsDialog {
             editing: None,
             buf: TextField::default(),
             status: None,
+            pending_mouse_capture: None,
         });
         let mut page = std::mem::replace(&mut self.page, placeholder);
         let nav = if let Page::Ui(p) = &mut page {
@@ -2704,10 +2725,19 @@ impl SettingsDialog {
                     p.status = save_status(self.save_extended());
                 }
                 4 => {
+                    self.extended.tui.mouse_capture = !self.extended.tui.mouse_capture;
+                    p.pending_mouse_capture = Some(self.extended.tui.mouse_capture);
+                    p.status = save_status(self.save_extended());
+                }
+                5 => {
+                    self.extended.tui.rich_text_copy = !self.extended.tui.rich_text_copy;
+                    p.status = save_status(self.save_extended());
+                }
+                6 => {
                     p.buf = TextField::new(self.extended.name.clone().unwrap_or_default());
                     p.editing = Some(UiField::Name);
                 }
-                5 => {
+                7 => {
                     let cur = self
                         .extended
                         .packages_directory
@@ -2717,7 +2747,7 @@ impl SettingsDialog {
                     p.buf = TextField::new(cur);
                     p.editing = Some(UiField::PackagesDir);
                 }
-                6 => {
+                8 => {
                     return Nav::Replace(Page::Instructions(InstructionsPage {
                         cursor: 0,
                         grabbed: None,
@@ -2742,7 +2772,7 @@ impl SettingsDialog {
         )));
         lines.push(Line::default());
 
-        let rows: [(&str, String); 7] = [
+        let rows: [(&str, String); 9] = [
             (
                 "vim mode",
                 vim_label(self.extended.tui.vim_mode).to_string(),
@@ -2765,6 +2795,22 @@ impl SettingsDialog {
                     self.extended.tui.render_user_markdown,
                     "on",
                     "off (default)",
+                ),
+            ),
+            (
+                "mouse",
+                bool_label(
+                    self.extended.tui.mouse_capture,
+                    "on (default — click + drag-select; hold Shift/Option for native select)",
+                    "off (native terminal select + copy)",
+                ),
+            ),
+            (
+                "rich-text copy",
+                bool_label(
+                    self.extended.tui.rich_text_copy,
+                    "on (default — Ctrl+Shift+Y copies last agent message as rich text)",
+                    "off (Ctrl+Shift+Y disabled)",
                 ),
             ),
             (
@@ -2904,10 +2950,11 @@ impl SettingsDialog {
             KeyCode::Esc | KeyCode::Char('q') => return Nav::Close,
             KeyCode::Left | KeyCode::Backspace | KeyCode::Char('h') => {
                 return Nav::Replace(Page::Ui(UiPage {
-                    cursor: 6,
+                    cursor: 8,
                     editing: None,
                     buf: TextField::default(),
                     status: None,
+                    pending_mouse_capture: None,
                 }));
             }
             KeyCode::Up | KeyCode::Char('k') => {
@@ -3351,7 +3398,7 @@ const AGENTS_STUB: &str = "(stub) Agent editor — list agent definitions, edit 
 
 /// Rows on the UI page (vim mode, thinking, render-agent-markdown,
 /// render-user-markdown, name, packages dir, instructions file).
-const UI_ROWS: usize = 7;
+const UI_ROWS: usize = 9;
 
 fn bool_label(on: bool, on_label: &str, off_label: &str) -> String {
     if on {
@@ -4165,14 +4212,14 @@ mod tests {
 
     #[test]
     fn enter_on_instructions_row_in_ui_opens_instructions_page() {
-        // The "can't edit instructions file" symptom: UI cursor=6 +
-        // Enter should land on the Instructions page. Under the
-        // swap-back bug, this navigation was silently dropped.
+        // UI page row 8 (instructions file) + Enter should land on the
+        // Instructions page. Rows 0-3 are vim/thinking/markdown,
+        // 4-5 are mouse/rich-text-copy (T8.c/T8.g), 6-7 are
+        // name/packages, 8 is instructions.
         let tmp = TempDir::new().unwrap();
         let mut d = fresh_dialog(&tmp);
         enter_ui_from_root(&mut d);
-        // Move cursor to row 6 (instructions file).
-        for _ in 0..6 {
+        for _ in 0..8 {
             d.handle_key(press(KeyCode::Char('j')));
         }
         d.handle_key(press(KeyCode::Enter));
@@ -4268,8 +4315,10 @@ mod tests {
     fn fresh_instructions_dialog(tmp: &TempDir) -> SettingsDialog {
         let mut d = fresh_dialog(tmp);
         enter_ui_from_root(&mut d);
-        // Move cursor to the instructions row (idx 6) and Enter to nav.
-        for _ in 0..6 {
+        // Move cursor to the instructions row (idx 8 since T8 added
+        // `mouse` and `rich-text copy` rows at positions 4 and 5)
+        // and Enter to nav.
+        for _ in 0..8 {
             d.handle_key(press(KeyCode::Char('j')));
         }
         d.handle_key(press(KeyCode::Enter));
