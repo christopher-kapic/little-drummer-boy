@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use crate::engine::tool::{Tool, ToolCtx, ToolOutput};
-use crate::tools::common::{detect_crlf, normalize_line_endings, resolve};
+use crate::tools::common::{detect_crlf, normalize_line_endings, resolve, write_and_release};
 
 pub struct WriteunlockTool;
 
@@ -70,15 +70,7 @@ impl Tool for WriteunlockTool {
 
         let normalized = normalize_line_endings(content, want_crlf);
 
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&path, &normalized)
-            .map_err(|e| anyhow::anyhow!("write `{}`: {e}", path.display()))?;
-        ctx.locks.release(&path, &ctx.agent_id)?;
-        // Mark as "read" too — a future tool call in the same session
-        // can re-edit without needing another read first.
-        ctx.locks.note_read(&path, &ctx.agent_id, ctx.session.id);
+        write_and_release(ctx, &path, normalized.as_bytes())?;
 
         Ok(ToolOutput::text(format!(
             "wrote `{}` ({} bytes, {})",

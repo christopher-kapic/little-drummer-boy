@@ -7,7 +7,6 @@
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use rand::Rng;
 use rusqlite::{Connection, params};
 use uuid::Uuid;
 

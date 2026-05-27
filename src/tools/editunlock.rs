@@ -31,7 +31,7 @@ use serde_json::Value;
 
 use crate::engine::repair::Recovery;
 use crate::engine::tool::{Tool, ToolCtx, ToolOutput};
-use crate::tools::common::{detect_crlf, normalize_line_endings, resolve};
+use crate::tools::common::{detect_crlf, normalize_line_endings, resolve, write_and_release};
 
 pub struct EditunlockTool;
 
@@ -116,10 +116,7 @@ impl Tool for EditunlockTool {
         };
 
         let normalized = normalize_line_endings(&updated, want_crlf);
-        std::fs::write(&path, &normalized)
-            .map_err(|e| anyhow::anyhow!("write `{}`: {e}", path.display()))?;
-        ctx.locks.release(&path, &ctx.agent_id)?;
-        ctx.locks.note_read(&path, &ctx.agent_id, ctx.session.id);
+        write_and_release(ctx, &path, normalized.as_bytes())?;
 
         let out = ToolOutput::text(format!(
             "edited `{}` ({}; {} bytes)",

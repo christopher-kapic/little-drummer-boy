@@ -28,12 +28,12 @@ pub mod registry;
 pub mod server;
 pub mod session_worker;
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+use tokio::io::AsyncBufReadExt;
 use tokio::net::{UnixListener, UnixStream};
 
 /// Legacy line greeting sent by the v0 daemon when it had no real

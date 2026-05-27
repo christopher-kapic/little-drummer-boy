@@ -2,6 +2,10 @@
 
 use std::path::{Path, PathBuf};
 
+use anyhow::Result;
+
+use crate::engine::tool::ToolCtx;
+
 /// Resolve a path argument the way every file tool does:
 ///   - tilde-expand,
 ///   - relative paths join against the session cwd.
@@ -47,6 +51,24 @@ pub fn looks_binary(bytes: &[u8]) -> bool {
 pub fn detect_crlf(bytes: &[u8]) -> bool {
     let head = &bytes[..bytes.len().min(1024)];
     head.windows(2).any(|w| w == b"\r\n")
+}
+
+/// Write `bytes` to `path`, release the file lock, and mark the path as
+/// read for this session. Creates parent directories as needed.
+///
+/// Centralizes the post-write sequence shared by every write-capable
+/// tool. The `note_read` after `release` is a footgun: skipping it
+/// leaves the agent unable to re-edit the same file without an
+/// intervening read.
+pub fn write_and_release(ctx: &ToolCtx, path: &Path, bytes: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, bytes)
+        .map_err(|e| anyhow::anyhow!("write `{}`: {e}", path.display()))?;
+    ctx.locks.release(path, &ctx.agent_id)?;
+    ctx.locks.note_read(path, &ctx.agent_id, ctx.session.id);
+    Ok(())
 }
 
 /// Normalize content for writing: if the original file used CRLF,
