@@ -23,7 +23,7 @@ graph) — and classifies them against cockpit's design constraints.
 Features with clear ROI, implementable purely in Rust with no new heavy
 dependencies, and directly serving the token-economy and OS-model goals.
 
-### 1. `tree` — File Tree with Symbol Counts
+### 1. `tree` — File Tree with Symbol Counts - CK Approved
 
 **What it does:** Returns a compact directory tree annotated with language,
 line count, and symbol count per file. No file content is transmitted.
@@ -42,7 +42,7 @@ blocking.
 
 ---
 
-### 2. `outline` — Structural Symbols per File
+### 2. `outline` — Structural Symbols per File - CK Approved
 
 **What it does:** Given a file path, returns all top-level symbols — functions,
 structs/classes, enums, traits/interfaces, constants, imports — with line
@@ -69,7 +69,7 @@ invalidated by the file watcher.
 
 ---
 
-### 3. `symbol_find` — Symbol Definition Lookup
+### 3. `symbol_find` — Symbol Definition Lookup - CK Approved
 
 **What it does:** Given a symbol name (exact or prefix), returns all definition
 sites across the project — file path, line number, kind (fn/struct/enum/…), and
@@ -90,7 +90,7 @@ Prefix and case-insensitive queries are supported. No new dependencies.
 
 ---
 
-### 4. `search` — Trigram-Accelerated Full-Text Search
+### 4. `search` — Trigram-Accelerated Full-Text Search - CK Approved
 
 **What it does:** Searches file contents for a query string or regex. Returns
 matching file paths, line numbers, and surrounding context lines. Respects
@@ -118,7 +118,7 @@ tool is working.
 
 ---
 
-### 5. `word` — Exact Identifier Lookup (O(1) Inverted Index)
+### 5. `word` — Exact Identifier Lookup (O(1) Inverted Index) - CK Approved
 
 **What it does:** Given an exact identifier token (function name, constant,
 type), returns every file and line that contains it as a word boundary match.
@@ -138,7 +138,7 @@ for a 100k-line Rust project is roughly 2–5 MB in SQLite.
 
 ---
 
-### 6. `deps` — Reverse Dependency Graph
+### 6. `deps` — Reverse Dependency Graph - CK Approved
 
 **What it does:** Given a file path, returns (a) all files it imports and (b)
 all files that import it. Optionally traverses N hops for transitive analysis.
@@ -158,7 +158,7 @@ with recursive CTEs. No new dependencies.
 
 ---
 
-### 7. `impact` — Symbol-Level Blast Radius
+### 7. `impact` — Symbol-Level Blast Radius - CK Approved
 
 **What it does:** Given a symbol name (function, method, type), returns every
 symbol across the project that calls or references it, grouped by hop distance.
@@ -179,7 +179,7 @@ meaningful work but entirely within SQLite and tree-sitter — no new heavy deps
 
 ---
 
-### 8. `hot` — Recently Modified Files
+### 8. `hot` — Recently Modified Files - CK Approved
 
 **What it does:** Returns the N most recently modified files in the project,
 with modification timestamps and change counts since the last session.
@@ -196,7 +196,7 @@ mtime desc. Zero new dependencies.
 
 ---
 
-### 9. `read` with Line Ranges
+### 9. `read` with Line Ranges - CK Approved
 
 **What it does:** Read a specific line range from a file (e.g., lines 45–120)
 rather than the entire file. Includes the file's current content hash for
@@ -216,7 +216,7 @@ and `end_line` parameters. Read the file, slice the lines, return with a
 
 ---
 
-### 10. `circular` — Circular Dependency Detection
+### 10. `circular` — Circular Dependency Detection - CK Approved
 
 **What it does:** Scans the dependency graph for import cycles and reports them
 as path lists (e.g., `A → B → C → A`).
@@ -241,7 +241,7 @@ carry design trade-offs, or are better suited for a later version.
 
 ---
 
-### M1. Semantic / Vector Search
+### M1. Semantic / Vector Search - CK Rejected (too heavy)
 
 **What it does:** Embedding-based search that finds semantically related code
 even when the query words don't appear in the source. "authentication middleware"
@@ -270,7 +270,7 @@ feature behind `extended.intelligence.semantic = true`.
 
 ---
 
-### M2. Call Flow Tracing (`flow`)
+### M2. Call Flow Tracing (`flow`) - CK Approved
 
 **What it does:** Given an entry point symbol (or auto-detected entry points),
 traces the forward call graph — what this function calls, what those functions
@@ -311,7 +311,7 @@ layer. Defer indexing until semantic search is available.
 
 ---
 
-### M4. Graph Visualization (Mermaid / HTML)
+### M4. Graph Visualization (Mermaid / HTML) - CK Approved (but defer)
 
 **What it does:** Renders the dependency graph as a Mermaid diagram (text,
 embeddable in chat) or an interactive HTML file (for browser viewing).
@@ -374,7 +374,7 @@ day one. Implement cross-project queries in v2.
 
 ---
 
-### M7. Branch-Aware Indexing
+### M7. Branch-Aware Indexing - CK Approved (although idk if it is necessary if we aren't doing vector embeddings)
 
 **What it does:** Maintain separate indexes per git branch. Switching branches
 (via git checkout hook) automatically activates the correct index.
