@@ -222,11 +222,7 @@ pub fn orchestrator_build(args: &SpawnArgs) -> Agent {
 
     Agent {
         name: "orchestrator-build".to_string(),
-        system: compose_system_prompt(
-            ORCHESTRATOR_BUILD_PROMPT,
-            &args.session_short_id,
-            &args.cwd,
-        ),
+        system: compose_system_prompt(ORCHESTRATOR_BUILD_PROMPT, &args.session_short_id, &args.cwd),
         tools,
         model: args.model.clone(),
         params: args.params.clone(),

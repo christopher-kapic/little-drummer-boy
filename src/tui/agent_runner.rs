@@ -57,8 +57,7 @@ pub fn try_spawn(cwd: &Path) -> Result<AgentRunner, String> {
             // to the next inference call. Fire-and-forget — a daemon
             // that doesn't yet speak `RefreshEnv` just errors back, and
             // we proceed as before.
-            let env: std::collections::HashMap<String, String> =
-                std::env::vars().collect();
+            let env: std::collections::HashMap<String, String> = std::env::vars().collect();
             let _ = daemon
                 .client
                 .request(Request::RefreshEnv { vars: env })

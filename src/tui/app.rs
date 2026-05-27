@@ -819,8 +819,10 @@ impl App {
         // role in the composer.
         if key.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(key.code, KeyCode::Char('j'))
-            && self.history.iter().any(|e| matches!(e,
-                HistoryEntry::Agent { reasoning, .. } if !reasoning.trim().is_empty()))
+            && self.history.iter().any(|e| {
+                matches!(e,
+                HistoryEntry::Agent { reasoning, .. } if !reasoning.trim().is_empty())
+            })
         {
             self.toggle_recent_reasoning();
             return false;

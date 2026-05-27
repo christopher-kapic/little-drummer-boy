@@ -3,10 +3,16 @@
 //! Walk order (matches the [[config_layering]] plan):
 //!
 //!   1. Home-scoped: `~/.config/cockpit/`, then `~/.cockpit/`.
-//!   2. Every ancestor of `cwd` containing `.cockpit/`, from `cwd` upward,
+//!   2. Machine-local-but-project-scoped: a hashed-cwd dir under the
+//!      cockpit data dir. Lets a user override per-cwd without
+//!      committing anything to the repo. Hashing the cwd dodges
+//!      filename-invalid characters and path-length limits.
+//!   3. Every ancestor of `cwd` containing `.cockpit/`, from `cwd` upward,
 //!      stopping at the `{$HOME, /srv, /opt}` stop set.
 
 use std::path::{Path, PathBuf};
+
+use sha2::{Digest, Sha256};
 
 /// Where a cockpit config directory was discovered.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -15,6 +21,9 @@ pub enum ConfigDirKind {
     HomeXdg,
     /// `~/.cockpit/`
     HomeDot,
+    /// `<cockpit_data_dir>/local-configs/<hash(cwd)>/` — machine-local
+    /// per-cwd config. Never checked into a repo.
+    MachineLocal,
     /// An ancestor of cwd containing `.cockpit/` (project-scoped layer).
     Project,
 }
@@ -46,6 +55,15 @@ pub fn discover_config_dirs(cwd: &Path) -> Vec<ConfigDir> {
         }
     }
 
+    if let Ok(local) = local_config_dir_for(cwd)
+        && local.is_dir()
+    {
+        out.push(ConfigDir {
+            kind: ConfigDirKind::MachineLocal,
+            path: local,
+        });
+    }
+
     for dir in walk_up_to_stops(cwd) {
         let candidate = dir.join(".cockpit");
         if candidate.is_dir() {
@@ -73,6 +91,42 @@ pub fn creatable_config_dirs() -> Vec<ConfigDir> {
         });
     }
     out
+}
+
+/// Candidate locations for "add a new config scoped to this directory":
+/// the project-local `.cockpit/` and the machine-local hashed-cwd dir.
+/// Returned even when they don't exist yet — the caller scaffolds them.
+pub fn cwd_scoped_creatable_dirs(cwd: &Path) -> Vec<ConfigDir> {
+    let mut out = vec![ConfigDir {
+        kind: ConfigDirKind::Project,
+        path: cwd.join(".cockpit"),
+    }];
+    if let Ok(local) = local_config_dir_for(cwd) {
+        out.push(ConfigDir {
+            kind: ConfigDirKind::MachineLocal,
+            path: local,
+        });
+    }
+    out
+}
+
+/// Stable per-cwd directory under the cockpit data dir. The cwd is
+/// canonicalized when possible (so `./foo` and `/abs/foo` map to the
+/// same layer), then SHA-256-hashed and truncated to 16 hex chars so
+/// it's filename-safe everywhere. Returns an error if the data dir
+/// can't be located (no `$HOME` and no XDG data var).
+pub fn local_config_dir_for(cwd: &Path) -> anyhow::Result<PathBuf> {
+    let canonical = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    let mut hasher = Sha256::new();
+    hasher.update(canonical.to_string_lossy().as_bytes());
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(16);
+    for byte in &digest[..8] {
+        use std::fmt::Write as _;
+        let _ = write!(&mut hex, "{byte:02x}");
+    }
+    let base = crate::config::resolve::cockpit_data_dir()?;
+    Ok(base.join("local-configs").join(hex))
 }
 
 /// Create `dir` (and parents) and write a minimal `config.json` if one

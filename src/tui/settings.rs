@@ -37,7 +37,8 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use crate::auth::copilot_setup::{self, Shell as CopilotShell};
 use crate::config::dirs::{
-    ConfigDir, ConfigDirKind, creatable_config_dirs, discover_config_dirs, scaffold_config_dir,
+    ConfigDir, ConfigDirKind, creatable_config_dirs, cwd_scoped_creatable_dirs,
+    discover_config_dirs, scaffold_config_dir,
 };
 use crate::config::extended::{
     ExtendedConfig, ExtendedConfigDoc, ThinkingDisplay, ToolCommandTemplate, VimModeSetting,
@@ -63,10 +64,24 @@ pub enum Dialog {
     PickConfig {
         dirs: Vec<ConfigDir>,
         cursor: usize,
+        /// Held so the `a` affordance can scaffold a new scoped config
+        /// in the right place.
+        cwd: PathBuf,
+        /// Transient error/status (e.g. scaffold-failure message).
+        status: Option<String>,
     },
     CreateConfig {
         choices: Vec<ConfigDir>,
         cursor: usize,
+    },
+    /// "Add a config scoped to the current directory" sub-dialog
+    /// reached by pressing `a` on the picker. Offers a `.cockpit/` in
+    /// the cwd (shareable with a team) or a hashed-cwd dir under the
+    /// cockpit data dir (machine-local).
+    CreateScopedConfig {
+        choices: Vec<ConfigDir>,
+        cursor: usize,
+        cwd: PathBuf,
     },
     Settings(SettingsDialog),
 }
@@ -83,6 +98,9 @@ pub struct SettingsDialog {
     /// Cached `extended-config.json` state. Read by the UI page and the
     /// Tools page; written back on each edit.
     extended: ExtendedConfig,
+    /// Root-page cursor restored when navigating back. Updated every
+    /// time we leave Root for a subpage.
+    last_root_cursor: usize,
 }
 
 enum Page {
@@ -632,7 +650,12 @@ impl Dialog {
                 cursor: 0,
             }
         } else {
-            Dialog::PickConfig { dirs, cursor: 0 }
+            Dialog::PickConfig {
+                dirs,
+                cursor: 0,
+                cwd: cwd.to_path_buf(),
+                status: None,
+            }
         }
     }
 
@@ -684,6 +707,25 @@ impl Dialog {
         d
     }
 
+    /// Re-open the picker after scaffolding a new scoped config, so the
+    /// fresh row shows up and lands as the cursor target.
+    fn reopen_picker(cwd: &std::path::Path, status: Option<String>) -> Self {
+        let dirs = discover_config_dirs(cwd);
+        if dirs.is_empty() {
+            Dialog::CreateConfig {
+                choices: creatable_config_dirs(),
+                cursor: 0,
+            }
+        } else {
+            Dialog::PickConfig {
+                dirs,
+                cursor: 0,
+                cwd: cwd.to_path_buf(),
+                status,
+            }
+        }
+    }
+
     /// Called by the event loop each tick so async fetches can apply
     /// their results.
     pub fn tick(&mut self) {
@@ -695,15 +737,34 @@ impl Dialog {
     pub fn handle_key(&mut self, key: KeyEvent) -> bool {
         match self {
             Dialog::None => false,
-            Dialog::PickConfig { dirs, cursor } => match list_key_action(key, cursor, dirs.len()) {
-                ListAction::Stay => false,
-                ListAction::Close => true,
-                ListAction::Select(idx) => {
-                    let chosen = dirs[idx].path.join("config.json");
-                    *self = Dialog::Settings(SettingsDialog::open(chosen));
-                    false
+            Dialog::PickConfig {
+                dirs,
+                cursor,
+                cwd,
+                status,
+            } => {
+                // `a` opens the "add a scoped config" sub-dialog.
+                // Anything else clears the transient status and falls
+                // through to the standard list nav.
+                if matches!(key.code, KeyCode::Char('a')) {
+                    *self = Dialog::CreateScopedConfig {
+                        choices: cwd_scoped_creatable_dirs(cwd),
+                        cursor: 0,
+                        cwd: cwd.clone(),
+                    };
+                    return false;
                 }
-            },
+                *status = None;
+                match list_key_action(key, cursor, dirs.len()) {
+                    ListAction::Stay => false,
+                    ListAction::Close => true,
+                    ListAction::Select(idx) => {
+                        let chosen = dirs[idx].path.join("config.json");
+                        *self = Dialog::Settings(SettingsDialog::open(chosen));
+                        false
+                    }
+                }
+            }
             Dialog::CreateConfig { choices, cursor } => {
                 match list_key_action(key, cursor, choices.len()) {
                     ListAction::Stay => false,
@@ -717,6 +778,33 @@ impl Dialog {
                     },
                 }
             }
+            Dialog::CreateScopedConfig {
+                choices,
+                cursor,
+                cwd,
+            } => match list_key_action(key, cursor, choices.len()) {
+                // Cancel → back to the picker.
+                ListAction::Close => {
+                    *self = Dialog::reopen_picker(cwd, None);
+                    false
+                }
+                ListAction::Stay => false,
+                ListAction::Select(idx) => {
+                    let target = &choices[idx];
+                    match scaffold_config_dir(&target.path) {
+                        Ok(config_path) => {
+                            *self = Dialog::Settings(SettingsDialog::open(config_path));
+                        }
+                        Err(e) => {
+                            *self = Dialog::reopen_picker(
+                                cwd,
+                                Some(format!("failed to create {}: {e}", target.path.display())),
+                            );
+                        }
+                    }
+                    false
+                }
+            },
             Dialog::Settings(s) => s.handle_key(key),
         }
     }
@@ -724,15 +812,36 @@ impl Dialog {
     pub fn render(&self, frame: &mut Frame, area: Rect) {
         match self {
             Dialog::None => {}
-            Dialog::PickConfig { dirs, cursor } => {
-                render_picker(frame, area, "pick a config to edit", dirs, *cursor)
-            }
+            Dialog::PickConfig {
+                dirs,
+                cursor,
+                status,
+                ..
+            } => render_picker(
+                frame,
+                area,
+                "pick a config to edit  ·  a: add scoped",
+                dirs,
+                *cursor,
+                status.as_deref(),
+            ),
             Dialog::CreateConfig { choices, cursor } => render_picker(
                 frame,
                 area,
                 "no config found, create one?",
                 choices,
                 *cursor,
+                None,
+            ),
+            Dialog::CreateScopedConfig {
+                choices, cursor, ..
+            } => render_picker(
+                frame,
+                area,
+                "where should the new config live?",
+                choices,
+                *cursor,
+                Some("esc: cancel"),
             ),
             Dialog::Settings(s) => s.render(frame, area),
         }
@@ -759,6 +868,7 @@ impl SettingsDialog {
             page: Page::Root { cursor: 0 },
             config,
             extended,
+            last_root_cursor: 0,
         }
     }
 
@@ -918,7 +1028,9 @@ impl SettingsDialog {
                     key.code,
                     KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') | KeyCode::Backspace
                 ) {
-                    self.page = Page::Root { cursor: 0 };
+                    self.page = Page::Root {
+                        cursor: self.last_root_cursor,
+                    };
                     false
                 } else if matches!(key.code, KeyCode::Char('q')) {
                     true
@@ -946,6 +1058,7 @@ impl SettingsDialog {
             }
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
                 let chosen = children.get(cursor).map(|n| n.title).unwrap_or("");
+                self.last_root_cursor = cursor;
                 match chosen {
                     "Providers" => self.enter_providers(),
                     "Agents" => self.page = Page::Agents,
@@ -1017,7 +1130,9 @@ impl SettingsDialog {
                 let pressed_d = matches!(key.code, KeyCode::Char('d'));
                 match key.code {
                     KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') | KeyCode::Backspace => {
-                        return Nav::Replace(Page::Root { cursor: 0 });
+                        return Nav::Replace(Page::Root {
+                            cursor: self.last_root_cursor,
+                        });
                     }
                     KeyCode::Char('q') => return Nav::Close,
                     KeyCode::Up | KeyCode::Char('k') => {
@@ -1839,7 +1954,6 @@ impl SettingsDialog {
         render_copilot_setup_body(&mut lines, s);
         frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
     }
-
 }
 
 /// Render the body of the Copilot auth-setup affordance (everything
@@ -1870,108 +1984,108 @@ fn render_copilot_setup_body(lines: &mut Vec<Line<'static>>, s: &CopilotSetupSta
         return;
     }
 
-        match (s.shell, &s.rc_path, s.already_configured) {
-            (Some(shell), Some(rc_path), false) => {
-                lines.push(Line::from(Span::styled(
-                    format!("Detected shell: {}", shell.name()),
-                    muted,
-                )));
-                lines.push(Line::from(vec![
-                    Span::styled("Will append to: ".to_string(), muted),
-                    Span::styled(rc_path.display().to_string(), cyan),
-                ]));
-                lines.push(Line::default());
-                lines.push(Line::from(Span::styled(
-                    "Lines to be added:".to_string(),
-                    muted,
-                )));
-                for line in copilot_setup::append_block(shell).lines() {
-                    if line.is_empty() {
-                        lines.push(Line::default());
-                    } else {
-                        lines.push(Line::from(Span::styled(format!("    {line}"), cyan)));
-                    }
-                }
-                lines.push(Line::default());
-                lines.push(Line::from(Span::styled(
-                    "We'll also run `gh auth token` once and set GH_TOKEN in this \
-                     cockpit session so Copilot works without restarting."
-                        .to_string(),
-                    muted,
-                )));
-                lines.push(Line::default());
-                lines.push(Line::from(Span::styled(
-                    "Press Enter to apply, Esc to cancel.".to_string(),
-                    yellow,
-                )));
-            }
-            (Some(shell), Some(rc_path), true) => {
-                lines.push(Line::from(Span::styled(
-                    format!(
-                        "{} already contains the cockpit Copilot-auth export.",
-                        rc_path.display()
-                    ),
-                    muted,
-                )));
-                lines.push(Line::default());
-                lines.push(Line::from(Span::styled(
-                    format!(
-                        "To re-apply: remove the marker block from your {} and try again.",
-                        shell.rc_filename()
-                    ),
-                    muted,
-                )));
-                lines.push(Line::default());
-                lines.push(Line::from(Span::styled(
-                    "Press Enter or Esc to return.".to_string(),
-                    yellow,
-                )));
-            }
-            _ => {
-                // Unsupported shell or unknown $HOME — show manual
-                // instructions instead of a write button.
-                lines.push(Line::from(Span::styled(
-                    "Couldn't detect a supported shell ($SHELL is unset, or it's \
-                     not zsh/bash/fish). Set GH_TOKEN manually with one of:"
-                        .to_string(),
-                    muted,
-                )));
-                lines.push(Line::default());
-                lines.push(Line::from(Span::styled(
-                    "  POSIX shell (zsh/bash/sh):".to_string(),
-                    muted,
-                )));
-                lines.push(Line::from(Span::styled(
-                    "    export GH_TOKEN=$(gh auth token)".to_string(),
-                    cyan,
-                )));
-                lines.push(Line::default());
-                lines.push(Line::from(Span::styled("  fish:".to_string(), muted)));
-                lines.push(Line::from(Span::styled(
-                    "    set -Ux GH_TOKEN (gh auth token)".to_string(),
-                    cyan,
-                )));
-                if cfg!(windows) {
+    match (s.shell, &s.rc_path, s.already_configured) {
+        (Some(shell), Some(rc_path), false) => {
+            lines.push(Line::from(Span::styled(
+                format!("Detected shell: {}", shell.name()),
+                muted,
+            )));
+            lines.push(Line::from(vec![
+                Span::styled("Will append to: ".to_string(), muted),
+                Span::styled(rc_path.display().to_string(), cyan),
+            ]));
+            lines.push(Line::default());
+            lines.push(Line::from(Span::styled(
+                "Lines to be added:".to_string(),
+                muted,
+            )));
+            for line in copilot_setup::append_block(shell).lines() {
+                if line.is_empty() {
                     lines.push(Line::default());
-                    lines.push(Line::from(Span::styled(
-                        "  Windows PowerShell ($PROFILE):".to_string(),
-                        muted,
-                    )));
-                    lines.push(Line::from(Span::styled(
-                        "    $env:GH_TOKEN = (gh auth token)".to_string(),
-                        cyan,
-                    )));
-                    lines.push(Line::from(Span::styled(
-                        "  Windows persistent (User scope):".to_string(),
-                        muted,
-                    )));
-                    lines.push(Line::from(Span::styled(
-                        "    [Environment]::SetEnvironmentVariable(\"GH_TOKEN\", \
-                         (gh auth token), \"User\")"
-                            .to_string(),
-                        cyan,
-                    )));
+                } else {
+                    lines.push(Line::from(Span::styled(format!("    {line}"), cyan)));
                 }
+            }
+            lines.push(Line::default());
+            lines.push(Line::from(Span::styled(
+                "We'll also run `gh auth token` once and set GH_TOKEN in this \
+                     cockpit session so Copilot works without restarting."
+                    .to_string(),
+                muted,
+            )));
+            lines.push(Line::default());
+            lines.push(Line::from(Span::styled(
+                "Press Enter to apply, Esc to cancel.".to_string(),
+                yellow,
+            )));
+        }
+        (Some(shell), Some(rc_path), true) => {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "{} already contains the cockpit Copilot-auth export.",
+                    rc_path.display()
+                ),
+                muted,
+            )));
+            lines.push(Line::default());
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "To re-apply: remove the marker block from your {} and try again.",
+                    shell.rc_filename()
+                ),
+                muted,
+            )));
+            lines.push(Line::default());
+            lines.push(Line::from(Span::styled(
+                "Press Enter or Esc to return.".to_string(),
+                yellow,
+            )));
+        }
+        _ => {
+            // Unsupported shell or unknown $HOME — show manual
+            // instructions instead of a write button.
+            lines.push(Line::from(Span::styled(
+                "Couldn't detect a supported shell ($SHELL is unset, or it's \
+                     not zsh/bash/fish). Set GH_TOKEN manually with one of:"
+                    .to_string(),
+                muted,
+            )));
+            lines.push(Line::default());
+            lines.push(Line::from(Span::styled(
+                "  POSIX shell (zsh/bash/sh):".to_string(),
+                muted,
+            )));
+            lines.push(Line::from(Span::styled(
+                "    export GH_TOKEN=$(gh auth token)".to_string(),
+                cyan,
+            )));
+            lines.push(Line::default());
+            lines.push(Line::from(Span::styled("  fish:".to_string(), muted)));
+            lines.push(Line::from(Span::styled(
+                "    set -Ux GH_TOKEN (gh auth token)".to_string(),
+                cyan,
+            )));
+            if cfg!(windows) {
+                lines.push(Line::default());
+                lines.push(Line::from(Span::styled(
+                    "  Windows PowerShell ($PROFILE):".to_string(),
+                    muted,
+                )));
+                lines.push(Line::from(Span::styled(
+                    "    $env:GH_TOKEN = (gh auth token)".to_string(),
+                    cyan,
+                )));
+                lines.push(Line::from(Span::styled(
+                    "  Windows persistent (User scope):".to_string(),
+                    muted,
+                )));
+                lines.push(Line::from(Span::styled(
+                    "    [Environment]::SetEnvironmentVariable(\"GH_TOKEN\", \
+                         (gh auth token), \"User\")"
+                        .to_string(),
+                    cyan,
+                )));
+            }
             lines.push(Line::default());
             lines.push(Line::from(Span::styled(
                 "Press Enter or Esc to return.".to_string(),
@@ -2352,6 +2466,9 @@ impl SettingsDialog {
 
     fn handle_ui_key(&mut self, key: KeyEvent) -> bool {
         // Detach + swap pattern (same rationale as handle_providers_key).
+        // The inner handler must return navigation intent via `Nav`
+        // instead of writing `self.page` directly — otherwise the
+        // swap-back below would discard the write.
         let placeholder = Page::Ui(UiPage {
             cursor: 0,
             editing: None,
@@ -2359,16 +2476,25 @@ impl SettingsDialog {
             status: None,
         });
         let mut page = std::mem::replace(&mut self.page, placeholder);
-        let close = if let Page::Ui(p) = &mut page {
+        let nav = if let Page::Ui(p) = &mut page {
             self.handle_ui_page_key(key, p)
         } else {
-            false
+            Nav::Stay
         };
-        self.page = page;
-        close
+        match nav {
+            Nav::Stay => {
+                self.page = page;
+                false
+            }
+            Nav::Replace(new) => {
+                self.page = new;
+                false
+            }
+            Nav::Close => true,
+        }
     }
 
-    fn handle_ui_page_key(&mut self, key: KeyEvent, p: &mut UiPage) -> bool {
+    fn handle_ui_page_key(&mut self, key: KeyEvent, p: &mut UiPage) -> Nav {
         if let Some(field) = p.editing {
             match key.code {
                 KeyCode::Enter => {
@@ -2399,15 +2525,16 @@ impl SettingsDialog {
                     p.buf.handle_key(key);
                 }
             }
-            return false;
+            return Nav::Stay;
         }
 
         let rows = UI_ROWS;
         match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => return true,
+            KeyCode::Esc | KeyCode::Char('q') => return Nav::Close,
             KeyCode::Left | KeyCode::Backspace | KeyCode::Char('h') => {
-                self.page = Page::Root { cursor: 0 };
-                return false;
+                return Nav::Replace(Page::Root {
+                    cursor: self.last_root_cursor,
+                });
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 p.cursor = p.cursor.saturating_sub(1);
@@ -2449,19 +2576,18 @@ impl SettingsDialog {
                     p.editing = Some(UiField::PackagesDir);
                 }
                 6 => {
-                    self.page = Page::Instructions(InstructionsPage {
+                    return Nav::Replace(Page::Instructions(InstructionsPage {
                         cursor: 0,
                         editing: None,
                         buf: TextField::default(),
                         status: None,
-                    });
-                    return false;
+                    }));
                 }
                 _ => {}
             },
             _ => {}
         }
-        false
+        Nav::Stay
     }
 
     fn render_ui_page(&self, frame: &mut Frame, area: Rect, p: &UiPage) {
@@ -2578,16 +2704,25 @@ impl SettingsDialog {
             status: None,
         });
         let mut page = std::mem::replace(&mut self.page, placeholder);
-        let close = if let Page::Instructions(p) = &mut page {
+        let nav = if let Page::Instructions(p) = &mut page {
             self.handle_instructions_page_key(key, p)
         } else {
-            false
+            Nav::Stay
         };
-        self.page = page;
-        close
+        match nav {
+            Nav::Stay => {
+                self.page = page;
+                false
+            }
+            Nav::Replace(new) => {
+                self.page = new;
+                false
+            }
+            Nav::Close => true,
+        }
     }
 
-    fn handle_instructions_page_key(&mut self, key: KeyEvent, p: &mut InstructionsPage) -> bool {
+    fn handle_instructions_page_key(&mut self, key: KeyEvent, p: &mut InstructionsPage) -> Nav {
         if let Some(idx) = p.editing {
             match key.code {
                 KeyCode::Enter => {
@@ -2615,22 +2750,21 @@ impl SettingsDialog {
                     p.buf.handle_key(key);
                 }
             }
-            return false;
+            return Nav::Stay;
         }
 
         let rows = self.extended.agent_guidance_files.len();
         // Max cursor = rows (the `[+ add]` synthetic row at the bottom).
         let max_cursor = rows;
         match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => return true,
+            KeyCode::Esc | KeyCode::Char('q') => return Nav::Close,
             KeyCode::Left | KeyCode::Backspace | KeyCode::Char('h') => {
-                self.page = Page::Ui(UiPage {
+                return Nav::Replace(Page::Ui(UiPage {
                     cursor: 6,
                     editing: None,
                     buf: TextField::default(),
                     status: None,
-                });
-                return false;
+                }));
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 p.cursor = p.cursor.saturating_sub(1);
@@ -2664,7 +2798,7 @@ impl SettingsDialog {
             }
             _ => {}
         }
-        false
+        Nav::Stay
     }
 
     fn render_instructions_page(&self, frame: &mut Frame, area: Rect, p: &InstructionsPage) {
@@ -2722,10 +2856,7 @@ impl SettingsDialog {
                 Span::styled("▎".to_string(), Style::default().fg(Color::Yellow)),
             ];
             if p.buf.text().is_empty() {
-                spans.insert(
-                    1,
-                    Span::styled("(type filename) ".to_string(), muted),
-                );
+                spans.insert(1, Span::styled("(type filename) ".to_string(), muted));
             }
             lines.push(Line::from(spans));
         } else {
@@ -2759,16 +2890,25 @@ impl SettingsDialog {
             status: None,
         });
         let mut page = std::mem::replace(&mut self.page, placeholder);
-        let close = if let Page::Tools(p) = &mut page {
+        let nav = if let Page::Tools(p) = &mut page {
             self.handle_tools_page_key(key, p)
         } else {
-            false
+            Nav::Stay
         };
-        self.page = page;
-        close
+        match nav {
+            Nav::Stay => {
+                self.page = page;
+                false
+            }
+            Nav::Replace(new) => {
+                self.page = new;
+                false
+            }
+            Nav::Close => true,
+        }
     }
 
-    fn handle_tools_page_key(&mut self, key: KeyEvent, p: &mut ToolsPage) -> bool {
+    fn handle_tools_page_key(&mut self, key: KeyEvent, p: &mut ToolsPage) -> Nav {
         if let Some(field) = p.editing {
             match key.code {
                 KeyCode::Enter => {
@@ -2800,7 +2940,7 @@ impl SettingsDialog {
                     p.buf.handle_key(key);
                 }
             }
-            return false;
+            return Nav::Stay;
         }
 
         // The tools page lays out a flat list:
@@ -2812,10 +2952,11 @@ impl SettingsDialog {
         let rows_per_tool = 3usize;
         let total_rows = builtins.len() * rows_per_tool;
         match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => return true,
+            KeyCode::Esc | KeyCode::Char('q') => return Nav::Close,
             KeyCode::Left | KeyCode::Backspace | KeyCode::Char('h') => {
-                self.page = Page::Root { cursor: 0 };
-                return false;
+                return Nav::Replace(Page::Root {
+                    cursor: self.last_root_cursor,
+                });
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 p.cursor = p.cursor.saturating_sub(1);
@@ -2874,7 +3015,7 @@ impl SettingsDialog {
             }
             _ => {}
         }
-        false
+        Nav::Stay
     }
 
     fn render_tools_page(&self, frame: &mut Frame, area: Rect, p: &ToolsPage) {
@@ -3288,6 +3429,7 @@ fn render_picker(
     subtitle: &str,
     entries: &[ConfigDir],
     cursor: usize,
+    status: Option<&str>,
 ) {
     let block = Block::default()
         .borders(Borders::ALL)
@@ -3332,6 +3474,13 @@ fn render_picker(
             lines.push(Line::from(spans));
         }
     }
+    if let Some(msg) = status {
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled(
+            msg.to_string(),
+            Style::default().fg(Color::Yellow),
+        )));
+    }
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), layout[0]);
     frame.render_widget(help_line("↑/↓/jk  enter: select  esc: cancel"), layout[1]);
 }
@@ -3347,7 +3496,8 @@ fn kind_label(kind: &ConfigDirKind) -> &'static str {
     match kind {
         ConfigDirKind::HomeXdg => "(home / XDG)",
         ConfigDirKind::HomeDot => "(home / dotfile)",
-        ConfigDirKind::Project => "(project)",
+        ConfigDirKind::MachineLocal => "(machine-local, scoped to cwd)",
+        ConfigDirKind::Project => "(project — shareable with team)",
     }
 }
 
@@ -3734,7 +3884,7 @@ mod tests {
     impl std::fmt::Debug for Page {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             match self {
-                Page::Root { .. } => f.write_str("Root"),
+                Page::Root { cursor } => write!(f, "Root({cursor})"),
                 Page::Agents => f.write_str("Agents"),
                 Page::Tools(_) => f.write_str("Tools"),
                 Page::Providers(_) => f.write_str("Providers"),
@@ -3742,5 +3892,135 @@ mod tests {
                 Page::Instructions(_) => f.write_str("Instructions"),
             }
         }
+    }
+
+    fn enter_ui_from_root(d: &mut SettingsDialog) {
+        // Root cursor 1 = UI (root_nodes order: Providers, UI, Agents, Tools).
+        d.page = Page::Root { cursor: 1 };
+        d.handle_key(press(KeyCode::Enter));
+    }
+
+    fn enter_tools_from_root(d: &mut SettingsDialog) {
+        d.page = Page::Root { cursor: 3 };
+        d.handle_key(press(KeyCode::Enter));
+    }
+
+    #[test]
+    fn pressing_h_in_ui_returns_to_root() {
+        // Regression for the swap-back bug: the Ui/Tools/Instructions
+        // wrappers used to clobber inner `self.page = Root` writes with
+        // the placeholder swap-back, so `h` from those pages did
+        // nothing.
+        let tmp = TempDir::new().unwrap();
+        let mut d = fresh_dialog(&tmp);
+        enter_ui_from_root(&mut d);
+        assert!(
+            matches!(d.page, Page::Ui(_)),
+            "expected Ui, got {:?}",
+            d.page
+        );
+        d.handle_key(press(KeyCode::Char('h')));
+        assert!(
+            on_root_page(&d),
+            "h from UI should return to Root, got {:?}",
+            d.page
+        );
+    }
+
+    #[test]
+    fn pressing_h_in_tools_returns_to_root() {
+        let tmp = TempDir::new().unwrap();
+        let mut d = fresh_dialog(&tmp);
+        enter_tools_from_root(&mut d);
+        assert!(matches!(d.page, Page::Tools(_)));
+        d.handle_key(press(KeyCode::Char('h')));
+        assert!(
+            on_root_page(&d),
+            "h from Tools should return to Root, got {:?}",
+            d.page
+        );
+    }
+
+    #[test]
+    fn enter_on_instructions_row_in_ui_opens_instructions_page() {
+        // The "can't edit instructions file" symptom: UI cursor=6 +
+        // Enter should land on the Instructions page. Under the
+        // swap-back bug, this navigation was silently dropped.
+        let tmp = TempDir::new().unwrap();
+        let mut d = fresh_dialog(&tmp);
+        enter_ui_from_root(&mut d);
+        // Move cursor to row 6 (instructions file).
+        for _ in 0..6 {
+            d.handle_key(press(KeyCode::Char('j')));
+        }
+        d.handle_key(press(KeyCode::Enter));
+        assert!(
+            matches!(d.page, Page::Instructions(_)),
+            "expected Instructions page after Enter on instructions row, got {:?}",
+            d.page
+        );
+    }
+
+    #[test]
+    fn back_from_ui_restores_root_cursor() {
+        let tmp = TempDir::new().unwrap();
+        let mut d = fresh_dialog(&tmp);
+        enter_ui_from_root(&mut d);
+        // last_root_cursor should be set to 1 (UI's index).
+        d.handle_key(press(KeyCode::Char('h')));
+        match &d.page {
+            Page::Root { cursor } => {
+                assert_eq!(*cursor, 1, "cursor should be on UI row after return")
+            }
+            other => panic!("expected Root, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn back_from_tools_restores_root_cursor() {
+        let tmp = TempDir::new().unwrap();
+        let mut d = fresh_dialog(&tmp);
+        enter_tools_from_root(&mut d);
+        d.handle_key(press(KeyCode::Char('h')));
+        match &d.page {
+            Page::Root { cursor } => {
+                assert_eq!(*cursor, 3, "cursor should be on Tools row after return")
+            }
+            other => panic!("expected Root, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pressing_a_on_picker_opens_scoped_create_dialog() {
+        // The new affordance: `a` on Dialog::PickConfig opens the
+        // "where should this config live?" sub-dialog.
+        let tmp = TempDir::new().unwrap();
+        let cockpit_dir = tmp.path().join(".cockpit");
+        std::fs::create_dir_all(&cockpit_dir).unwrap();
+        std::fs::write(cockpit_dir.join("config.json"), "{}").unwrap();
+        let mut d = Dialog::open(tmp.path());
+        assert!(matches!(d, Dialog::PickConfig { .. }));
+        let close = d.handle_key(press(KeyCode::Char('a')));
+        assert!(!close);
+        assert!(
+            matches!(d, Dialog::CreateScopedConfig { .. }),
+            "after `a` the dialog should be on CreateScopedConfig"
+        );
+    }
+
+    #[test]
+    fn esc_from_scoped_create_returns_to_picker() {
+        let tmp = TempDir::new().unwrap();
+        let cockpit_dir = tmp.path().join(".cockpit");
+        std::fs::create_dir_all(&cockpit_dir).unwrap();
+        std::fs::write(cockpit_dir.join("config.json"), "{}").unwrap();
+        let mut d = Dialog::open(tmp.path());
+        d.handle_key(press(KeyCode::Char('a')));
+        assert!(matches!(d, Dialog::CreateScopedConfig { .. }));
+        d.handle_key(press(KeyCode::Esc));
+        assert!(
+            matches!(d, Dialog::PickConfig { .. }),
+            "Esc from CreateScopedConfig should return to PickConfig"
+        );
     }
 }
