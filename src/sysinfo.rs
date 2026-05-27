@@ -30,7 +30,10 @@ pub fn os_string() -> String {
     }
     #[cfg(windows)]
     {
-        match std::process::Command::new("cmd").args(["/C", "ver"]).output() {
+        match std::process::Command::new("cmd")
+            .args(["/C", "ver"])
+            .output()
+        {
             Ok(out) if out.status.success() => {
                 let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
                 if s.is_empty() {

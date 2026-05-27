@@ -361,24 +361,22 @@ pub struct ExtendedConfigDoc {
 impl ExtendedConfigDoc {
     pub fn load(path: &Path) -> Result<Self> {
         let raw_str = if path.exists() {
-            std::fs::read_to_string(path).with_context(|| {
-                format!("reading extended-config.json at {}", path.display())
-            })?
+            std::fs::read_to_string(path)
+                .with_context(|| format!("reading extended-config.json at {}", path.display()))?
         } else {
             "{}".to_string()
         };
         let raw: Value = if raw_str.trim().is_empty() {
             Value::Object(Map::new())
         } else {
-            serde_json::from_str(&raw_str).with_context(|| {
-                format!("parsing extended-config.json at {}", path.display())
-            })?
+            serde_json::from_str(&raw_str)
+                .with_context(|| format!("parsing extended-config.json at {}", path.display()))?
         };
         let raw = match raw {
             Value::Object(_) => raw,
-            other => anyhow::bail!(
-                "expected extended-config.json root to be an object, found {other:?}"
-            ),
+            other => {
+                anyhow::bail!("expected extended-config.json root to be an object, found {other:?}")
+            }
         };
         Ok(Self {
             path: path.to_path_buf(),
@@ -407,8 +405,8 @@ impl ExtendedConfigDoc {
                 obj.insert(k, v);
             }
         }
-        let pretty = serde_json::to_string_pretty(&self.raw)
-            .context("serializing extended-config.json")?;
+        let pretty =
+            serde_json::to_string_pretty(&self.raw).context("serializing extended-config.json")?;
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -487,7 +485,10 @@ mod tests {
 
         let doc2 = ExtendedConfigDoc::load(&path).unwrap();
         let cfg2 = doc2.config();
-        assert_eq!(cfg2.utility_model.as_deref(), Some("anthropic:claude-haiku-4-5"));
+        assert_eq!(
+            cfg2.utility_model.as_deref(),
+            Some("anthropic:claude-haiku-4-5")
+        );
         assert!(cfg2.prompt_injection_guard.enabled);
         assert_eq!(
             cfg2.prompt_injection_guard.model.as_deref(),

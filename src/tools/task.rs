@@ -46,7 +46,10 @@ impl TaskTool {
             },
             "required": ["agent", "prompt"]
         });
-        Self { description, parameters }
+        Self {
+            description,
+            parameters,
+        }
     }
 }
 

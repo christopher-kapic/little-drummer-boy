@@ -53,7 +53,8 @@ pub(crate) fn read_impl(args: Value, ctx: &ToolCtx, was_locked: bool) -> Result<
         .ok_or_else(|| anyhow::anyhow!("`path` is required"))?;
     let path = resolve(path_arg, &ctx.cwd);
 
-    let bytes = std::fs::read(&path).map_err(|e| anyhow::anyhow!("read `{}`: {e}", path.display()))?;
+    let bytes =
+        std::fs::read(&path).map_err(|e| anyhow::anyhow!("read `{}`: {e}", path.display()))?;
     if looks_binary(&bytes) {
         return Ok(ToolOutput::text(format!(
             "Error: `{}` looks binary (NUL bytes in first 1 KB); use `bash` with `head -c` or `file` for binary inspection",
@@ -116,7 +117,9 @@ pub(crate) fn read_impl(args: Value, ctx: &ToolCtx, was_locked: bool) -> Result<
         ));
     }
     if default_offset && default_limit && truncated {
-        prelude.push_str("Note: `limit` defaulted to 2000; pass both `offset` and `limit` to override.\n");
+        prelude.push_str(
+            "Note: `limit` defaulted to 2000; pass both `offset` and `limit` to override.\n",
+        );
     }
     if truncated {
         // The "next offset" is the first line we *didn't* show.

@@ -22,9 +22,7 @@ use tokio::net::UnixStream;
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
-use crate::daemon::proto::{
-    self, Body, Envelope, ErrorPayload, ProtoStream, Request, Response,
-};
+use crate::daemon::proto::{self, Body, Envelope, ErrorPayload, ProtoStream, Request, Response};
 
 /// Outbound queue depth. Generous — request payloads are tiny.
 const REQUEST_QUEUE: usize = 64;
@@ -89,10 +87,7 @@ impl DaemonClient {
     ) -> Result<std::result::Result<Response, ErrorPayload>> {
         let (tx, rx) = oneshot::channel();
         self.request_tx
-            .send(Pending {
-                request,
-                reply: tx,
-            })
+            .send(Pending { request, reply: tx })
             .await
             .map_err(|_| anyhow!("daemon client task has stopped"))?;
         match tokio::time::timeout(REQUEST_TIMEOUT, rx).await {

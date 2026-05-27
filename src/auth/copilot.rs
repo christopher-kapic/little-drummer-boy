@@ -241,8 +241,12 @@ pub async fn poll_for_token(cfg: &LoginConfig, device: &DeviceCode) -> Result<St
         match err.error.as_str() {
             "authorization_pending" => {}
             "slow_down" => interval = interval.saturating_add(5),
-            "expired_token" | "access_denied" | "unsupported_grant_type" | "incorrect_client_credentials"
-            | "incorrect_device_code" | "device_flow_disabled" => {
+            "expired_token"
+            | "access_denied"
+            | "unsupported_grant_type"
+            | "incorrect_client_credentials"
+            | "incorrect_device_code"
+            | "device_flow_disabled" => {
                 bail!("device-code login failed: {}", err.error);
             }
             other => bail!("device-code login failed: {other}"),

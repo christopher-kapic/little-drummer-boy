@@ -61,19 +61,21 @@ pub async fn run(args: FetchModelsArgs) -> Result<()> {
         let entry = cfg.providers.get(id).expect("filtered above").clone();
         println!("→ {id} ({})", entry.url);
 
-        let (_, missing) = models_fetch::resolve_headers(&entry.headers);
-        if !missing.is_empty() {
-            println!("  ⚠ skipped: missing env var(s): {}", missing.join(", "));
-            summaries.push((
-                id.clone(),
-                Err(anyhow::anyhow!("missing env vars: {}", missing.join(", "))),
-            ));
-            continue;
-        }
+        let resolved = match models_fetch::resolve_provider_request(id, &entry) {
+            Ok(r) => r,
+            Err(e) => {
+                println!("  ⚠ skipped: {e}");
+                summaries.push((id.clone(), Err(e)));
+                continue;
+            }
+        };
 
-        let outcome =
-            models_fetch::fetch_models(&entry.url, &entry.headers, Some(Duration::from_secs(15)))
-                .await;
+        let outcome = models_fetch::fetch_models(
+            &resolved.base_url,
+            &resolved.headers,
+            Some(Duration::from_secs(15)),
+        )
+        .await;
 
         match &outcome {
             Ok(FetchOutcome::Models(models)) => {

@@ -67,6 +67,11 @@ pub struct Session {
     /// Resets to 0 on each new `Session::create` (and `create_fork`,
     /// so forks get their own threshold pass).
     user_content_tokens: AtomicUsize,
+    /// Provider-reported usage from the most recent round-trip.
+    /// Populated by [`Self::record_usage`] after each `model.complete`
+    /// call. The TUI prefers this over the local tiktoken estimate
+    /// when it's `Some(_)`.
+    last_usage: Mutex<Option<crate::tokens::TokenUsage>>,
 }
 
 impl Session {
@@ -107,7 +112,8 @@ impl Session {
     }
 
     fn from_row(db: Db, project_root: PathBuf, row: SessionRow) -> Result<Self> {
-        let started_at = DateTime::<Utc>::from_timestamp(row.started_at, 0).unwrap_or_else(Utc::now);
+        let started_at =
+            DateTime::<Utc>::from_timestamp(row.started_at, 0).unwrap_or_else(Utc::now);
         let short_id = match row.short_id {
             Some(s) => s,
             None => db
@@ -129,6 +135,7 @@ impl Session {
             provider: Mutex::new(row.provider),
             last_time_prelude: Mutex::new(None),
             user_content_tokens: AtomicUsize::new(0),
+            last_usage: Mutex::new(None),
         })
     }
 
@@ -178,7 +185,9 @@ impl Session {
         if increment == 0 {
             return false;
         }
-        let before = self.user_content_tokens.fetch_add(increment, Ordering::Relaxed);
+        let before = self
+            .user_content_tokens
+            .fetch_add(increment, Ordering::Relaxed);
         let after = before + increment;
         let threshold = crate::auto_title::TITLE_TOKEN_THRESHOLD;
         let just_crossed = before < threshold && after >= threshold;
@@ -278,6 +287,42 @@ impl Session {
             .insert_tool_call(&event)
             .context("inserting tool_call_event")
     }
+
+    /// Record provider-reported token usage for a round-trip: persist
+    /// it to `inference_calls` for `/stats` and store the latest value
+    /// on the session so the TUI can show it in the context indicator.
+    /// No-op when the active provider/model isn't set on the session
+    /// (background calls during startup).
+    pub fn record_usage(&self, usage: crate::tokens::TokenUsage) -> Result<()> {
+        *self.last_usage.lock().unwrap() = Some(usage);
+
+        let (Some(provider), Some(model)) = (self.active_provider(), self.active_model()) else {
+            return Ok(());
+        };
+        let row = crate::db::inference_calls::InferenceCallRow {
+            call_id: Uuid::new_v4(),
+            session_id: self.id,
+            project_id: self.project_id.clone(),
+            project_root: self.project_root.to_string_lossy().into_owned(),
+            model,
+            provider,
+            timestamp: Utc::now().timestamp(),
+            input_tokens: usage.input_tokens as i64,
+            output_tokens: usage.output_tokens as i64,
+            cached_input_tokens: usage.cached_input_tokens as i64,
+            cost_usd_micros: None,
+        };
+        self.db
+            .insert_inference_call(&row)
+            .context("inserting inference_call")
+    }
+
+    /// Most recent provider-reported usage, if we've made any calls
+    /// this session. Returns `None` before the first round-trip
+    /// finishes — callers fall back to a local tiktoken estimate.
+    pub fn last_usage(&self) -> Option<crate::tokens::TokenUsage> {
+        *self.last_usage.lock().unwrap()
+    }
 }
 
 /// In-memory analog of `tool_call_events` (GOALS §15b). The driver
@@ -345,7 +390,8 @@ mod tests {
     #[test]
     fn fork_inherits_parent_metadata() {
         let db = Db::open_in_memory().unwrap();
-        let parent = Session::create(db.clone(), PathBuf::from("/x"), "orchestrator-build").unwrap();
+        let parent =
+            Session::create(db.clone(), PathBuf::from("/x"), "orchestrator-build").unwrap();
         parent.set_active_model("anthropic", "opus-4-7").unwrap();
         let fork = Session::create_fork(db.clone(), parent.id, Some("turn-7".into())).unwrap();
         assert_eq!(fork.parent_session_id, Some(parent.id));
@@ -400,21 +446,33 @@ mod tests {
         assert!(s.take_time_prelude(0).is_some());
     }
 
+    /// Build a string whose cl100k_base token count is at least
+    /// `target` tokens. Repeats an English sentence so the BPE
+    /// merges land realistically (unlike `"x".repeat(N)`, which
+    /// collapses to a tiny number of tokens).
+    fn text_of_at_least(target: usize) -> String {
+        let sentence = "the quick brown fox jumps over the lazy dog. ";
+        let mut s = String::new();
+        while crate::tokens::count(&s) < target {
+            s.push_str(sentence);
+        }
+        s
+    }
+
     #[test]
     fn note_user_content_below_threshold_returns_false() {
         let db = Db::open_in_memory().unwrap();
         let s = Session::create(db, PathBuf::from("/x"), "a").unwrap();
-        // ~16 tokens worth — well below the 500-token threshold.
-        assert!(!s.note_user_content("a short message"));
-        assert_eq!(s.user_content_tokens(), "a short message".chars().count() / 4);
+        let msg = "a short message";
+        assert!(!s.note_user_content(msg));
+        assert_eq!(s.user_content_tokens(), crate::tokens::count(msg));
     }
 
     #[test]
     fn note_user_content_fires_once_at_threshold_crossing() {
         let db = Db::open_in_memory().unwrap();
         let s = Session::create(db, PathBuf::from("/x"), "a").unwrap();
-        // chars/4 ≈ tokens. 500 tokens × 4 chars = 2000 chars.
-        let big = "x".repeat(2000);
+        let big = text_of_at_least(crate::auto_title::TITLE_TOKEN_THRESHOLD);
         assert!(s.note_user_content(&big), "should fire on crossing");
         // Another big chunk after firing once: still eligible by
         // raw threshold, but the *crossing* only happens once.
@@ -426,7 +484,7 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let s = Session::create(db, PathBuf::from("/x"), "a").unwrap();
         s.rename("user-set").unwrap();
-        let big = "x".repeat(2000);
+        let big = text_of_at_least(crate::auto_title::TITLE_TOKEN_THRESHOLD);
         // Threshold crossed, but user_renamed locks us out.
         assert!(!s.note_user_content(&big));
     }
@@ -436,7 +494,7 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let s = Session::create(db, PathBuf::from("/x"), "a").unwrap();
         assert!(s.set_auto_title("preset-title").unwrap());
-        let big = "x".repeat(2000);
+        let big = text_of_at_least(crate::auto_title::TITLE_TOKEN_THRESHOLD);
         assert!(!s.note_user_content(&big));
     }
 
@@ -452,8 +510,8 @@ mod tests {
     fn note_user_content_accumulates_across_calls() {
         let db = Db::open_in_memory().unwrap();
         let s = Session::create(db, PathBuf::from("/x"), "a").unwrap();
-        // Two ~250-token chunks should sum to crossing on the second.
-        let half = "x".repeat(1000); // 250 tokens
+        // Two half-threshold chunks should sum to crossing on the second.
+        let half = text_of_at_least(crate::auto_title::TITLE_TOKEN_THRESHOLD / 2);
         assert!(!s.note_user_content(&half));
         assert!(s.note_user_content(&half), "second chunk should cross");
     }

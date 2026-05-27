@@ -347,7 +347,13 @@ pub async fn turn(
                 })
                 .await;
         } else {
-            let truncated = matches!(&result, Ok(ToolOutput { truncated: true, .. }));
+            let truncated = matches!(
+                &result,
+                Ok(ToolOutput {
+                    truncated: true,
+                    ..
+                })
+            );
             let _ = tx
                 .send(TurnEvent::ToolEnd {
                     agent: agent.name.clone(),
@@ -359,7 +365,13 @@ pub async fn turn(
                 .await;
         }
 
-        let truncated = matches!(&result, Ok(ToolOutput { truncated: true, .. }));
+        let truncated = matches!(
+            &result,
+            Ok(ToolOutput {
+                truncated: true,
+                ..
+            })
+        );
 
         // Persist the audit row. v0 stores the original AND a wire form
         // that's equal to the original; §13c canonical-form rewrite
@@ -370,10 +382,7 @@ pub async fn turn(
             agent: agent.name.clone(),
             call_id: tc.id.clone(),
             tool: tc.function.name.clone(),
-            path: args
-                .get("path")
-                .and_then(Value::as_str)
-                .map(str::to_string),
+            path: args.get("path").and_then(Value::as_str).map(str::to_string),
             original_input_json: original,
             wire_input_json: args,
             recovery,

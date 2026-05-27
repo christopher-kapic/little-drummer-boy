@@ -20,14 +20,26 @@ use anyhow::{Context, Result, anyhow};
 use reqwest::StatusCode;
 use serde_json::{Map, Value};
 
-use crate::config::providers::{HeaderSpec, ModelEntry, ThinkingMode};
+use crate::config::providers::{HeaderSpec, ModelEntry, ProviderEntry, ThinkingMode};
 use crate::envref;
+
+const COPILOT_TOKEN_ENV_VARS: [&str; 3] = ["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"];
+const COPILOT_DIRECT_API_TOKEN_ENV: &str = "GITHUB_COPILOT_API_TOKEN";
+const COPILOT_API_URL_ENV: &str = "COPILOT_API_URL";
 
 /// Resolved view of a `HeaderSpec` after `$VAR` expansion.
 #[derive(Debug, Clone)]
 pub struct ResolvedHeader {
     pub name: String,
     pub value: String,
+}
+
+/// Fully resolved provider request inputs after applying `$VAR`
+/// expansion plus GitHub Copilot's documented token fallbacks.
+#[derive(Debug, Clone)]
+pub struct ResolvedRequest {
+    pub base_url: String,
+    pub headers: Vec<ResolvedHeader>,
 }
 
 /// Apply `$VAR` resolution to every header, collecting any missing-env
@@ -37,17 +49,95 @@ pub fn resolve_headers(headers: &[HeaderSpec]) -> (Vec<ResolvedHeader>, Vec<Stri
     let mut missing: Vec<String> = Vec::new();
     for h in headers {
         let r = envref::resolve(&h.value);
-        for m in r.missing {
-            if !missing.iter().any(|n| n == &m) {
-                missing.push(m);
-            }
-        }
+        push_missing(&mut missing, &r.missing);
         out.push(ResolvedHeader {
             name: h.name.clone(),
             value: r.value,
         });
     }
     (out, missing)
+}
+
+/// Resolve a provider entry into concrete request inputs. For most
+/// providers this is just `$VAR` expansion over `headers`; GitHub
+/// Copilot also accepts documented token sources in the same priority
+/// order as GitHub's SDK docs.
+pub fn resolve_provider_request(
+    provider_id: &str,
+    entry: &ProviderEntry,
+) -> Result<ResolvedRequest> {
+    let is_copilot = is_github_copilot_provider(provider_id, entry);
+    let mut headers: Vec<ResolvedHeader> = Vec::with_capacity(entry.headers.len() + 1);
+    let mut missing_other: Vec<String> = Vec::new();
+    let mut auth_header: Option<ResolvedHeader> = None;
+    let mut auth_missing: Vec<String> = Vec::new();
+
+    for h in &entry.headers {
+        let resolved = envref::resolve(&h.value);
+        if h.name.eq_ignore_ascii_case("authorization") {
+            if resolved.has_missing() {
+                push_missing(&mut auth_missing, &resolved.missing);
+            } else {
+                auth_header = Some(ResolvedHeader {
+                    name: h.name.clone(),
+                    value: resolved.value,
+                });
+            }
+            continue;
+        }
+
+        push_missing(&mut missing_other, &resolved.missing);
+        headers.push(ResolvedHeader {
+            name: h.name.clone(),
+            value: resolved.value,
+        });
+    }
+
+    if !missing_other.is_empty() {
+        anyhow::bail!(
+            "provider `{provider_id}` references unset env var(s): {}",
+            missing_other.join(", ")
+        );
+    }
+
+    if let Some(auth) = auth_header {
+        headers.push(auth);
+    } else if is_copilot {
+        match resolve_copilot_token()? {
+            Some(token) => headers.push(ResolvedHeader {
+                name: "Authorization".to_string(),
+                value: format!("Bearer {token}"),
+            }),
+            None => {
+                let configured = if auth_missing.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        " Configured Authorization refs were unset: {}.",
+                        auth_missing.join(", ")
+                    )
+                };
+                anyhow::bail!(
+                    "GitHub Copilot requires an official GitHub token. \
+                     Export one of COPILOT_GITHUB_TOKEN, GH_TOKEN, or GITHUB_TOKEN; \
+                     or use the documented direct API pair \
+                     GITHUB_COPILOT_API_TOKEN + COPILOT_API_URL.{configured}"
+                );
+            }
+        }
+    } else if !auth_missing.is_empty() {
+        anyhow::bail!(
+            "Authorization for provider `{provider_id}` references unset env var(s): {}",
+            auth_missing.join(", ")
+        );
+    } else {
+        anyhow::bail!("provider `{provider_id}` has no Authorization header configured");
+    }
+
+    Ok(ResolvedRequest {
+        base_url: resolve_provider_base_url(provider_id, entry),
+        headers,
+    })
 }
 
 /// Outcome of [`fetch_models`].
@@ -61,17 +151,10 @@ pub enum FetchOutcome {
 
 pub async fn fetch_models(
     base_url: &str,
-    headers: &[HeaderSpec],
+    headers: &[ResolvedHeader],
     timeout: Option<Duration>,
 ) -> Result<FetchOutcome> {
     let url = format!("{}/models", base_url.trim_end_matches('/'));
-    let (resolved, missing) = resolve_headers(headers);
-    if !missing.is_empty() {
-        anyhow::bail!(
-            "cannot fetch models: env var(s) not set: {}",
-            missing.join(", ")
-        );
-    }
 
     let mut builder = reqwest::Client::builder();
     if let Some(t) = timeout {
@@ -80,8 +163,8 @@ pub async fn fetch_models(
     let client = builder.build().context("building reqwest client")?;
 
     let mut req = client.get(&url).header("Accept", "application/json");
-    for h in resolved {
-        req = req.header(h.name, h.value);
+    for h in headers {
+        req = req.header(&h.name, &h.value);
     }
 
     let resp = req.send().await.with_context(|| format!("GET {url}"))?;
@@ -153,8 +236,7 @@ pub fn parse_models_body(body: &str) -> Result<Vec<ModelEntry>> {
             for (k, v) in obj {
                 if matches!(
                     k.as_str(),
-                    "id"
-                        | "name"
+                    "id" | "name"
                         | "display_name"
                         | "thinking_modes"
                         | "inputs"
@@ -189,9 +271,84 @@ pub fn parse_models_body(body: &str) -> Result<Vec<ModelEntry>> {
         .collect())
 }
 
+fn is_github_copilot_provider(provider_id: &str, entry: &ProviderEntry) -> bool {
+    provider_id.eq_ignore_ascii_case("copilot")
+        || entry.credential_ref.as_deref() == Some("copilot")
+        || entry.url.contains("githubcopilot.com")
+}
+
+fn resolve_provider_base_url(provider_id: &str, entry: &ProviderEntry) -> String {
+    if is_github_copilot_provider(provider_id, entry)
+        && let Some(url) = env_var_nonempty(COPILOT_API_URL_ENV)
+    {
+        return url.trim_end_matches('/').to_string();
+    }
+    entry.url.trim_end_matches('/').to_string()
+}
+
+fn resolve_copilot_token() -> Result<Option<String>> {
+    for name in COPILOT_TOKEN_ENV_VARS {
+        if let Some(token) = env_var_nonempty(name) {
+            validate_copilot_token(name, &token)?;
+            return Ok(Some(token));
+        }
+    }
+
+    if let Some(token) = env_var_nonempty(COPILOT_DIRECT_API_TOKEN_ENV) {
+        validate_copilot_token(COPILOT_DIRECT_API_TOKEN_ENV, &token)?;
+        return Ok(Some(token));
+    }
+
+    Ok(None)
+}
+
+fn validate_copilot_token(source: &str, token: &str) -> Result<()> {
+    if token.starts_with("ghp_") {
+        anyhow::bail!(
+            "{source} looks like a classic GitHub PAT (`ghp_...`). \
+             GitHub Copilot expects a GitHub OAuth token (`gho_`/`ghu_`), \
+             a GitHub App installation token, or a fine-grained PAT \
+             (`github_pat_...`) issued to an account with Copilot access."
+        );
+    }
+    Ok(())
+}
+
+fn env_var_nonempty(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+fn push_missing(dst: &mut Vec<String>, src: &[String]) {
+    for name in src {
+        if !dst.iter().any(|existing| existing == name) {
+            dst.push(name.clone());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Cargo runs tests in parallel by default. Several tests below
+    /// mutate process-wide env vars (`COPILOT_GITHUB_TOKEN` and friends)
+    /// to exercise resolver fallbacks, so they must serialize against
+    /// one another to avoid spurious failures.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn clear_copilot_env() {
+        unsafe {
+            std::env::remove_var("COPILOT_GITHUB_TOKEN");
+            std::env::remove_var("GH_TOKEN");
+            std::env::remove_var("GITHUB_TOKEN");
+            std::env::remove_var("GITHUB_COPILOT_API_TOKEN");
+            std::env::remove_var("COPILOT_API_URL");
+        }
+    }
 
     #[test]
     fn parses_canonical_envelope() {
@@ -251,5 +408,175 @@ mod tests {
         assert_eq!(resolved.len(), 2);
         assert_eq!(missing.len(), 1);
         assert_eq!(missing[0], "NONEXISTENT_VAR_123");
+    }
+
+    #[test]
+    fn copilot_falls_back_to_gh_token_when_default_header_var_is_missing() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_copilot_env();
+        let entry = ProviderEntry {
+            url: "https://api.githubcopilot.com".into(),
+            headers: vec![HeaderSpec {
+                name: "Authorization".into(),
+                value: "Bearer $COPILOT_GITHUB_TOKEN".into(),
+            }],
+            ..ProviderEntry::default()
+        };
+        unsafe {
+            std::env::set_var("GH_TOKEN", "ghu_test");
+        }
+        let resolved = resolve_provider_request("copilot", &entry).unwrap();
+        let auth = resolved
+            .headers
+            .iter()
+            .find(|h| h.name.eq_ignore_ascii_case("authorization"))
+            .unwrap();
+        assert_eq!(auth.value, "Bearer ghu_test");
+        clear_copilot_env();
+    }
+
+    #[test]
+    fn copilot_uses_direct_api_url_override() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_copilot_env();
+        let entry = ProviderEntry {
+            url: "https://api.githubcopilot.com".into(),
+            headers: vec![],
+            ..ProviderEntry::default()
+        };
+        unsafe {
+            std::env::set_var("GITHUB_COPILOT_API_TOKEN", "token");
+            std::env::set_var("COPILOT_API_URL", "https://copilot-proxy.example/v1/");
+        }
+        let resolved = resolve_provider_request("copilot", &entry).unwrap();
+        assert_eq!(resolved.base_url, "https://copilot-proxy.example/v1");
+        clear_copilot_env();
+    }
+
+    #[test]
+    fn copilot_rejects_classic_pat() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_copilot_env();
+        let entry = ProviderEntry {
+            url: "https://api.githubcopilot.com".into(),
+            headers: vec![],
+            ..ProviderEntry::default()
+        };
+        unsafe {
+            std::env::set_var("COPILOT_GITHUB_TOKEN", "ghp_legacy");
+        }
+        let err = resolve_provider_request("copilot", &entry).unwrap_err();
+        assert!(err.to_string().contains("classic GitHub PAT"));
+        clear_copilot_env();
+    }
+
+    #[test]
+    fn copilot_detected_via_url_when_provider_id_differs() {
+        // A user might add a Copilot endpoint under a custom id; the
+        // resolver still picks up the documented env-var fallbacks.
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_copilot_env();
+        let entry = ProviderEntry {
+            url: "https://api.githubcopilot.com".into(),
+            headers: vec![],
+            ..ProviderEntry::default()
+        };
+        unsafe {
+            std::env::set_var("COPILOT_GITHUB_TOKEN", "gho_via_url");
+        }
+        let resolved = resolve_provider_request("my-copilot", &entry).unwrap();
+        let auth = resolved
+            .headers
+            .iter()
+            .find(|h| h.name.eq_ignore_ascii_case("authorization"))
+            .unwrap();
+        assert_eq!(auth.value, "Bearer gho_via_url");
+        clear_copilot_env();
+    }
+
+    #[test]
+    fn copilot_priority_prefers_copilot_github_token_over_gh_token() {
+        // With both vars set the highest-priority source wins.
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_copilot_env();
+        let entry = ProviderEntry {
+            url: "https://api.githubcopilot.com".into(),
+            headers: vec![],
+            ..ProviderEntry::default()
+        };
+        unsafe {
+            std::env::set_var("COPILOT_GITHUB_TOKEN", "gho_primary");
+            std::env::set_var("GH_TOKEN", "gho_secondary");
+            std::env::set_var("GITHUB_TOKEN", "gho_tertiary");
+        }
+        let resolved = resolve_provider_request("copilot", &entry).unwrap();
+        let auth = resolved
+            .headers
+            .iter()
+            .find(|h| h.name.eq_ignore_ascii_case("authorization"))
+            .unwrap();
+        assert_eq!(auth.value, "Bearer gho_primary");
+        clear_copilot_env();
+    }
+
+    #[test]
+    fn copilot_errors_when_no_env_var_set() {
+        // Sanity check: with no headers and no env vars, the resolver
+        // emits the documented-token guidance instead of falling back
+        // to the legacy device-code path.
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_copilot_env();
+        let entry = ProviderEntry {
+            url: "https://api.githubcopilot.com".into(),
+            headers: vec![],
+            ..ProviderEntry::default()
+        };
+        let err = resolve_provider_request("copilot", &entry).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("COPILOT_GITHUB_TOKEN"));
+        assert!(msg.contains("GH_TOKEN"));
+        assert!(msg.contains("GITHUB_TOKEN"));
+        // Critically, the message must not point users at the old
+        // device-code login path.
+        assert!(!msg.contains("device-code"));
+        assert!(!msg.contains("copilot_internal"));
+    }
+
+    #[test]
+    fn non_copilot_provider_with_missing_auth_env_errors() {
+        // A non-Copilot provider whose `Authorization` references an
+        // unset var must NOT silently fall back to Copilot env vars.
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_copilot_env();
+        let entry = ProviderEntry {
+            url: "https://api.example.com/v1".into(),
+            headers: vec![HeaderSpec {
+                name: "Authorization".into(),
+                value: "Bearer $TOTALLY_UNSET_VAR_PROBE".into(),
+            }],
+            ..ProviderEntry::default()
+        };
+        unsafe {
+            std::env::remove_var("TOTALLY_UNSET_VAR_PROBE");
+            // Even if a Copilot fallback is set, a non-Copilot
+            // provider must not pick it up.
+            std::env::set_var("COPILOT_GITHUB_TOKEN", "gho_should_not_leak");
+        }
+        let err = resolve_provider_request("some-vendor", &entry).unwrap_err();
+        assert!(err.to_string().contains("TOTALLY_UNSET_VAR_PROBE"));
+        clear_copilot_env();
+    }
+
+    #[test]
+    fn copilot_template_is_apikey_with_documented_default_env() {
+        // The Add-Provider wizard should no longer offer a device-code
+        // flow for Copilot. Pin the template's shape so it can't
+        // regress.
+        let t = crate::providers::template_by_id("copilot").expect("copilot template");
+        assert!(matches!(t.auth, crate::config::providers::AuthKind::ApiKey));
+        assert_eq!(t.default_env_var, Some("COPILOT_GITHUB_TOKEN"));
+        assert_eq!(t.default_headers.len(), 1);
+        assert_eq!(t.default_headers[0].0, "Authorization");
+        assert_eq!(t.default_headers[0].1, "Bearer $COPILOT_GITHUB_TOKEN");
     }
 }

@@ -25,7 +25,7 @@ use crossterm::terminal::{Clear, ClearType, size as terminal_size};
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, BorderType, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
 use ratatui::{DefaultTerminal, TerminalOptions, Viewport};
 
 use crate::config::dirs::discover_config_dirs;
@@ -306,7 +306,30 @@ impl App {
             last_usage: None,
         };
         app.pane_height = app.geometry().desired_pane_height();
+        // First-run convenience: if the daemon prompt doesn't gate
+        // startup, open the Add-Provider wizard immediately when no
+        // providers are configured. The prompt-resolution branches
+        // call this same helper after the user dismisses the daemon
+        // prompt.
+        if app.daemon_prompt.is_none() {
+            app.maybe_open_add_provider_wizard();
+        }
         app
+    }
+
+    /// If the user has no providers configured in the active config
+    /// layer, open `/settings → Providers → Add` directly. No-op when
+    /// providers already exist or when the settings dialog is already
+    /// open. Evaluated each launch so emptying the providers list
+    /// re-triggers the wizard on the next start.
+    fn maybe_open_add_provider_wizard(&mut self) {
+        if self.dialog.is_active() {
+            return;
+        }
+        if !crate::tui::settings::Dialog::has_no_providers(&self.launch.cwd) {
+            return;
+        }
+        self.dialog = crate::tui::settings::Dialog::open_providers_add(&self.launch.cwd);
     }
 
     fn geometry(&self) -> PaneGeometry {
@@ -410,7 +433,10 @@ impl App {
                 let mut lines = entry_to_plain_lines(entry);
                 // Match the chat-area visual: one blank row after
                 // each user/agent block.
-                if matches!(entry, HistoryEntry::User { .. } | HistoryEntry::Agent { .. }) {
+                if matches!(
+                    entry,
+                    HistoryEntry::User { .. } | HistoryEntry::Agent { .. }
+                ) {
                     lines.push(String::new());
                 }
                 lines
@@ -536,10 +562,7 @@ impl App {
         // the scrollback area. We lose bg color in scrollback — that's
         // acceptable; the alternative is dumping ANSI escape sequences
         // into the user's terminal scrollback, which is messier.
-        let plain: Vec<String> = items
-            .iter()
-            .flat_map(|e| entry_to_plain_lines(e))
-            .collect();
+        let plain: Vec<String> = items.iter().flat_map(|e| entry_to_plain_lines(e)).collect();
         let n = plain.len() as u16;
         if n > 0 {
             terminal.insert_before(n, |buf| {
@@ -572,7 +595,10 @@ impl App {
                 .iter()
                 .flat_map(|entry| {
                     let mut lines = entry_to_plain_lines(entry);
-                    if matches!(entry, HistoryEntry::User { .. } | HistoryEntry::Agent { .. }) {
+                    if matches!(
+                        entry,
+                        HistoryEntry::User { .. } | HistoryEntry::Agent { .. }
+                    ) {
                         lines.push(String::new());
                     }
                     lines
@@ -655,6 +681,7 @@ impl App {
                             });
                             self.daemon_connected = true;
                             self.daemon_prompt = None;
+                            self.maybe_open_add_provider_wizard();
                         }
                         Err(e) => {
                             if let Some(p) = self.daemon_prompt.as_mut() {
@@ -670,6 +697,7 @@ impl App {
                                 .to_string(),
                     });
                     self.daemon_prompt = None;
+                    self.maybe_open_add_provider_wizard();
                 }
                 Some(crate::tui::daemon_prompt::DaemonChoice::Exit) | None => {
                     return true;
@@ -709,9 +737,7 @@ impl App {
         // block expand/collapse. (See the doc comment on
         // `toggle_recent_reasoning` for why this is a keybind rather
         // than a click handler.)
-        if key.modifiers.contains(KeyModifiers::CONTROL)
-            && matches!(key.code, KeyCode::Char('r'))
-        {
+        if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('r')) {
             self.toggle_recent_reasoning();
             return false;
         }
@@ -1234,9 +1260,7 @@ impl App {
                 self.pending = Some(new_pending(agent));
             }
             TurnEvent::AssistantTextDelta { agent, delta } => {
-                let p = self
-                    .pending
-                    .get_or_insert_with(|| new_pending(agent));
+                let p = self.pending.get_or_insert_with(|| new_pending(agent));
                 let wrote = route_text_delta(
                     &delta,
                     &mut p.text,
@@ -1249,9 +1273,7 @@ impl App {
                 }
             }
             TurnEvent::ReasoningDelta { agent, delta } => {
-                let p = self
-                    .pending
-                    .get_or_insert_with(|| new_pending(agent));
+                let p = self.pending.get_or_insert_with(|| new_pending(agent));
                 p.reasoning.push_str(&delta);
             }
             TurnEvent::AssistantText { .. } => {
@@ -1386,7 +1408,9 @@ impl App {
     fn toggle_recent_reasoning(&mut self) {
         for entry in self.history.iter_mut().rev() {
             if let HistoryEntry::Agent {
-                expanded, reasoning, ..
+                expanded,
+                reasoning,
+                ..
             } = entry
                 && !reasoning.trim().is_empty()
             {
@@ -1604,20 +1628,16 @@ impl App {
             let ids: Vec<String> = cfg.providers.keys().cloned().collect();
             for id in &ids {
                 let entry = cfg.providers.get(id).cloned().unwrap();
-                let (_, missing) = models_fetch::resolve_headers(&entry.headers);
-                if !missing.is_empty() {
-                    push(
-                        &progress,
-                        format!(
-                            "/fetch-models: {id} skipped — missing env var(s): {}",
-                            missing.join(", ")
-                        ),
-                    );
-                    continue;
-                }
+                let resolved = match models_fetch::resolve_provider_request(id, &entry) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        push(&progress, format!("/fetch-models: {id} skipped — {e}"));
+                        continue;
+                    }
+                };
                 match models_fetch::fetch_models(
-                    &entry.url,
-                    &entry.headers,
+                    &resolved.base_url,
+                    &resolved.headers,
                     Some(Duration::from_secs(15)),
                 )
                 .await
@@ -1909,14 +1929,13 @@ impl App {
         // chip occupies row `i` of `all`, or `None` otherwise.
         let mut targets: Vec<Option<usize>> = Vec::new();
         for (idx, entry) in self.history.iter().enumerate() {
-            let Rendered { lines, chip_row } =
-                render_entry(
-                    entry,
-                    area.width,
-                    self.thinking_setting,
-                    self.markdown_opts,
-                    self.diff_style,
-                );
+            let Rendered { lines, chip_row } = render_entry(
+                entry,
+                area.width,
+                self.thinking_setting,
+                self.markdown_opts,
+                self.diff_style,
+            );
             let chip_abs = chip_row.map(|cr| all.len() + cr);
             for i in 0..lines.len() {
                 targets.push(if Some(all.len() + i) == chip_abs {
@@ -1972,12 +1991,7 @@ impl App {
         frame.render_widget(Paragraph::new(visible).wrap(Wrap { trim: false }), area);
     }
 
-    fn render_input(
-        &self,
-        frame: &mut ratatui::Frame,
-        area: Rect,
-        queue_above: bool,
-    ) -> Position {
+    fn render_input(&self, frame: &mut ratatui::Frame, area: Rect, queue_above: bool) -> Position {
         // When the queue strip is above, its shared bottom row IS our
         // top border — render only sides + bottom here.
         let borders = if queue_above {
@@ -2133,11 +2147,7 @@ impl App {
                 let line = Line::from(vec![
                     Span::raw("  "),
                     Span::styled("Press ", muted),
-                    Span::styled(
-                        "`i`",
-                        Style::default()
-                            .fg(Color::Yellow),
-                    ),
+                    Span::styled("`i`", Style::default().fg(Color::Yellow)),
                     Span::styled(" to resume typing. Disable vim mode in ", muted),
                     Span::styled("/settings", muted),
                 ]);
@@ -2378,7 +2388,10 @@ fn entry_to_plain_lines(entry: &HistoryEntry) -> Vec<String> {
     match entry {
         HistoryEntry::Plain { line } => vec![line.clone()],
         HistoryEntry::Diff {
-            tool, path, old, new,
+            tool,
+            path,
+            old,
+            new,
         } => {
             // Plain-lines is what the "spill to scrollback" path uses
             // on `/new`. Reduce the diff to a tool-result-style

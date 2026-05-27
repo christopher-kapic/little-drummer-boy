@@ -117,7 +117,7 @@ fn summary_line(tool: &str, path: &str, added: usize, removed: usize) -> Line<'s
     ])
 }
 
-fn count_changes<'a>(diff: &TextDiff<'a, 'a, 'a, str>) -> (usize, usize) {
+fn count_changes<'a>(diff: &TextDiff<'a, 'a, str>) -> (usize, usize) {
     let mut added = 0usize;
     let mut removed = 0usize;
     for change in diff.iter_all_changes() {
@@ -132,7 +132,7 @@ fn count_changes<'a>(diff: &TextDiff<'a, 'a, 'a, str>) -> (usize, usize) {
 
 // ---- inline ---------------------------------------------------------------
 
-fn render_inline<'a>(diff: &TextDiff<'a, 'a, 'a, str>) -> Vec<Line<'static>> {
+fn render_inline<'a>(diff: &TextDiff<'a, 'a, str>) -> Vec<Line<'static>> {
     let mut out = Vec::new();
     for group in diff.grouped_ops(CONTEXT_LINES) {
         if !out.is_empty() {
@@ -159,10 +159,7 @@ fn render_inline<'a>(diff: &TextDiff<'a, 'a, 'a, str>) -> Vec<Line<'static>> {
 
 // ---- side-by-side ---------------------------------------------------------
 
-fn render_side_by_side<'a>(
-    diff: &TextDiff<'a, 'a, 'a, str>,
-    width: u16,
-) -> Vec<Line<'static>> {
+fn render_side_by_side<'a>(diff: &TextDiff<'a, 'a, str>, width: u16) -> Vec<Line<'static>> {
     let col_width = side_by_side_column_width(width);
     let mut out = Vec::new();
 
@@ -273,7 +270,12 @@ fn pad_to_width(s: &str, width: usize) -> String {
 fn ellipsis_line() -> Line<'static> {
     Line::from(vec![
         Span::raw(LEFT_INDENT.to_string()),
-        Span::styled("…", Style::default().fg(COL_ELLIPSIS).add_modifier(Modifier::DIM)),
+        Span::styled(
+            "…",
+            Style::default()
+                .fg(COL_ELLIPSIS)
+                .add_modifier(Modifier::DIM),
+        ),
     ])
 }
 

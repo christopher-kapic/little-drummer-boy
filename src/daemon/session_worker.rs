@@ -22,9 +22,9 @@ use tokio::sync::{broadcast, mpsc};
 use uuid::Uuid;
 
 use crate::daemon::proto;
-use crate::engine::{Driver, TurnEvent};
 use crate::engine::builtin::{self, SpawnArgs};
 use crate::engine::model::{Model, ModelParams};
+use crate::engine::{Driver, TurnEvent};
 use crate::locks::LockManager;
 use crate::redact::RedactionTable;
 use crate::session::Session;
@@ -105,7 +105,13 @@ pub fn spawn(
     };
 
     tokio::spawn(run_worker(
-        session, locks, redact, model, project_root, work_rx, event_tx,
+        session,
+        locks,
+        redact,
+        model,
+        project_root,
+        work_rx,
+        event_tx,
     ));
 
     handle
@@ -153,7 +159,10 @@ async fn run_worker(
         let project_root = project_root.clone();
         tokio::spawn(async move {
             let mut driver = Driver::new(session, locks, redact, project_root, root);
-            if let Err(e) = driver.run_main_loop(driver_input_rx, &engine_event_tx).await {
+            if let Err(e) = driver
+                .run_main_loop(driver_input_rx, &engine_event_tx)
+                .await
+            {
                 tracing::error!(error = ?e, "driver loop terminated with error");
             }
         })

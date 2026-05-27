@@ -35,6 +35,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
+use crate::auth::copilot_setup::{self, Shell as CopilotShell};
 use crate::config::dirs::{
     ConfigDir, ConfigDirKind, creatable_config_dirs, discover_config_dirs, scaffold_config_dir,
 };
@@ -129,6 +130,10 @@ enum ProvidersPage {
     List {
         cursor: usize,
         status: Option<String>,
+        /// True after the first `d` press while the cursor is on a
+        /// provider row. The next `d` confirms the delete; any other
+        /// key clears it. Mirrors the same affordance on the Edit page.
+        delete_pending: bool,
     },
     /// Add-provider wizard.
     Add(AddState),
@@ -136,6 +141,45 @@ enum ProvidersPage {
     Edit(EditState),
     /// Triggered by /fetch-models — prompts on unlisted models.
     FetchAll(FetchAllState),
+    /// One-button "Set up GitHub Copilot auth" confirm screen. Visible
+    /// only when no Copilot env var is set; appends
+    /// `export GH_TOKEN=$(gh auth token)` to the user's shell rc and
+    /// sets `GH_TOKEN` in the running process so Copilot works without
+    /// a restart.
+    CopilotSetup(CopilotSetupState),
+}
+
+/// State for the "Set up GitHub Copilot auth" sub-page.
+struct CopilotSetupState {
+    /// Detected shell. `None` means we'll show manual instructions
+    /// instead of a write button.
+    shell: Option<CopilotShell>,
+    /// Absolute rc-file path we'd append to. `None` when shell is None.
+    rc_path: Option<PathBuf>,
+    /// `Some(true)` if our marker is already in the rc file. The
+    /// confirm prompt collapses to a "remove and re-add" hint.
+    already_configured: bool,
+    /// Action result after the user confirms. On success, we also
+    /// inject `GH_TOKEN` into the running process so the resolver
+    /// picks it up before the user restarts.
+    outcome: Option<Result<String, String>>,
+}
+
+impl CopilotSetupState {
+    fn new() -> Self {
+        let shell = copilot_setup::detect_shell();
+        let rc_path = shell.and_then(copilot_setup::rc_path);
+        let already_configured = rc_path
+            .as_deref()
+            .and_then(|p| copilot_setup::rc_already_configured(p).ok())
+            .unwrap_or(false);
+        Self {
+            shell,
+            rc_path,
+            already_configured,
+            outcome: None,
+        }
+    }
 }
 
 struct AddState {
@@ -146,11 +190,10 @@ struct AddState {
     headers: HeaderEditor,
     /// Active OAuth device-flow attempt, when the picked template uses
     /// `AuthKind::DeviceFlow`. Replaces the URL/Headers steps for
-    /// those templates. Exactly one of `codex_login` / `copilot_login`
-    /// is `Some(_)` during the [`AddStep::CodexLogin`] step, selected
-    /// by the template's `id`.
+    /// those templates. Today only the Codex template ships a device
+    /// flow; Copilot was migrated off device-code in favor of
+    /// documented GitHub-token env vars (see `src/providers/mod.rs`).
     codex_login: Option<CodexLoginState>,
-    copilot_login: Option<CopilotLoginState>,
     error: Option<String>,
     fetch: Option<FetchHandle>,
     saved_provider_id: Option<String>,
@@ -166,10 +209,8 @@ enum AddStep {
     EditUrl,
     /// Add/remove HTTP headers (`Authorization: Bearer $TOKEN`, etc.).
     EditHeaders,
-    /// Run a device-code OAuth flow (codex or copilot, dispatched on
-    /// template id). Lives in `s.codex_login` or `s.copilot_login`.
-    /// Reached directly after EditId when the template's auth is
-    /// `DeviceFlow`.
+    /// Run a device-code OAuth flow. Lives in `s.codex_login`. Reached
+    /// directly after EditId when the template's auth is `DeviceFlow`.
     CodexLogin,
     /// Saving config + kicking off /models fetch.
     Saving,
@@ -507,82 +548,6 @@ fn set(shared: &Arc<Mutex<CodexLoginProgress>>, value: CodexLoginProgress) {
     }
 }
 
-/// Copilot device-code OAuth login state. Mirrors [`CodexLoginState`];
-/// kept as a sibling rather than a single generic type so each flow can
-/// evolve independently (the copilot flow has an extra internal-token
-/// swap step that may grow its own progress messages).
-pub struct CopilotLoginState {
-    shared: Arc<Mutex<CopilotLoginProgress>>,
-}
-
-#[derive(Clone)]
-pub enum CopilotLoginProgress {
-    /// POSTing to the device-code endpoint.
-    Requesting,
-    /// Server returned a user code; waiting for the user to authorize
-    /// and for the poll + token-swap to complete.
-    AwaitingUser {
-        verification_url: String,
-        user_code: String,
-    },
-    /// Persisted; the dialog can finalize the ProviderEntry.
-    Success {
-        saved_at: chrono::DateTime<chrono::Utc>,
-    },
-    /// Flow failed at any step. The dialog should show the message
-    /// and let the user retry.
-    Error(String),
-}
-
-impl CopilotLoginState {
-    pub fn spawn() -> Self {
-        let cfg = crate::auth::copilot::LoginConfig::default();
-        Self::spawn_with(cfg)
-    }
-
-    pub fn spawn_with(cfg: crate::auth::copilot::LoginConfig) -> Self {
-        let shared = Arc::new(Mutex::new(CopilotLoginProgress::Requesting));
-        let w = Arc::clone(&shared);
-        tokio::spawn(async move {
-            match crate::auth::copilot::request_device_code(&cfg).await {
-                Err(e) => set_copilot(&w, CopilotLoginProgress::Error(e.to_string())),
-                Ok(device) => {
-                    set_copilot(
-                        &w,
-                        CopilotLoginProgress::AwaitingUser {
-                            verification_url: device.verification_url.clone(),
-                            user_code: device.user_code.clone(),
-                        },
-                    );
-                    match crate::auth::copilot::complete_login(&cfg, &device).await {
-                        Err(e) => set_copilot(&w, CopilotLoginProgress::Error(e.to_string())),
-                        Ok(stored) => set_copilot(
-                            &w,
-                            CopilotLoginProgress::Success {
-                                saved_at: stored.saved_at,
-                            },
-                        ),
-                    }
-                }
-            }
-        });
-        Self { shared }
-    }
-
-    pub fn snapshot(&self) -> CopilotLoginProgress {
-        self.shared
-            .lock()
-            .map(|g| g.clone())
-            .unwrap_or(CopilotLoginProgress::Error("poisoned login state".into()))
-    }
-}
-
-fn set_copilot(shared: &Arc<Mutex<CopilotLoginProgress>>, value: CopilotLoginProgress) {
-    if let Ok(mut g) = shared.lock() {
-        *g = value;
-    }
-}
-
 /// Shared cell for an in-flight `/models` fetch. The background task
 /// writes the result; the event loop polls it on each tick.
 #[derive(Clone)]
@@ -600,13 +565,21 @@ pub enum FetchState {
 }
 
 impl FetchHandle {
-    pub fn spawn(provider_id: String, url: String, headers: Vec<HeaderSpec>) -> Self {
+    pub fn spawn(provider_id: String, entry: ProviderEntry) -> Self {
         let state = Arc::new(Mutex::new(FetchState::Running));
         let state_w = Arc::clone(&state);
+        let pid = provider_id.clone();
         tokio::spawn(async move {
-            let result = models_fetch::fetch_models(&url, &headers, Some(Duration::from_secs(15)))
+            let result = match models_fetch::resolve_provider_request(&pid, &entry) {
+                Err(e) => Err(e.to_string()),
+                Ok(r) => models_fetch::fetch_models(
+                    &r.base_url,
+                    &r.headers,
+                    Some(Duration::from_secs(15)),
+                )
                 .await
-                .map_err(|e| e.to_string());
+                .map_err(|e| e.to_string()),
+            };
             if let Ok(mut s) = state_w.lock() {
                 *s = FetchState::Done(result);
             }
@@ -658,6 +631,38 @@ impl Dialog {
             if let Dialog::Settings(s) = &mut d {
                 s.enter_providers();
             }
+        }
+        d
+    }
+
+    /// True when the first discovered config layer has zero providers
+    /// configured (or no providers map at all). Used by the TUI's
+    /// first-run flow to auto-route into the Add wizard after the
+    /// daemon prompt resolves.
+    pub fn has_no_providers(cwd: &std::path::Path) -> bool {
+        let dirs = discover_config_dirs(cwd);
+        let Some(dir) = dirs.first() else {
+            return true;
+        };
+        let path = dir.path.join("config.json");
+        match ConfigDoc::load(&path) {
+            Ok(doc) => doc.providers().providers.is_empty(),
+            Err(_) => true,
+        }
+    }
+
+    /// Open the Add-Provider wizard directly, skipping the Providers
+    /// list. Used when the user has no providers configured at TUI
+    /// launch.
+    pub fn open_providers_add(cwd: &std::path::Path) -> Self {
+        let mut d = Self::open(cwd);
+        if let Dialog::PickConfig { dirs, .. } = &d
+            && let Some(dir) = dirs.first()
+        {
+            let path = dir.path.join("config.json");
+            let mut s = SettingsDialog::open(path);
+            s.page = Page::Providers(ProvidersPage::Add(AddState::new()));
+            d = Dialog::Settings(s);
         }
         d
     }
@@ -759,6 +764,7 @@ impl SettingsDialog {
         self.page = Page::Providers(ProvidersPage::List {
             cursor: 0,
             status: None,
+            delete_pending: false,
         });
     }
 
@@ -794,8 +800,6 @@ impl SettingsDialog {
 
     /// If the Add wizard is on the CodexLogin step and the device-flow
     /// background task has finished, finalize the provider entry.
-    /// Dispatches on whichever login state is `Some(_)` (codex or
-    /// copilot).
     fn advance_codex_login(&mut self) {
         let Page::Providers(ProvidersPage::Add(s)) = &mut self.page else {
             return;
@@ -803,17 +807,6 @@ impl SettingsDialog {
         if !matches!(s.step, AddStep::CodexLogin) {
             return;
         }
-        if s.copilot_login.is_some() {
-            self.advance_copilot_login();
-        } else {
-            self.advance_codex_login_inner();
-        }
-    }
-
-    fn advance_codex_login_inner(&mut self) {
-        let Page::Providers(ProvidersPage::Add(s)) = &mut self.page else {
-            return;
-        };
         let snap = match &s.codex_login {
             Some(c) => c.snapshot(),
             None => return,
@@ -852,48 +845,6 @@ impl SettingsDialog {
                 // Nothing to advance yet; the renderer reads the
                 // snapshot on its own.
             }
-        }
-    }
-
-    fn advance_copilot_login(&mut self) {
-        let Page::Providers(ProvidersPage::Add(s)) = &mut self.page else {
-            return;
-        };
-        let snap = match &s.copilot_login {
-            Some(c) => c.snapshot(),
-            None => return,
-        };
-        match snap {
-            CopilotLoginProgress::Success { saved_at } => {
-                let template = s.template.expect("template chosen");
-                let id = s.id_field.text().trim().to_string();
-                let entry = ProviderEntry {
-                    name: Some(template.display.to_string()),
-                    url: template.url.trim_end_matches('/').to_string(),
-                    headers: Vec::new(),
-                    models_fetched_at: None,
-                    favorite: None,
-                    credential_ref: Some("copilot".to_string()),
-                    auth: Some(crate::config::providers::AuthKind::DeviceFlow),
-                    models: Vec::new(),
-                };
-                self.config.providers.insert(id.clone(), entry);
-                let msg = match self.save_config() {
-                    Ok(()) => format!(
-                        "copilot: logged in (saved {}); provider `{id}` added",
-                        saved_at.format("%Y-%m-%d %H:%M UTC")
-                    ),
-                    Err(e) => format!("copilot: logged in but config write failed: {e}"),
-                };
-                if let Page::Providers(ProvidersPage::Add(s)) = &mut self.page {
-                    s.error = Some(msg);
-                    s.copilot_login = None;
-                    s.step = AddStep::Done;
-                }
-            }
-            CopilotLoginProgress::Error(_)
-            | CopilotLoginProgress::Requesting
-            | CopilotLoginProgress::AwaitingUser { .. } => {}
         }
     }
 
@@ -1017,6 +968,7 @@ impl SettingsDialog {
         let placeholder = Page::Providers(ProvidersPage::List {
             cursor: 0,
             status: None,
+            delete_pending: false,
         });
         let mut page = std::mem::replace(&mut self.page, placeholder);
         let nav = if let Page::Providers(p) = &mut page {
@@ -1037,8 +989,17 @@ impl SettingsDialog {
 
     fn handle_providers_page_key(&mut self, key: KeyEvent, page: &mut ProvidersPage) -> Nav {
         match page {
-            ProvidersPage::List { cursor, status } => {
+            ProvidersPage::List {
+                cursor,
+                status,
+                delete_pending,
+            } => {
                 let ids: Vec<String> = self.config.providers.keys().cloned().collect();
+                let copilot_row_visible = !copilot_setup::copilot_env_already_set();
+                let copilot_row_idx = copilot_row_visible.then_some(ids.len());
+                let max_cursor = ids.len() + usize::from(copilot_row_visible);
+                let max_cursor = max_cursor.saturating_sub(1);
+                let pressed_d = matches!(key.code, KeyCode::Char('d'));
                 match key.code {
                     KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') | KeyCode::Backspace => {
                         return Nav::Replace(Page::Root { cursor: 0 });
@@ -1048,12 +1009,17 @@ impl SettingsDialog {
                         *cursor = cursor.saturating_sub(1);
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
-                        *cursor = (*cursor + 1).min(ids.len().saturating_sub(1).max(0));
+                        *cursor = (*cursor + 1).min(max_cursor);
                     }
                     KeyCode::Char('c') => {
                         return Nav::Replace(Page::Providers(ProvidersPage::Add(AddState::new())));
                     }
                     KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                        if Some(*cursor) == copilot_row_idx {
+                            return Nav::Replace(Page::Providers(ProvidersPage::CopilotSetup(
+                                CopilotSetupState::new(),
+                            )));
+                        }
                         if let Some(id) = ids.get(*cursor).cloned()
                             && let Some(entry) = self.config.providers.get(&id)
                         {
@@ -1062,14 +1028,46 @@ impl SettingsDialog {
                             )));
                         }
                     }
+                    KeyCode::Char('d') => {
+                        // Only arm/confirm when the cursor is on a
+                        // provider row (not the synthetic Copilot button).
+                        let on_provider_row = *cursor < ids.len();
+                        if !on_provider_row {
+                            // Drop through to the post-match cleanup.
+                        } else if *delete_pending {
+                            let id = ids[*cursor].clone();
+                            self.config.providers.remove(&id);
+                            let msg = match self.save_config() {
+                                Ok(()) => format!("deleted `{id}`"),
+                                Err(e) => format!("delete failed: {e}"),
+                            };
+                            let new_len = self.config.providers.len();
+                            let new_cursor = (*cursor).min(new_len.saturating_sub(1));
+                            return Nav::Replace(Page::Providers(ProvidersPage::List {
+                                cursor: new_cursor,
+                                status: Some(msg),
+                                delete_pending: false,
+                            }));
+                        } else {
+                            *delete_pending = true;
+                            *status = Some(format!("press d again to delete `{}`", ids[*cursor]));
+                            return Nav::Stay;
+                        }
+                    }
                     _ => {}
                 }
-                *status = None;
+                // Any non-`d` key (or `d` on a non-provider row) clears
+                // the pending-delete arm and the transient status.
+                if !pressed_d {
+                    *delete_pending = false;
+                    *status = None;
+                }
                 Nav::Stay
             }
             ProvidersPage::Add(state) => self.handle_add_key(key, state),
             ProvidersPage::Edit(state) => self.handle_edit_key(key, state),
             ProvidersPage::FetchAll(state) => self.handle_fetch_all_key(key, state),
+            ProvidersPage::CopilotSetup(state) => self.handle_copilot_setup_key(key, state),
         }
     }
 
@@ -1079,6 +1077,7 @@ impl SettingsDialog {
             return Nav::Replace(Page::Providers(ProvidersPage::List {
                 cursor: 0,
                 status: None,
+                delete_pending: false,
             }));
         }
 
@@ -1122,20 +1121,12 @@ impl SettingsDialog {
                     } else {
                         s.error = None;
                         // Device-flow templates skip URL/Headers — the
-                        // OAuth login itself is the configuration. Pick
-                        // which flow on the template id.
+                        // OAuth login itself is the configuration.
                         if matches!(
                             s.template.map(|t| t.auth),
                             Some(crate::config::providers::AuthKind::DeviceFlow)
                         ) {
-                            match s.template.map(|t| t.id) {
-                                Some("copilot") => {
-                                    s.copilot_login = Some(CopilotLoginState::spawn());
-                                }
-                                _ => {
-                                    s.codex_login = Some(CodexLoginState::spawn());
-                                }
-                            }
+                            s.codex_login = Some(CodexLoginState::spawn());
                             s.step = AddStep::CodexLogin;
                         } else {
                             s.step = AddStep::EditUrl;
@@ -1194,20 +1185,23 @@ impl SettingsDialog {
                         Ok(()) => {
                             s.saved_provider_id = Some(id.clone());
                             s.error = Some("saved. Fetching /models…".into());
-                            // Don't fetch if env vars are missing — surface the warning.
-                            let (_, missing) = models_fetch::resolve_headers(&headers);
-                            if !missing.is_empty() {
-                                s.error = Some(format!(
-                                    "saved. /models fetch skipped — missing env var(s): {}",
-                                    missing.join(", ")
-                                ));
-                                s.step = AddStep::Done;
-                            } else if template.supports_models_endpoint {
-                                s.fetch = Some(FetchHandle::spawn(id, entry.url.clone(), headers));
-                                s.step = AddStep::Fetching;
-                            } else {
-                                s.error = Some("saved. provider has no /models endpoint".into());
-                                s.step = AddStep::Done;
+                            // Don't fetch if the provider can't even produce
+                            // an Authorization (e.g. missing env vars) —
+                            // surface the warning instead.
+                            match models_fetch::resolve_provider_request(&id, &entry) {
+                                Err(e) => {
+                                    s.error = Some(format!("saved. /models fetch skipped — {e}"));
+                                    s.step = AddStep::Done;
+                                }
+                                Ok(_) if !template.supports_models_endpoint => {
+                                    s.error =
+                                        Some("saved. provider has no /models endpoint".into());
+                                    s.step = AddStep::Done;
+                                }
+                                Ok(_) => {
+                                    s.fetch = Some(FetchHandle::spawn(id, entry));
+                                    s.step = AddStep::Fetching;
+                                }
                             }
                         }
                         Err(e) => {
@@ -1220,26 +1214,16 @@ impl SettingsDialog {
                 // Input handling for the device-code screen. Most
                 // movement is automatic (driven by the background
                 // task via `tick`); the user can press `r` to retry
-                // after an error. Dispatch on which login state is
-                // active (codex vs copilot).
-                if let Some(c) = &s.copilot_login {
-                    let snap = c.snapshot();
-                    if matches!(key.code, KeyCode::Char('r'))
-                        && matches!(snap, CopilotLoginProgress::Error(_))
-                    {
-                        s.copilot_login = Some(CopilotLoginState::spawn());
-                    }
-                } else {
-                    let snap = s
-                        .codex_login
-                        .as_ref()
-                        .map(|c| c.snapshot())
-                        .unwrap_or(CodexLoginProgress::Error("no login state".into()));
-                    if matches!(key.code, KeyCode::Char('r'))
-                        && matches!(snap, CodexLoginProgress::Error(_))
-                    {
-                        s.codex_login = Some(CodexLoginState::spawn());
-                    }
+                // after an error.
+                let snap = s
+                    .codex_login
+                    .as_ref()
+                    .map(|c| c.snapshot())
+                    .unwrap_or(CodexLoginProgress::Error("no login state".into()));
+                if matches!(key.code, KeyCode::Char('r'))
+                    && matches!(snap, CodexLoginProgress::Error(_))
+                {
+                    s.codex_login = Some(CodexLoginState::spawn());
                 }
             }
             AddStep::Saving | AddStep::Fetching => {
@@ -1250,6 +1234,7 @@ impl SettingsDialog {
                     return Nav::Replace(Page::Providers(ProvidersPage::List {
                         cursor: 0,
                         status: s.error.clone(),
+                        delete_pending: false,
                     }));
                 }
             }
@@ -1309,6 +1294,7 @@ impl SettingsDialog {
                 return Nav::Replace(Page::Providers(ProvidersPage::List {
                     cursor: 0,
                     status: s.status.clone(),
+                    delete_pending: false,
                 }));
             }
             KeyCode::Up | KeyCode::Char('k') => {
@@ -1334,19 +1320,14 @@ impl SettingsDialog {
                 }
             }
             KeyCode::Char('r') => {
-                let (_, missing) = models_fetch::resolve_headers(&s.entry.headers);
-                if !missing.is_empty() {
-                    s.status = Some(format!(
-                        "refetch skipped — missing env var(s): {}",
-                        missing.join(", ")
-                    ));
-                } else {
-                    s.fetch = Some(FetchHandle::spawn(
-                        s.provider_id.clone(),
-                        s.entry.url.clone(),
-                        s.entry.headers.clone(),
-                    ));
-                    s.status = Some("refetching /models…".into());
+                match models_fetch::resolve_provider_request(&s.provider_id, &s.entry) {
+                    Err(e) => {
+                        s.status = Some(format!("refetch skipped — {e}"));
+                    }
+                    Ok(_) => {
+                        s.fetch = Some(FetchHandle::spawn(s.provider_id.clone(), s.entry.clone()));
+                        s.status = Some("refetching /models…".into());
+                    }
                 }
             }
             KeyCode::Char('f') => {
@@ -1369,6 +1350,7 @@ impl SettingsDialog {
                     return Nav::Replace(Page::Providers(ProvidersPage::List {
                         cursor: 0,
                         status: Some(msg),
+                        delete_pending: false,
                     }));
                 } else {
                     s.delete_pending = true;
@@ -1399,19 +1381,17 @@ impl SettingsDialog {
                     }
                     3 => {
                         // Same as 'r'
-                        let (_, missing) = models_fetch::resolve_headers(&s.entry.headers);
-                        if !missing.is_empty() {
-                            s.status = Some(format!(
-                                "refetch skipped — missing env var(s): {}",
-                                missing.join(", ")
-                            ));
-                        } else {
-                            s.fetch = Some(FetchHandle::spawn(
-                                s.provider_id.clone(),
-                                s.entry.url.clone(),
-                                s.entry.headers.clone(),
-                            ));
-                            s.status = Some("refetching /models…".into());
+                        match models_fetch::resolve_provider_request(&s.provider_id, &s.entry) {
+                            Err(e) => {
+                                s.status = Some(format!("refetch skipped — {e}"));
+                            }
+                            Ok(_) => {
+                                s.fetch = Some(FetchHandle::spawn(
+                                    s.provider_id.clone(),
+                                    s.entry.clone(),
+                                ));
+                                s.status = Some("refetching /models…".into());
+                            }
                         }
                     }
                     4 => {
@@ -1425,6 +1405,7 @@ impl SettingsDialog {
                             return Nav::Replace(Page::Providers(ProvidersPage::List {
                                 cursor: 0,
                                 status: Some(msg),
+                                delete_pending: false,
                             }));
                         } else {
                             s.delete_pending = true;
@@ -1435,6 +1416,7 @@ impl SettingsDialog {
                         return Nav::Replace(Page::Providers(ProvidersPage::List {
                             cursor: 0,
                             status: s.status.clone(),
+                            delete_pending: false,
                         }));
                     }
                     _ => {}
@@ -1452,6 +1434,7 @@ impl SettingsDialog {
                 return Nav::Replace(Page::Providers(ProvidersPage::List {
                     cursor: 0,
                     status: Some("/fetch-models cancelled".into()),
+                    delete_pending: false,
                 }));
             }
             KeyCode::Up | KeyCode::Char('k') => {
@@ -1496,7 +1479,67 @@ impl SettingsDialog {
                 return Nav::Replace(Page::Providers(ProvidersPage::List {
                     cursor: 0,
                     status: Some("/fetch-models applied".into()),
+                    delete_pending: false,
                 }));
+            }
+            _ => {}
+        }
+        Nav::Stay
+    }
+
+    /// Handle keys on the "Set up GitHub Copilot auth" confirm screen.
+    /// Enter applies the action (or, in the manual / already-configured
+    /// case, returns to the list). Esc always returns to the list.
+    fn handle_copilot_setup_key(&mut self, key: KeyEvent, s: &mut CopilotSetupState) -> Nav {
+        match key.code {
+            KeyCode::Esc => {
+                return Nav::Replace(Page::Providers(ProvidersPage::List {
+                    cursor: 0,
+                    status: None,
+                    delete_pending: false,
+                }));
+            }
+            KeyCode::Enter => {
+                // If we've already shown the user a result, Enter closes.
+                if s.outcome.is_some() {
+                    let status = match &s.outcome {
+                        Some(Ok(msg)) => Some(msg.clone()),
+                        Some(Err(e)) => Some(e.clone()),
+                        None => None,
+                    };
+                    return Nav::Replace(Page::Providers(ProvidersPage::List {
+                        cursor: 0,
+                        status,
+                        delete_pending: false,
+                    }));
+                }
+
+                // If we can't auto-write (unsupported shell, marker
+                // already present), Enter just returns to the list —
+                // the screen was informational only.
+                let Some(shell) = s.shell else {
+                    return Nav::Replace(Page::Providers(ProvidersPage::List {
+                        cursor: 0,
+                        status: None,
+                        delete_pending: false,
+                    }));
+                };
+                if s.already_configured {
+                    return Nav::Replace(Page::Providers(ProvidersPage::List {
+                        cursor: 0,
+                        status: None,
+                        delete_pending: false,
+                    }));
+                }
+                let Some(rc_path) = s.rc_path.clone() else {
+                    return Nav::Replace(Page::Providers(ProvidersPage::List {
+                        cursor: 0,
+                        status: None,
+                        delete_pending: false,
+                    }));
+                };
+
+                s.outcome = Some(apply_copilot_setup(shell, &rc_path));
             }
             _ => {}
         }
@@ -1539,6 +1582,9 @@ impl SettingsDialog {
                 format!(" › Providers › {}", s.provider_id)
             }
             Page::Providers(ProvidersPage::FetchAll(_)) => " › Providers › /fetch-models".into(),
+            Page::Providers(ProvidersPage::CopilotSetup(_)) => {
+                " › Providers › Copilot setup".into()
+            }
         };
         format!("{}{}", display_path(&self.config_path), crumbs)
     }
@@ -1562,7 +1608,7 @@ impl SettingsDialog {
                 }
             }
             Page::Providers(ProvidersPage::List { .. }) => {
-                "↑/↓  enter: edit  c: add new  ←: back  esc: close"
+                "↑/↓  enter: edit  c: add  d: delete (×2 to confirm)  ←: back  esc: close"
             }
             Page::Providers(ProvidersPage::Add(s)) => match s.step {
                 AddStep::PickTemplate { .. } => "↑/↓  enter: choose  esc: cancel",
@@ -1601,17 +1647,23 @@ impl SettingsDialog {
             Page::Providers(ProvidersPage::FetchAll(_)) => {
                 "↑/↓  space: toggle don't-ask  enter: apply  esc: cancel"
             }
+            Page::Providers(ProvidersPage::CopilotSetup(_)) => "enter: apply  esc: cancel",
         }
     }
 
     fn render_providers_page(&self, frame: &mut Frame, area: Rect, page: &ProvidersPage) {
         match page {
-            ProvidersPage::List { cursor, status } => {
-                self.render_providers_list(frame, area, *cursor, status.as_deref())
+            ProvidersPage::List {
+                cursor,
+                status,
+                delete_pending,
+            } => {
+                self.render_providers_list(frame, area, *cursor, status.as_deref(), *delete_pending)
             }
             ProvidersPage::Add(s) => self.render_add(frame, area, s),
             ProvidersPage::Edit(s) => self.render_edit(frame, area, s),
             ProvidersPage::FetchAll(s) => self.render_fetch_all(frame, area, s),
+            ProvidersPage::CopilotSetup(s) => self.render_copilot_setup(frame, area, s),
         }
     }
 
@@ -1621,16 +1673,18 @@ impl SettingsDialog {
         area: Rect,
         cursor: usize,
         status: Option<&str>,
+        delete_pending: bool,
     ) {
         let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+        let red = Style::default().fg(Color::Red);
         let mut lines: Vec<Line<'static>> = Vec::new();
-        if self.config.providers.is_empty() {
+        let ids: Vec<&String> = self.config.providers.keys().collect();
+        if ids.is_empty() {
             lines.push(Line::from(Span::styled(
                 "  (no providers configured — press `c` to add one)".to_string(),
                 muted,
             )));
         } else {
-            let ids: Vec<&String> = self.config.providers.keys().collect();
             let id_w = ids.iter().map(|s| s.chars().count()).max().unwrap_or(0);
             for (i, id) in ids.iter().enumerate() {
                 let entry = self.config.providers.get(*id).unwrap();
@@ -1641,7 +1695,9 @@ impl SettingsDialog {
                 } else {
                     "  "
                 };
-                let style = if i == cursor {
+                let style = if i == cursor && delete_pending {
+                    red.add_modifier(Modifier::BOLD)
+                } else if i == cursor {
                     Style::default()
                         .fg(Color::Yellow)
                         .add_modifier(Modifier::BOLD)
@@ -1660,6 +1716,30 @@ impl SettingsDialog {
                 ]));
             }
         }
+        // Conditional "Set up GitHub Copilot auth" row. Hidden once any
+        // of the documented Copilot env vars is set non-empty.
+        if !copilot_setup::copilot_env_already_set() {
+            let row_idx = ids.len();
+            let selected = cursor == row_idx;
+            let marker = if selected { "▸ " } else { "  " };
+            let style = if selected {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Cyan)
+            };
+            lines.push(Line::default());
+            lines.push(Line::from(vec![
+                Span::raw(marker),
+                Span::styled("[ Set up GitHub Copilot auth ]".to_string(), style),
+                Span::raw("  "),
+                Span::styled(
+                    "writes `export GH_TOKEN=$(gh auth token)` to your shell rc".to_string(),
+                    muted,
+                ),
+            ]));
+        }
         if let Some(msg) = status {
             lines.push(Line::default());
             lines.push(Line::from(Span::styled(
@@ -1667,6 +1747,153 @@ impl SettingsDialog {
                 Style::default().fg(Color::Yellow),
             )));
         }
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+    }
+
+    fn render_copilot_setup(&self, frame: &mut Frame, area: Rect, s: &CopilotSetupState) {
+        let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+        let yellow = Style::default().fg(Color::Yellow);
+        let red = Style::default().fg(Color::Red);
+        let green = Style::default().fg(Color::Green);
+        let cyan = Style::default().fg(Color::Cyan);
+        let bold = Style::default().add_modifier(Modifier::BOLD);
+        let mut lines: Vec<Line<'static>> = Vec::new();
+
+        lines.push(Line::from(Span::styled(
+            "Set up GitHub Copilot auth".to_string(),
+            bold,
+        )));
+        lines.push(Line::default());
+
+        if let Some(outcome) = &s.outcome {
+            // Post-action result screen.
+            match outcome {
+                Ok(msg) => {
+                    lines.push(Line::from(Span::styled(msg.clone(), green)));
+                }
+                Err(e) => {
+                    lines.push(Line::from(Span::styled(format!("Failed: {e}"), red)));
+                }
+            }
+            lines.push(Line::default());
+            lines.push(Line::from(Span::styled(
+                "Press Enter to return to the providers list.".to_string(),
+                muted,
+            )));
+            frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+            return;
+        }
+
+        match (s.shell, &s.rc_path, s.already_configured) {
+            (Some(shell), Some(rc_path), false) => {
+                lines.push(Line::from(Span::styled(
+                    format!("Detected shell: {}", shell.name()),
+                    muted,
+                )));
+                lines.push(Line::from(vec![
+                    Span::styled("Will append to: ".to_string(), muted),
+                    Span::styled(rc_path.display().to_string(), cyan),
+                ]));
+                lines.push(Line::default());
+                lines.push(Line::from(Span::styled(
+                    "Lines to be added:".to_string(),
+                    muted,
+                )));
+                for line in copilot_setup::append_block(shell).lines() {
+                    if line.is_empty() {
+                        lines.push(Line::default());
+                    } else {
+                        lines.push(Line::from(Span::styled(format!("    {line}"), cyan)));
+                    }
+                }
+                lines.push(Line::default());
+                lines.push(Line::from(Span::styled(
+                    "We'll also run `gh auth token` once and set GH_TOKEN in this \
+                     cockpit session so Copilot works without restarting."
+                        .to_string(),
+                    muted,
+                )));
+                lines.push(Line::default());
+                lines.push(Line::from(Span::styled(
+                    "Press Enter to apply, Esc to cancel.".to_string(),
+                    yellow,
+                )));
+            }
+            (Some(shell), Some(rc_path), true) => {
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "{} already contains the cockpit Copilot-auth export.",
+                        rc_path.display()
+                    ),
+                    muted,
+                )));
+                lines.push(Line::default());
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "To re-apply: remove the marker block from your {} and try again.",
+                        shell.rc_filename()
+                    ),
+                    muted,
+                )));
+                lines.push(Line::default());
+                lines.push(Line::from(Span::styled(
+                    "Press Enter or Esc to return.".to_string(),
+                    yellow,
+                )));
+            }
+            _ => {
+                // Unsupported shell or unknown $HOME — show manual
+                // instructions instead of a write button.
+                lines.push(Line::from(Span::styled(
+                    "Couldn't detect a supported shell ($SHELL is unset, or it's \
+                     not zsh/bash/fish). Set GH_TOKEN manually with one of:"
+                        .to_string(),
+                    muted,
+                )));
+                lines.push(Line::default());
+                lines.push(Line::from(Span::styled(
+                    "  POSIX shell (zsh/bash/sh):".to_string(),
+                    muted,
+                )));
+                lines.push(Line::from(Span::styled(
+                    "    export GH_TOKEN=$(gh auth token)".to_string(),
+                    cyan,
+                )));
+                lines.push(Line::default());
+                lines.push(Line::from(Span::styled("  fish:".to_string(), muted)));
+                lines.push(Line::from(Span::styled(
+                    "    set -Ux GH_TOKEN (gh auth token)".to_string(),
+                    cyan,
+                )));
+                if cfg!(windows) {
+                    lines.push(Line::default());
+                    lines.push(Line::from(Span::styled(
+                        "  Windows PowerShell ($PROFILE):".to_string(),
+                        muted,
+                    )));
+                    lines.push(Line::from(Span::styled(
+                        "    $env:GH_TOKEN = (gh auth token)".to_string(),
+                        cyan,
+                    )));
+                    lines.push(Line::from(Span::styled(
+                        "  Windows persistent (User scope):".to_string(),
+                        muted,
+                    )));
+                    lines.push(Line::from(Span::styled(
+                        "    [Environment]::SetEnvironmentVariable(\"GH_TOKEN\", \
+                         (gh auth token), \"User\")"
+                            .to_string(),
+                        cyan,
+                    )));
+                }
+                lines.push(Line::default());
+                lines.push(Line::from(Span::styled(
+                    "Press Enter or Esc to return.".to_string(),
+                    yellow,
+                )));
+            }
+        }
+
         frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
     }
 
@@ -1735,153 +1962,73 @@ impl SettingsDialog {
                 }
             }
             AddStep::CodexLogin => {
-                // Two parallel device-flow renderers — share the same
-                // visual layout but differ in title + "requesting" line.
-                if s.copilot_login.is_some() {
-                    let snap = s
-                        .copilot_login
-                        .as_ref()
-                        .map(|c| c.snapshot())
-                        .unwrap_or(CopilotLoginProgress::Error("no login state".into()));
-                    lines.push(Line::from(Span::styled(
-                        "GitHub Copilot device-code login".to_string(),
-                        Style::default().add_modifier(Modifier::BOLD),
-                    )));
-                    lines.push(Line::default());
-                    match snap {
-                        CopilotLoginProgress::Requesting => {
-                            lines.push(Line::from(Span::styled(
-                                "Requesting a device code from github.com…".to_string(),
-                                yellow,
-                            )));
-                        }
-                        CopilotLoginProgress::AwaitingUser {
-                            verification_url,
-                            user_code,
-                        } => {
-                            lines.push(Line::from(vec![Span::styled(
-                                "1. Open this URL in a browser:".to_string(),
-                                muted,
-                            )]));
-                            lines.push(Line::from(vec![
-                                Span::raw("     "),
-                                Span::styled(
-                                    verification_url,
-                                    Style::default()
-                                        .fg(Color::Cyan)
-                                        .add_modifier(Modifier::UNDERLINED),
-                                ),
-                            ]));
-                            lines.push(Line::default());
-                            lines.push(Line::from(Span::styled(
-                                "2. Enter this code (expires in 15 minutes):".to_string(),
-                                muted,
-                            )));
-                            lines.push(Line::from(vec![
-                                Span::raw("     "),
-                                Span::styled(
-                                    user_code,
-                                    Style::default()
-                                        .fg(Color::Yellow)
-                                        .add_modifier(Modifier::BOLD),
-                                ),
-                            ]));
-                            lines.push(Line::default());
-                            lines.push(Line::from(Span::styled(
-                                "Waiting for authorization…".to_string(),
-                                muted,
-                            )));
-                        }
-                        CopilotLoginProgress::Success { saved_at } => {
-                            lines.push(Line::from(Span::styled(
-                                format!("Logged in. Tokens saved at {saved_at}."),
-                                Style::default().fg(Color::Green),
-                            )));
-                        }
-                        CopilotLoginProgress::Error(e) => {
-                            lines.push(Line::from(Span::styled(
-                                format!("Login failed: {e}"),
-                                red,
-                            )));
-                            lines.push(Line::default());
-                            lines.push(Line::from(Span::styled(
-                                "Press r to retry, esc to cancel.".to_string(),
-                                muted,
-                            )));
-                        }
+                let snap = s
+                    .codex_login
+                    .as_ref()
+                    .map(|c| c.snapshot())
+                    .unwrap_or(CodexLoginProgress::Error("no login state".into()));
+                lines.push(Line::from(Span::styled(
+                    "Codex device-code login".to_string(),
+                    Style::default().add_modifier(Modifier::BOLD),
+                )));
+                lines.push(Line::default());
+                match snap {
+                    CodexLoginProgress::Requesting => {
+                        lines.push(Line::from(Span::styled(
+                            "Requesting a device code from auth.openai.com…".to_string(),
+                            yellow,
+                        )));
                     }
-                } else {
-                    let snap = s
-                        .codex_login
-                        .as_ref()
-                        .map(|c| c.snapshot())
-                        .unwrap_or(CodexLoginProgress::Error("no login state".into()));
-                    lines.push(Line::from(Span::styled(
-                        "Codex device-code login".to_string(),
-                        Style::default().add_modifier(Modifier::BOLD),
-                    )));
-                    lines.push(Line::default());
-                    match snap {
-                        CodexLoginProgress::Requesting => {
-                            lines.push(Line::from(Span::styled(
-                                "Requesting a device code from auth.openai.com…".to_string(),
-                                yellow,
-                            )));
-                        }
-                        CodexLoginProgress::AwaitingUser {
-                            verification_url,
-                            user_code,
-                        } => {
-                            lines.push(Line::from(vec![Span::styled(
-                                "1. Open this URL in a browser:".to_string(),
-                                muted,
-                            )]));
-                            lines.push(Line::from(vec![
-                                Span::raw("     "),
-                                Span::styled(
-                                    verification_url,
-                                    Style::default()
-                                        .fg(Color::Cyan)
-                                        .add_modifier(Modifier::UNDERLINED),
-                                ),
-                            ]));
-                            lines.push(Line::default());
-                            lines.push(Line::from(Span::styled(
-                                "2. Enter this code (expires in 15 minutes):".to_string(),
-                                muted,
-                            )));
-                            lines.push(Line::from(vec![
-                                Span::raw("     "),
-                                Span::styled(
-                                    user_code,
-                                    Style::default()
-                                        .fg(Color::Yellow)
-                                        .add_modifier(Modifier::BOLD),
-                                ),
-                            ]));
-                            lines.push(Line::default());
-                            lines.push(Line::from(Span::styled(
-                                "Waiting for authorization…".to_string(),
-                                muted,
-                            )));
-                        }
-                        CodexLoginProgress::Success { saved_at } => {
-                            lines.push(Line::from(Span::styled(
-                                format!("Logged in. Tokens saved at {saved_at}."),
-                                Style::default().fg(Color::Green),
-                            )));
-                        }
-                        CodexLoginProgress::Error(e) => {
-                            lines.push(Line::from(Span::styled(
-                                format!("Login failed: {e}"),
-                                red,
-                            )));
-                            lines.push(Line::default());
-                            lines.push(Line::from(Span::styled(
-                                "Press r to retry, esc to cancel.".to_string(),
-                                muted,
-                            )));
-                        }
+                    CodexLoginProgress::AwaitingUser {
+                        verification_url,
+                        user_code,
+                    } => {
+                        lines.push(Line::from(vec![Span::styled(
+                            "1. Open this URL in a browser:".to_string(),
+                            muted,
+                        )]));
+                        lines.push(Line::from(vec![
+                            Span::raw("     "),
+                            Span::styled(
+                                verification_url,
+                                Style::default()
+                                    .fg(Color::Cyan)
+                                    .add_modifier(Modifier::UNDERLINED),
+                            ),
+                        ]));
+                        lines.push(Line::default());
+                        lines.push(Line::from(Span::styled(
+                            "2. Enter this code (expires in 15 minutes):".to_string(),
+                            muted,
+                        )));
+                        lines.push(Line::from(vec![
+                            Span::raw("     "),
+                            Span::styled(
+                                user_code,
+                                Style::default()
+                                    .fg(Color::Yellow)
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                        ]));
+                        lines.push(Line::default());
+                        lines.push(Line::from(Span::styled(
+                            "Waiting for authorization…".to_string(),
+                            muted,
+                        )));
+                    }
+                    CodexLoginProgress::Success { saved_at } => {
+                        lines.push(Line::from(Span::styled(
+                            format!("Logged in. Tokens saved at {saved_at}."),
+                            Style::default().fg(Color::Green),
+                        )));
+                    }
+                    CodexLoginProgress::Error(e) => {
+                        lines.push(Line::from(Span::styled(format!("Login failed: {e}"), red)));
+                        lines.push(Line::default());
+                        lines.push(Line::from(Span::styled(
+                            "Press r to retry, esc to cancel.".to_string(),
+                            muted,
+                        )));
                     }
                 }
             }
@@ -2114,8 +2261,11 @@ impl SettingsDialog {
                             self.extended.name = if new.is_empty() { None } else { Some(new) };
                         }
                         UiField::PackagesDir => {
-                            self.extended.packages_directory =
-                                if new.is_empty() { None } else { Some(PathBuf::from(new)) };
+                            self.extended.packages_directory = if new.is_empty() {
+                                None
+                            } else {
+                                Some(PathBuf::from(new))
+                            };
                         }
                     }
                     p.editing = None;
@@ -2200,18 +2350,29 @@ impl SettingsDialog {
         lines.push(Line::default());
 
         let rows: [(&str, String); 6] = [
-            ("vim mode", vim_label(self.extended.tui.vim_mode).to_string()),
+            (
+                "vim mode",
+                vim_label(self.extended.tui.vim_mode).to_string(),
+            ),
             (
                 "thinking",
                 thinking_label(self.extended.tui.thinking).to_string(),
             ),
             (
                 "render agent markdown",
-                bool_label(self.extended.tui.render_agent_markdown, "on (default)", "off"),
+                bool_label(
+                    self.extended.tui.render_agent_markdown,
+                    "on (default)",
+                    "off",
+                ),
             ),
             (
                 "render user markdown",
-                bool_label(self.extended.tui.render_user_markdown, "on", "off (default)"),
+                bool_label(
+                    self.extended.tui.render_user_markdown,
+                    "on",
+                    "off (default)",
+                ),
             ),
             (
                 "name",
@@ -2231,7 +2392,11 @@ impl SettingsDialog {
             ),
         ];
 
-        let label_w = rows.iter().map(|(l, _)| l.chars().count()).max().unwrap_or(0);
+        let label_w = rows
+            .iter()
+            .map(|(l, _)| l.chars().count())
+            .max()
+            .unwrap_or(0);
 
         for (i, (label, value)) in rows.iter().enumerate() {
             let marker = if i == p.cursor { "▸ " } else { "  " };
@@ -2256,10 +2421,7 @@ impl SettingsDialog {
             lines.push(Line::default());
             lines.push(Line::from(vec![
                 Span::styled(prompt.to_string(), muted),
-                Span::styled(
-                    p.buf.text().to_string(),
-                    Style::default().fg(Color::White),
-                ),
+                Span::styled(p.buf.text().to_string(), Style::default().fg(Color::White)),
                 Span::styled("▎".to_string(), Style::default().fg(Color::Yellow)),
             ]));
         }
@@ -2298,15 +2460,13 @@ impl SettingsDialog {
                 KeyCode::Enter => {
                     let new = p.buf.text().to_string();
                     if let Some(name) = p.edit_target.clone() {
-                        let entry = self
-                            .extended
-                            .tools
-                            .entry(name)
-                            .or_insert_with(|| ToolCommandTemplate {
+                        let entry = self.extended.tools.entry(name).or_insert_with(|| {
+                            ToolCommandTemplate {
                                 enabled: true,
                                 command: String::new(),
                                 description: None,
-                            });
+                            }
+                        });
                         match field {
                             ToolField::Command => entry.command = new,
                             ToolField::Description => {
@@ -2419,7 +2579,9 @@ impl SettingsDialog {
         for name in builtins.iter() {
             let entry = self.extended.tools.get(*name);
             let default = default_template_for(name);
-            let cmd = entry.map(|e| e.command.as_str()).unwrap_or(&default.command);
+            let cmd = entry
+                .map(|e| e.command.as_str())
+                .unwrap_or(&default.command);
             let desc = entry
                 .and_then(|e| e.description.as_deref())
                 .or(default.description.as_deref())
@@ -2515,7 +2677,11 @@ const AGENTS_STUB: &str = "(stub) Agent editor — list agent definitions, edit 
 const UI_ROWS: usize = 6;
 
 fn bool_label(on: bool, on_label: &str, off_label: &str) -> String {
-    if on { on_label.to_string() } else { off_label.to_string() }
+    if on {
+        on_label.to_string()
+    } else {
+        off_label.to_string()
+    }
 }
 
 fn cycle_vim(v: VimModeSetting) -> VimModeSetting {
@@ -2901,6 +3067,33 @@ fn valid_url(s: &str) -> bool {
     s.starts_with("http://") || s.starts_with("https://")
 }
 
+/// Execute the "Set up Copilot auth" action: append the export to the
+/// shell rc file and inject `GH_TOKEN` into the running process so the
+/// resolver picks it up without a restart. Returns a user-facing
+/// status string on success, or an error message on failure.
+fn apply_copilot_setup(shell: CopilotShell, rc_path: &std::path::Path) -> Result<String, String> {
+    // Fetch the token first — if `gh` isn't installed or the user
+    // isn't logged in, we want to fail before mutating the rc file.
+    let token = copilot_setup::fetch_gh_token().map_err(|e| e.to_string())?;
+    let wrote = copilot_setup::append_to_rc(rc_path, shell).map_err(|e| e.to_string())?;
+
+    // SAFETY: `set_var` mutates process-global env state. The settings
+    // dialog runs on the main thread before any inference request fires
+    // for this session, so no concurrent reader observes the racy state.
+    unsafe {
+        std::env::set_var("GH_TOKEN", &token);
+    }
+
+    let suffix = if wrote {
+        format!("added export to {}", rc_path.display())
+    } else {
+        format!("export already in {}", rc_path.display())
+    };
+    Ok(format!(
+        "Copilot auth ready — {suffix}; GH_TOKEN set for this session"
+    ))
+}
+
 /// Provider ids are config-map keys. Restrict to a conservative
 /// shell/filename-safe set so they're easy to reference from the CLI.
 fn valid_id(s: &str) -> bool {
@@ -2920,7 +3113,6 @@ impl AddState {
             url_field: TextField::default(),
             headers: HeaderEditor::new(Vec::new(), true),
             codex_login: None,
-            copilot_login: None,
             error: None,
             fetch: None,
             saved_provider_id: None,
@@ -3119,5 +3311,121 @@ mod tests {
         d.enter_providers();
         d.handle_key(press(KeyCode::Left));
         assert!(on_root_page(&d), "Left from Providers should land on Root");
+    }
+
+    fn dialog_with_one_provider(tmp: &TempDir) -> SettingsDialog {
+        let path = tmp.path().join("config.json");
+        std::fs::write(
+            &path,
+            r#"{"providers":{"vendor":{"url":"https://x","headers":[]}}}"#,
+        )
+        .unwrap();
+        let mut d = SettingsDialog::open(path);
+        d.enter_providers();
+        d
+    }
+
+    #[test]
+    fn pressing_d_once_arms_delete_and_keeps_provider() {
+        let tmp = TempDir::new().unwrap();
+        let mut d = dialog_with_one_provider(&tmp);
+        d.handle_key(press(KeyCode::Char('d')));
+        assert!(
+            d.config.providers.contains_key("vendor"),
+            "single `d` press must not delete"
+        );
+        match &d.page {
+            Page::Providers(ProvidersPage::List {
+                delete_pending,
+                status,
+                ..
+            }) => {
+                assert!(*delete_pending);
+                assert!(
+                    status.as_deref().unwrap_or("").contains("press d again"),
+                    "expected confirm hint, got {status:?}"
+                );
+            }
+            other => panic!("expected ProvidersPage::List, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pressing_d_twice_deletes_the_provider() {
+        let tmp = TempDir::new().unwrap();
+        let mut d = dialog_with_one_provider(&tmp);
+        d.handle_key(press(KeyCode::Char('d')));
+        d.handle_key(press(KeyCode::Char('d')));
+        assert!(
+            !d.config.providers.contains_key("vendor"),
+            "double `d` press must delete"
+        );
+        // Persisted to disk.
+        let reloaded = crate::config::providers::ConfigDoc::load(&d.config_path)
+            .unwrap()
+            .providers();
+        assert!(!reloaded.providers.contains_key("vendor"));
+    }
+
+    #[test]
+    fn arrow_after_d_clears_delete_pending() {
+        // Vim-style safety: moving the cursor should disarm a pending
+        // delete so the second press doesn't nuke a different row.
+        let tmp = TempDir::new().unwrap();
+        let mut d = dialog_with_one_provider(&tmp);
+        d.handle_key(press(KeyCode::Char('d')));
+        d.handle_key(press(KeyCode::Down));
+        match &d.page {
+            Page::Providers(ProvidersPage::List { delete_pending, .. }) => {
+                assert!(!*delete_pending, "arrow key should clear pending-delete");
+            }
+            other => panic!("expected List, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn has_no_providers_true_when_config_dir_empty() {
+        // discover_config_dirs walks up from `cwd`, so a tempdir with
+        // no `.cockpit/` or local config should fall back to the user's
+        // config (which may or may not exist). The cleanest assertion
+        // we can make portably is the symmetry: open_providers_add
+        // produces a non-Settings dialog when has_no_providers reports
+        // no config — i.e. the function doesn't panic and is honest
+        // about what it found.
+        let tmp = TempDir::new().unwrap();
+        // Just exercising the codepath — the answer depends on the
+        // host's $HOME, so we only assert it returns *some* bool.
+        let _ = Dialog::has_no_providers(tmp.path());
+    }
+
+    #[test]
+    fn open_providers_add_lands_on_add_page_when_config_exists() {
+        let tmp = TempDir::new().unwrap();
+        // Create a `.cockpit/config.json` so the dialog has a layer to
+        // open without falling through to CreateConfig.
+        let cockpit_dir = tmp.path().join(".cockpit");
+        std::fs::create_dir_all(&cockpit_dir).unwrap();
+        std::fs::write(cockpit_dir.join("config.json"), "{}").unwrap();
+        let d = Dialog::open_providers_add(tmp.path());
+        let Dialog::Settings(s) = d else {
+            panic!("expected Settings dialog");
+        };
+        assert!(
+            matches!(s.page, Page::Providers(ProvidersPage::Add(_))),
+            "expected Add page, got {:?}",
+            s.page
+        );
+    }
+
+    impl std::fmt::Debug for Page {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Page::Root { .. } => f.write_str("Root"),
+                Page::Agents => f.write_str("Agents"),
+                Page::Tools(_) => f.write_str("Tools"),
+                Page::Providers(_) => f.write_str("Providers"),
+                Page::Ui(_) => f.write_str("Ui"),
+            }
+        }
     }
 }

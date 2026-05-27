@@ -171,10 +171,8 @@ const MIGRATIONS: &[&str] = &[
 ];
 
 fn migrate(conn: &Connection) -> Result<()> {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY);",
-    )
-    .context("creating schema_version table")?;
+    conn.execute_batch("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY);")
+        .context("creating schema_version table")?;
 
     let current: i64 = conn
         .query_row(
@@ -224,11 +222,11 @@ mod tests {
         db.with_conn(|conn| migrate(conn)).unwrap();
         let v: i64 = db
             .with_conn(|conn| {
-                Ok(conn.query_row(
-                    "SELECT MAX(version) FROM schema_version",
-                    [],
-                    |row| row.get(0),
-                )?)
+                Ok(
+                    conn.query_row("SELECT MAX(version) FROM schema_version", [], |row| {
+                        row.get(0)
+                    })?,
+                )
             })
             .unwrap();
         assert_eq!(v, MIGRATIONS.len() as i64);

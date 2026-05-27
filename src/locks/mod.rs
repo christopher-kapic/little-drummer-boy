@@ -114,7 +114,9 @@ impl LockManager {
             ),
             None => {}
         }
-        state.held.insert(canon.clone(), (session, agent.to_string()));
+        state
+            .held
+            .insert(canon.clone(), (session, agent.to_string()));
         state
             .read_tracker
             .entry((session, agent.to_string()))
@@ -310,12 +312,7 @@ impl LockManager {
     /// Check the §3c invariant before a write: the caller must hold
     /// the lock, OR (no one holds it AND the caller has read the file
     /// in this session). Returns `Ok(())` if the write is permitted.
-    pub fn check_write_permitted(
-        &self,
-        path: &Path,
-        agent: &str,
-        session: Uuid,
-    ) -> Result<()> {
+    pub fn check_write_permitted(&self, path: &Path, agent: &str, session: Uuid) -> Result<()> {
         let canon = canonicalize(path);
         let state = self.inner.lock().unwrap();
         match state.held.get(&canon) {
@@ -487,10 +484,7 @@ mod tests {
         // No change to the file — resume should reacquire.
         let reacquired = lm.resume_agent("coder", sid).unwrap();
         assert_eq!(reacquired.len(), 1);
-        assert_eq!(
-            lm.holder(&p).map(|(_, a)| a).as_deref(),
-            Some("coder")
-        );
+        assert_eq!(lm.holder(&p).map(|(_, a)| a).as_deref(), Some("coder"));
     }
 
     #[test]
@@ -524,10 +518,7 @@ mod tests {
         lm.acquire(&p, "coder", s_b.session_id).unwrap();
         let reacquired = lm.resume_agent("coder", sid).unwrap();
         assert!(reacquired.is_empty());
-        assert_eq!(
-            lm.holder(&p).map(|(s, _)| s),
-            Some(s_b.session_id)
-        );
+        assert_eq!(lm.holder(&p).map(|(s, _)| s), Some(s_b.session_id));
     }
 
     #[test]

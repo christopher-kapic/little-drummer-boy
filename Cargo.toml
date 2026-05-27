@@ -37,14 +37,17 @@ crossterm = "0.29"
 pulldown-cmark = { version = "0.13", default-features = false }
 
 # HTTP / providers
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "webpki-roots", "stream"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream"] }
 # Provider layer — used as request-builder primitives, not as an agent framework.
-# See opencode-features-review.md §13 for the rationale.
-rig-core = { version = "0.36", features = ["image"] }
+# See opencode-features-review.md §13 for the rationale. The crate
+# was renamed to `rig_core` in 0.37 (was `rig` through 0.36); we
+# rename it back to `rig` via the `package` key so the existing
+# `use rig::…` imports keep working.
+rig = { version = "0.37", package = "rig-core", features = ["image"] }
 # tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] } # for `cockpit connect` later
 
 # Storage
-rusqlite = { version = "0.39", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 
 # Codec helpers for the NDJSON daemon wire protocol (GOALS §8c).
 # `Framed<UnixStream, LinesCodec>` lifts a byte stream into a
@@ -68,12 +71,17 @@ notify = "8"
 aho-corasick = "1"
 dotenvy = "0.15"
 
+# Tokenizer (cl100k_base) — used as the fallback counter when the
+# active provider doesn't expose its own. Singleton-backed; the BPE
+# vocab is built once on first call.
+tiktoken-rs = "0.11"
+
 # OAuth device-code flow (Codex login). PKCE = SHA-256 + URL-safe base64
 # (no padding); `urlencoding` is just for the form-encoded body of the
 # RFC 8628 token exchange step.
 base64 = "0.22"
-sha2 = "0.10"
-rand = "0.9"
+sha2 = "0.11"
+rand = "0.10"
 urlencoding = "2"
 
 # Subprocess discovery (Windows: gitbash, on every platform: harness commands)
@@ -95,7 +103,7 @@ regex = "1"
 unicode-width = "0.2"
 # Diff rendering for the edit/write tool entries in the TUI history
 # pane (tui.diff_style). Provides line+intraline diff primitives.
-similar = "2"
+similar = "3"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

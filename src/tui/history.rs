@@ -129,7 +129,9 @@ pub fn agent_color(name: &str) -> Color {
                 Color::LightYellow,
                 Color::LightRed,
             ];
-            let h: u32 = name.bytes().fold(0u32, |a, b| a.wrapping_mul(31).wrapping_add(b as u32));
+            let h: u32 = name
+                .bytes()
+                .fold(0u32, |a, b| a.wrapping_mul(31).wrapping_add(b as u32));
             PALETTE[(h as usize) % PALETTE.len()]
         }
     }
@@ -312,11 +314,7 @@ fn render_user(
     let wrapped = wrap_with_reserved_first_line(text, text_w, TIMESTAMP_WIDTH + 1);
     for (i, chunk) in wrapped.iter().enumerate() {
         let chunk_w = chunk.chars().count();
-        let mut spans = vec![
-            gutter.clone(),
-            Span::styled("│", border_style),
-            inner_pad(),
-        ];
+        let mut spans = vec![gutter.clone(), Span::styled("│", border_style), inner_pad()];
         if i == 0 {
             let used = chunk_w + TIMESTAMP_WIDTH + 1;
             let middle = text_w.saturating_sub(used);
@@ -370,7 +368,9 @@ fn render_user_markdown(text: &str, timestamp: DateTime<Local>, width: u16) -> V
     }
     if out.is_empty() {
         let mut spans: Vec<Span<'static>> = vec![Span::styled("│ ".to_string(), bar_style)];
-        let pad = area.saturating_sub(2 + TIMESTAMP_WIDTH + 1).saturating_add(1);
+        let pad = area
+            .saturating_sub(2 + TIMESTAMP_WIDTH + 1)
+            .saturating_add(1);
         spans.push(Span::raw(" ".repeat(pad)));
         spans.push(Span::styled(ts, Style::default().fg(TIMESTAMP_FG)));
         out.push(Line::from(spans));
@@ -465,11 +465,11 @@ fn render_agent(
             // lines wrap explicitly so the continuation keeps the same
             // left indent — otherwise ratatui's auto-wrap drops them
             // to column 0 and the block looks ragged.
-            out.push(render_first_line_timestamped(chip_spans, timestamp, width, false));
+            out.push(render_first_line_timestamped(
+                chip_spans, timestamp, width, false,
+            ));
             let reasoning_indent = AGENT_INDENT + 2;
-            let reasoning_w = (width as usize)
-                .saturating_sub(reasoning_indent)
-                .max(1);
+            let reasoning_w = (width as usize).saturating_sub(reasoning_indent).max(1);
             for raw_line in reasoning.lines() {
                 let chunks = if raw_line.is_empty() {
                     vec![String::new()]
@@ -488,7 +488,9 @@ fn render_agent(
             // Collapsed + markdown: chip on its own row (folding
             // markdown spans onto the chip line is more visual jank than
             // it's worth), body markdown lines follow.
-            out.push(render_first_line_timestamped(chip_spans, timestamp, width, false));
+            out.push(render_first_line_timestamped(
+                chip_spans, timestamp, width, false,
+            ));
             out.extend(body_lines);
         } else {
             // Collapsed: chip + first text chunk on the same line so
@@ -498,7 +500,12 @@ fn render_agent(
                 first_line_spans.push(Span::raw(" "));
                 first_line_spans.push(Span::raw(wrapped[0].clone()));
             }
-            out.push(render_first_line_timestamped(first_line_spans, timestamp, width, false));
+            out.push(render_first_line_timestamped(
+                first_line_spans,
+                timestamp,
+                width,
+                false,
+            ));
             for chunk in wrapped.iter().skip(1) {
                 out.push(Line::from(vec![Span::raw(format!("{indent}{chunk}"))]));
             }
@@ -513,7 +520,9 @@ fn render_agent(
         } else {
             for (i, line) in body.into_iter().enumerate() {
                 if i == 0 {
-                    out.push(render_first_line_with_timestamp(line.spans, timestamp, width));
+                    out.push(render_first_line_with_timestamp(
+                        line.spans, timestamp, width,
+                    ));
                 } else {
                     out.push(line);
                 }
@@ -860,8 +869,14 @@ mod tests {
 
     #[test]
     fn format_duration_human_readable() {
-        assert_eq!(format_think_duration(Duration::from_millis(500)), "<1 second");
-        assert_eq!(format_think_duration(Duration::from_millis(1500)), "1.5 seconds");
+        assert_eq!(
+            format_think_duration(Duration::from_millis(500)),
+            "<1 second"
+        );
+        assert_eq!(
+            format_think_duration(Duration::from_millis(1500)),
+            "1.5 seconds"
+        );
         assert_eq!(format_think_duration(Duration::from_secs(7)), "7.0 seconds");
         assert_eq!(format_think_duration(Duration::from_secs(45)), "45 seconds");
         assert_eq!(format_think_duration(Duration::from_secs(134)), "2m 14s");

@@ -83,10 +83,7 @@ pub fn try_spawn(cwd: &Path) -> Result<AgentRunner, String> {
         let client = client.clone();
         tokio::spawn(async move {
             while let Some(text) = input_rx.recv().await {
-                if let Err(e) = client
-                    .request(Request::SendUserMessage { text })
-                    .await
-                {
+                if let Err(e) = client.request(Request::SendUserMessage { text }).await {
                     tracing::warn!(error = ?e, "send_user_message transport failed");
                     break;
                 }

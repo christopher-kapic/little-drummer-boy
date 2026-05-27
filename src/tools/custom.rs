@@ -96,7 +96,9 @@ impl Tool for CustomBashTool {
                 .output(),
         )
         .await
-        .map_err(|_| anyhow::anyhow!("tool `{}` timed out after {SHELL_TIMEOUT_SECS}s", self.name))??;
+        .map_err(|_| {
+            anyhow::anyhow!("tool `{}` timed out after {SHELL_TIMEOUT_SECS}s", self.name)
+        })??;
 
         let mut combined = String::new();
         combined.push_str(&String::from_utf8_lossy(&output.stdout));
@@ -150,9 +152,9 @@ fn shell_quote(s: &str) -> String {
     if s.is_empty() {
         return "''".to_string();
     }
-    if s.chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '/' | ':' | '.' | '@' | '+' | '%'))
-    {
+    if s.chars().all(|c| {
+        c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '/' | ':' | '.' | '@' | '+' | '%')
+    }) {
         return s.to_string();
     }
     let mut out = String::with_capacity(s.len() + 2);
@@ -189,7 +191,14 @@ mod tests {
     fn placeholder_extraction_finds_named_tokens_once() {
         let tpl = "curl -sSL --max-time {timeout} {url} | head -c {bytes} # ignore {timeout}";
         let p = extract_placeholders(tpl);
-        assert_eq!(p, vec!["timeout".to_string(), "url".to_string(), "bytes".to_string()]);
+        assert_eq!(
+            p,
+            vec![
+                "timeout".to_string(),
+                "url".to_string(),
+                "bytes".to_string()
+            ]
+        );
     }
 
     #[test]

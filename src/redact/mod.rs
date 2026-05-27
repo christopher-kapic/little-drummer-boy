@@ -62,10 +62,7 @@ fn is_allowlisted(name: &str, user_allowlist: &[String]) -> bool {
     if ENV_ALLOWLIST.contains(&name) {
         return true;
     }
-    if ENV_ALLOWLIST_PREFIXES
-        .iter()
-        .any(|p| name.starts_with(p))
-    {
+    if ENV_ALLOWLIST_PREFIXES.iter().any(|p| name.starts_with(p)) {
         return true;
     }
     user_allowlist.iter().any(|a| a == name)
@@ -395,7 +392,9 @@ mod tests {
         // SAFETY: tests run single-threaded enough that env mutation
         // here is acceptable; the same pattern is used elsewhere in the
         // test suite.
-        unsafe { std::env::set_var(key, val); }
+        unsafe {
+            std::env::set_var(key, val);
+        }
         let cfg = RedactConfig {
             enabled: true,
             scan_environment: true,
@@ -411,14 +410,18 @@ mod tests {
         let scrubbed = t.scrub(&format!("the token is {val} ok"));
         assert!(scrubbed.contains("**REDACTED BY COCKPIT - DO NOT TRY TO OBTAIN BY WORKAROUND**"));
         assert!(!scrubbed.contains(val));
-        unsafe { std::env::remove_var(key); }
+        unsafe {
+            std::env::remove_var(key);
+        }
     }
 
     #[test]
     fn short_env_values_not_redacted() {
         let key = "COCKPIT_TEST_SHORT_VALUE";
         let val = "abc";
-        unsafe { std::env::set_var(key, val); }
+        unsafe {
+            std::env::set_var(key, val);
+        }
         let mut cfg = enabled_cfg();
         cfg.scan_environment = true;
         cfg.min_secret_length = 8;
@@ -426,7 +429,9 @@ mod tests {
         let t = RedactionTable::build(&cfg, dir.path()).unwrap();
         // The 3-char value must not contribute a pattern.
         assert_eq!(t.scrub("the value is abc here"), "the value is abc here");
-        unsafe { std::env::remove_var(key); }
+        unsafe {
+            std::env::remove_var(key);
+        }
     }
 
     #[test]

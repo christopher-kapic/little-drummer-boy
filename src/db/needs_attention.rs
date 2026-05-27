@@ -62,11 +62,7 @@ impl Db {
         Ok(interrupt_id)
     }
 
-    pub fn resolve_interrupt(
-        &self,
-        interrupt_id: Uuid,
-        response: &ResolveResponse,
-    ) -> Result<()> {
+    pub fn resolve_interrupt(&self, interrupt_id: Uuid, response: &ResolveResponse) -> Result<()> {
         let now = Utc::now().timestamp();
         let response_json =
             serde_json::to_string(response).context("serializing resolve response")?;
@@ -121,22 +117,14 @@ fn decode_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<NeedsAttentionRow> {
     let question_json: Option<String> = row.get("question_json")?;
     let question = match question_json {
         Some(s) => Some(serde_json::from_str(&s).map_err(|e| {
-            rusqlite::Error::FromSqlConversionFailure(
-                0,
-                rusqlite::types::Type::Text,
-                Box::new(e),
-            )
+            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
         })?),
         None => None,
     };
     let response_json: Option<String> = row.get("response_json")?;
     let response = match response_json {
         Some(s) => Some(serde_json::from_str(&s).map_err(|e| {
-            rusqlite::Error::FromSqlConversionFailure(
-                0,
-                rusqlite::types::Type::Text,
-                Box::new(e),
-            )
+            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
         })?),
         None => None,
     };
@@ -201,21 +189,11 @@ mod tests {
         let iid = db
             .raise_interrupt(s.session_id, "coder", "x", None)
             .unwrap();
-        db.resolve_interrupt(
-            iid,
-            &ResolveResponse::Freetext {
-                text: "ok".into(),
-            },
-        )
-        .unwrap();
+        db.resolve_interrupt(iid, &ResolveResponse::Freetext { text: "ok".into() })
+            .unwrap();
         assert!(
-            db.resolve_interrupt(
-                iid,
-                &ResolveResponse::Freetext {
-                    text: "ok".into(),
-                },
-            )
-            .is_err()
+            db.resolve_interrupt(iid, &ResolveResponse::Freetext { text: "ok".into() },)
+                .is_err()
         );
     }
 }

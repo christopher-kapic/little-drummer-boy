@@ -114,7 +114,10 @@ impl Db {
                 .context("preparing list_reads_for_session")?;
             let rows = stmt
                 .query_map([session_id.to_string()], |row| {
-                    Ok((row.get::<_, String>("agent_id")?, row.get::<_, String>("path")?))
+                    Ok((
+                        row.get::<_, String>("agent_id")?,
+                        row.get::<_, String>("path")?,
+                    ))
                 })
                 .context("querying lock_reads")?;
             let mut out = Vec::new();

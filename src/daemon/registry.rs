@@ -147,7 +147,9 @@ impl SessionRegistry {
             workers.values().cloned().collect()
         };
         for h in &handles {
-            let _ = h.send_work(crate::daemon::session_worker::SessionWork::Shutdown).await;
+            let _ = h
+                .send_work(crate::daemon::session_worker::SessionWork::Shutdown)
+                .await;
         }
         // The worker tasks set ended_at on the session row before
         // exiting; we don't have a join handle for them here (they're

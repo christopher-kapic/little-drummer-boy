@@ -80,8 +80,8 @@ impl Tool for EditunlockTool {
         ctx.locks
             .check_write_permitted(&path, &ctx.agent_id, ctx.session.id)?;
 
-        let existing = std::fs::read(&path)
-            .map_err(|e| anyhow::anyhow!("read `{}`: {e}", path.display()))?;
+        let existing =
+            std::fs::read(&path).map_err(|e| anyhow::anyhow!("read `{}`: {e}", path.display()))?;
         let want_crlf = detect_crlf(&existing);
         let original = String::from_utf8_lossy(&existing).into_owned();
 
@@ -178,7 +178,10 @@ fn find_match(file: &str, target: &str, replace_all: bool) -> Result<Option<Matc
 
     // Stage 2 — line-trim.
     if let Some(c) = match_via_normalizer(file, target, replace_all, line_trim_normalize)? {
-        return Ok(Some(Match { canonical: c, stage: "line_trim" }));
+        return Ok(Some(Match {
+            canonical: c,
+            stage: "line_trim",
+        }));
     }
 
     // Stage 3 — block-anchor (anchored region with ≥90% interior overlap).
@@ -285,10 +288,7 @@ fn match_via_normalizer(
 }
 
 fn line_trim_normalize(s: &str) -> String {
-    s.lines()
-        .map(str::trim_end)
-        .collect::<Vec<_>>()
-        .join("\n")
+    s.lines().map(str::trim_end).collect::<Vec<_>>().join("\n")
 }
 
 fn whitespace_collapse(s: &str) -> String {
@@ -318,7 +318,13 @@ fn indent_flexible_normalize(s: &str) -> String {
         .unwrap_or(0);
     lines
         .iter()
-        .map(|l| if l.len() >= min_indent { &l[min_indent..] } else { *l })
+        .map(|l| {
+            if l.len() >= min_indent {
+                &l[min_indent..]
+            } else {
+                *l
+            }
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -445,7 +451,9 @@ mod tests {
 
     #[test]
     fn exact_match() {
-        let res = find_match("hello world\n", "hello", false).unwrap().unwrap();
+        let res = find_match("hello world\n", "hello", false)
+            .unwrap()
+            .unwrap();
         assert_eq!(res.canonical, "hello");
         assert_eq!(res.stage, "exact");
     }
@@ -454,7 +462,9 @@ mod tests {
     fn line_trim_match() {
         let file = "line one   \nline two\n";
         // target has no trailing whitespace on line one
-        let res = find_match(file, "line one\nline two", false).unwrap().unwrap();
+        let res = find_match(file, "line one\nline two", false)
+            .unwrap()
+            .unwrap();
         assert_eq!(res.stage, "line_trim");
     }
 

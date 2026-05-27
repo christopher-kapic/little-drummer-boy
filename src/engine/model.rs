@@ -8,17 +8,22 @@
 //! user's [`crate::providers`] templates) and a stub for adding
 //! `Anthropic` / `OpenRouter` / `Ollama` later.
 //!
-//! Authentication: we expect the resolved `Authorization` header to be
-//! `Bearer <token>` (every template in `src/providers/mod.rs` matches).
-//! The bearer is extracted and handed to rig's `api_key`; the rest of
-//! the headers cockpit owns aren't passed yet (good enough for v0;
-//! provider-specific headers like `OpenAI-Beta` or `anthropic-version`
-//! get added when we wire the Anthropic variant).
+//! Authentication: we delegate to
+//! [`crate::providers::models_fetch::resolve_provider_request`], the
+//! same resolver `/models` fetches use. For most providers that's just
+//! `$VAR` expansion over the configured `Authorization` header; for
+//! GitHub Copilot it also honors the documented env-var sources
+//! (`COPILOT_GITHUB_TOKEN`/`GH_TOKEN`/`GITHUB_TOKEN`/`GITHUB_COPILOT_API_TOKEN`)
+//! and the `COPILOT_API_URL` base-URL override. The bearer token is
+//! handed to rig's `api_key`; the rest of the resolved headers aren't
+//! passed yet (good enough for v0; provider-specific headers like
+//! `OpenAI-Beta` or `anthropic-version` get added when we wire the
+//! Anthropic variant).
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use futures::StreamExt;
 use rig::client::CompletionClient;
 use rig::completion::Completion;
@@ -58,9 +63,9 @@ fn debug_last_message_path() -> Option<&'static Path> {
     DEBUG_LAST_MESSAGE_PATH.get().map(PathBuf::as_path)
 }
 
-use crate::config::providers::{ActiveModelRef, ProvidersConfig};
-use crate::envref;
+use crate::config::providers::{ActiveModelRef, ProviderEntry, ProvidersConfig};
 use crate::engine::message::{AssistantContent, OneOrMany, ToolDefinition};
+use crate::providers::models_fetch;
 use crate::tokens::TokenUsage;
 use rig::completion::GetTokenUsage;
 
@@ -83,59 +88,14 @@ impl Model {
     /// build a concrete `Model`. Returns a descriptive error when nothing
     /// is configured or the env var that holds the key isn't set.
     pub fn from_config(cfg: &ProvidersConfig) -> Result<Self> {
-        let active: &ActiveModelRef = cfg
-            .active_model
-            .as_ref()
-            .context("no active model selected — run /model or set COCKPIT_PROVIDER/COCKPIT_MODEL")?;
+        let active: &ActiveModelRef = cfg.active_model.as_ref().context(
+            "no active model selected — run /model or set COCKPIT_PROVIDER/COCKPIT_MODEL",
+        )?;
         let entry = cfg
             .providers
             .get(&active.provider)
             .with_context(|| format!("provider `{}` is not configured", active.provider))?;
-
-        // Pull the Authorization header, resolve env vars in its value,
-        // and strip a leading `Bearer ` so rig's `api_key()` gets just
-        // the token. If we can't find one, error loud.
-        let auth_header = entry
-            .headers
-            .iter()
-            .find(|h| h.name.eq_ignore_ascii_case("authorization"))
-            .with_context(|| {
-                format!(
-                    "provider `{}` has no Authorization header configured",
-                    active.provider
-                )
-            })?;
-        let resolved = envref::resolve(&auth_header.value);
-        if resolved.has_missing() {
-            bail!(
-                "Authorization for provider `{}` references unset env var(s): {}",
-                active.provider,
-                resolved.missing.join(", ")
-            );
-        }
-        let token = resolved
-            .value
-            .strip_prefix("Bearer ")
-            .or_else(|| resolved.value.strip_prefix("bearer "))
-            .unwrap_or(&resolved.value)
-            .trim()
-            .to_string();
-
-        // rig appends `/chat/completions` to the base URL (see
-        // `OpenAICompletionsExt`'s build_uri). The user's templates put
-        // the version segment in the base URL already
-        // (e.g. `https://api.minimax.io/v1`), giving the right final URL
-        // `https://api.minimax.io/v1/chat/completions`.
-        let client = openai::CompletionsClient::builder()
-            .api_key(token)
-            .base_url(&entry.url)
-            .build()
-            .with_context(|| format!("building openai-compatible client for `{}`", active.provider))?;
-
-        Ok(Model::OpenAi {
-            client,
-            model_id: active.model.clone(),
-        })
+        build_openai_model(&active.provider, entry, &active.model)
     }
 
     /// Build a `Model` for an arbitrary `(provider, model_id)` pair,
@@ -144,47 +104,12 @@ impl Model {
     /// Used by background-only flows (auto-titling §17d, prompt-
     /// injection guard §4i) that target the utility model rather than
     /// whatever the user has selected for the foreground turn.
-    pub fn for_provider(
-        cfg: &ProvidersConfig,
-        provider_id: &str,
-        model_id: &str,
-    ) -> Result<Self> {
+    pub fn for_provider(cfg: &ProvidersConfig, provider_id: &str, model_id: &str) -> Result<Self> {
         let entry = cfg
             .providers
             .get(provider_id)
             .with_context(|| format!("provider `{provider_id}` is not configured"))?;
-        let auth_header = entry
-            .headers
-            .iter()
-            .find(|h| h.name.eq_ignore_ascii_case("authorization"))
-            .with_context(|| {
-                format!("provider `{provider_id}` has no Authorization header configured")
-            })?;
-        let resolved = envref::resolve(&auth_header.value);
-        if resolved.has_missing() {
-            bail!(
-                "Authorization for provider `{provider_id}` references unset env var(s): {}",
-                resolved.missing.join(", ")
-            );
-        }
-        let token = resolved
-            .value
-            .strip_prefix("Bearer ")
-            .or_else(|| resolved.value.strip_prefix("bearer "))
-            .unwrap_or(&resolved.value)
-            .trim()
-            .to_string();
-        let client = openai::CompletionsClient::builder()
-            .api_key(token)
-            .base_url(&entry.url)
-            .build()
-            .with_context(|| {
-                format!("building openai-compatible client for `{provider_id}`")
-            })?;
-        Ok(Model::OpenAi {
-            client,
-            model_id: model_id.to_string(),
-        })
+        build_openai_model(provider_id, entry, model_id)
     }
 
     /// One-shot, non-streaming, no-tools text completion. Used by
@@ -225,7 +150,11 @@ impl Model {
         params: ModelParams,
         agent_name: &str,
         event_tx: &mpsc::Sender<TurnEvent>,
-    ) -> Result<(Option<String>, OneOrMany<AssistantContent>, Option<TokenUsage>)> {
+    ) -> Result<(
+        Option<String>,
+        OneOrMany<AssistantContent>,
+        Option<TokenUsage>,
+    )> {
         // Strip reasoning content from every prior assistant turn
         // before sending it back to the model. Past thinking blocks
         // bloat the prompt without informing the next turn's output
@@ -235,7 +164,15 @@ impl Model {
         let history: Vec<Message> = history.iter().map(strip_reasoning).collect();
 
         if let Some(path) = debug_last_message_path() {
-            dump_request(path, self.model_id(), system, &history, &prompt, tools, &params);
+            dump_request(
+                path,
+                self.model_id(),
+                system,
+                &history,
+                &prompt,
+                tools,
+                &params,
+            );
         }
 
         match self {
@@ -304,6 +241,41 @@ impl Model {
             Model::OpenAi { model_id, .. } => model_id,
         }
     }
+}
+
+/// Build an OpenAI-compat client using the shared provider resolver so
+/// that Copilot's documented env-var fallbacks (and `COPILOT_API_URL`
+/// base-URL override) work for inference, not just `/models` fetches.
+fn build_openai_model(provider_id: &str, entry: &ProviderEntry, model_id: &str) -> Result<Model> {
+    let resolved = models_fetch::resolve_provider_request(provider_id, entry)?;
+    let auth = resolved
+        .headers
+        .iter()
+        .find(|h| h.name.eq_ignore_ascii_case("authorization"))
+        .with_context(|| {
+            format!("provider `{provider_id}` produced no Authorization header after resolution")
+        })?;
+    let token = auth
+        .value
+        .strip_prefix("Bearer ")
+        .or_else(|| auth.value.strip_prefix("bearer "))
+        .unwrap_or(&auth.value)
+        .trim()
+        .to_string();
+
+    // rig appends `/chat/completions` to the base URL (see
+    // `OpenAICompletionsExt`'s build_uri). The user's templates put the
+    // version segment in the base URL already (e.g. `https://api.minimax.io/v1`),
+    // giving the right final URL `https://api.minimax.io/v1/chat/completions`.
+    let client = openai::CompletionsClient::builder()
+        .api_key(token)
+        .base_url(&resolved.base_url)
+        .build()
+        .with_context(|| format!("building openai-compatible client for `{provider_id}`"))?;
+    Ok(Model::OpenAi {
+        client,
+        model_id: model_id.to_string(),
+    })
 }
 
 /// Per-turn knobs the agent loop hands to the model.

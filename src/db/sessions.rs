@@ -85,6 +85,7 @@ fn parse_uuid(s: &str) -> rusqlite::Result<Uuid> {
 /// Generate a random 6-char Crockford base32 string. Not collision-safe
 /// on its own — use [`generate_unique_short_id`] for DB inserts.
 fn random_short_id() -> String {
+    use rand::RngExt;
     let mut rng = rand::rng();
     (0..SHORT_ID_LEN)
         .map(|_| {
@@ -284,12 +285,13 @@ impl Db {
     /// user-set title — auto-titling never clobbers manual labels.
     pub fn set_auto_title(&self, session_id: Uuid, title: &str) -> Result<bool> {
         self.with_conn(|conn| {
-            let affected = conn.execute(
-                "UPDATE sessions SET title = ?1
+            let affected = conn
+                .execute(
+                    "UPDATE sessions SET title = ?1
                  WHERE session_id = ?2 AND user_renamed = 0",
-                params![title, session_id.to_string()],
-            )
-            .context("setting auto title")?;
+                    params![title, session_id.to_string()],
+                )
+                .context("setting auto title")?;
             Ok(affected > 0)
         })
     }
@@ -297,10 +299,12 @@ impl Db {
     /// Direct children of a session in the fork tree. Most-recent-first.
     pub fn list_forks(&self, parent_session_id: Uuid) -> Result<Vec<SessionRow>> {
         self.with_conn(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT * FROM sessions WHERE parent_session_id = ?1
+            let mut stmt = conn
+                .prepare(
+                    "SELECT * FROM sessions WHERE parent_session_id = ?1
                  ORDER BY last_active_at DESC",
-            ).context("preparing list_forks")?;
+                )
+                .context("preparing list_forks")?;
             let rows = stmt
                 .query_map([parent_session_id.to_string()], SessionRow::from_row)
                 .context("querying list_forks")?;
@@ -316,12 +320,13 @@ impl Db {
     /// browser. Counts immediate children only (depth-1).
     pub fn count_forks_for(&self, parent_session_id: Uuid) -> Result<u32> {
         self.with_conn(|conn| {
-            let count: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM sessions WHERE parent_session_id = ?1",
-                [parent_session_id.to_string()],
-                |row| row.get(0),
-            )
-            .context("counting forks")?;
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sessions WHERE parent_session_id = ?1",
+                    [parent_session_id.to_string()],
+                    |row| row.get(0),
+                )
+                .context("counting forks")?;
             Ok(count as u32)
         })
     }
@@ -329,17 +334,15 @@ impl Db {
     /// Root sessions (no parent) for a project, most-recent-first.
     /// This is what the top-level `/sessions` view shows; forks descend
     /// via [`Self::list_forks`].
-    pub fn list_root_sessions(
-        &self,
-        project_id: &str,
-        limit: u32,
-    ) -> Result<Vec<SessionRow>> {
+    pub fn list_root_sessions(&self, project_id: &str, limit: u32) -> Result<Vec<SessionRow>> {
         self.with_conn(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT * FROM sessions
+            let mut stmt = conn
+                .prepare(
+                    "SELECT * FROM sessions
                  WHERE project_id = ?1 AND parent_session_id IS NULL
                  ORDER BY last_active_at DESC LIMIT ?2",
-            ).context("preparing list_root_sessions")?;
+                )
+                .context("preparing list_root_sessions")?;
             let rows = stmt
                 .query_map(params![project_id, limit], SessionRow::from_row)
                 .context("querying list_root_sessions")?;
@@ -407,12 +410,7 @@ impl Db {
         })
     }
 
-    pub fn set_session_model(
-        &self,
-        session_id: Uuid,
-        provider: &str,
-        model: &str,
-    ) -> Result<()> {
+    pub fn set_session_model(&self, session_id: Uuid, provider: &str, model: &str) -> Result<()> {
         self.with_conn(|conn| {
             conn.execute(
                 "UPDATE sessions SET provider = ?1, model = ?2 WHERE session_id = ?3",
@@ -504,7 +502,9 @@ mod tests {
     #[test]
     fn create_and_get() {
         let db = Db::open_in_memory().unwrap();
-        let s = db.create_session("p1", "/x/y", "orchestrator-build").unwrap();
+        let s = db
+            .create_session("p1", "/x/y", "orchestrator-build")
+            .unwrap();
         let g = db.get_session(s.session_id).unwrap().unwrap();
         assert_eq!(g.project_id, "p1");
         assert_eq!(g.project_root, "/x/y");
@@ -556,8 +556,11 @@ mod tests {
     #[test]
     fn create_fork_inherits_parent_metadata() {
         let db = Db::open_in_memory().unwrap();
-        let parent = db.create_session("p", "/proj", "orchestrator-build").unwrap();
-        db.set_session_model(parent.session_id, "anthropic", "opus-4-7").unwrap();
+        let parent = db
+            .create_session("p", "/proj", "orchestrator-build")
+            .unwrap();
+        db.set_session_model(parent.session_id, "anthropic", "opus-4-7")
+            .unwrap();
         let fork = db
             .create_fork(parent.session_id, Some("turn-42".into()))
             .unwrap();

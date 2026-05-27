@@ -77,7 +77,11 @@ pub fn suggestions(cwd: &Path, query: &str) -> Vec<Suggestion> {
             Ok(p) => p.to_string_lossy().replace('\\', "/"),
             Err(_) => dent.path().to_string_lossy().to_string(),
         };
-        let display = if is_dir { format!("{rel}/") } else { rel.clone() };
+        let display = if is_dir {
+            format!("{rel}/")
+        } else {
+            rel.clone()
+        };
         let replacement = display.clone();
         out.push(Suggestion {
             display,
@@ -108,7 +112,11 @@ fn split_query(q: &str) -> (&str, &str) {
 
 fn resolve_query_dir(cwd: &Path, dir_part: &str) -> PathBuf {
     let p = Path::new(dir_part);
-    if p.is_absolute() { p.to_path_buf() } else { cwd.join(p) }
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        cwd.join(p)
+    }
 }
 
 /// Parse a tag body like `path/to/file.rs:10-80` into (path, range).
@@ -150,8 +158,7 @@ pub fn expand_tags(buffer: &str, cwd: &Path) -> String {
         // `@` starts a tag only at the buffer start or after whitespace,
         // matching how the composer lets users type emails / handles
         // mid-word without triggering expansion.
-        let at_boundary = i == 0
-            || matches!(bytes[i - 1], b' ' | b'\t' | b'\n' | b'\r');
+        let at_boundary = i == 0 || matches!(bytes[i - 1], b' ' | b'\t' | b'\n' | b'\r');
         if ch == b'@' && at_boundary {
             let body_start = i + 1;
             let mut j = body_start;
@@ -170,9 +177,7 @@ pub fn expand_tags(buffer: &str, cwd: &Path) -> String {
                     Err(reason) => {
                         out.push('@');
                         out.push_str(body);
-                        out.push_str(&format!(
-                            " [note: @{body} could not be inlined: {reason}]"
-                        ));
+                        out.push_str(&format!(" [note: @{body} could not be inlined: {reason}]"));
                         i = j;
                         continue;
                     }
@@ -213,7 +218,11 @@ fn try_inline(
 fn resolve_path(cwd: &Path, path_part: &str) -> PathBuf {
     let expanded = shellexpand::tilde(path_part);
     let p = Path::new(expanded.as_ref());
-    if p.is_absolute() { p.to_path_buf() } else { cwd.join(p) }
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        cwd.join(p)
+    }
 }
 
 fn render_file(text: &str, display_path: &str, range: Option<(usize, usize)>) -> String {

@@ -20,7 +20,9 @@ pub fn count(text: &str) -> usize {
     if text.is_empty() {
         return 0;
     }
-    cl100k_base_singleton().encode_with_special_tokens(text).len()
+    cl100k_base_singleton()
+        .encode_with_special_tokens(text)
+        .len()
 }
 
 /// Per-call provider-reported token usage. Mirrors the columns we

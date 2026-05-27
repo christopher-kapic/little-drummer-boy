@@ -178,10 +178,7 @@ pub enum Request {
 
     /// Manually set a session's title; locks out auto-titling.
     /// GOALS §17d.
-    RenameSession {
-        session_id: Uuid,
-        title: String,
-    },
+    RenameSession { session_id: Uuid, title: String },
 
     /// Drop a session and (optionally) its descendant forks.
     /// FK cascades take care of tool_call_events / inference_calls /

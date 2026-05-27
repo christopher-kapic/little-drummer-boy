@@ -299,9 +299,7 @@ async fn handle_request(
             fork_point_turn_id,
         } => fork_session(ctx, parent_session_id, fork_point_turn_id),
 
-        Request::RenameSession { session_id, title } => {
-            rename_session(ctx, session_id, &title)
-        }
+        Request::RenameSession { session_id, title } => rename_session(ctx, session_id, &title),
 
         Request::DeleteSession {
             session_id,
@@ -403,10 +401,7 @@ fn attach(
     let project_root = handle.project_root.to_string_lossy().into_owned();
     let active_agent = handle.active_agent_name.clone();
 
-    state.attached = Some(AttachedSession {
-        handle,
-        event_rx,
-    });
+    state.attached = Some(AttachedSession { handle, event_rx });
 
     // History snapshot of past tool calls / assistant turns for the
     // attached session, projected into the wire `HistoryEntry` shape.
@@ -419,7 +414,7 @@ fn attach(
                 tool: ev.tool,
                 original_input: ev.original_input_json,
                 wire_input: ev.wire_input_json,
-                recovery_kind: None,    // §14: filled once we read recovery back
+                recovery_kind: None, // §14: filled once we read recovery back
                 recovery_stage: None,
                 output: ev.output,
                 hard_fail: ev.hard_fail,
@@ -525,9 +520,7 @@ fn rename_session(
         }
         Err(e) => return Err(internal(e)),
     }
-    ctx.db
-        .rename_session(session_id, title)
-        .map_err(internal)?;
+    ctx.db.rename_session(session_id, title).map_err(internal)?;
     Ok(Response::Ack)
 }
 

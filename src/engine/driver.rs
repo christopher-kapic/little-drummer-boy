@@ -96,7 +96,10 @@ impl Driver {
     /// Name of the agent currently holding the user's conversation.
     /// Used by the TUI for the active-agent slot.
     pub fn active_agent(&self) -> &str {
-        self.stack.last().map(|a| a.agent.name.as_str()).unwrap_or("")
+        self.stack
+            .last()
+            .map(|a| a.agent.name.as_str())
+            .unwrap_or("")
     }
 
     /// Long-running main loop: pulls user input from `input_rx` and
@@ -212,9 +215,7 @@ impl Driver {
                         // §3c invariant doesn't extend across the
                         // child's lifetime, and lingering locks would
                         // block whatever takes its slot next.
-                        if let Err(e) = self
-                            .locks
-                            .suspend_agent(&child.agent.name, self.session.id)
+                        if let Err(e) = self.locks.suspend_agent(&child.agent.name, self.session.id)
                         {
                             tracing::warn!(error = ?e, agent = %child.agent.name, "suspend_agent on pop failed");
                         }
@@ -223,9 +224,8 @@ impl Driver {
                         // taken when it was suspended (see SpawnSubagent
                         // below).
                         if let Some(parent) = self.stack.last() {
-                            if let Err(e) = self
-                                .locks
-                                .resume_agent(&parent.agent.name, self.session.id)
+                            if let Err(e) =
+                                self.locks.resume_agent(&parent.agent.name, self.session.id)
                             {
                                 tracing::warn!(error = ?e, agent = %parent.agent.name, "resume_agent on pop failed");
                             }
@@ -325,9 +325,9 @@ impl Driver {
                     )
                     .await
                     {
-                            Ok(text) => text,
-                            Err(e) => format!("Error: {e:#}"),
-                        };
+                        Ok(text) => text,
+                        Err(e) => format!("Error: {e:#}"),
+                    };
                     let _ = tx
                         .send(TurnEvent::ToolEnd {
                             agent: self.stack.last().unwrap().agent.name.clone(),
@@ -432,13 +432,19 @@ async fn run_noninteractive(
                 // doesn't spin.
                 drop(sink_tx);
                 let _ = drain.await;
-                anyhow::bail!("noninteractive agent `{}` attempted to delegate via task", agent.name);
+                anyhow::bail!(
+                    "noninteractive agent `{}` attempted to delegate via task",
+                    agent.name
+                );
             }
         }
     }
     drop(sink_tx);
     let _ = drain.await;
-    anyhow::bail!("noninteractive agent `{}` exceeded {MAX_NONINTERACTIVE_TURNS} turns", agent.name)
+    anyhow::bail!(
+        "noninteractive agent `{}` exceeded {MAX_NONINTERACTIVE_TURNS} turns",
+        agent.name
+    )
 }
 
 fn collect_final_text(history: &[Message]) -> String {

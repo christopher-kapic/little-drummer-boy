@@ -152,7 +152,13 @@ mod tests {
     fn null_for_optional_dropped() {
         let mut v = json!({ "path": "/x", "offset": null });
         let r = repair(&mut v, &[]);
-        assert!(matches!(r, Recovery::ShapeRepair { stage: "null_for_optional", .. }));
+        assert!(matches!(
+            r,
+            Recovery::ShapeRepair {
+                stage: "null_for_optional",
+                ..
+            }
+        ));
         assert_eq!(v, json!({ "path": "/x" }));
     }
 
@@ -160,7 +166,13 @@ mod tests {
     fn bare_string_wrapped_for_array_field() {
         let mut v = json!({ "files": "src/main.rs" });
         let r = repair(&mut v, &["files"]);
-        assert!(matches!(r, Recovery::ShapeRepair { stage: "wrap_bare_string", .. }));
+        assert!(matches!(
+            r,
+            Recovery::ShapeRepair {
+                stage: "wrap_bare_string",
+                ..
+            }
+        ));
         assert_eq!(v, json!({ "files": ["src/main.rs"] }));
     }
 

@@ -9,7 +9,7 @@ use rusqlite::params;
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::db::{lang::language_for_path, Db};
+use crate::db::{Db, lang::language_for_path};
 use crate::engine::repair::Recovery;
 
 #[derive(Debug, Clone)]

@@ -190,10 +190,7 @@ mod tests {
 
     #[test]
     fn slugify_collapses_runs() {
-        assert_eq!(
-            slugify_title("a   b\n\nc").as_deref(),
-            Some("a-b-c")
-        );
+        assert_eq!(slugify_title("a   b\n\nc").as_deref(), Some("a-b-c"));
     }
 
     #[test]

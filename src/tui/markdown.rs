@@ -90,9 +90,7 @@ impl Emitter {
                     format!("{hashes} "),
                     Style::default().fg(HEADING_FG).add_modifier(Modifier::BOLD),
                 ));
-                self.push_style(
-                    Style::default().fg(HEADING_FG).add_modifier(Modifier::BOLD),
-                );
+                self.push_style(Style::default().fg(HEADING_FG).add_modifier(Modifier::BOLD));
             }
             Tag::BlockQuote(_) => {
                 self.flush_line();
@@ -112,7 +110,9 @@ impl Emitter {
             }
             Tag::List(start) => {
                 self.flush_line();
-                self.list_stack.push(ListState { ordered_index: start });
+                self.list_stack.push(ListState {
+                    ordered_index: start,
+                });
             }
             Tag::Item => {
                 self.flush_line();
@@ -136,7 +136,11 @@ impl Emitter {
                 self.push_style(Style::default().add_modifier(Modifier::CROSSED_OUT));
             }
             Tag::Link { .. } => {
-                self.push_style(Style::default().fg(LINK_FG).add_modifier(Modifier::UNDERLINED));
+                self.push_style(
+                    Style::default()
+                        .fg(LINK_FG)
+                        .add_modifier(Modifier::UNDERLINED),
+                );
             }
             Tag::Image { .. } => self.push_style(Style::default().fg(QUOTE_FG)),
             _ => {}
@@ -212,10 +216,8 @@ impl Emitter {
     }
 
     fn inline_code(&mut self, s: String) {
-        self.current.push(Span::styled(
-            s,
-            Style::default().fg(CODE_FG).bg(CODE_BG),
-        ));
+        self.current
+            .push(Span::styled(s, Style::default().fg(CODE_FG).bg(CODE_BG)));
     }
 
     fn horizontal_rule(&mut self) {
