@@ -197,19 +197,19 @@ pub fn header_lines(info: &LaunchInfo) -> Vec<String> {
             // between the title and provider line. The two art-only rows
             // at the bottom are the new art's natural padding.
             vec![
-                format!("{}   {}", art[0], title),
-                format!("{}   {GREY}Welcome, {BOLD}{name}{RESET}", art[1]),
-                format!("{}   {GREY}{}{RESET}", art[2], info.provider_line),
-                format!("{}   {}", art[3], path_line_ansi(info)),
-                art[4].clone(),
+                art[0].clone(),  // art only, no text
+                format!("{}   {}", art[1], title),
+                format!("{}   {GREY}Welcome, {BOLD}{name}{RESET}", art[2]),
+                format!("{}   {GREY}{}{RESET}", art[3], info.provider_line),
+                format!("{}   {}", art[4], path_line_ansi(info)),
                 art[5].clone(),
             ]
         }
         _ => vec![
-            format!("{}   {}", art[0], title),
-            format!("{}   {GREY}{}{RESET}", art[1], info.provider_line),
-            format!("{}   {}", art[2], path_line_ansi(info)),
-            art[3].to_string(),
+            art[0].clone(),  // art only, no text
+            format!("{}   {}", art[1], title),
+            format!("{}   {GREY}{}{RESET}", art[2], info.provider_line),
+            format!("{}   {}", art[3], path_line_ansi(info)),
             art[4].clone(),
             art[5].clone(),
         ],
