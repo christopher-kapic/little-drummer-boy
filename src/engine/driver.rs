@@ -50,6 +50,11 @@ pub struct Driver {
     pub redact: Arc<RedactionTable>,
     pub cwd: std::path::PathBuf,
     pub stack: Vec<AgentSession>,
+    /// Minutes between `[time: ...]` preludes injected on user
+    /// messages (GOALS §17g). Loaded from
+    /// `extended.system_prompt.time_injection_interval_minutes`;
+    /// defaults to 5 if unset.
+    pub time_injection_interval_minutes: u32,
 }
 
 impl Driver {
@@ -70,6 +75,21 @@ impl Driver {
                 history: Vec::new(),
                 answering: None,
             }],
+            time_injection_interval_minutes: 5,
+        }
+    }
+
+    /// Wrap `user_text` with the `[time: ...]` prelude when the
+    /// session's interval has elapsed. Side-effect: stamps the
+    /// session's last-prelude timestamp on success. No-op when the
+    /// interval hasn't elapsed.
+    fn with_time_prelude(&self, user_text: String) -> String {
+        match self
+            .session
+            .take_time_prelude(self.time_injection_interval_minutes)
+        {
+            Some(prelude) => format!("{prelude}\n\n{user_text}"),
+            None => user_text,
         }
     }
 
@@ -117,7 +137,7 @@ impl Driver {
         input_rx: &mut mpsc::Receiver<String>,
         tx: &mpsc::Sender<TurnEvent>,
     ) -> Result<()> {
-        let mut next_prompt = Message::user(user_text);
+        let mut next_prompt = Message::user(self.with_time_prelude(user_text));
 
         loop {
             let agent = {
@@ -158,7 +178,8 @@ impl Driver {
                         next_prompt = last_tool_result;
                     } else {
                         top.history.push(last_tool_result);
-                        next_prompt = Message::user(self.redact.scrub(&fold_messages(queued)));
+                        let folded = self.redact.scrub(&fold_messages(queued));
+                        next_prompt = Message::user(self.with_time_prelude(folded));
                     }
                     continue;
                 }
@@ -311,6 +332,7 @@ impl Driver {
             model: self.stack[0].agent.model.clone(),
             params: self.stack[0].agent.params.clone(),
             cwd: self.cwd.clone(),
+            session_short_id: self.session.short_id.clone(),
         }
     }
 }

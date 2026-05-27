@@ -93,6 +93,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"]
 tempfile = "3"
 regex = "1"
 unicode-width = "0.2"
+# Diff rendering for the edit/write tool entries in the TUI history
+# pane (tui.diff_style). Provides line+intraline diff primitives.
+similar = "2"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

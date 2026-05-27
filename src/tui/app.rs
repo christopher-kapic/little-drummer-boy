@@ -8,6 +8,7 @@
 //! `EnableMouseCapture` and route `MouseEvent`s in the event loop —
 //! revisit the scroll path when that happens.
 
+use std::collections::HashMap;
 use std::io::{Write, stdout};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -28,7 +29,7 @@ use ratatui::widgets::{Block, Borders, BorderType, Paragraph, Wrap};
 use ratatui::{DefaultTerminal, TerminalOptions, Viewport};
 
 use crate::config::dirs::discover_config_dirs;
-use crate::config::extended::{ExtendedConfig, ThinkingDisplay, VimModeSetting};
+use crate::config::extended::{DiffStyle, ExtendedConfig, ThinkingDisplay, VimModeSetting};
 use crate::engine::TurnEvent;
 use crate::git::{self, RepoStatus};
 use crate::tui::agent_runner::{self, AgentRunner};
@@ -79,6 +80,10 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "Refresh model lists from every configured provider",
     },
     SlashCommand {
+        name: "fork",
+        description: "Branch a new conversation from the current point",
+    },
+    SlashCommand {
         name: "model",
         description: "Switch the active model",
     },
@@ -89,6 +94,18 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
     SlashCommand {
         name: "prune",
         description: "Drop the oldest messages",
+    },
+    SlashCommand {
+        name: "resume",
+        description: "Browse and resume previous sessions (alias of /sessions)",
+    },
+    SlashCommand {
+        name: "session",
+        description: "Session subcommands (e.g. /session rename <title>)",
+    },
+    SlashCommand {
+        name: "sessions",
+        description: "Browse and resume previous sessions",
     },
     SlashCommand {
         name: "settings",
@@ -109,6 +126,17 @@ pub struct App {
     /// `render_entry` call so the renderer can pick the markdown path
     /// per kind of entry.
     markdown_opts: MarkdownOpts,
+    /// How `edit` / `editunlock` tool calls render in history
+    /// (`tui.diff_style`). The narrow-terminal degradation from
+    /// side-by-side → inline is per-render, computed from the
+    /// rendered pane width.
+    diff_style: DiffStyle,
+    /// Cached args from `ToolStart` for edit tools that need them at
+    /// `ToolEnd` time (to build the `Diff` history entry). Keyed by
+    /// `call_id`; entries are popped at `ToolEnd`. Anything left
+    /// behind (e.g. a tool that errored before emitting `ToolEnd`)
+    /// gets cleaned up on the next `finalize_pending`.
+    pending_edit_args: HashMap<String, PendingEditArgs>,
     /// Messages typed and submitted while an agent turn is in flight.
     /// Mirrors the daemon's queue (GOALS §1c) for display; the daemon
     /// is the source of truth — these get cleared on `ThinkingStarted`
@@ -187,6 +215,16 @@ pub struct App {
     pending_new_session: bool,
 }
 
+/// Args cached at `ToolStart` for an `edit` / `editunlock` call so the
+/// matching `ToolEnd` can build a `HistoryEntry::Diff`. We don't keep
+/// the whole `Value` because we only need three fields.
+#[derive(Debug, Clone)]
+struct PendingEditArgs {
+    path: String,
+    old: String,
+    new: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CursorShape {
     /// Steady vertical bar — used in Insert mode (and when vim is
@@ -232,12 +270,15 @@ impl App {
             Err(_) => (None, false),
         };
 
+        let diff_style = tui_cfg.diff_style;
         let mut app = Self {
             launch,
             composer,
             vim_setting,
             thinking_setting,
             markdown_opts,
+            diff_style,
+            pending_edit_args: HashMap::new(),
             queue: Vec::new(),
             prompt_history: Vec::new(),
             prompt_history_cursor: 0,
@@ -1218,8 +1259,22 @@ impl App {
                 }
                 self.finalize_pending();
             }
-            TurnEvent::ToolStart { tool, args, .. } => {
+            TurnEvent::ToolStart {
+                tool,
+                args,
+                call_id,
+                ..
+            } => {
                 self.finalize_pending();
+                if is_edit_tool(&tool) {
+                    if let Some(captured) = extract_edit_args(&args) {
+                        self.pending_edit_args.insert(call_id, captured);
+                        // Diff replaces both the placeholder and the
+                        // result line — wait for ToolEnd to push the
+                        // entry.
+                        return;
+                    }
+                }
                 let short = agent_runner::short_args(&args);
                 self.history.push(HistoryEntry::Plain {
                     line: format!("  → {tool}({short})"),
@@ -1229,16 +1284,35 @@ impl App {
                 tool,
                 output,
                 truncated,
+                call_id,
                 ..
             } => {
+                if let Some(args) = self.pending_edit_args.remove(&call_id) {
+                    self.history.push(HistoryEntry::Diff {
+                        tool,
+                        path: args.path,
+                        old: args.old,
+                        new: args.new,
+                    });
+                    return;
+                }
                 let snippet = agent_runner::first_line(&output, 200);
                 let mark = if truncated { " (truncated)" } else { "" };
                 self.history.push(HistoryEntry::Plain {
                     line: format!("  ✓ {tool}: {snippet}{mark}"),
                 });
             }
-            TurnEvent::ToolError { tool, error, .. } => {
+            TurnEvent::ToolError {
+                tool,
+                error,
+                call_id,
+                ..
+            } => {
                 self.finalize_pending();
+                // Drop any cached args from a paired ToolStart that
+                // never produced a ToolEnd — the diff would be
+                // misleading on a hard failure.
+                self.pending_edit_args.remove(&call_id);
                 self.history.push(HistoryEntry::Plain {
                     line: format!("  ✗ {tool}: {error}"),
                 });
@@ -1420,6 +1494,19 @@ impl App {
             }
             "compact" => "/compact: stub — context compaction not wired yet.",
             "prune" => "/prune: stub — history pruning not wired yet.",
+            "sessions" | "resume" => {
+                "/sessions: stub — session-picker UI not wired yet. The wire RPCs \
+                 (ListSessions with project_id/parent filters, ForkSession, \
+                 RenameSession, DeleteSession) are live in the daemon."
+            }
+            "fork" => {
+                "/fork: stub — the ForkSession RPC is live in the daemon; the TUI \
+                 re-attach flow on top of it ships in a later cut."
+            }
+            "session" => {
+                "/session: subcommand router not wired yet. `/session rename <title>` \
+                 will call the RenameSession RPC once the AgentRunner exposes it."
+            }
             _ => return false,
         };
         self.history.push(HistoryEntry::Plain {
@@ -1449,6 +1536,7 @@ impl App {
             agent: tui_cfg.render_agent_markdown,
             user: tui_cfg.render_user_markdown,
         };
+        self.diff_style = tui_cfg.diff_style;
         let vim_enabled = self.vim_setting.vim_enabled();
         if self.composer.vim_enabled() != vim_enabled {
             self.composer.set_vim_enabled(vim_enabled);
@@ -1667,6 +1755,7 @@ impl App {
         for entry in &self.history {
             total = total.saturating_add(match entry {
                 HistoryEntry::Plain { .. } => 1,
+                HistoryEntry::Diff { old, new, .. } => diff_row_estimate(old, new),
                 HistoryEntry::User { text, .. } => {
                     let body = text.matches('\n').count() as u16 + 1;
                     // Bubble = top border + body + bottom border (+2);
@@ -1813,7 +1902,13 @@ impl App {
         let mut targets: Vec<Option<usize>> = Vec::new();
         for (idx, entry) in self.history.iter().enumerate() {
             let Rendered { lines, chip_row } =
-                render_entry(entry, area.width, self.thinking_setting, self.markdown_opts);
+                render_entry(
+                    entry,
+                    area.width,
+                    self.thinking_setting,
+                    self.markdown_opts,
+                    self.diff_style,
+                );
             let chip_abs = chip_row.map(|cr| all.len() + cr);
             for i in 0..lines.len() {
                 targets.push(if Some(all.len() + i) == chip_abs {
@@ -1991,6 +2086,9 @@ impl App {
             chars += match entry {
                 HistoryEntry::User { text, .. } => text.chars().count(),
                 HistoryEntry::Plain { line } => line.chars().count(),
+                HistoryEntry::Diff { old, new, .. } => {
+                    old.chars().count() + new.chars().count()
+                }
                 HistoryEntry::Agent {
                     text, reasoning, ..
                 } => text.chars().count() + reasoning.chars().count(),
@@ -2127,6 +2225,7 @@ impl App {
 fn entry_rendered_rows(entry: &HistoryEntry) -> u16 {
     match entry {
         HistoryEntry::Plain { .. } => 1,
+        HistoryEntry::Diff { old, new, .. } => diff_row_estimate(old, new),
         HistoryEntry::User { text, .. } => (text.matches('\n').count() as u16 + 1) + 2,
         HistoryEntry::Agent {
             text,
@@ -2214,6 +2313,35 @@ fn cursor_visual_pos(
     (visual_row + row_within, col_within)
 }
 
+/// True for tools that take an `old_string` / `new_string` pair we
+/// can render as a diff. `write` / `writeunlock` aren't in here yet
+/// because the engine doesn't surface the pre-write file content (see
+/// `flagged-for-christopher.md`).
+fn is_edit_tool(tool: &str) -> bool {
+    matches!(tool, "edit" | "editunlock")
+}
+
+/// Approximate row count for a `Diff` entry, used by the chat-pane
+/// sizing math. SideBySide ≈ max(old, new); Inline ≈ old + new. The
+/// chat sizer doesn't know which mode is active at this point, so
+/// we use the inline (upper-bound) estimate to avoid undersized
+/// panes — slight over-allocation is cheaper than clipping.
+fn diff_row_estimate(old: &str, new: &str) -> u16 {
+    let old_lines = old.matches('\n').count() as u16 + 1;
+    let new_lines = new.matches('\n').count() as u16 + 1;
+    old_lines.saturating_add(new_lines).saturating_add(1) // +1 for header
+}
+
+/// Pull `(path, old, new)` out of an edit tool's args. Returns
+/// `None` when any field is missing; the caller falls back to the
+/// generic Plain rendering in that case.
+fn extract_edit_args(args: &serde_json::Value) -> Option<PendingEditArgs> {
+    let path = args.get("path")?.as_str()?.to_string();
+    let old = args.get("old_string")?.as_str()?.to_string();
+    let new = args.get("new_string")?.as_str()?.to_string();
+    Some(PendingEditArgs { path, old, new })
+}
+
 fn new_pending(name: String) -> PendingMsg {
     PendingMsg {
         name,
@@ -2230,6 +2358,36 @@ fn new_pending(name: String) -> PendingMsg {
 fn entry_to_plain_lines(entry: &HistoryEntry) -> Vec<String> {
     match entry {
         HistoryEntry::Plain { line } => vec![line.clone()],
+        HistoryEntry::Diff {
+            tool, path, old, new,
+        } => {
+            // Plain-lines is what the "spill to scrollback" path uses
+            // on `/new`. Reduce the diff to a tool-result-style
+            // summary plus the textual diff body in unified form —
+            // anything fancier would need ratatui Lines which the
+            // plain-text dump can't render.
+            let added = new.lines().count();
+            let removed = old.lines().count();
+            let mut out = vec![format!("  ✓ {tool}: {path} (+{added} −{removed})")];
+            let diff = similar::TextDiff::from_lines(old.as_str(), new.as_str());
+            for group in diff.grouped_ops(3) {
+                if out.len() > 1 {
+                    out.push("    …".to_string());
+                }
+                for op in group {
+                    for change in diff.iter_changes(&op) {
+                        let v = change.value().trim_end_matches('\n');
+                        let prefix = match change.tag() {
+                            similar::ChangeTag::Delete => "- ",
+                            similar::ChangeTag::Insert => "+ ",
+                            similar::ChangeTag::Equal => "  ",
+                        };
+                        out.push(format!("  {prefix}{v}"));
+                    }
+                }
+            }
+            out
+        }
         HistoryEntry::User { text, timestamp } => {
             let ts = timestamp.format("%H:%M").to_string();
             let mut out: Vec<String> = Vec::new();

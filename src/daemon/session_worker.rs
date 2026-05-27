@@ -126,6 +126,7 @@ async fn run_worker(
         model,
         params: ModelParams::default(),
         cwd: project_root.clone(),
+        session_short_id: session.short_id.clone(),
     };
     let root = Arc::new(builtin::orchestrator_build(&spawn_args));
 

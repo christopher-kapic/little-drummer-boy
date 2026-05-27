@@ -52,6 +52,17 @@ pub enum HistoryEntry {
         expanded: bool,
         think_duration: Option<Duration>,
     },
+    /// Completed `edit` / `editunlock` tool call. Rendered as a diff
+    /// per `tui.diff_style` (side-by-side / inline / hidden). Stored
+    /// instead of a `Plain` line so the renderer can re-flow if the
+    /// pane width changes mid-session and re-pick side-by-side vs.
+    /// inline.
+    Diff {
+        tool: String,
+        path: String,
+        old: String,
+        new: String,
+    },
 }
 
 /// In-flight assistant turn. Lives in `App.pending` from
@@ -168,6 +179,7 @@ pub fn render_entry(
     width: u16,
     thinking: ThinkingDisplay,
     md: MarkdownOpts,
+    diff_style: crate::config::extended::DiffStyle,
 ) -> Rendered {
     match entry {
         HistoryEntry::User { text, timestamp } => Rendered {
@@ -176,6 +188,15 @@ pub fn render_entry(
         },
         HistoryEntry::Plain { line } => Rendered {
             lines: vec![Line::from(line.clone())],
+            chip_row: None,
+        },
+        HistoryEntry::Diff {
+            tool,
+            path,
+            old,
+            new,
+        } => Rendered {
+            lines: crate::tui::diff::render_diff(tool, path, old, new, diff_style, width),
             chip_row: None,
         },
         HistoryEntry::Agent {

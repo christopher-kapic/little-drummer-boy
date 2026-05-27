@@ -7,10 +7,18 @@
 
 use anyhow::{Context, Result};
 use chrono::Utc;
+use rand::Rng;
 use rusqlite::{Connection, params};
 use uuid::Uuid;
 
 use crate::db::Db;
+
+/// Crockford base32 alphabet, lowercased. Excludes I/L/O/U for visual
+/// disambiguation. Used for 6-char session display ids (GOALS §17b).
+const CROCKFORD_BASE32: &[u8] = b"0123456789abcdefghjkmnpqrstvwxyz";
+
+/// Length of a session's human-display short id, in characters.
+pub const SHORT_ID_LEN: usize = 6;
 
 #[derive(Debug, Clone)]
 pub struct SessionRow {
@@ -23,18 +31,32 @@ pub struct SessionRow {
     pub provider: Option<String>,
     pub model: Option<String>,
     pub active_agent: String,
+    /// 6-char display id, unique within `project_id`. NULL for pre-§17
+    /// rows until lazy backfill populates them (see [`Db::resume_session`]).
+    pub short_id: Option<String>,
+    /// Parent session in the fork tree. NULL = root session (GOALS §17e).
+    pub parent_session_id: Option<Uuid>,
+    /// Turn id in the parent at which this fork branched off. NULL for
+    /// root sessions; also NULL for tail-forks until the daemon resolves
+    /// the parent's last turn.
+    pub fork_point_turn_id: Option<String>,
+    /// Auto-generated or user-set title (GOALS §17d).
+    pub title: Option<String>,
+    /// `true` when the user has manually set [`title`]. Locks out the
+    /// utility-model auto-titling pass.
+    pub user_renamed: bool,
 }
 
 impl SessionRow {
     fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
         let id: String = row.get("session_id")?;
-        let session_id = Uuid::parse_str(&id).map_err(|e| {
-            rusqlite::Error::FromSqlConversionFailure(
-                0,
-                rusqlite::types::Type::Text,
-                Box::new(e),
-            )
-        })?;
+        let session_id = parse_uuid(&id)?;
+        let parent_str: Option<String> = row.get("parent_session_id")?;
+        let parent_session_id = match parent_str {
+            Some(s) => Some(parse_uuid(&s)?),
+            None => None,
+        };
+        let user_renamed: i64 = row.get("user_renamed")?;
         Ok(Self {
             session_id,
             project_id: row.get("project_id")?,
@@ -45,8 +67,53 @@ impl SessionRow {
             provider: row.get("provider")?,
             model: row.get("model")?,
             active_agent: row.get("active_agent")?,
+            short_id: row.get("short_id")?,
+            parent_session_id,
+            fork_point_turn_id: row.get("fork_point_turn_id")?,
+            title: row.get("title")?,
+            user_renamed: user_renamed != 0,
         })
     }
+}
+
+fn parse_uuid(s: &str) -> rusqlite::Result<Uuid> {
+    Uuid::parse_str(s).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+    })
+}
+
+/// Generate a random 6-char Crockford base32 string. Not collision-safe
+/// on its own — use [`generate_unique_short_id`] for DB inserts.
+fn random_short_id() -> String {
+    let mut rng = rand::rng();
+    (0..SHORT_ID_LEN)
+        .map(|_| {
+            let idx = rng.random_range(0..CROCKFORD_BASE32.len());
+            CROCKFORD_BASE32[idx] as char
+        })
+        .collect()
+}
+
+/// Generate a 6-char short id that doesn't collide within `project_id`.
+/// 32^6 ≈ 1.07e9 namespace; collisions are astronomically rare even at
+/// hundreds of thousands of sessions per project. The retry loop is a
+/// belt-and-braces guard.
+fn generate_unique_short_id(conn: &Connection, project_id: &str) -> rusqlite::Result<String> {
+    for _ in 0..16 {
+        let candidate = random_short_id();
+        let exists: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sessions WHERE project_id = ?1 AND short_id = ?2",
+            params![project_id, candidate],
+            |row| row.get(0),
+        )?;
+        if exists == 0 {
+            return Ok(candidate);
+        }
+    }
+    // 16 misses with a 1B namespace means something is wrong (PRNG
+    // dead, or the project actually contains ~1B sessions). Surface
+    // it loudly rather than spinning forever.
+    Err(rusqlite::Error::ExecuteReturnedResults)
 }
 
 impl Db {
@@ -58,12 +125,14 @@ impl Db {
     ) -> Result<SessionRow> {
         let session_id = Uuid::new_v4();
         let now = Utc::now().timestamp();
-        self.with_conn(|conn| {
+        let short_id = self.with_conn(|conn| {
+            let short_id = generate_unique_short_id(conn, project_id)
+                .context("generating session short_id")?;
             conn.execute(
                 "INSERT INTO sessions
                  (session_id, project_id, project_root, started_at,
-                  last_active_at, active_agent)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                  last_active_at, active_agent, short_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     session_id.to_string(),
                     project_id,
@@ -71,10 +140,11 @@ impl Db {
                     now,
                     now,
                     active_agent,
+                    short_id,
                 ],
             )
             .context("inserting session")?;
-            Ok(())
+            Ok(short_id)
         })?;
         Ok(SessionRow {
             session_id,
@@ -86,11 +156,241 @@ impl Db {
             provider: None,
             model: None,
             active_agent: active_agent.to_string(),
+            short_id: Some(short_id),
+            parent_session_id: None,
+            fork_point_turn_id: None,
+            title: None,
+            user_renamed: false,
+        })
+    }
+
+    /// Create a fork session branching from `parent_session_id` at
+    /// `fork_point_turn_id` (None = tail). Inherits the parent's
+    /// project_id, project_root, active_agent, provider, model.
+    /// Returns the new session row (with a fresh UUID + short_id).
+    pub fn create_fork(
+        &self,
+        parent_session_id: Uuid,
+        fork_point_turn_id: Option<String>,
+    ) -> Result<SessionRow> {
+        let session_id = Uuid::new_v4();
+        let now = Utc::now().timestamp();
+        self.with_conn(|conn| {
+            let parent = get_session_inner(conn, parent_session_id)?
+                .ok_or_else(|| anyhow::anyhow!("parent session {parent_session_id} not found"))?;
+            let short_id = generate_unique_short_id(conn, &parent.project_id)
+                .context("generating fork short_id")?;
+            conn.execute(
+                "INSERT INTO sessions
+                 (session_id, project_id, project_root, started_at,
+                  last_active_at, active_agent, short_id,
+                  parent_session_id, fork_point_turn_id,
+                  provider, model)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![
+                    session_id.to_string(),
+                    parent.project_id,
+                    parent.project_root,
+                    now,
+                    now,
+                    parent.active_agent,
+                    short_id,
+                    parent_session_id.to_string(),
+                    fork_point_turn_id,
+                    parent.provider,
+                    parent.model,
+                ],
+            )
+            .context("inserting fork session")?;
+            Ok(SessionRow {
+                session_id,
+                project_id: parent.project_id,
+                project_root: parent.project_root,
+                started_at: now,
+                last_active_at: now,
+                ended_at: None,
+                provider: parent.provider,
+                model: parent.model,
+                active_agent: parent.active_agent,
+                short_id: Some(short_id),
+                parent_session_id: Some(parent_session_id),
+                fork_point_turn_id,
+                title: None,
+                user_renamed: false,
+            })
         })
     }
 
     pub fn get_session(&self, session_id: Uuid) -> Result<Option<SessionRow>> {
         self.with_conn(|conn| Ok(get_session_inner(conn, session_id)?))
+    }
+
+    /// Lookup by short id within a project. Used by CLI/RPC paths where
+    /// the user types the 6-char display id rather than the full UUID.
+    pub fn get_session_by_short_id(
+        &self,
+        project_id: &str,
+        short_id: &str,
+    ) -> Result<Option<SessionRow>> {
+        self.with_conn(|conn| {
+            let result = conn.query_row(
+                "SELECT * FROM sessions
+                 WHERE project_id = ?1 AND short_id = ?2",
+                params![project_id, short_id],
+                SessionRow::from_row,
+            );
+            match result {
+                Ok(row) => Ok(Some(row)),
+                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                Err(e) => Err(e).context("query get_session_by_short_id"),
+            }
+        })
+    }
+
+    /// Ensure the session has a short_id (lazy backfill for rows
+    /// migrated from pre-§17 schemas). Returns the resolved short_id.
+    pub fn ensure_short_id(&self, session_id: Uuid) -> Result<String> {
+        self.with_conn(|conn| {
+            let row = get_session_inner(conn, session_id)?
+                .ok_or_else(|| anyhow::anyhow!("session {session_id} not found"))?;
+            if let Some(existing) = row.short_id {
+                return Ok(existing);
+            }
+            let short_id = generate_unique_short_id(conn, &row.project_id)
+                .context("generating backfill short_id")?;
+            conn.execute(
+                "UPDATE sessions SET short_id = ?1 WHERE session_id = ?2",
+                params![short_id, session_id.to_string()],
+            )
+            .context("backfilling short_id")?;
+            Ok(short_id)
+        })
+    }
+
+    /// Set or replace the session's title. `user_renamed` flips to true
+    /// to lock out the auto-titling pass (GOALS §17d).
+    pub fn rename_session(&self, session_id: Uuid, title: &str) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "UPDATE sessions SET title = ?1, user_renamed = 1 WHERE session_id = ?2",
+                params![title, session_id.to_string()],
+            )
+            .context("renaming session")?;
+            Ok(())
+        })
+    }
+
+    /// Set the title from the auto-titling pass. Refuses to overwrite a
+    /// user-set title — auto-titling never clobbers manual labels.
+    pub fn set_auto_title(&self, session_id: Uuid, title: &str) -> Result<bool> {
+        self.with_conn(|conn| {
+            let affected = conn.execute(
+                "UPDATE sessions SET title = ?1
+                 WHERE session_id = ?2 AND user_renamed = 0",
+                params![title, session_id.to_string()],
+            )
+            .context("setting auto title")?;
+            Ok(affected > 0)
+        })
+    }
+
+    /// Direct children of a session in the fork tree. Most-recent-first.
+    pub fn list_forks(&self, parent_session_id: Uuid) -> Result<Vec<SessionRow>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT * FROM sessions WHERE parent_session_id = ?1
+                 ORDER BY last_active_at DESC",
+            ).context("preparing list_forks")?;
+            let rows = stmt
+                .query_map([parent_session_id.to_string()], SessionRow::from_row)
+                .context("querying list_forks")?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.context("decoding fork row")?);
+            }
+            Ok(out)
+        })
+    }
+
+    /// Cheap fork count for the `[N forks]` chip in the `/sessions`
+    /// browser. Counts immediate children only (depth-1).
+    pub fn count_forks_for(&self, parent_session_id: Uuid) -> Result<u32> {
+        self.with_conn(|conn| {
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM sessions WHERE parent_session_id = ?1",
+                [parent_session_id.to_string()],
+                |row| row.get(0),
+            )
+            .context("counting forks")?;
+            Ok(count as u32)
+        })
+    }
+
+    /// Root sessions (no parent) for a project, most-recent-first.
+    /// This is what the top-level `/sessions` view shows; forks descend
+    /// via [`Self::list_forks`].
+    pub fn list_root_sessions(
+        &self,
+        project_id: &str,
+        limit: u32,
+    ) -> Result<Vec<SessionRow>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT * FROM sessions
+                 WHERE project_id = ?1 AND parent_session_id IS NULL
+                 ORDER BY last_active_at DESC LIMIT ?2",
+            ).context("preparing list_root_sessions")?;
+            let rows = stmt
+                .query_map(params![project_id, limit], SessionRow::from_row)
+                .context("querying list_root_sessions")?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.context("decoding root session row")?);
+            }
+            Ok(out)
+        })
+    }
+
+    /// Delete a session. With `cascade = true`, also deletes every
+    /// descendant fork (depth-unbounded). FK CASCADE on tool_call_events
+    /// / inference_calls / lock state takes care of dependent rows.
+    pub fn delete_session(&self, session_id: Uuid, cascade: bool) -> Result<()> {
+        self.with_conn(|conn| {
+            if cascade {
+                let mut to_delete = vec![session_id];
+                let mut frontier = vec![session_id];
+                while let Some(parent) = frontier.pop() {
+                    let mut stmt = conn
+                        .prepare("SELECT session_id FROM sessions WHERE parent_session_id = ?1")
+                        .context("preparing fork-walk")?;
+                    let children = stmt
+                        .query_map([parent.to_string()], |row| {
+                            let s: String = row.get(0)?;
+                            parse_uuid(&s)
+                        })
+                        .context("querying fork-walk")?;
+                    for child in children {
+                        let id = child.context("decoding fork child")?;
+                        to_delete.push(id);
+                        frontier.push(id);
+                    }
+                }
+                for id in to_delete {
+                    conn.execute(
+                        "DELETE FROM sessions WHERE session_id = ?1",
+                        [id.to_string()],
+                    )
+                    .context("deleting session in cascade")?;
+                }
+            } else {
+                conn.execute(
+                    "DELETE FROM sessions WHERE session_id = ?1",
+                    [session_id.to_string()],
+                )
+                .context("deleting session")?;
+            }
+            Ok(())
+        })
     }
 
     /// Move `last_active_at` to now. Called by the daemon on every
@@ -230,5 +530,138 @@ mod tests {
         db.end_session(s2.session_id).unwrap();
         let recent = db.most_recent_open_session_for("p").unwrap().unwrap();
         assert_ne!(recent.session_id, s2.session_id);
+    }
+
+    #[test]
+    fn create_session_populates_short_id() {
+        let db = Db::open_in_memory().unwrap();
+        let s = db.create_session("p", "/x", "a").unwrap();
+        let sid = s.short_id.expect("short_id missing");
+        assert_eq!(sid.len(), SHORT_ID_LEN);
+        assert!(sid.chars().all(|c| CROCKFORD_BASE32.contains(&(c as u8))));
+        let by_short = db.get_session_by_short_id("p", &sid).unwrap().unwrap();
+        assert_eq!(by_short.session_id, s.session_id);
+    }
+
+    #[test]
+    fn short_ids_unique_within_project() {
+        let db = Db::open_in_memory().unwrap();
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..50 {
+            let s = db.create_session("p", "/x", "a").unwrap();
+            assert!(seen.insert(s.short_id.unwrap()));
+        }
+    }
+
+    #[test]
+    fn create_fork_inherits_parent_metadata() {
+        let db = Db::open_in_memory().unwrap();
+        let parent = db.create_session("p", "/proj", "orchestrator-build").unwrap();
+        db.set_session_model(parent.session_id, "anthropic", "opus-4-7").unwrap();
+        let fork = db
+            .create_fork(parent.session_id, Some("turn-42".into()))
+            .unwrap();
+        assert_eq!(fork.project_id, "p");
+        assert_eq!(fork.project_root, "/proj");
+        assert_eq!(fork.active_agent, "orchestrator-build");
+        assert_eq!(fork.parent_session_id, Some(parent.session_id));
+        assert_eq!(fork.fork_point_turn_id.as_deref(), Some("turn-42"));
+        assert_eq!(fork.provider.as_deref(), Some("anthropic"));
+        assert_eq!(fork.model.as_deref(), Some("opus-4-7"));
+        assert_ne!(fork.session_id, parent.session_id);
+        assert_ne!(fork.short_id, parent.short_id);
+    }
+
+    #[test]
+    fn list_forks_returns_children_most_recent_first() {
+        let db = Db::open_in_memory().unwrap();
+        let parent = db.create_session("p", "/x", "a").unwrap();
+        let _f1 = db.create_fork(parent.session_id, None).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let f2 = db.create_fork(parent.session_id, None).unwrap();
+        let forks = db.list_forks(parent.session_id).unwrap();
+        assert_eq!(forks.len(), 2);
+        assert_eq!(forks[0].session_id, f2.session_id);
+        assert_eq!(db.count_forks_for(parent.session_id).unwrap(), 2);
+    }
+
+    #[test]
+    fn rename_sets_user_renamed_and_blocks_auto_title() {
+        let db = Db::open_in_memory().unwrap();
+        let s = db.create_session("p", "/x", "a").unwrap();
+        db.rename_session(s.session_id, "my-custom-title").unwrap();
+        let row = db.get_session(s.session_id).unwrap().unwrap();
+        assert!(row.user_renamed);
+        assert_eq!(row.title.as_deref(), Some("my-custom-title"));
+        let updated = db.set_auto_title(s.session_id, "robot-name").unwrap();
+        assert!(!updated, "auto-title should refuse a user-renamed row");
+        let row2 = db.get_session(s.session_id).unwrap().unwrap();
+        assert_eq!(row2.title.as_deref(), Some("my-custom-title"));
+    }
+
+    #[test]
+    fn set_auto_title_populates_unset_title() {
+        let db = Db::open_in_memory().unwrap();
+        let s = db.create_session("p", "/x", "a").unwrap();
+        let updated = db.set_auto_title(s.session_id, "auto-name").unwrap();
+        assert!(updated);
+        let row = db.get_session(s.session_id).unwrap().unwrap();
+        assert!(!row.user_renamed);
+        assert_eq!(row.title.as_deref(), Some("auto-name"));
+    }
+
+    #[test]
+    fn list_root_sessions_excludes_forks() {
+        let db = Db::open_in_memory().unwrap();
+        let root_a = db.create_session("p", "/x", "a").unwrap();
+        let _fork_a = db.create_fork(root_a.session_id, None).unwrap();
+        let _root_b = db.create_session("p", "/x", "a").unwrap();
+        let roots = db.list_root_sessions("p", 100).unwrap();
+        assert_eq!(roots.len(), 2);
+        assert!(roots.iter().all(|r| r.parent_session_id.is_none()));
+    }
+
+    #[test]
+    fn delete_session_cascade_drops_forks() {
+        let db = Db::open_in_memory().unwrap();
+        let parent = db.create_session("p", "/x", "a").unwrap();
+        let child = db.create_fork(parent.session_id, None).unwrap();
+        let grandchild = db.create_fork(child.session_id, None).unwrap();
+        db.delete_session(parent.session_id, true).unwrap();
+        assert!(db.get_session(parent.session_id).unwrap().is_none());
+        assert!(db.get_session(child.session_id).unwrap().is_none());
+        assert!(db.get_session(grandchild.session_id).unwrap().is_none());
+    }
+
+    #[test]
+    fn delete_session_no_cascade_leaves_forks() {
+        let db = Db::open_in_memory().unwrap();
+        let parent = db.create_session("p", "/x", "a").unwrap();
+        let child = db.create_fork(parent.session_id, None).unwrap();
+        db.delete_session(parent.session_id, false).unwrap();
+        assert!(db.get_session(parent.session_id).unwrap().is_none());
+        // The child is still there — its parent_session_id now points at a
+        // dangling id, which the application layer is expected to handle.
+        assert!(db.get_session(child.session_id).unwrap().is_some());
+    }
+
+    #[test]
+    fn ensure_short_id_backfills_null() {
+        let db = Db::open_in_memory().unwrap();
+        let s = db.create_session("p", "/x", "a").unwrap();
+        // Simulate a pre-0002 row by clearing the short_id.
+        db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE sessions SET short_id = NULL WHERE session_id = ?1",
+                [s.session_id.to_string()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let backfilled = db.ensure_short_id(s.session_id).unwrap();
+        assert_eq!(backfilled.len(), SHORT_ID_LEN);
+        // Idempotent: a second call returns the same id, doesn't churn.
+        let again = db.ensure_short_id(s.session_id).unwrap();
+        assert_eq!(again, backfilled);
     }
 }

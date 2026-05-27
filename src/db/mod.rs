@@ -165,7 +165,10 @@ fn apply_connection_pragmas(conn: &Connection, on_disk: bool) -> Result<()> {
 /// All schema migrations, in order. Adding one: append `include_str!`
 /// for the new file and bump nothing else — the index in this slice
 /// is the version number.
-const MIGRATIONS: &[&str] = &[include_str!("migrations/0001_initial.sql")];
+const MIGRATIONS: &[&str] = &[
+    include_str!("migrations/0001_initial.sql"),
+    include_str!("migrations/0002_sessions_fork.sql"),
+];
 
 fn migrate(conn: &Connection) -> Result<()> {
     conn.execute_batch(

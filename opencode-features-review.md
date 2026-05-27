@@ -227,6 +227,17 @@ Confirmed-or-likely set from opencode + codex influence:
 - `/pin` — **NEW (cockpit)** — pin a message so it survives `/compact`
   verbatim (inlined into the handoff appendix, not summarized).
   Pin-on-hover in the TUI transcript or `/pin <id>` headless.
+- `/sessions` — **NEW (cockpit)** — interactive session-tree browser
+  for the current project: recency-sorted, fork navigation via
+  right-arrow, arbitrary fork depth. Resumes a selected session at
+  its tail on Enter. See `GOALS.md` §17f.
+- `/resume` — **NEW (cockpit)** — alias for `/sessions`.
+- `/fork` — **NEW (cockpit)** — tail-fork the current session (no
+  arg), or mid-history-fork at the cursor's selected message from
+  inside a resumed session. See `GOALS.md` §17e.
+- `/session rename <new-title>` — **NEW (cockpit)** — manually
+  override a session's auto-generated title (§17d). Sets
+  `user_renamed = 1` so the utility model does not overwrite.
 
 ---
 
@@ -376,7 +387,7 @@ Compat-dropped: we do not share opencode's snapshot directory.
 | Mouse support | **COPY** |
 | Vim composer | **COPY**, but **default ON** (deviation from opencode/codex). See `GOALS.md` §1b. |
 | External editor for long prompts (Ctrl+G with live hint "press ctrl+g to edit in <editor>", `$VISUAL`/`$EDITOR` handoff) | **COPY from Claude Code**. See `GOALS.md` §1f. Realizes the composer-overflow `$EDITOR` case in `TUI-design-philosophy.md` §8. |
-| Diff style (`unified` / `split`) | **COPY** |
+| Diff style (`unified` / `split`) | **COPY + EXTEND** — cockpit ships three modes (`side-by-side`/`inline`/`hidden`) and degrades side-by-side → inline dynamically at terminal widths below 80 cells. The third "hidden" mode is cockpit-original: a one-line summary with churn counts, for users who want to see edits happened without the noise. See `GOALS.md` §1h. |
 | `/statusline` & `/terminaltitle` (codex-isms) | **OMIT** — cockpit always shows cwd + branch (`GOALS.md` §1a). |
 | Image attachment in composer | **COPY** if the chosen provider supports it; otherwise gracefully degrade. |
 | Bracketed paste / large-paste placeholder | **COPY** (good UX from codex). |

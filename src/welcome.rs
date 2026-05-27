@@ -56,6 +56,11 @@ pub struct LaunchInfo {
     /// When `Some`, the splash renders `Welcome, {name}` between the
     /// title and provider lines.
     pub user_name: Option<String>,
+    /// Whether the pixel-banner splash (GOALS §1g) is enabled. Read
+    /// from `tui.banner.enabled` in `extended-config.json`. Even when
+    /// `true`, the banner suppresses itself on `NO_COLOR`, non-TTY
+    /// stdout, narrow terminals, or `COCKPIT_ROOSTER=1`.
+    pub banner_enabled: bool,
 }
 
 pub fn load(project: Option<&Path>) -> LaunchInfo {
@@ -74,6 +79,7 @@ pub fn load(project: Option<&Path>) -> LaunchInfo {
         .and_then(|(p, m)| lookup_model_context(&cwd, p, m));
     let repo_status = git::repo_status(&cwd).ok().flatten();
     let user_name = load_user_name(&cwd);
+    let banner_enabled = load_banner_enabled(&cwd);
 
     LaunchInfo {
         version: env!("CARGO_PKG_VERSION"),
@@ -86,7 +92,24 @@ pub fn load(project: Option<&Path>) -> LaunchInfo {
         repo_status,
         agent_name: DEFAULT_AGENT.to_string(),
         user_name,
+        banner_enabled,
     }
+}
+
+/// Resolve the effective `tui.banner.enabled` from layered config.
+/// Defaults to `true` when no layer specifies it.
+fn load_banner_enabled(cwd: &Path) -> bool {
+    use crate::config::dirs::discover_config_dirs;
+    use crate::config::extended::ExtendedConfigDoc;
+    for dir in discover_config_dirs(cwd) {
+        let path = dir.path.join("extended-config.json");
+        if path.exists()
+            && let Ok(doc) = ExtendedConfigDoc::load(&path)
+        {
+            return doc.config().tui.banner.enabled;
+        }
+    }
+    true
 }
 
 /// Walk the layered-config discovery and return the `name` field from
@@ -199,10 +222,19 @@ pub fn header_lines(info: &LaunchInfo) -> Vec<String> {
     }
 }
 
-/// Print just the launch header (4 lines). Used by the TUI at startup
-/// so the header lands in normal terminal output — it scrolls naturally
-/// with the chat and ends up in scrollback once enough messages arrive.
+/// Print just the launch header. Used by the TUI at startup so the
+/// header lands in normal terminal output — it scrolls naturally with
+/// the chat and ends up in scrollback once enough messages arrive.
+///
+/// When the §1g banner is enabled and the terminal supports it, the
+/// banner renders above the standard header block.
 pub fn print_header(info: &LaunchInfo) {
+    if let Some(lines) = crate::banner::render_lines(info.banner_enabled) {
+        for line in lines {
+            println!("{line}");
+        }
+        println!();
+    }
     for line in header_lines(info) {
         println!("{line}");
     }

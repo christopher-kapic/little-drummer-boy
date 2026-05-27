@@ -325,6 +325,60 @@ handoff in the design philosophy. The same mechanism is reused for
 in-TUI editing of agent files, custom slash commands, and other
 multi-line text the user owns.
 
+### 1h. Diff rendering for edit/write tool calls
+
+`edit` / `editunlock` tool calls render as a styled diff in the
+history pane rather than the raw "edited file X" line every other
+harness uses. Three modes, configured via `tui.diff_style`:
+
+- **`side-by-side`** (default) — two columns, old on the left, new
+  on the right, separated by a vertical rule. Degrades to `inline`
+  dynamically when the terminal is narrower than 80 columns.
+- **`inline`** — unified diff. Removed lines prefixed `-` in red;
+  added lines prefixed `+` in green; ±3 context lines around hunks,
+  with `…` separators between collapsed regions.
+- **`hidden`** — one-line summary (`✓ edit: path/to/file.rs
+  (+N −M)`). Useful when the user wants to see *that* edits
+  happened but doesn't want the diff churn in the transcript.
+
+Diffing uses the [`similar`](https://docs.rs/similar) crate (line-
+granular `TextDiff`, ±3 context). Tool-call args (`old_string`,
+`new_string`) are captured at `ToolStart` and consumed at
+`ToolEnd` to assemble the `HistoryEntry::Diff` row.
+
+`write` / `writeunlock` are **not yet** diff-rendered — the engine
+doesn't currently surface the pre-write file content to the TUI,
+so we have no `old` to diff against. Follow-up tracked in
+`flagged-for-christopher.md`.
+
+### 1g. Startup banner
+
+cockpit renders a small pixel banner on TUI startup, after raw mode
+is enabled and before the first frame. The default art is a P-51
+Mustang in 256-color ANSI half-blocks; the reference rendering
+lives in `p51-6.sh` in the repo root (color palette + character
+grid). The banner is **on by default**.
+
+Suppression — any of:
+
+- `NO_COLOR=1` in the environment.
+- stdout is not a TTY (piped, non-interactive).
+- Terminal narrower than the art (~36 columns).
+- `tui.banner.enabled = false` in `config.json` (§4j).
+- `--no-banner` CLI flag on the launching command.
+- Terminal does not advertise 256-color support (degrade-to-nothing
+  rather than degrade-to-monochrome — a four-color plane isn't
+  worth the special case).
+
+Interaction with the `cock` shortcut (`miscellaneous.md` §3a): when
+`COCKPIT_ROOSTER=1` is set — which the `cock` shim does — the
+rooster splash **preempts** this banner. Only one banner ever
+renders.
+
+Implementation: port the data structure in `p51-6.sh` (palette +
+cell grid) into Rust. Rendering uses crossterm's 256-color ANSI
+sequences. The banner is one-shot; no animation.
+
 ---
 
 ## 2. cockpit-native config
@@ -775,6 +829,9 @@ merge mode the resolver uses when combining layers:
 | `redact.denylist`                                     | `concat`; subtracts from `redact.allowlist` |
 | `tui.*`                                               | `replace` per scalar |
 | `composer.tagging.*`                                  | `replace` per scalar |
+| `utility_model`                                       | `replace` |
+| `prompt_injection_guard.*`                            | `replace` per scalar |
+| `system_prompt.*`                                     | `replace` per scalar |
 | `permission` (added per §6a)                          | `key-merge` by `tool` pattern, smaller-scope ordered first — *pending confirmation* |
 | Discovered agent set (`.cockpit/agents/` per §3)  | `key-merge` by agent name |
 
@@ -881,7 +938,14 @@ Initial schema:
   "tui": {
     "vim_mode": true,
     "show_cwd": true,
-    "show_branch": true
+    "show_branch": true,
+    "banner": { "enabled": true },   // §1g — pixel banner on TUI startup
+    // §1h — diff rendering for edit/write tool calls. Three modes:
+    //   side-by-side (default) — two columns; degrades to inline at
+    //     terminal widths below 80 cells.
+    //   inline                  — unified diff with -/+ prefixes.
+    //   hidden                  — one-line summary (path + churn).
+    "diff_style": "side-by-side"
   },
 
   // 4g. Composer @-tagging (see §1e).
@@ -904,6 +968,45 @@ Initial schema:
       // them at the source).
       "list_hidden_in_directories": true
     }
+  },
+
+  // 4h. Utility model.
+  // A small/cheap model used for background work that doesn't need
+  // the user's primary model: session auto-titling (§17d), the
+  // prompt-injection guard when enabled (§4i), and future similar
+  // background tasks. Identifier format mirrors the primary model
+  // selector (e.g. "anthropic:claude-haiku-4-5-20251001"). Unset
+  // disables every utility-model-dependent feature — auto-titling
+  // is skipped and sessions display their session-ID as the label.
+  "utility_model": null,
+
+  // 4i. Prompt-injection guard.
+  // Scans user-authored input (composer prose + `@`-tagged inlined
+  // content per §1e) for prompt-injection patterns before the
+  // request reaches the model. Off by default. v1 scope is
+  // user input only; scanning incoming tool results is out of
+  // scope and tracked in flagged-for-christopher.md. On detection,
+  // the daemon warns the user and pauses the send for explicit
+  // confirmation — it does not strip, block, or silently rewrite.
+  // `model` falls back to `utility_model` (§4h) when null; if both
+  // are unset and `enabled = true`, the guard logs a one-time
+  // warning and behaves as disabled.
+  "prompt_injection_guard": {
+    "enabled": false,
+    "model": null
+  },
+
+  // 4j. (banner) — see §4f "tui.banner" above.
+
+  // 4k. System-prompt injection (§17g).
+  // Volatile context (current time) is appended to user messages
+  // rather than baked into the cached system prompt, to avoid
+  // invalidating the provider's prompt cache on every send. The
+  // first user message of a session always carries a timestamp
+  // prelude; subsequent messages carry one only when the gap since
+  // the last prelude exceeds this many minutes.
+  "system_prompt": {
+    "time_injection_interval_minutes": 5
   }
 }
 ```
@@ -1156,6 +1259,13 @@ that touches every subsystem.
   ~400 tokens. AGENTS.md and skills are layered on top *only when
   applicable* (skills lazy-load, AGENTS.md only loads if the file
   resolves).
+- **Cached system block stays cache-stable across sends.** Stable
+  per-session metadata (OS + version, session ID, per §17g) goes
+  inside the cached system prompt and counts against the
+  ~400-token budget above. Volatile per-message context (current
+  time) rides on user messages with an interval-based suppression
+  (default 5 min), so the provider's prompt cache is not
+  invalidated every turn. Full rule in §17g.
 - **Skills are lazy.** Discovery returns `(name, one-line description)`
   pairs only — never the full skill body. The model invokes
   `skill <name>` to load the body on demand. This is opencode's design
@@ -2292,6 +2402,275 @@ They differ in the load-bearing direction of consent:
 The 16e public benchmark is the *reason* an opted-in user opted
 in — they're contributing to a public good, not buying their way
 out of a tax.
+
+---
+
+## 17. Sessions, forks, and resumption
+
+cockpit's session model is a tree. Every interactive conversation is
+a session; every session belongs to exactly one project; sessions can
+be **forked** at any turn boundary, and the resulting forest is what
+the user navigates from a single TUI surface. Resumption — picking
+up a paused session, hours or days later — is the default mode of
+operation, not a special command.
+
+This section captures the session-shaped pieces (storage, IDs,
+auto-titling, fork semantics, the `/sessions` browser, per-session
+system-prompt injections) in one place. Related primitives live in
+§4c (the model-facing `task` mode that exposes fork to the agent)
+and `miscellaneous.md` §7 (the fork vs. subagent trade-off
+rationale).
+
+### 17a. Project scope
+
+A "project" is the unit by which sessions are bucketed. Resolution
+at session-creation time matches the rule §15b already specifies
+for `project_id`:
+
+- If cwd is inside a git repo (`git rev-parse --show-toplevel`
+  succeeds), the project root is the repo top-level path.
+- Otherwise, the project root is `realpath(cwd)` — symlinks
+  collapsed.
+
+`project_id` is a short hash of the project root, the same id
+that drives `/stats` filtering (§15b). One project identity
+across sessions, stats, and the future remote dashboard.
+
+Consequences worth knowing:
+
+- Sessions opened in `~/proj/frontend` and `~/proj/backend`
+  (subdirs of one git repo) **share** a session list — they're
+  both "this repo." Monorepo users who want subprojects separated
+  must work in different repos or accept the unified list.
+- Two `git worktree` working trees of the same repo have
+  **different** project_ids, because `--show-toplevel` returns
+  each worktree's own root.
+- Symlinks pointing at the same canonical directory share a
+  project_id (realpath resolves to the same target).
+- A cwd not under git (e.g. `/tmp/scratch`) gets its own
+  project_id keyed to the realpath. Renaming the directory
+  fragments history.
+
+The rule is intentional but not flag-controlled in v1. If a real
+workflow makes the worktree-split or monorepo-merge behavior
+wrong, we add a per-project override later — not a global config
+knob.
+
+### 17b. Session IDs
+
+Six base-32 characters (Crockford alphabet — no `I`/`L`/`O`/`U`),
+unique within a `project_id`. Generated at session creation,
+collision-checked against active sessions in the same project,
+regenerated on conflict. ~10⁹ namespace per project — orders of
+magnitude beyond any single user's session count.
+
+Display: 6-char id in `/sessions` chrome, in the system-prompt
+injection (§17g), and in CLI URLs. The full `(project_id,
+session_id)` pair is the DB key.
+
+### 17c. Storage
+
+The daemon owns `~/.local/share/cockpit/cockpit.db` (per §8,
+§15b). A new `sessions` table:
+
+```sql
+CREATE TABLE sessions (
+  session_id          TEXT PRIMARY KEY,
+  project_id          TEXT NOT NULL,
+  project_root        TEXT NOT NULL,           -- displayed path
+  parent_session_id   TEXT,                    -- NULL for root sessions
+  fork_point_turn_id  TEXT,                    -- NULL for root; turn id in parent where this fork branched
+  title               TEXT,                    -- NULL until utility model auto-titles (§17d)
+  user_renamed        INTEGER NOT NULL DEFAULT 0,  -- 1 = manual title; do not auto-overwrite
+  created_at          INTEGER NOT NULL,        -- epoch seconds
+  updated_at          INTEGER NOT NULL         -- last user interaction
+);
+
+CREATE INDEX idx_sessions_project_updated ON sessions (project_id, updated_at DESC);
+CREATE INDEX idx_sessions_parent          ON sessions (parent_session_id);
+```
+
+The daemon is authoritative. The TUI fetches the list over the
+wire schema (§8c); it never walks SQLite directly. This is what
+makes the v2 remote dashboard (§8d) free — `/sessions` is one RPC
+available to any client speaking the wire schema.
+
+Crash recovery: sessions survive daemon restarts because they're
+written through to SQLite at every interaction boundary. The
+in-flight model call dies if the daemon crashes mid-stream
+(§8b); the session itself does not.
+
+### 17d. Auto-titling via the utility model
+
+When a session's cumulative user-authored content (composer prose
++ `@`-tagged inlined file content, **excluding** the base system
+prompt and the resolved `agent_guidance_files` per §4b) crosses
+**500 tokens** (cl100k_base; same tokenizer §10 uses for
+subagent caps), the daemon issues one inference call to
+`utility_model` (§4h) to produce a title.
+
+Title format:
+
+- Slugified: `[a-z0-9-]` only; runs of non-allowed characters
+  collapse to single hyphens; leading/trailing hyphens trimmed.
+- ≤ 60 characters.
+- One title per session. No auto-generated description in v1 —
+  the second inference call costs token spend for a field with
+  no consumer yet. `/sessions` shows the title; that's enough.
+
+Behaviors:
+
+- The 500-token threshold counts only fresh user-authored
+  content. A short "hi" first message doesn't trigger titling; a
+  substantive first message with several turns or a meaningful
+  `@`-tag does.
+- If `utility_model` is unset, no auto-titling occurs. The
+  session's row keeps `title = NULL` and `/sessions` displays the
+  session-ID as the label.
+- Manual override is available: `/session rename <new-title>`
+  from inside a session, or in-place from `/sessions`. Manual
+  rename sets `user_renamed = 1` and the utility-model pass
+  thereafter does not overwrite the title — even if the user
+  clears it back to NULL, the row stays user-owned.
+- **Forks get their own auto-titling pass keyed to the first
+  user message *after* the fork**, not the parent's title.
+  Triggered by the same 500-token rule applied to the fork's
+  post-divergence content only.
+
+The utility-model call is one-shot and non-interactive: it's a
+small prompt (the user-authored content prefix + a "produce a
+title" instruction) and the response is parsed strictly. If
+parsing fails or the model returns garbage, the title stays NULL
+and the daemon retries on the next interaction boundary.
+
+### 17e. Fork semantics
+
+`/fork` creates a new session that branches from a parent at a
+turn boundary. The fork inherits the parent's full conversation
+up to the fork point and diverges from there. This is the
+user-facing slash command on top of the §4c primitive — the
+model can fork (`task({mode: "fork"})`) and the user can fork
+(`/fork`); both write the same `sessions` row shape.
+
+Two ways to invoke from the TUI:
+
+- **Tail fork.** `/fork` with no argument while inside a session.
+  Forks at the last assistant turn. The common case: "save this
+  state and try something different from here."
+- **Mid-history fork.** Scroll the resumed session's transcript
+  to a prior message, press the fork keybinding. Forks at that
+  turn. Use case: "rewind, branch, retry" — escape a derailed
+  path without losing it.
+
+Both write `(parent_session_id, fork_point_turn_id)` on the new
+row. The fork's wire transcript starts as a deep copy of the
+parent's wire transcript up to the fork point; the §14 wire/user
+split is preserved (both projections of the parent are reachable
+in the fork).
+
+Forks can be forked. There is no depth limit. The session tree
+is `parent_session_id`-linked all the way down; `/sessions`
+(§17f) renders it.
+
+Forks do **not** share live state with their parent after
+divergence. A `coder` file lock acquired in the parent session is
+not held in the fork; the fork acquires its own locks against
+the file system. This keeps "explore an alternative direction"
+safe — a fork can edit files the parent was about to edit
+without stepping on the parent's in-flight work.
+
+### 17f. `/sessions` and `/resume`
+
+`/sessions` opens a TUI browser of the active project's session
+tree. `/resume` is an alias.
+
+Layout:
+
+```
+┌─ /sessions ─ project: cockpit-cli ──────────────────────────────────┐
+│                                                                     │
+│  fix-redact-allowlist-regression                  2m ago            │
+│ ▌add-pixel-banner                                45m ago [3 forks] │
+│  refactor-config-loader                           3h ago            │
+│  …                                                                  │
+│                                                                     │
+└─ ↑↓ jk select  → l forks  ↵ resume  f fork  r rename  q quit ──────┘
+```
+
+- **Recency.** Sorted by `updated_at` descending — most recent
+  session first.
+- **Navigation.** `↑`/`↓`/`j`/`k` cursor between sessions.
+  `→`/`l` descends into the selected session's forks (when
+  `[N forks]` is shown). `←`/`h` returns to the parent level.
+  Arbitrary depth — fork-of-fork-of-fork composes the same way.
+- **Resumption.** `Enter` on a cursor-selected session resumes
+  it at its tail. The next message goes to whichever agent was
+  driving when the conversation paused (§1a's active-agent
+  chip identifies it).
+- **Forking.** `f` (default; rebindable) tail-forks the
+  cursor-selected session without entering it. To mid-history
+  fork, press Enter to enter the session, scroll the transcript
+  to the target message, press the fork keybinding there.
+- **Rename.** `r` opens an inline rename for the cursor-selected
+  session and sets `user_renamed = 1` (§17d).
+- **Cross-project visibility.** None in v1. The browser shows
+  only sessions in the current project. A cross-project surface
+  is a different problem and is out of scope until someone asks.
+
+### 17g. System-prompt injections
+
+Three pieces of context attach to every session. Two are stable
+(go in the cached system block); one is volatile (must not
+invalidate the cache on every send).
+
+**Stable — cached system prompt:**
+
+1. **Operating system + version.** One line, e.g.
+   `Operating system: Linux 6.8.0-111-generic` (or the
+   macOS/Windows equivalent). Doesn't change for the session's
+   lifetime; counts against the §10 ~400-token budget.
+2. **Session ID.** One line: `Session: <6-char id>`. Counts
+   against the same budget. The model can echo it back to the
+   user when needed (e.g. surfacing the id in a status report).
+
+**Volatile — message-level prelude:**
+
+3. **Current time.** A one-line prelude prepended to user
+   messages, of the form `[time: 2026-05-26T14:32:11Z]` (ISO
+   8601, UTC). Rules:
+   - The **first** user message of the session always carries a
+     time prelude.
+   - **Subsequent** messages carry a prelude only when ≥ N
+     minutes have elapsed since the last prelude (default
+     `N = 5`, configured as
+     `system_prompt.time_injection_interval_minutes`, §4k).
+   - The system prompt itself **never** carries the time.
+
+This split is non-negotiable per §10's token-economy commitments:
+putting the time in the cached system block would invalidate the
+provider's prompt cache on every request. The prelude approach
+gives the model a rolling sense of time without paying the cache
+cost; in a continuous conversation the model sees a fresh
+timestamp ~once per interval, not once per turn.
+
+### 17h. Wire-protocol surfaces
+
+Per §8c, sessions live in the daemon and clients (TUI today,
+remote dashboard later) reach them via the wire schema. The RPCs
+needed for §17:
+
+| RPC                                                                 | Used by |
+|---------------------------------------------------------------------|---------|
+| `sessions.list(project_id, parent_session_id?)`                     | `/sessions` browser, recency-sorted |
+| `sessions.get(session_id)`                                          | Loading metadata for resume |
+| `sessions.resume(session_id)`                                       | Attaching the client to a session |
+| `sessions.fork(parent_session_id, fork_point_turn_id?)`             | `/fork`, model `task({mode: "fork"})` |
+| `sessions.rename(session_id, title)`                                | Manual title override (`r` in browser) |
+| `sessions.delete(session_id, cascade?: bool)`                       | Cleanup — `cascade` controls whether forks are also deleted |
+
+One schema, two transports (Unix socket today; outbound WebSocket
+to relay later, per §8d). The remote-dashboard endgame falls out
+of the v1 architecture without protocol churn.
 
 ---
 

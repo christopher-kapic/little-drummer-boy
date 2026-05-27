@@ -152,8 +152,45 @@ pub enum Request {
         response: ResolveResponse,
     },
 
-    /// List every session the daemon currently holds, newest first.
-    ListSessions,
+    /// List sessions, newest first. Both filters default to None:
+    ///
+    /// - `project_id = None, parent_session_id = None` — every session
+    ///   (legacy behavior, used by `cockpit session list`).
+    /// - `project_id = Some(p), parent_session_id = None` — root
+    ///   sessions in project `p` (the top level of the `/sessions`
+    ///   browser, GOALS §17f).
+    /// - `project_id = _, parent_session_id = Some(s)` — direct forks
+    ///   of session `s` (the right-arrow descent in `/sessions`).
+    ListSessions {
+        #[serde(default)]
+        project_id: Option<String>,
+        #[serde(default)]
+        parent_session_id: Option<Uuid>,
+    },
+
+    /// Branch a fork off `parent_session_id` at `fork_point_turn_id`
+    /// (None = tail). GOALS §17e.
+    ForkSession {
+        parent_session_id: Uuid,
+        #[serde(default)]
+        fork_point_turn_id: Option<String>,
+    },
+
+    /// Manually set a session's title; locks out auto-titling.
+    /// GOALS §17d.
+    RenameSession {
+        session_id: Uuid,
+        title: String,
+    },
+
+    /// Drop a session and (optionally) its descendant forks.
+    /// FK cascades take care of tool_call_events / inference_calls /
+    /// lock state. GOALS §17h.
+    DeleteSession {
+        session_id: Uuid,
+        #[serde(default)]
+        cascade: bool,
+    },
 
     /// Return the resolved config plus the per-layer view, for the
     /// `/config` tabbed editor (GOALS §2c).
@@ -208,6 +245,15 @@ pub enum Response {
 
     Sessions {
         sessions: Vec<SessionSummary>,
+    },
+
+    /// New session created by `ForkSession`.
+    Forked {
+        session_id: Uuid,
+        short_id: String,
+        parent_session_id: Uuid,
+        #[serde(default)]
+        fork_point_turn_id: Option<String>,
     },
 
     Config {
@@ -422,12 +468,26 @@ pub enum HistoryEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionSummary {
     pub session_id: Uuid,
+    /// 6-char display id (GOALS §17b). Optional for backwards-compat
+    /// with pre-§17 rows that haven't been backfilled yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub short_id: Option<String>,
     pub project_root: String,
     pub project_id: String,
     pub started_at: i64,
     pub last_active_at: i64,
     pub turns: u32,
     pub active_agent: String,
+    /// Auto- or user-set title (GOALS §17d). `None` until generated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Parent session in the fork tree (§17e). `None` = root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<Uuid>,
+    /// Number of direct forks. The `/sessions` browser renders
+    /// `[N forks]` from this.
+    #[serde(default)]
+    pub fork_count: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

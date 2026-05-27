@@ -35,6 +35,34 @@ pub struct SpawnArgs {
     /// so user-defined custom-bash tools (`webfetch`, `websearch`, …)
     /// land on the toolbox for agents that should see them.
     pub cwd: std::path::PathBuf,
+    /// 6-char session display id (GOALS §17b). Appended to the cached
+    /// system prompt (§17g) so the model knows which conversation it
+    /// is participating in. Empty string is acceptable for legacy /
+    /// test paths where a session id isn't yet resolved.
+    pub session_short_id: String,
+}
+
+/// Append the per-session lines (OS + session id) to the role-specific
+/// prompt before handing it to [`Agent::system`]. Per GOALS §17g these
+/// stay inside the cached system block — both fields are stable for
+/// the session's lifetime so prompt-cache hits aren't disturbed.
+fn compose_system_prompt(role_prompt: &str, session_short_id: &str) -> String {
+    let os = crate::sysinfo::os_string();
+    let mut out = String::with_capacity(role_prompt.len() + 96);
+    out.push_str(role_prompt);
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push('\n');
+    out.push_str("Operating system: ");
+    out.push_str(&os);
+    out.push('\n');
+    if !session_short_id.is_empty() {
+        out.push_str("Session: ");
+        out.push_str(session_short_id);
+        out.push('\n');
+    }
+    out
 }
 
 /// Load user-defined custom-bash tools from the first `extended-config.json`
@@ -86,6 +114,36 @@ pub fn is_noninteractive(name: &str) -> bool {
     matches!(name, "explore")
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compose_system_prompt_appends_os_and_session() {
+        let out = compose_system_prompt("ROLE PROMPT", "abc123");
+        assert!(out.starts_with("ROLE PROMPT"));
+        assert!(out.contains("Operating system:"));
+        assert!(out.contains("Session: abc123"));
+    }
+
+    #[test]
+    fn compose_system_prompt_omits_session_when_empty() {
+        let out = compose_system_prompt("ROLE PROMPT", "");
+        assert!(out.contains("Operating system:"));
+        assert!(!out.contains("Session:"));
+    }
+
+    #[test]
+    fn compose_system_prompt_normalizes_trailing_newline() {
+        let with_nl = compose_system_prompt("ROLE\n", "abc123");
+        let without_nl = compose_system_prompt("ROLE", "abc123");
+        // The role-prompt's own newline is preserved either way; the
+        // appended lines are identical in both cases.
+        assert!(with_nl.contains("\nOperating system:"));
+        assert!(without_nl.contains("\nOperating system:"));
+    }
+}
+
 /// `orchestrator-build` — the user-facing primary agent. Owns the chat
 /// when the focus is *making the change* (GOALS §3a). Delegates writes
 /// to `coder` via `task`.
@@ -102,7 +160,7 @@ pub fn orchestrator_build(args: &SpawnArgs) -> Agent {
 
     Agent {
         name: "orchestrator-build".to_string(),
-        system: ORCHESTRATOR_BUILD_PROMPT.to_string(),
+        system: compose_system_prompt(ORCHESTRATOR_BUILD_PROMPT, &args.session_short_id),
         tools,
         model: args.model.clone(),
         params: args.params.clone(),
@@ -124,7 +182,7 @@ pub fn coder(args: &SpawnArgs) -> Agent {
 
     Agent {
         name: "coder".to_string(),
-        system: CODER_PROMPT.to_string(),
+        system: compose_system_prompt(CODER_PROMPT, &args.session_short_id),
         tools,
         model: args.model.clone(),
         params: args.params.clone(),
@@ -148,7 +206,7 @@ pub fn explore(args: &SpawnArgs) -> Agent {
 
     Agent {
         name: "explore".to_string(),
-        system: EXPLORE_PROMPT.to_string(),
+        system: compose_system_prompt(EXPLORE_PROMPT, &args.session_short_id),
         tools,
         model: args.model.clone(),
         params: args.params.clone(),

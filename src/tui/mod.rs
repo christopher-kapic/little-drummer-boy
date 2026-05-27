@@ -18,6 +18,7 @@ pub mod chat;
 pub mod chrome;
 pub mod composer;
 pub mod daemon_prompt;
+pub mod diff;
 pub mod file_tag;
 pub mod geometry;
 pub mod history;

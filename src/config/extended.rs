@@ -56,6 +56,65 @@ pub struct ExtendedConfig {
     /// Opt-in to fetching remote `.well-known/cockpit` configs.
     #[serde(default)]
     pub allow_remote_config: bool,
+
+    /// Utility model used for background work that doesn't need the
+    /// primary model: session auto-titling (GOALS §17d), the
+    /// prompt-injection guard when enabled, and similar small tasks.
+    /// Identifier format mirrors the primary model selector
+    /// (`"<provider>:<model-id>"`). Unset disables every
+    /// utility-model-dependent feature — auto-titling is skipped and
+    /// sessions display their short id as the label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub utility_model: Option<String>,
+
+    /// Prompt-injection guard config (GOALS §4i). Off by default; v1
+    /// scope is user-authored input only.
+    #[serde(default)]
+    pub prompt_injection_guard: PromptInjectionGuardConfig,
+
+    /// System-prompt injection knobs (GOALS §17g, §4k).
+    #[serde(default)]
+    pub system_prompt: SystemPromptConfig,
+}
+
+/// Prompt-injection guard config. The substance is deferred (see
+/// `flagged-for-christopher.md`); this struct exists so the config
+/// schema is forward-compatible with v1.5.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PromptInjectionGuardConfig {
+    /// Master enable. Defaults false.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Model used for the classification call. When None, falls back
+    /// to [`ExtendedConfig::utility_model`]; if both are unset and
+    /// `enabled = true`, the guard logs a one-time warning and
+    /// behaves as disabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
+/// System-prompt assembly knobs (GOALS §17g).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SystemPromptConfig {
+    /// Minimum gap (in minutes) between `[time: ...]` preludes on
+    /// user messages. The first user message always carries a
+    /// prelude; subsequent messages get one only when this many
+    /// minutes have elapsed since the last. The system prompt
+    /// itself never carries the time.
+    #[serde(default = "default_time_injection_interval")]
+    pub time_injection_interval_minutes: u32,
+}
+
+impl Default for SystemPromptConfig {
+    fn default() -> Self {
+        Self {
+            time_injection_interval_minutes: default_time_injection_interval(),
+        }
+    }
+}
+
+fn default_time_injection_interval() -> u32 {
+    5
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -145,6 +204,45 @@ pub struct TuiConfig {
     pub render_user_markdown: bool,
     pub show_cwd: bool,
     pub show_branch: bool,
+    /// Pixel banner on TUI startup (GOALS §1g). Default on; suppressed
+    /// when stdout is not a TTY, `NO_COLOR` is set, the window is
+    /// narrower than the art, or `COCKPIT_ROOSTER=1` preempts it.
+    #[serde(default)]
+    pub banner: BannerConfig,
+    /// How `edit` / `editunlock` (and, later, `write` /
+    /// `writeunlock`) tool calls render their changes in the history
+    /// pane. SideBySide degrades to Inline when the terminal is
+    /// narrower than 80 columns.
+    #[serde(default)]
+    pub diff_style: DiffStyle,
+}
+
+/// Diff rendering mode for edit/write tool calls.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum DiffStyle {
+    /// Two columns: old text on the left, new on the right, separated
+    /// by a vertical rule. Falls back to [`Self::Inline`] dynamically
+    /// when the terminal is narrower than 80 columns.
+    #[default]
+    SideBySide,
+    /// Unified diff: `-` red for removed lines, `+` green for added,
+    /// ` ` for context.
+    Inline,
+    /// Show only a one-line summary (`edited {path} (+N -M)`).
+    Hidden,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BannerConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+impl Default for BannerConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
 }
 
 /// How reasoning/thinking is surfaced in the chat pane.
@@ -241,6 +339,8 @@ impl Default for TuiConfig {
             render_user_markdown: false,
             show_cwd: true,
             show_branch: true,
+            banner: BannerConfig::default(),
+            diff_style: DiffStyle::default(),
         }
     }
 }
@@ -359,5 +459,41 @@ mod tests {
     #[test]
     fn thinking_default_is_condensed() {
         assert_eq!(ThinkingDisplay::default(), ThinkingDisplay::Condensed);
+    }
+
+    #[test]
+    fn new_top_level_keys_have_expected_defaults() {
+        let cfg = ExtendedConfig::default();
+        assert!(cfg.utility_model.is_none());
+        assert!(!cfg.prompt_injection_guard.enabled);
+        assert!(cfg.prompt_injection_guard.model.is_none());
+        assert_eq!(cfg.system_prompt.time_injection_interval_minutes, 5);
+        assert!(cfg.tui.banner.enabled);
+    }
+
+    #[test]
+    fn new_keys_round_trip_through_extended_doc() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("extended-config.json");
+        std::fs::write(&path, "{}").unwrap();
+        let mut doc = ExtendedConfigDoc::load(&path).unwrap();
+        let mut cfg = doc.config();
+        cfg.utility_model = Some("anthropic:claude-haiku-4-5".into());
+        cfg.prompt_injection_guard.enabled = true;
+        cfg.prompt_injection_guard.model = Some("openai:gpt-4o-mini".into());
+        cfg.system_prompt.time_injection_interval_minutes = 10;
+        cfg.tui.banner.enabled = false;
+        doc.write(&cfg).unwrap();
+
+        let doc2 = ExtendedConfigDoc::load(&path).unwrap();
+        let cfg2 = doc2.config();
+        assert_eq!(cfg2.utility_model.as_deref(), Some("anthropic:claude-haiku-4-5"));
+        assert!(cfg2.prompt_injection_guard.enabled);
+        assert_eq!(
+            cfg2.prompt_injection_guard.model.as_deref(),
+            Some("openai:gpt-4o-mini")
+        );
+        assert_eq!(cfg2.system_prompt.time_injection_interval_minutes, 10);
+        assert!(!cfg2.tui.banner.enabled);
     }
 }

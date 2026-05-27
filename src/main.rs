@@ -10,6 +10,7 @@
 
 mod agents;
 mod auth;
+mod banner;
 mod cli;
 mod commands;
 mod config;
@@ -25,6 +26,7 @@ mod providers;
 mod redact;
 mod session;
 mod skills;
+mod sysinfo;
 mod tools;
 mod tui;
 mod welcome;

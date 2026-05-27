@@ -289,7 +289,24 @@ async fn handle_request(
             Ok(Response::Ack)
         }
 
-        Request::ListSessions => list_sessions(ctx),
+        Request::ListSessions {
+            project_id,
+            parent_session_id,
+        } => list_sessions(ctx, project_id, parent_session_id),
+
+        Request::ForkSession {
+            parent_session_id,
+            fork_point_turn_id,
+        } => fork_session(ctx, parent_session_id, fork_point_turn_id),
+
+        Request::RenameSession { session_id, title } => {
+            rename_session(ctx, session_id, &title)
+        }
+
+        Request::DeleteSession {
+            session_id,
+            cascade,
+        } => delete_session(ctx, session_id, cascade),
 
         Request::GetConfig => {
             // The /config TUI payload lands in P3. For now stub it
@@ -429,23 +446,110 @@ fn attach(
     })
 }
 
-fn list_sessions(ctx: &DaemonContext) -> std::result::Result<Response, ErrorPayload> {
-    let rows = ctx.db.list_sessions(true, 100).map_err(internal)?;
-    let active = ctx.registry.active_session_ids();
-    let sessions = rows
-        .into_iter()
-        .map(|row| proto::SessionSummary {
+fn list_sessions(
+    ctx: &DaemonContext,
+    project_id: Option<String>,
+    parent_session_id: Option<Uuid>,
+) -> std::result::Result<Response, ErrorPayload> {
+    let rows = match (project_id.as_deref(), parent_session_id) {
+        (_, Some(parent)) => ctx.db.list_forks(parent).map_err(internal)?,
+        (Some(pid), None) => ctx.db.list_root_sessions(pid, 100).map_err(internal)?,
+        (None, None) => ctx.db.list_sessions(true, 100).map_err(internal)?,
+    };
+    let mut sessions = Vec::with_capacity(rows.len());
+    for row in rows {
+        let fork_count = ctx
+            .db
+            .count_forks_for(row.session_id)
+            .map_err(internal)
+            .unwrap_or(0);
+        sessions.push(proto::SessionSummary {
             session_id: row.session_id,
+            short_id: row.short_id,
             project_root: row.project_root,
             project_id: row.project_id,
             started_at: row.started_at,
             last_active_at: row.last_active_at,
             turns: 0, // wire up when we track turn count
             active_agent: row.active_agent,
-        })
-        .collect::<Vec<_>>();
-    let _ = active; // surface "currently attached" in a later milestone
+            title: row.title,
+            parent_session_id: row.parent_session_id,
+            fork_count,
+        });
+    }
     Ok(Response::Sessions { sessions })
+}
+
+fn fork_session(
+    ctx: &DaemonContext,
+    parent_session_id: Uuid,
+    fork_point_turn_id: Option<String>,
+) -> std::result::Result<Response, ErrorPayload> {
+    // Guard rail: refuse forks of unknown parents with the typed
+    // `UnknownSession` code so the TUI can surface a friendlier error
+    // than a generic internal failure.
+    match ctx.db.get_session(parent_session_id) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return Err(ErrorPayload {
+                code: ErrorCode::UnknownSession,
+                message: format!("unknown parent session {parent_session_id}"),
+            });
+        }
+        Err(e) => return Err(internal(e)),
+    }
+    let row = ctx
+        .db
+        .create_fork(parent_session_id, fork_point_turn_id.clone())
+        .map_err(internal)?;
+    Ok(Response::Forked {
+        session_id: row.session_id,
+        short_id: row.short_id.unwrap_or_default(),
+        parent_session_id,
+        fork_point_turn_id,
+    })
+}
+
+fn rename_session(
+    ctx: &DaemonContext,
+    session_id: Uuid,
+    title: &str,
+) -> std::result::Result<Response, ErrorPayload> {
+    match ctx.db.get_session(session_id) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return Err(ErrorPayload {
+                code: ErrorCode::UnknownSession,
+                message: format!("unknown session {session_id}"),
+            });
+        }
+        Err(e) => return Err(internal(e)),
+    }
+    ctx.db
+        .rename_session(session_id, title)
+        .map_err(internal)?;
+    Ok(Response::Ack)
+}
+
+fn delete_session(
+    ctx: &DaemonContext,
+    session_id: Uuid,
+    cascade: bool,
+) -> std::result::Result<Response, ErrorPayload> {
+    match ctx.db.get_session(session_id) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return Err(ErrorPayload {
+                code: ErrorCode::UnknownSession,
+                message: format!("unknown session {session_id}"),
+            });
+        }
+        Err(e) => return Err(internal(e)),
+    }
+    ctx.db
+        .delete_session(session_id, cascade)
+        .map_err(internal)?;
+    Ok(Response::Ack)
 }
 
 fn require_attached(state: &ClientState) -> std::result::Result<&AttachedSession, ErrorPayload> {

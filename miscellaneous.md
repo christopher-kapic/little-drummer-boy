@@ -444,6 +444,12 @@ and before the first frame. If the terminal can't render it
 window too narrow, etc.), the rooster is silently skipped — no
 error, no fallback prose, just no rooster. Cosmetic only.
 
+**Precedence over the default banner.** `GOALS.md` §1g introduces
+a default startup banner (a P-51 Mustang) that renders on every
+TUI launch unless suppressed. When `COCKPIT_ROOSTER=1` is set, the
+rooster **preempts** the default banner — only one banner ever
+appears, the rooster wins.
+
 ---
 
 ## 10. License
