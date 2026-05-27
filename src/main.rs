@@ -10,6 +10,7 @@
 
 mod agents;
 mod auth;
+mod auto_title;
 mod banner;
 mod cli;
 mod commands;

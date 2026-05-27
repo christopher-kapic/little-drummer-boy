@@ -20,6 +20,7 @@
 
 use std::path::PathBuf;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -60,6 +61,12 @@ pub struct Session {
     /// memory only: the daemon re-evaluates the interval on every
     /// send, so re-attaching a resumed session naturally re-injects.
     pub last_time_prelude: Mutex<Option<DateTime<Utc>>>,
+    /// Running token estimate of user-authored content this session.
+    /// Bumped by [`Self::note_user_content`]; used by auto-titling
+    /// (§17d) to decide when to fire the utility-model call.
+    /// Resets to 0 on each new `Session::create` (and `create_fork`,
+    /// so forks get their own threshold pass).
+    user_content_tokens: AtomicUsize,
 }
 
 impl Session {
@@ -121,6 +128,7 @@ impl Session {
             model: Mutex::new(row.model),
             provider: Mutex::new(row.provider),
             last_time_prelude: Mutex::new(None),
+            user_content_tokens: AtomicUsize::new(0),
         })
     }
 
@@ -154,6 +162,36 @@ impl Session {
 
     pub fn user_renamed(&self) -> bool {
         *self.user_renamed.lock().unwrap()
+    }
+
+    /// Add a user-authored chunk to the running token estimate
+    /// (GOALS §17d). Returns `true` when this call crossed the
+    /// auto-title threshold *and* the session is eligible
+    /// (`title.is_none()` && `!user_renamed`). The caller spawns the
+    /// title-generation task on a `true` return.
+    ///
+    /// The check is one-shot: once the threshold is crossed and a
+    /// title is set (or refused due to user_renamed), this returns
+    /// `false` forever for this session. Forks start fresh.
+    pub fn note_user_content(&self, text: &str) -> bool {
+        let increment = crate::auto_title::estimate_tokens(text);
+        if increment == 0 {
+            return false;
+        }
+        let before = self.user_content_tokens.fetch_add(increment, Ordering::Relaxed);
+        let after = before + increment;
+        let threshold = crate::auto_title::TITLE_TOKEN_THRESHOLD;
+        let just_crossed = before < threshold && after >= threshold;
+        if !just_crossed {
+            return false;
+        }
+        self.title().is_none() && !self.user_renamed()
+    }
+
+    /// Read-only view of the running user-content token estimate.
+    /// Mostly for tests and `/stats`-style introspection.
+    pub fn user_content_tokens(&self) -> usize {
+        self.user_content_tokens.load(Ordering::Relaxed)
     }
 
     /// Compute the `[time: <iso8601>]` prelude for the next user
@@ -360,6 +398,73 @@ mod tests {
         let s = Session::create(db, PathBuf::from("/x"), "a").unwrap();
         assert!(s.take_time_prelude(0).is_some());
         assert!(s.take_time_prelude(0).is_some());
+    }
+
+    #[test]
+    fn note_user_content_below_threshold_returns_false() {
+        let db = Db::open_in_memory().unwrap();
+        let s = Session::create(db, PathBuf::from("/x"), "a").unwrap();
+        // ~16 tokens worth — well below the 500-token threshold.
+        assert!(!s.note_user_content("a short message"));
+        assert_eq!(s.user_content_tokens(), "a short message".chars().count() / 4);
+    }
+
+    #[test]
+    fn note_user_content_fires_once_at_threshold_crossing() {
+        let db = Db::open_in_memory().unwrap();
+        let s = Session::create(db, PathBuf::from("/x"), "a").unwrap();
+        // chars/4 ≈ tokens. 500 tokens × 4 chars = 2000 chars.
+        let big = "x".repeat(2000);
+        assert!(s.note_user_content(&big), "should fire on crossing");
+        // Another big chunk after firing once: still eligible by
+        // raw threshold, but the *crossing* only happens once.
+        assert!(!s.note_user_content(&big));
+    }
+
+    #[test]
+    fn note_user_content_skips_when_user_renamed() {
+        let db = Db::open_in_memory().unwrap();
+        let s = Session::create(db, PathBuf::from("/x"), "a").unwrap();
+        s.rename("user-set").unwrap();
+        let big = "x".repeat(2000);
+        // Threshold crossed, but user_renamed locks us out.
+        assert!(!s.note_user_content(&big));
+    }
+
+    #[test]
+    fn note_user_content_skips_when_title_set() {
+        let db = Db::open_in_memory().unwrap();
+        let s = Session::create(db, PathBuf::from("/x"), "a").unwrap();
+        assert!(s.set_auto_title("preset-title").unwrap());
+        let big = "x".repeat(2000);
+        assert!(!s.note_user_content(&big));
+    }
+
+    #[test]
+    fn note_user_content_empty_is_noop() {
+        let db = Db::open_in_memory().unwrap();
+        let s = Session::create(db, PathBuf::from("/x"), "a").unwrap();
+        assert!(!s.note_user_content(""));
+        assert_eq!(s.user_content_tokens(), 0);
+    }
+
+    #[test]
+    fn note_user_content_accumulates_across_calls() {
+        let db = Db::open_in_memory().unwrap();
+        let s = Session::create(db, PathBuf::from("/x"), "a").unwrap();
+        // Two ~250-token chunks should sum to crossing on the second.
+        let half = "x".repeat(1000); // 250 tokens
+        assert!(!s.note_user_content(&half));
+        assert!(s.note_user_content(&half), "second chunk should cross");
+    }
+
+    #[test]
+    fn fork_starts_user_content_counter_at_zero() {
+        let db = Db::open_in_memory().unwrap();
+        let parent = Session::create(db.clone(), PathBuf::from("/x"), "a").unwrap();
+        let _ = parent.note_user_content(&"x".repeat(1000));
+        let fork = Session::create_fork(db, parent.id, None).unwrap();
+        assert_eq!(fork.user_content_tokens(), 0);
     }
 
     #[test]

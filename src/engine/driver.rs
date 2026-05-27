@@ -137,6 +137,28 @@ impl Driver {
         input_rx: &mut mpsc::Receiver<String>,
         tx: &mpsc::Sender<TurnEvent>,
     ) -> Result<()> {
+        // Auto-title hook (GOALS §17d). `note_user_content` returns
+        // true only when this call's tokens cross the threshold for
+        // the first time *and* the session is eligible (no title,
+        // not user-renamed). Spawn the inference in a detached task
+        // so the driver loop isn't blocked on a network round-trip;
+        // failures inside the task silently drop the title.
+        if self.session.note_user_content(&user_text) {
+            let session = self.session.clone();
+            let cwd = self.cwd.clone();
+            let content_prefix = user_text.clone();
+            tokio::spawn(async move {
+                let (extended, providers) = crate::auto_title::load_configs_for(&cwd);
+                crate::auto_title::generate_session_title(
+                    session,
+                    extended,
+                    providers,
+                    content_prefix,
+                )
+                .await;
+            });
+        }
+
         let mut next_prompt = Message::user(self.with_time_prelude(user_text));
 
         loop {

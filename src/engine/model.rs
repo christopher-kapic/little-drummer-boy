@@ -136,6 +136,74 @@ impl Model {
         })
     }
 
+    /// Build a `Model` for an arbitrary `(provider, model_id)` pair,
+    /// re-using the same auth-header / env-resolve pipeline as
+    /// [`Self::from_config`] but bypassing the active-model selection.
+    /// Used by background-only flows (auto-titling §17d, prompt-
+    /// injection guard §4i) that target the utility model rather than
+    /// whatever the user has selected for the foreground turn.
+    pub fn for_provider(
+        cfg: &ProvidersConfig,
+        provider_id: &str,
+        model_id: &str,
+    ) -> Result<Self> {
+        let entry = cfg
+            .providers
+            .get(provider_id)
+            .with_context(|| format!("provider `{provider_id}` is not configured"))?;
+        let auth_header = entry
+            .headers
+            .iter()
+            .find(|h| h.name.eq_ignore_ascii_case("authorization"))
+            .with_context(|| {
+                format!("provider `{provider_id}` has no Authorization header configured")
+            })?;
+        let resolved = envref::resolve(&auth_header.value);
+        if resolved.has_missing() {
+            bail!(
+                "Authorization for provider `{provider_id}` references unset env var(s): {}",
+                resolved.missing.join(", ")
+            );
+        }
+        let token = resolved
+            .value
+            .strip_prefix("Bearer ")
+            .or_else(|| resolved.value.strip_prefix("bearer "))
+            .unwrap_or(&resolved.value)
+            .trim()
+            .to_string();
+        let client = openai::CompletionsClient::builder()
+            .api_key(token)
+            .base_url(&entry.url)
+            .build()
+            .with_context(|| {
+                format!("building openai-compatible client for `{provider_id}`")
+            })?;
+        Ok(Model::OpenAi {
+            client,
+            model_id: model_id.to_string(),
+        })
+    }
+
+    /// One-shot, non-streaming, no-tools text completion. Used by
+    /// background tasks (auto-titling, prompt-injection guard) that
+    /// just want a string back without the streaming + tool-dispatch
+    /// machinery of [`Self::complete`]. Returns the assistant's full
+    /// text response, trimmed.
+    pub async fn text_completion(&self, prompt: &str) -> Result<String> {
+        use rig::completion::Prompt;
+        match self {
+            Model::OpenAi { client, model_id } => {
+                let agent = client.agent(model_id).build();
+                let response = agent
+                    .prompt(prompt)
+                    .await
+                    .context("text_completion: prompt failed")?;
+                Ok(response.trim().to_string())
+            }
+        }
+    }
+
     /// Build a streaming completion request and aggregate it.
     ///
     /// Streaming is on for every provider variant — rig's
