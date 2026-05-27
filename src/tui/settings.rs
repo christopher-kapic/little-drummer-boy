@@ -196,6 +196,15 @@ enum ProvidersPage {
     Add(AddState),
     /// Edit a specific provider.
     Edit(EditState),
+    /// Edit the headers list for the provider whose Edit state is in
+    /// `parent`. Reached by Enter on the "Headers" row of the Edit
+    /// page. The whole pane is the header editor; back navigation
+    /// returns to `Edit(parent)` with `parent.entry.headers` set from
+    /// `editor.rows`.
+    Headers {
+        editor: HeaderEditor,
+        parent: Box<EditState>,
+    },
     /// Triggered by /fetch-models — prompts on unlisted models.
     FetchAll(FetchAllState),
     /// One-button "Set up GitHub Copilot auth" confirm screen. Visible
@@ -293,8 +302,6 @@ struct EditState {
     status: Option<String>,
     fetch: Option<FetchHandle>,
     delete_pending: bool,
-    /// `Some(...)` when the user opens the headers sub-editor with `h`.
-    headers_editor: Option<HeaderEditor>,
 }
 
 #[derive(Copy, Clone)]
@@ -971,10 +978,15 @@ impl SettingsDialog {
     }
 
     fn tick(&mut self) {
-        // Drain finished fetches into config.
+        // Drain finished fetches into config. The Headers sub-page
+        // owns its parent's EditState (via Box) — if a /models fetch
+        // was started on Edit and the user navigated into Headers
+        // while it was in flight, the handle still needs to be
+        // drained so the result lands when they come back.
         let pending = match &mut self.page {
             Page::Providers(ProvidersPage::Add(s)) => s.fetch.clone(),
             Page::Providers(ProvidersPage::Edit(s)) => s.fetch.clone(),
+            Page::Providers(ProvidersPage::Headers { parent, .. }) => parent.fetch.clone(),
             _ => None,
         };
         if let Some(handle) = pending
@@ -1069,6 +1081,16 @@ impl SettingsDialog {
                 // refresh the entry view
                 if let Some(entry) = self.config.providers.get(provider_id) {
                     s.entry = entry.clone();
+                }
+            }
+            Page::Providers(ProvidersPage::Headers { parent, .. }) => {
+                parent.status = Some(message);
+                parent.fetch = None;
+                // Don't clobber the in-flight header edits — only
+                // refresh non-header fields from the saved entry.
+                if let Some(entry) = self.config.providers.get(provider_id) {
+                    parent.entry.models = entry.models.clone();
+                    parent.entry.models_fetched_at = entry.models_fetched_at;
                 }
             }
             _ => {}
@@ -1260,6 +1282,9 @@ impl SettingsDialog {
             }
             ProvidersPage::Add(state) => self.handle_add_key(key, state),
             ProvidersPage::Edit(state) => self.handle_edit_key(key, state),
+            ProvidersPage::Headers { editor, parent } => {
+                self.handle_headers_key(key, editor, parent)
+            }
             ProvidersPage::FetchAll(state) => self.handle_fetch_all_key(key, state),
             ProvidersPage::CopilotSetup(state) => self.handle_copilot_setup_key(key, state),
         }
@@ -1520,22 +1545,6 @@ impl SettingsDialog {
     }
 
     fn handle_edit_key(&mut self, key: KeyEvent, s: &mut EditState) -> Nav {
-        // Headers sub-editor open: all keys go there until it signals Back.
-        if let Some(editor) = s.headers_editor.as_mut() {
-            match editor.handle_key(key) {
-                HeaderResult::Stay | HeaderResult::Continue => {
-                    return Nav::Stay;
-                }
-                HeaderResult::Back => {
-                    if let Some(editor) = s.headers_editor.take() {
-                        s.entry.headers = editor.rows;
-                        s.status = Some("headers updated; press s to save".into());
-                    }
-                    return Nav::Stay;
-                }
-            }
-        }
-
         // Inline-edit mode: keystrokes go to the field until Enter/Esc.
         if let Some(field) = s.editing_field {
             match key.code {
@@ -1564,10 +1573,11 @@ impl SettingsDialog {
             return Nav::Stay;
         }
 
-        // Action menu. Note: vim `h` is repurposed here as "open headers
-        // editor"; ← and Backspace still go back to the list.
+        // Action menu. `h` / `←` / Backspace all go back to the list —
+        // header editing now lives on its own sub-page reached by
+        // cursor → Enter on the "Headers" row.
         match key.code {
-            KeyCode::Esc | KeyCode::Left | KeyCode::Backspace => {
+            KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') | KeyCode::Backspace => {
                 return Nav::Replace(Page::Providers(ProvidersPage::List {
                     cursor: 0,
                     status: s.status.clone(),
@@ -1579,13 +1589,6 @@ impl SettingsDialog {
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 s.cursor = (s.cursor + 1).min(EDIT_MENU_LEN - 1);
-            }
-            KeyCode::Char('h') => {
-                s.headers_editor = Some(HeaderEditor::new(
-                    s.entry.headers.clone(),
-                    /* show_continue */ false,
-                ));
-                return Nav::Stay;
             }
             KeyCode::Char('s') => {
                 self.config
@@ -1642,10 +1645,21 @@ impl SettingsDialog {
                         s.editing_field = Some(EditField::Url);
                     }
                     1 => {
-                        s.headers_editor = Some(HeaderEditor::new(
+                        // Hand off to the Headers sub-page. We move
+                        // the EditState out via `mem::replace` so the
+                        // Headers page can return it intact on back.
+                        let editor = HeaderEditor::new(
                             s.entry.headers.clone(),
                             /* show_continue */ false,
-                        ));
+                        );
+                        let owned = std::mem::replace(
+                            s,
+                            EditState::new(String::new(), ProviderEntry::default()),
+                        );
+                        return Nav::Replace(Page::Providers(ProvidersPage::Headers {
+                            editor,
+                            parent: Box::new(owned),
+                        }));
                     }
                     2 => {
                         let new = !s.entry.favorite.unwrap_or(false);
@@ -1703,6 +1717,38 @@ impl SettingsDialog {
         }
         s.delete_pending = matches!(key.code, KeyCode::Char('d')) && s.delete_pending;
         Nav::Stay
+    }
+
+    /// Handle keys on the Headers sub-page. All keys go to the
+    /// [`HeaderEditor`] until it signals `Back`; on back, copy the
+    /// editor's rows into `parent.entry.headers` and return to the
+    /// Edit page with the parent intact (so its cursor, status, and
+    /// any unsaved entry-level edits survive the round trip).
+    fn handle_headers_key(
+        &mut self,
+        key: KeyEvent,
+        editor: &mut HeaderEditor,
+        parent: &mut Box<EditState>,
+    ) -> Nav {
+        match editor.handle_key(key) {
+            HeaderResult::Stay | HeaderResult::Continue => Nav::Stay,
+            HeaderResult::Back => {
+                // Move both the editor's rows and the parent state
+                // out by swapping with placeholders, then build the
+                // restored Edit page.
+                let rows = std::mem::take(&mut editor.rows);
+                let mut owned = std::mem::replace(
+                    parent.as_mut(),
+                    EditState::new(String::new(), ProviderEntry::default()),
+                );
+                owned.entry.headers = rows;
+                // Put the cursor back on the Headers row and tell the
+                // user there are unsaved changes to commit with `s`.
+                owned.cursor = 1;
+                owned.status = Some("headers updated; press s to save".into());
+                Nav::Replace(Page::Providers(ProvidersPage::Edit(owned)))
+            }
+        }
     }
 
     fn handle_fetch_all_key(&mut self, key: KeyEvent, s: &mut FetchAllState) -> Nav {
@@ -1860,6 +1906,9 @@ impl SettingsDialog {
             Page::Providers(ProvidersPage::Edit(s)) => {
                 format!(" › Providers › {}", s.provider_id)
             }
+            Page::Providers(ProvidersPage::Headers { parent, .. }) => {
+                format!(" › Providers › {} › Headers", parent.provider_id)
+            }
             Page::Providers(ProvidersPage::FetchAll(_)) => " › Providers › /fetch-models".into(),
             Page::Providers(ProvidersPage::CopilotSetup(_)) => {
                 " › Providers › Copilot setup".into()
@@ -1920,21 +1969,17 @@ impl SettingsDialog {
                 AddStep::Done => "enter: back to list",
             },
             Page::Providers(ProvidersPage::Edit(s)) => {
-                if s.headers_editor.is_some() {
-                    let editing = s
-                        .headers_editor
-                        .as_ref()
-                        .map(HeaderEditor::is_editing)
-                        .unwrap_or(false);
-                    if editing {
-                        "type to edit  Tab: name/value  enter: apply  esc: cancel"
-                    } else {
-                        "↑/↓  a: add  enter: edit  d: delete  esc: close headers"
-                    }
-                } else if s.editing_field.is_some() {
+                if s.editing_field.is_some() {
                     "type to edit  enter: apply  esc: cancel"
                 } else {
-                    "↑/↓  enter: edit  h: headers  s: save  r: refetch  f: favorite  d: delete  esc: back"
+                    "↑/↓  enter: edit  s: save  r: refetch  f: favorite  d: delete  h: back"
+                }
+            }
+            Page::Providers(ProvidersPage::Headers { editor, .. }) => {
+                if editor.is_editing() {
+                    "type to edit  Tab: name/value  enter: apply  esc: cancel"
+                } else {
+                    "↑/↓  a: add  enter: edit  d: delete  h: back"
                 }
             }
             Page::Providers(ProvidersPage::FetchAll(_)) => {
@@ -1955,6 +2000,9 @@ impl SettingsDialog {
             }
             ProvidersPage::Add(s) => self.render_add(frame, area, s),
             ProvidersPage::Edit(s) => self.render_edit(frame, area, s),
+            ProvidersPage::Headers { editor, parent } => {
+                self.render_headers_page(frame, area, editor, parent.as_ref())
+            }
             ProvidersPage::FetchAll(s) => self.render_fetch_all(frame, area, s),
             ProvidersPage::CopilotSetup(s) => self.render_copilot_setup(frame, area, s),
         }
@@ -2477,16 +2525,35 @@ impl SettingsDialog {
             ]));
         }
 
-        if let Some(editor) = &s.headers_editor {
-            lines.push(Line::default());
-            render_header_editor(&mut lines, editor);
-        }
-
         if let Some(status) = &s.status {
             lines.push(Line::default());
             lines.push(Line::from(Span::styled(status.clone(), yellow)));
         }
 
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+    }
+
+    /// Full-pane render for the Headers sub-page. The header rows are
+    /// the entire content; the parent Edit state is recalled on back.
+    fn render_headers_page(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        editor: &HeaderEditor,
+        parent: &EditState,
+    ) {
+        let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+        let mut lines: Vec<Line<'static>> = vec![
+            Line::from(vec![
+                Span::styled("Provider: ", muted),
+                Span::styled(
+                    parent.provider_id.clone(),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::default(),
+        ];
+        render_header_editor(&mut lines, editor);
         frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
     }
 
@@ -3751,7 +3818,6 @@ impl EditState {
             status: None,
             fetch: None,
             delete_pending: false,
-            headers_editor: None,
         }
     }
 }
@@ -4318,6 +4384,70 @@ mod tests {
         // Commit with Enter.
         d.handle_key(press(KeyCode::Enter));
         assert_eq!(d.extended.agent_guidance_files, vec!["XY".to_string()]);
+    }
+
+    #[test]
+    fn enter_on_headers_row_navigates_to_headers_subpage() {
+        // Provider Edit page → cursor on row 1 (Headers) → Enter
+        // should land on the dedicated Headers sub-page, not open an
+        // overlay on the Edit page.
+        let tmp = TempDir::new().unwrap();
+        let mut d = dialog_with_one_provider(&tmp);
+        d.handle_key(press(KeyCode::Enter)); // List → Edit(vendor)
+        match &d.page {
+            Page::Providers(ProvidersPage::Edit(_)) => {}
+            other => panic!("expected Edit, got {other:?}"),
+        }
+        // Move to Headers row (idx 1).
+        d.handle_key(press(KeyCode::Char('j')));
+        d.handle_key(press(KeyCode::Enter));
+        match &d.page {
+            Page::Providers(ProvidersPage::Headers { parent, .. }) => {
+                assert_eq!(parent.provider_id, "vendor");
+            }
+            other => panic!("expected Headers sub-page, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn back_from_headers_returns_to_edit_with_updated_headers() {
+        let tmp = TempDir::new().unwrap();
+        let mut d = dialog_with_one_provider(&tmp);
+        d.handle_key(press(KeyCode::Enter)); // → Edit
+        d.handle_key(press(KeyCode::Char('j'))); // cursor → row 1 (Headers)
+        d.handle_key(press(KeyCode::Enter)); // → Headers sub-page
+        // Add a header from the Browse-mode `a` action.
+        d.handle_key(press(KeyCode::Char('a')));
+        // We're now inline-editing a header name. Tab to value, Enter
+        // commits, then Esc to leave Browse, then `h` to go back.
+        d.handle_key(press(KeyCode::Enter)); // commit (empty name+value, still adds the row)
+        d.handle_key(press(KeyCode::Char('h')));
+        match &d.page {
+            Page::Providers(ProvidersPage::Edit(s)) => {
+                assert_eq!(s.provider_id, "vendor");
+                assert_eq!(s.cursor, 1, "cursor returns to the Headers row");
+                assert_eq!(
+                    s.entry.headers.len(),
+                    1,
+                    "headers added on the sub-page should be on the parent EditState"
+                );
+            }
+            other => panic!("expected Edit after back, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn h_on_edit_page_returns_to_list() {
+        // `h` on the Edit page is back-to-list — it must not open the
+        // (now-removed) inline header editor.
+        let tmp = TempDir::new().unwrap();
+        let mut d = dialog_with_one_provider(&tmp);
+        d.handle_key(press(KeyCode::Enter)); // → Edit
+        d.handle_key(press(KeyCode::Char('h')));
+        match &d.page {
+            Page::Providers(ProvidersPage::List { .. }) => {}
+            other => panic!("expected List after `h`, got {other:?}"),
+        }
     }
 
     #[test]
