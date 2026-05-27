@@ -361,6 +361,17 @@ pub enum Event {
         report: String,
     },
 
+    /// Provider-reported token usage for the round-trip that just
+    /// finished. Emitted once per `model.complete` call; absent when
+    /// the provider didn't include a usage chunk.
+    Usage {
+        session_id: Uuid,
+        agent: String,
+        input_tokens: u64,
+        output_tokens: u64,
+        cached_input_tokens: u64,
+    },
+
     /// A background coder paused with a question (GOALS §3b). Wire
     /// shape lands now; the dispatch logic that pauses turns ships
     /// in a later milestone.

@@ -28,6 +28,7 @@ mod redact;
 mod session;
 mod skills;
 mod sysinfo;
+mod tokens;
 mod tools;
 mod tui;
 mod welcome;

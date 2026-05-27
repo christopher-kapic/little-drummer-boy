@@ -147,6 +147,7 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         | ToolError { session_id, .. }
         | SubagentSpawned { session_id, .. }
         | SubagentReport { session_id, .. }
+        | Usage { session_id, .. }
         | InterruptRaised { session_id, .. }
         | InterruptResolved { session_id, .. }
         | SessionEnded { session_id, .. } => *session_id,
@@ -209,6 +210,20 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
             prompt,
         },
         SubagentReport { agent, report, .. } => TurnEvent::SubagentReport { agent, report },
+        Usage {
+            agent,
+            input_tokens,
+            output_tokens,
+            cached_input_tokens,
+            ..
+        } => TurnEvent::Usage {
+            agent,
+            usage: crate::tokens::TokenUsage {
+                input_tokens,
+                output_tokens,
+                cached_input_tokens,
+            },
+        },
         // Interrupts and SessionEnded don't have TurnEvent analogues
         // yet — the TUI's needs-attention surface lands with the
         // approval router.

@@ -105,6 +105,13 @@ pub enum TurnEvent {
     /// A subagent's final text. Delivered back to the parent as the
     /// tool result for its outstanding `task` call.
     SubagentReport { agent: String, report: String },
+    /// Provider-reported token usage for the round-trip that just
+    /// completed. Absent when the provider didn't include a usage
+    /// chunk in the response stream.
+    Usage {
+        agent: String,
+        usage: crate::tokens::TokenUsage,
+    },
 }
 
 /// Outcome of one [`turn`] call. The driver loops on the result.
@@ -174,7 +181,7 @@ pub async fn turn(
         })
         .await;
 
-    let (msg_id, choice) = agent
+    let (msg_id, choice, usage) = agent
         .model
         .complete(
             &agent.system,
@@ -187,6 +194,18 @@ pub async fn turn(
         )
         .await
         .with_context(|| format!("completion call for agent `{}`", agent.name))?;
+
+    if let Some(u) = usage {
+        if let Err(e) = session.record_usage(u) {
+            tracing::warn!(error = %e, "session.record_usage failed");
+        }
+        let _ = tx
+            .send(TurnEvent::Usage {
+                agent: agent.name.clone(),
+                usage: u,
+            })
+            .await;
+    }
 
     // Persist the assistant turn.
     history.push(prompt);

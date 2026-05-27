@@ -320,6 +320,15 @@ fn turn_event_to_proto(event: TurnEvent, session_id: Uuid) -> Vec<proto::Event> 
                 report,
             }]
         }
+        TurnEvent::Usage { agent, usage } => {
+            vec![proto::Event::Usage {
+                session_id,
+                agent,
+                input_tokens: usage.input_tokens,
+                output_tokens: usage.output_tokens,
+                cached_input_tokens: usage.cached_input_tokens,
+            }]
+        }
     }
 }
 

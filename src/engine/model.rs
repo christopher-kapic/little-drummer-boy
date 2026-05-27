@@ -61,6 +61,8 @@ fn debug_last_message_path() -> Option<&'static Path> {
 use crate::config::providers::{ActiveModelRef, ProvidersConfig};
 use crate::envref;
 use crate::engine::message::{AssistantContent, OneOrMany, ToolDefinition};
+use crate::tokens::TokenUsage;
+use rig::completion::GetTokenUsage;
 
 /// One concrete provider-flavor of completion model. Add variants here
 /// as we wire more providers.
@@ -223,7 +225,7 @@ impl Model {
         params: ModelParams,
         agent_name: &str,
         event_tx: &mpsc::Sender<TurnEvent>,
-    ) -> Result<(Option<String>, OneOrMany<AssistantContent>)> {
+    ) -> Result<(Option<String>, OneOrMany<AssistantContent>, Option<TokenUsage>)> {
         // Strip reasoning content from every prior assistant turn
         // before sending it back to the model. Past thinking blocks
         // bloat the prompt without informing the next turn's output
@@ -283,7 +285,16 @@ impl Model {
                         _ => {}
                     }
                 }
-                Ok((stream.message_id.clone(), stream.choice.clone()))
+                // rig requests `stream_options.include_usage = true`
+                // on every OpenAI-compat stream; the final usage chunk
+                // lands on `stream.response` (Option, because some
+                // providers omit it).
+                let usage = stream
+                    .response
+                    .token_usage()
+                    .map(TokenUsage::from)
+                    .filter(|u| !u.is_empty());
+                Ok((stream.message_id.clone(), stream.choice.clone(), usage))
             }
         }
     }

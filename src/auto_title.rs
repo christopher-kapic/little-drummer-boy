@@ -26,12 +26,11 @@ use crate::config::extended::ExtendedConfig;
 use crate::config::providers::ProvidersConfig;
 use crate::session::Session;
 
-/// Rough token estimate. cl100k_base would be more accurate but
-/// pulling in the vocab adds ~2 MB of static data; the chars/4
-/// heuristic is within ~20% for typical English+code text and good
-/// enough for the "have we accumulated enough context yet" gate.
+/// cl100k_base token count for `text`. Re-exported here for callers
+/// that already imported this module — new code should call
+/// [`crate::tokens::count`] directly.
 pub fn estimate_tokens(text: &str) -> usize {
-    text.chars().count() / 4
+    crate::tokens::count(text)
 }
 
 /// Threshold for firing the auto-title pass (GOALS §17d).
@@ -165,10 +164,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn estimate_tokens_chars_over_4() {
+    fn estimate_tokens_delegates_to_tiktoken() {
         assert_eq!(estimate_tokens(""), 0);
-        assert_eq!(estimate_tokens("abcdefgh"), 2);
-        assert_eq!(estimate_tokens(&"x".repeat(100)), 25);
+        // Real cl100k_base counts; just sanity-check that non-empty
+        // input produces a positive count and grows with length.
+        assert!(estimate_tokens("abcdefgh") > 0);
+        assert!(estimate_tokens(&"hello ".repeat(100)) > estimate_tokens("hello"));
     }
 
     #[test]

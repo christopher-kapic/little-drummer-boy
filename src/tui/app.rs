@@ -213,6 +213,10 @@ pub struct App {
     /// history spills to scrollback before the welcome header is
     /// reprinted above the viewport).
     pending_new_session: bool,
+    /// Provider-reported usage from the most recent round-trip.
+    /// Preferred over the local tiktoken estimate in the context
+    /// indicator; `None` until the first call returns.
+    last_usage: Option<crate::tokens::TokenUsage>,
 }
 
 /// Args cached at `ToolStart` for an `edit` / `editunlock` call so the
@@ -299,6 +303,7 @@ impl App {
             at_selected: 0,
             at_dismissed: false,
             pending_new_session: false,
+            last_usage: None,
         };
         app.pane_height = app.geometry().desired_pane_height();
         app
@@ -1333,6 +1338,9 @@ impl App {
                     line: format!("{agent} returned to caller."),
                 });
             }
+            TurnEvent::Usage { usage, .. } => {
+                self.last_usage = Some(usage);
+            }
         }
     }
 
@@ -2060,7 +2068,7 @@ impl App {
     /// `prunable` is a placeholder zero until the pruning estimator
     /// (plan §10) lands.
     fn context_indicator_text(&self) -> String {
-        let tokens = self.estimate_context_tokens();
+        let tokens = self.context_tokens();
         let prunable = 0u32; // placeholder
         match self.launch.active_model_max_context {
             Some(max) if max > 0 => {
@@ -2075,29 +2083,40 @@ impl App {
         }
     }
 
-    /// Cheap chars-÷-4 token estimate over visible chat content. Tools
-    /// and system prompts aren't included — they live on the engine
-    /// side. For the chrome's "context usage" affordance this rough
-    /// number is fine; the engine will surface a real count once the
-    /// tokenizer is wired (GOALS §10 / plan §3h).
+    /// Best available token count for the current context. Prefers the
+    /// provider's `input + output` from the most recent round-trip
+    /// (authoritative for what the model actually saw + produced) and
+    /// falls back to the local tiktoken estimate over visible history
+    /// when no provider count is available yet.
+    fn context_tokens(&self) -> u32 {
+        if let Some(u) = self.last_usage {
+            return u.total().min(u32::MAX as u64) as u32;
+        }
+        self.estimate_context_tokens()
+    }
+
+    /// cl100k_base token count over visible chat content. Tools and
+    /// system prompts aren't included — they live on the engine side.
+    /// Provider-native counts will replace this where available
+    /// (GOALS §10 / plan §3h); cl100k_base is the documented fallback.
     fn estimate_context_tokens(&self) -> u32 {
-        let mut chars: usize = 0;
+        let mut tokens: usize = 0;
         for entry in &self.history {
-            chars += match entry {
-                HistoryEntry::User { text, .. } => text.chars().count(),
-                HistoryEntry::Plain { line } => line.chars().count(),
+            tokens += match entry {
+                HistoryEntry::User { text, .. } => crate::tokens::count(text),
+                HistoryEntry::Plain { line } => crate::tokens::count(line),
                 HistoryEntry::Diff { old, new, .. } => {
-                    old.chars().count() + new.chars().count()
+                    crate::tokens::count(old) + crate::tokens::count(new)
                 }
                 HistoryEntry::Agent {
                     text, reasoning, ..
-                } => text.chars().count() + reasoning.chars().count(),
+                } => crate::tokens::count(text) + crate::tokens::count(reasoning),
             };
         }
         if let Some(p) = &self.pending {
-            chars += p.text.chars().count() + p.reasoning.chars().count();
+            tokens += crate::tokens::count(&p.text) + crate::tokens::count(&p.reasoning);
         }
-        (chars / 4).min(u32::MAX as usize) as u32
+        tokens.min(u32::MAX as usize) as u32
     }
 
     fn render_popup(&self, frame: &mut ratatui::Frame, area: Rect) {

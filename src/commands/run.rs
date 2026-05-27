@@ -202,6 +202,7 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         | ToolError { session_id, .. }
         | SubagentSpawned { session_id, .. }
         | SubagentReport { session_id, .. }
+        | Usage { session_id, .. }
         | InterruptRaised { session_id, .. }
         | InterruptResolved { session_id, .. }
         | SessionEnded { session_id, .. } => *session_id,
