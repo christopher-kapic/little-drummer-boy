@@ -91,13 +91,22 @@ fn load_agent_guidance(cwd: &Path) -> Option<(std::path::PathBuf, String)> {
         .find_map(|d| ExtendedConfigDoc::load(&d.path.join("extended-config.json")).ok())
         .map(|d| d.config())
         .unwrap_or_default();
-    if cfg.agent_guidance_files.is_empty() {
+    find_agent_guidance(cwd, &cfg.agent_guidance_files)
+}
+
+/// Inner search used by [`load_agent_guidance`]. Walks `cwd` and its
+/// ancestors (stopping at the git worktree root) and returns the first
+/// existing file whose basename matches an entry in `names`, scanning
+/// `names` in order at each directory level. Exposed for tests so they
+/// can pin the name list without touching layered config.
+fn find_agent_guidance(cwd: &Path, names: &[String]) -> Option<(std::path::PathBuf, String)> {
+    if names.is_empty() {
         return None;
     }
     let stop_at = crate::git::find_worktree_root(cwd);
     let mut dir: Option<&Path> = Some(cwd);
     while let Some(d) = dir {
-        for name in &cfg.agent_guidance_files {
+        for name in names {
             let candidate = d.join(name);
             if candidate.is_file()
                 && let Ok(body) = std::fs::read_to_string(&candidate)
@@ -203,6 +212,45 @@ mod tests {
         let out = compose_system_prompt("ROLE", "abc", tmp.path());
         assert!(out.contains("Project guidance"));
         assert!(out.contains("RULES"));
+    }
+
+    /// Contract test: when multiple configured filenames exist in the
+    /// same directory, only the first entry in the user's config list
+    /// is loaded. The other files must not contribute.
+    #[test]
+    fn find_agent_guidance_only_loads_first_match_when_multiple_exist() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("AGENTS.md"), "A-CONTENT").unwrap();
+        std::fs::write(tmp.path().join("CLAUDE.md"), "C-CONTENT").unwrap();
+
+        let names = vec!["AGENTS.md".to_string(), "CLAUDE.md".to_string()];
+        let (path, body) = find_agent_guidance(tmp.path(), &names).expect("expected a hit");
+        assert!(path.ends_with("AGENTS.md"), "got {path:?}");
+        assert_eq!(body, "A-CONTENT");
+
+        // Reverse the order: CLAUDE.md now wins, AGENTS.md is ignored.
+        let names_rev = vec!["CLAUDE.md".to_string(), "AGENTS.md".to_string()];
+        let (path2, body2) = find_agent_guidance(tmp.path(), &names_rev).expect("expected a hit");
+        assert!(path2.ends_with("CLAUDE.md"), "got {path2:?}");
+        assert_eq!(body2, "C-CONTENT");
+    }
+
+    /// Same shape, but the second-listed file lives in a parent dir.
+    /// The first-listed file in the same starting cwd still wins.
+    #[test]
+    fn find_agent_guidance_first_match_wins_across_ancestors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sub = tmp.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("AGENTS.md"), "FROM-SUB").unwrap();
+        std::fs::write(tmp.path().join("CLAUDE.md"), "FROM-ROOT").unwrap();
+
+        // From `sub`, AGENTS.md is right there — CLAUDE.md in the
+        // parent must not be loaded.
+        let names = vec!["AGENTS.md".to_string(), "CLAUDE.md".to_string()];
+        let (path, body) = find_agent_guidance(&sub, &names).expect("expected a hit");
+        assert!(path.ends_with("sub/AGENTS.md"), "got {path:?}");
+        assert_eq!(body, "FROM-SUB");
     }
 }
 

@@ -73,6 +73,10 @@ pub enum Dialog {
     CreateConfig {
         choices: Vec<ConfigDir>,
         cursor: usize,
+        /// Held so the resulting settings dialog can offer "back to
+        /// picker" — once a config has been scaffolded, reopening the
+        /// picker yields a non-empty list.
+        cwd: PathBuf,
     },
     /// "Add a config scoped to the current directory" sub-dialog
     /// reached by pressing `a` on the picker. Offers a `.cockpit/` in
@@ -101,6 +105,14 @@ pub struct SettingsDialog {
     /// Root-page cursor restored when navigating back. Updated every
     /// time we leave Root for a subpage.
     last_root_cursor: usize,
+    /// The cwd this dialog was opened against. Held so Root's `h`/←
+    /// can reopen the picker without losing context. `None` when the
+    /// settings dialog was opened from a flow that has no picker to
+    /// return to.
+    picker_cwd: Option<PathBuf>,
+    /// Set by Root's back action to ask the outer [`Dialog`] to
+    /// re-open the picker on the next `true` return from `handle_key`.
+    back_to_picker: bool,
 }
 
 enum Page {
@@ -116,10 +128,26 @@ enum Page {
 /// `extended.agent_guidance_files` list.
 struct InstructionsPage {
     cursor: usize,
-    /// `Some(idx)` when the user is editing row `idx`'s filename inline.
-    editing: Option<usize>,
-    buf: TextField,
+    /// When `Some(g)`, the user is holding the row currently at
+    /// `cursor`. While grabbed they may rename it (typing goes to
+    /// `g.buf`) and reorder it (↑/↓ swaps with the adjacent row —
+    /// only arrows; j/k stay free so the user can type those letters
+    /// into the filename). Enter commits and drops; Esc reverts the
+    /// filename, swaps the row back to `g.origin`, and drops.
+    grabbed: Option<GrabState>,
     status: Option<String>,
+}
+
+/// Per-row state while a row is grabbed.
+struct GrabState {
+    /// Live text buffer for the grabbed row's filename.
+    buf: TextField,
+    /// Index the row had when grabbed, restored on Esc.
+    origin: usize,
+    /// Original filename. `Some` for rows that already existed
+    /// (Esc restores the name); `None` for rows freshly created by
+    /// `a` or Enter-on-`[+ add]` (Esc deletes them).
+    original_name: Option<String>,
 }
 
 /// `/settings → UI` state.
@@ -396,7 +424,7 @@ impl HeaderEditor {
                 self.mode = HeaderMode::EditName(i);
                 HeaderResult::Stay
             }
-            KeyCode::Char('x') | KeyCode::Delete => {
+            KeyCode::Char('d') | KeyCode::Delete => {
                 if self.cursor < self.rows.len() {
                     self.rows.remove(self.cursor);
                     if self.cursor > 0 && self.cursor >= self.rows.len() {
@@ -648,6 +676,7 @@ impl Dialog {
             Dialog::CreateConfig {
                 choices: creatable_config_dirs(),
                 cursor: 0,
+                cwd: cwd.to_path_buf(),
             }
         } else {
             Dialog::PickConfig {
@@ -667,7 +696,7 @@ impl Dialog {
             && let Some(dir) = dirs.first()
         {
             let path = dir.path.join("config.json");
-            d = Dialog::Settings(SettingsDialog::open(path));
+            d = Dialog::Settings(SettingsDialog::open_from_picker(path, cwd.to_path_buf()));
             if let Dialog::Settings(s) = &mut d {
                 s.enter_providers();
             }
@@ -700,7 +729,7 @@ impl Dialog {
             && let Some(dir) = dirs.first()
         {
             let path = dir.path.join("config.json");
-            let mut s = SettingsDialog::open(path);
+            let mut s = SettingsDialog::open_from_picker(path, cwd.to_path_buf());
             s.page = Page::Providers(ProvidersPage::Add(AddState::new()));
             d = Dialog::Settings(s);
         }
@@ -715,6 +744,7 @@ impl Dialog {
             Dialog::CreateConfig {
                 choices: creatable_config_dirs(),
                 cursor: 0,
+                cwd: cwd.to_path_buf(),
             }
         } else {
             Dialog::PickConfig {
@@ -760,24 +790,29 @@ impl Dialog {
                     ListAction::Close => true,
                     ListAction::Select(idx) => {
                         let chosen = dirs[idx].path.join("config.json");
-                        *self = Dialog::Settings(SettingsDialog::open(chosen));
+                        let cwd = cwd.clone();
+                        *self = Dialog::Settings(SettingsDialog::open_from_picker(chosen, cwd));
                         false
                     }
                 }
             }
-            Dialog::CreateConfig { choices, cursor } => {
-                match list_key_action(key, cursor, choices.len()) {
-                    ListAction::Stay => false,
-                    ListAction::Close => true,
-                    ListAction::Select(idx) => match scaffold_config_dir(&choices[idx].path) {
-                        Ok(config_path) => {
-                            *self = Dialog::Settings(SettingsDialog::open(config_path));
-                            false
-                        }
-                        Err(_) => true,
-                    },
-                }
-            }
+            Dialog::CreateConfig {
+                choices,
+                cursor,
+                cwd,
+            } => match list_key_action(key, cursor, choices.len()) {
+                ListAction::Stay => false,
+                ListAction::Close => true,
+                ListAction::Select(idx) => match scaffold_config_dir(&choices[idx].path) {
+                    Ok(config_path) => {
+                        let cwd = cwd.clone();
+                        *self =
+                            Dialog::Settings(SettingsDialog::open_from_picker(config_path, cwd));
+                        false
+                    }
+                    Err(_) => true,
+                },
+            },
             Dialog::CreateScopedConfig {
                 choices,
                 cursor,
@@ -793,7 +828,11 @@ impl Dialog {
                     let target = &choices[idx];
                     match scaffold_config_dir(&target.path) {
                         Ok(config_path) => {
-                            *self = Dialog::Settings(SettingsDialog::open(config_path));
+                            let cwd = cwd.clone();
+                            *self = Dialog::Settings(SettingsDialog::open_from_picker(
+                                config_path,
+                                cwd,
+                            ));
                         }
                         Err(e) => {
                             *self = Dialog::reopen_picker(
@@ -805,7 +844,16 @@ impl Dialog {
                     false
                 }
             },
-            Dialog::Settings(s) => s.handle_key(key),
+            Dialog::Settings(s) => {
+                let close = s.handle_key(key);
+                if close && s.back_to_picker {
+                    if let Some(cwd) = s.picker_cwd.clone() {
+                        *self = Dialog::reopen_picker(&cwd, None);
+                        return false;
+                    }
+                }
+                close
+            }
         }
     }
 
@@ -820,18 +868,22 @@ impl Dialog {
             } => render_picker(
                 frame,
                 area,
-                "pick a config to edit  ·  a: add scoped",
+                "pick a config to edit",
                 dirs,
                 *cursor,
                 status.as_deref(),
+                "↑/↓  enter: select  a: add scoped  esc: close",
             ),
-            Dialog::CreateConfig { choices, cursor } => render_picker(
+            Dialog::CreateConfig {
+                choices, cursor, ..
+            } => render_picker(
                 frame,
                 area,
                 "no config found, create one?",
                 choices,
                 *cursor,
                 None,
+                "↑/↓  enter: select  esc: cancel",
             ),
             Dialog::CreateScopedConfig {
                 choices, cursor, ..
@@ -841,7 +893,8 @@ impl Dialog {
                 "where should the new config live?",
                 choices,
                 *cursor,
-                Some("esc: cancel"),
+                None,
+                "↑/↓  enter: select  esc: back to picker",
             ),
             Dialog::Settings(s) => s.render(frame, area),
         }
@@ -869,7 +922,17 @@ impl SettingsDialog {
             config,
             extended,
             last_root_cursor: 0,
+            picker_cwd: None,
+            back_to_picker: false,
         }
+    }
+
+    /// Same as [`Self::open`] but records the cwd of the picker that
+    /// opened this dialog so Root's back keybind can reopen it.
+    pub fn open_from_picker(config_path: PathBuf, cwd: PathBuf) -> Self {
+        let mut s = Self::open(config_path);
+        s.picker_cwd = Some(cwd);
+        s
     }
 
     /// Reload extended-config from disk. Used after saving so the
@@ -1050,6 +1113,12 @@ impl SettingsDialog {
         let children = root_nodes();
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => return true,
+            KeyCode::Left | KeyCode::Char('h') | KeyCode::Backspace
+                if self.picker_cwd.is_some() =>
+            {
+                self.back_to_picker = true;
+                return true;
+            }
             KeyCode::Up | KeyCode::Char('k') => {
                 cursor = cursor.saturating_sub(1);
             }
@@ -1141,7 +1210,7 @@ impl SettingsDialog {
                     KeyCode::Down | KeyCode::Char('j') => {
                         *cursor = (*cursor + 1).min(max_cursor);
                     }
-                    KeyCode::Char('c') => {
+                    KeyCode::Char('a') => {
                         return Nav::Replace(Page::Providers(ProvidersPage::Add(AddState::new())));
                     }
                     KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
@@ -1801,31 +1870,37 @@ impl SettingsDialog {
 
     fn help_text(&self) -> &'static str {
         match &self.page {
-            Page::Root { .. } => "↑/↓  enter: open  esc: close",
-            Page::Agents => "←/h/backspace: back  esc: close",
-            Page::Instructions(p) => {
-                if p.editing.is_some() {
-                    "type to edit  enter: apply  esc: cancel"
+            Page::Root { .. } => {
+                if self.picker_cwd.is_some() {
+                    "↑/↓  enter: open  h: back to picker  esc: close"
                 } else {
-                    "↑/↓  a: add  enter: edit  x: delete  ←: back  esc: close"
+                    "↑/↓  enter: open  esc: close"
+                }
+            }
+            Page::Agents => "h: back  esc: close",
+            Page::Instructions(p) => {
+                if p.grabbed.is_some() {
+                    "type to rename  ↑/↓: reorder  enter: drop & save  esc: cancel"
+                } else {
+                    "↑/↓  a: add  enter: grab to rename/reorder  d: delete  h: back  esc: close"
                 }
             }
             Page::Tools(p) => {
                 if p.editing.is_some() {
                     "type to edit  enter: apply  esc: cancel"
                 } else {
-                    "↑/↓  enter: edit  t: toggle  r: reset to default  ←: back"
+                    "↑/↓  enter: edit  t: toggle  r: reset  h: back  esc: close"
                 }
             }
             Page::Ui(p) => {
                 if p.editing.is_some() {
                     "type to edit  enter: apply  esc: cancel"
                 } else {
-                    "↑/↓  enter: edit / cycle  ←: back  esc: close"
+                    "↑/↓  enter: edit / cycle  h: back  esc: close"
                 }
             }
             Page::Providers(ProvidersPage::List { .. }) => {
-                "↑/↓  enter: edit  c: add  d: delete (×2 to confirm)  ←: back  esc: close"
+                "↑/↓  enter: edit  a: add  d: delete (×2 to confirm)  h: back  esc: close"
             }
             Page::Providers(ProvidersPage::Add(s)) => match s.step {
                 AddStep::PickTemplate { .. } => "↑/↓  enter: choose  esc: cancel",
@@ -1834,7 +1909,7 @@ impl SettingsDialog {
                     if s.headers.is_editing() {
                         "type to edit  Tab: name/value  enter: apply  esc: cancel"
                     } else {
-                        "↑/↓  a: add  enter: edit  x: delete  enter on continue: save  esc: back"
+                        "↑/↓  a: add  enter: edit  d: delete  enter on continue: save  esc: back"
                     }
                 }
                 AddStep::CodexLogin => {
@@ -1854,7 +1929,7 @@ impl SettingsDialog {
                     if editing {
                         "type to edit  Tab: name/value  enter: apply  esc: cancel"
                     } else {
-                        "↑/↓  a: add  enter: edit  x: delete  esc: close headers"
+                        "↑/↓  a: add  enter: edit  d: delete  esc: close headers"
                     }
                 } else if s.editing_field.is_some() {
                     "type to edit  enter: apply  esc: cancel"
@@ -2578,8 +2653,7 @@ impl SettingsDialog {
                 6 => {
                     return Nav::Replace(Page::Instructions(InstructionsPage {
                         cursor: 0,
-                        editing: None,
-                        buf: TextField::default(),
+                        grabbed: None,
                         status: None,
                     }));
                 }
@@ -2699,8 +2773,7 @@ impl SettingsDialog {
     fn handle_instructions_key(&mut self, key: KeyEvent) -> bool {
         let placeholder = Page::Instructions(InstructionsPage {
             cursor: 0,
-            editing: None,
-            buf: TextField::default(),
+            grabbed: None,
             status: None,
         });
         let mut page = std::mem::replace(&mut self.page, placeholder);
@@ -2723,31 +2796,35 @@ impl SettingsDialog {
     }
 
     fn handle_instructions_page_key(&mut self, key: KeyEvent, p: &mut InstructionsPage) -> Nav {
-        if let Some(idx) = p.editing {
+        // ── Grab mode ───────────────────────────────────────────────
+        // The user is holding a row: typing edits its filename, arrow
+        // keys (only arrows — j/k stay free for typing into the
+        // filename) swap it with the neighbor, Enter commits, Esc
+        // reverts (both name and position).
+        if p.grabbed.is_some() {
             match key.code {
                 KeyCode::Enter => {
-                    let new = p.buf.text().trim().to_string();
-                    if new.is_empty() {
-                        // Treat blank as delete.
-                        if idx < self.extended.agent_guidance_files.len() {
-                            self.extended.agent_guidance_files.remove(idx);
-                        }
-                    } else if idx >= self.extended.agent_guidance_files.len() {
-                        self.extended.agent_guidance_files.push(new);
-                    } else {
-                        self.extended.agent_guidance_files[idx] = new;
-                    }
-                    p.editing = None;
-                    let total = self.extended.agent_guidance_files.len();
-                    p.cursor = p.cursor.min(total.saturating_sub(1).max(0));
-                    p.status = save_status(self.save_extended());
+                    self.commit_instructions_grab(p);
                 }
                 KeyCode::Esc => {
-                    p.editing = None;
-                    p.status = None;
+                    self.cancel_instructions_grab(p);
+                }
+                KeyCode::Up if p.cursor > 0 => {
+                    self.extended
+                        .agent_guidance_files
+                        .swap(p.cursor, p.cursor - 1);
+                    p.cursor -= 1;
+                }
+                KeyCode::Down if p.cursor + 1 < self.extended.agent_guidance_files.len() => {
+                    self.extended
+                        .agent_guidance_files
+                        .swap(p.cursor, p.cursor + 1);
+                    p.cursor += 1;
                 }
                 _ => {
-                    p.buf.handle_key(key);
+                    if let Some(g) = p.grabbed.as_mut() {
+                        g.buf.handle_key(key);
+                    }
                 }
             }
             return Nav::Stay;
@@ -2773,12 +2850,9 @@ impl SettingsDialog {
                 p.cursor = (p.cursor + 1).min(max_cursor);
             }
             KeyCode::Char('a') => {
-                let idx = self.extended.agent_guidance_files.len();
-                p.cursor = idx;
-                p.buf = TextField::default();
-                p.editing = Some(idx);
+                self.start_instructions_grab_on_new(p);
             }
-            KeyCode::Char('x') | KeyCode::Delete => {
+            KeyCode::Char('d') | KeyCode::Delete => {
                 if p.cursor < self.extended.agent_guidance_files.len() {
                     self.extended.agent_guidance_files.remove(p.cursor);
                     let total = self.extended.agent_guidance_files.len();
@@ -2789,11 +2863,14 @@ impl SettingsDialog {
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
                 if p.cursor < self.extended.agent_guidance_files.len() {
                     let cur = self.extended.agent_guidance_files[p.cursor].clone();
-                    p.buf = TextField::new(cur);
-                    p.editing = Some(p.cursor);
+                    p.grabbed = Some(GrabState {
+                        buf: TextField::new(cur.clone()),
+                        origin: p.cursor,
+                        original_name: Some(cur),
+                    });
+                    p.status = None;
                 } else if p.cursor == rows {
-                    p.buf = TextField::default();
-                    p.editing = Some(rows);
+                    self.start_instructions_grab_on_new(p);
                 }
             }
             _ => {}
@@ -2801,9 +2878,86 @@ impl SettingsDialog {
         Nav::Stay
     }
 
+    /// Append an empty row, move the cursor to it, and grab it for
+    /// rename + reorder. Used by `a` and by Enter on `[+ add]`.
+    fn start_instructions_grab_on_new(&mut self, p: &mut InstructionsPage) {
+        self.extended.agent_guidance_files.push(String::new());
+        let idx = self.extended.agent_guidance_files.len() - 1;
+        p.cursor = idx;
+        p.grabbed = Some(GrabState {
+            buf: TextField::default(),
+            origin: idx,
+            original_name: None,
+        });
+        p.status = None;
+    }
+
+    /// Drop the grabbed row, writing its buffer back to the list.
+    /// An empty trimmed filename deletes the row instead.
+    fn commit_instructions_grab(&mut self, p: &mut InstructionsPage) {
+        let Some(g) = p.grabbed.take() else { return };
+        let trimmed = g.buf.text().trim().to_string();
+        if trimmed.is_empty() {
+            if p.cursor < self.extended.agent_guidance_files.len() {
+                self.extended.agent_guidance_files.remove(p.cursor);
+            }
+        } else if let Some(slot) = self.extended.agent_guidance_files.get_mut(p.cursor) {
+            *slot = trimmed;
+        }
+        let total = self.extended.agent_guidance_files.len();
+        if total == 0 {
+            p.cursor = 0;
+        } else {
+            p.cursor = p.cursor.min(total - 1);
+        }
+        p.status = save_status(self.save_extended());
+    }
+
+    /// Drop the grabbed row without saving: restore its original
+    /// position and (for previously-existing rows) its original name.
+    /// A row created in this grab is removed.
+    fn cancel_instructions_grab(&mut self, p: &mut InstructionsPage) {
+        let Some(g) = p.grabbed.take() else { return };
+        match g.original_name {
+            Some(name) => {
+                if let Some(slot) = self.extended.agent_guidance_files.get_mut(p.cursor) {
+                    *slot = name;
+                }
+                let target = g
+                    .origin
+                    .min(self.extended.agent_guidance_files.len().saturating_sub(1));
+                while p.cursor > target {
+                    self.extended
+                        .agent_guidance_files
+                        .swap(p.cursor, p.cursor - 1);
+                    p.cursor -= 1;
+                }
+                while p.cursor < target {
+                    self.extended
+                        .agent_guidance_files
+                        .swap(p.cursor, p.cursor + 1);
+                    p.cursor += 1;
+                }
+            }
+            None => {
+                if p.cursor < self.extended.agent_guidance_files.len() {
+                    self.extended.agent_guidance_files.remove(p.cursor);
+                }
+                let total = self.extended.agent_guidance_files.len();
+                if total == 0 {
+                    p.cursor = 0;
+                } else {
+                    p.cursor = p.cursor.min(total - 1);
+                }
+            }
+        }
+        p.status = None;
+    }
+
     fn render_instructions_page(&self, frame: &mut Frame, area: Rect, p: &InstructionsPage) {
         let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
         let yellow = Style::default().fg(Color::Yellow);
+        let cyan = Style::default().fg(Color::Cyan);
         let mut lines: Vec<Line<'static>> = vec![
             Line::from(Span::styled(
                 "Instructions File".to_string(),
@@ -2811,8 +2965,8 @@ impl SettingsDialog {
             )),
             Line::default(),
             Line::from(Span::styled(
-                "Filenames injected into orchestrator/coder/explore. First \
-                 match found by walking up from cwd to the git root wins."
+                "Only the first matching file (in this order) is injected \
+                 into prompts. Walks up from cwd to the git root."
                     .to_string(),
                 muted,
             )),
@@ -2820,46 +2974,47 @@ impl SettingsDialog {
         ];
 
         for (i, name) in self.extended.agent_guidance_files.iter().enumerate() {
-            let marker = if i == p.cursor { "▸ " } else { "  " };
-            let is_editing = matches!(p.editing, Some(j) if j == i);
-            let style = if is_editing || i == p.cursor {
+            let is_grabbed = p.grabbed.is_some() && i == p.cursor;
+            let on_cursor = i == p.cursor;
+            // Marker shows grab state: ✥ when held, ▸ on the cursor,
+            // blank otherwise.
+            let marker = if is_grabbed {
+                "✥ "
+            } else if on_cursor {
+                "▸ "
+            } else {
+                "  "
+            };
+            let display = if is_grabbed {
+                p.grabbed.as_ref().unwrap().buf.text().to_string()
+            } else {
+                name.clone()
+            };
+            let style = if is_grabbed {
+                cyan.add_modifier(Modifier::BOLD)
+            } else if on_cursor {
                 yellow.add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::White)
             };
-            let display = if is_editing {
-                p.buf.text().to_string()
-            } else {
-                name.clone()
-            };
             let mut spans = vec![Span::raw(marker), Span::styled(display, style)];
-            if is_editing {
-                spans.push(Span::styled(
-                    "▎".to_string(),
-                    Style::default().fg(Color::Yellow),
-                ));
+            if is_grabbed {
+                // Inline cursor caret + an inline hint if the buffer
+                // is still empty (freshly-added row).
+                spans.push(Span::styled("▎".to_string(), cyan));
+                if p.grabbed.as_ref().unwrap().buf.text().is_empty() {
+                    spans.push(Span::styled("  (type filename)".to_string(), muted));
+                }
             }
             lines.push(Line::from(spans));
         }
 
-        let add_idx = self.extended.agent_guidance_files.len();
-        let add_selected = p.cursor == add_idx;
-        let editing_new = matches!(p.editing, Some(i) if i == add_idx);
-        let marker = if add_selected { "▸ " } else { "  " };
-        if editing_new {
-            let mut spans = vec![
-                Span::raw(marker),
-                Span::styled(
-                    p.buf.text().to_string(),
-                    yellow.add_modifier(Modifier::BOLD),
-                ),
-                Span::styled("▎".to_string(), Style::default().fg(Color::Yellow)),
-            ];
-            if p.buf.text().is_empty() {
-                spans.insert(1, Span::styled("(type filename) ".to_string(), muted));
-            }
-            lines.push(Line::from(spans));
-        } else {
+        // The `[+ add filename]` row is hidden while a row is held —
+        // the user is already on the grabbed row's text input.
+        if p.grabbed.is_none() {
+            let add_idx = self.extended.agent_guidance_files.len();
+            let add_selected = p.cursor == add_idx;
+            let marker = if add_selected { "▸ " } else { "  " };
             let style = if add_selected {
                 yellow.add_modifier(Modifier::BOLD)
             } else {
@@ -3430,6 +3585,7 @@ fn render_picker(
     entries: &[ConfigDir],
     cursor: usize,
     status: Option<&str>,
+    help: &str,
 ) {
     let block = Block::default()
         .borders(Borders::ALL)
@@ -3482,7 +3638,7 @@ fn render_picker(
         )));
     }
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), layout[0]);
-    frame.render_widget(help_line("↑/↓/jk  enter: select  esc: cancel"), layout[1]);
+    frame.render_widget(help_line(help), layout[1]);
 }
 
 fn help_line(text: &str) -> Paragraph<'static> {
@@ -3740,8 +3896,8 @@ mod tests {
     }
 
     #[test]
-    fn pressing_c_from_providers_list_enters_add_wizard() {
-        // Reproduces the "dialog freezes on c" bug — the original
+    fn pressing_a_from_providers_list_enters_add_wizard() {
+        // Reproduces the "dialog freezes on a" bug — the original
         // implementation swapped the page out, then the inner handler
         // wrote `self.page = Add(...)` into the placeholder slot, and
         // the outer's unconditional swap-back discarded that write.
@@ -3749,11 +3905,11 @@ mod tests {
         let mut d = fresh_dialog(&tmp);
         d.enter_providers();
         assert!(on_list_page(&d));
-        let close = d.handle_key(press(KeyCode::Char('c')));
+        let close = d.handle_key(press(KeyCode::Char('a')));
         assert!(!close);
         assert!(
             on_add_page(&d),
-            "after pressing `c` the dialog should be on the Add wizard, not stuck on List"
+            "after pressing `a` the dialog should be on the Add wizard, not stuck on List"
         );
     }
 
@@ -3762,7 +3918,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut d = fresh_dialog(&tmp);
         d.enter_providers();
-        d.handle_key(press(KeyCode::Char('c')));
+        d.handle_key(press(KeyCode::Char('a')));
         assert!(on_add_page(&d));
         d.handle_key(press(KeyCode::Esc));
         assert!(on_list_page(&d), "Esc from Add should return to List");
@@ -4021,6 +4177,175 @@ mod tests {
         assert!(
             matches!(d, Dialog::PickConfig { .. }),
             "Esc from CreateScopedConfig should return to PickConfig"
+        );
+    }
+
+    #[test]
+    fn h_from_settings_root_returns_to_picker() {
+        // After picking a config, the user should be able to back out
+        // of the settings root with h/← and land on the picker again.
+        let tmp = TempDir::new().unwrap();
+        let cockpit_dir = tmp.path().join(".cockpit");
+        std::fs::create_dir_all(&cockpit_dir).unwrap();
+        std::fs::write(cockpit_dir.join("config.json"), "{}").unwrap();
+        let mut d = Dialog::open(tmp.path());
+        // Step into the (only) config.
+        d.handle_key(press(KeyCode::Enter));
+        assert!(matches!(d, Dialog::Settings(_)));
+        d.handle_key(press(KeyCode::Char('h')));
+        assert!(
+            matches!(d, Dialog::PickConfig { .. }),
+            "h from Settings Root should reopen the picker"
+        );
+    }
+
+    fn fresh_instructions_dialog(tmp: &TempDir) -> SettingsDialog {
+        let mut d = fresh_dialog(tmp);
+        enter_ui_from_root(&mut d);
+        // Move cursor to the instructions row (idx 6) and Enter to nav.
+        for _ in 0..6 {
+            d.handle_key(press(KeyCode::Char('j')));
+        }
+        d.handle_key(press(KeyCode::Enter));
+        assert!(matches!(d.page, Page::Instructions(_)));
+        d
+    }
+
+    #[test]
+    fn instructions_a_starts_grab_with_empty_buffer() {
+        let tmp = TempDir::new().unwrap();
+        let mut d = fresh_instructions_dialog(&tmp);
+        d.handle_key(press(KeyCode::Char('a')));
+        match &d.page {
+            Page::Instructions(p) => {
+                let g = p.grabbed.as_ref().expect("expected grabbed state");
+                assert!(g.buf.text().is_empty());
+                assert!(g.original_name.is_none(), "new row has no original name");
+                assert_eq!(p.cursor, d.extended.agent_guidance_files.len() - 1);
+            }
+            other => panic!("expected Instructions, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn instructions_esc_on_freshly_added_row_removes_it() {
+        let tmp = TempDir::new().unwrap();
+        let mut d = fresh_instructions_dialog(&tmp);
+        let before = d.extended.agent_guidance_files.len();
+        d.handle_key(press(KeyCode::Char('a')));
+        d.handle_key(press(KeyCode::Esc));
+        match &d.page {
+            Page::Instructions(p) => {
+                assert!(p.grabbed.is_none(), "esc should drop the grab");
+                assert_eq!(
+                    d.extended.agent_guidance_files.len(),
+                    before,
+                    "esc on a freshly-added row should delete it"
+                );
+            }
+            other => panic!("expected Instructions, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn instructions_enter_grabs_existing_row_then_arrow_swaps() {
+        let tmp = TempDir::new().unwrap();
+        let mut d = fresh_instructions_dialog(&tmp);
+        // Seed two known rows.
+        d.extended.agent_guidance_files = vec!["AGENTS.md".into(), "CLAUDE.md".into()];
+        // Reset to row 0 and grab it.
+        d.page = Page::Instructions(InstructionsPage {
+            cursor: 0,
+            grabbed: None,
+            status: None,
+        });
+        d.handle_key(press(KeyCode::Enter));
+        // Now grabbed at idx 0. Press ↓ to swap with row 1.
+        d.handle_key(press(KeyCode::Down));
+        assert_eq!(
+            d.extended.agent_guidance_files,
+            vec!["CLAUDE.md".to_string(), "AGENTS.md".to_string()]
+        );
+        // Drop with Enter → save.
+        d.handle_key(press(KeyCode::Enter));
+        match &d.page {
+            Page::Instructions(p) => assert!(p.grabbed.is_none()),
+            other => panic!("expected Instructions, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn instructions_esc_after_swap_restores_original_order() {
+        let tmp = TempDir::new().unwrap();
+        let mut d = fresh_instructions_dialog(&tmp);
+        d.extended.agent_guidance_files = vec!["AGENTS.md".into(), "CLAUDE.md".into()];
+        d.page = Page::Instructions(InstructionsPage {
+            cursor: 0,
+            grabbed: None,
+            status: None,
+        });
+        d.handle_key(press(KeyCode::Enter));
+        d.handle_key(press(KeyCode::Down));
+        // Mid-grab the list is mutated. Esc must restore.
+        d.handle_key(press(KeyCode::Esc));
+        assert_eq!(
+            d.extended.agent_guidance_files,
+            vec!["AGENTS.md".to_string(), "CLAUDE.md".to_string()],
+            "esc should restore original order"
+        );
+    }
+
+    #[test]
+    fn instructions_typing_while_grabbed_edits_filename() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let tmp = TempDir::new().unwrap();
+        let mut d = fresh_instructions_dialog(&tmp);
+        d.extended.agent_guidance_files = vec!["X".into()];
+        d.page = Page::Instructions(InstructionsPage {
+            cursor: 0,
+            grabbed: None,
+            status: None,
+        });
+        d.handle_key(press(KeyCode::Enter));
+        for ch in "Y".chars() {
+            d.handle_key(KeyEvent {
+                code: KeyCode::Char(ch),
+                modifiers: KeyModifiers::empty(),
+                kind: KeyEventKind::Press,
+                state: KeyEventState::empty(),
+            });
+        }
+        // Commit with Enter.
+        d.handle_key(press(KeyCode::Enter));
+        assert_eq!(d.extended.agent_guidance_files, vec!["XY".to_string()]);
+    }
+
+    #[test]
+    fn instructions_esc_after_rename_restores_original_name() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let tmp = TempDir::new().unwrap();
+        let mut d = fresh_instructions_dialog(&tmp);
+        d.extended.agent_guidance_files = vec!["AGENTS.md".into()];
+        d.page = Page::Instructions(InstructionsPage {
+            cursor: 0,
+            grabbed: None,
+            status: None,
+        });
+        d.handle_key(press(KeyCode::Enter));
+        // Type some junk.
+        for ch in "ZZZ".chars() {
+            d.handle_key(KeyEvent {
+                code: KeyCode::Char(ch),
+                modifiers: KeyModifiers::empty(),
+                kind: KeyEventKind::Press,
+                state: KeyEventState::empty(),
+            });
+        }
+        d.handle_key(press(KeyCode::Esc));
+        assert_eq!(
+            d.extended.agent_guidance_files,
+            vec!["AGENTS.md".to_string()],
+            "esc should restore the original filename"
         );
     }
 }
