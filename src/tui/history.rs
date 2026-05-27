@@ -429,10 +429,12 @@ fn render_agent(
         chip_row = Some(out.len());
         let indent = " ".repeat(bullet_width);
         let text_width = (width as usize).saturating_sub(bullet_width).max(1);
-        let wrapped: Vec<String> = text
-            .split('\n')
-            .flat_map(|raw_line| wrap_with_reserved_first_line(raw_line, text_width, 0))
-            .collect();
+        let label_width = label.chars().count();
+        // Default wrap (used for the expanded body and for wrapped[1..]
+        // continuation lines in the collapsed case). The collapsed-no-
+        // markdown branch will re-wrap with extra reserve so the first
+        // chunk can sit beside the chip without pushing the timestamp.
+        let wrapped: Vec<String> = wrap_with_reserved_first_line(text, text_width, 0);
 
         let mut chip_spans: Vec<Span<'static>> = vec![indent_span()];
         if !AGENT_BULLET.is_empty() {
@@ -495,10 +497,19 @@ fn render_agent(
         } else {
             // Collapsed: chip + first text chunk on the same line so
             // there's no visual blank between the chip and the answer.
+            // The first chunk shares row 1 with `chip + " "` and the
+            // right-edge timestamp, so re-wrap with both reserved —
+            // otherwise the chunk pushes the timestamp onto row 2.
+            let collapsed_first_reserve = label_width + 1 + TIMESTAMP_WIDTH + 1;
+            let collapsed_wrapped: Vec<String> = wrap_with_reserved_first_line(
+                text,
+                text_width,
+                collapsed_first_reserve,
+            );
             let mut first_line_spans = chip_spans;
-            if !wrapped.is_empty() {
+            if !collapsed_wrapped.is_empty() {
                 first_line_spans.push(Span::raw(" "));
-                first_line_spans.push(Span::raw(wrapped[0].clone()));
+                first_line_spans.push(Span::raw(collapsed_wrapped[0].clone()));
             }
             out.push(render_first_line_timestamped(
                 first_line_spans,
@@ -506,27 +517,34 @@ fn render_agent(
                 width,
                 true,
             ));
-            for chunk in wrapped.iter().skip(1) {
+            for chunk in collapsed_wrapped.iter().skip(1) {
                 out.push(Line::from(vec![Span::raw(format!("{indent}{chunk}"))]));
             }
         }
     } else if markdown {
         // No reasoning + markdown: emit markdown lines, attaching the
         // timestamp to the first line via right-edge padding. Every
-        // line carries AGENT_INDENT on the left.
+        // line carries AGENT_INDENT on the left. If the first line's
+        // content would overlap the timestamp's reserved column, slice
+        // it (preserving span styles) so the timestamp stays anchored
+        // at the right edge of row 1 and the overflow flows to row 2.
         let body = indent_lines(markdown::render(text), AGENT_INDENT);
         if body.is_empty() {
             out.extend(render_with_timestamp(vec![], timestamp, width));
         } else {
-            for (i, line) in body.into_iter().enumerate() {
-                if i == 0 {
-                    out.push(render_first_line_with_timestamp(
-                        line.spans, timestamp, width,
-                    ));
-                } else {
-                    out.push(line);
-                }
+            let first_line_budget = (width as usize)
+                .saturating_sub(TIMESTAMP_WIDTH + 1)
+                .max(1);
+            let mut iter = body.into_iter();
+            let first = iter.next().expect("body non-empty");
+            let (head, tail) = slice_spans_at_width(first.spans, first_line_budget);
+            out.push(render_first_line_with_timestamp(head, timestamp, width));
+            if let Some(tail_spans) = tail {
+                let mut spans = vec![Span::raw(" ".repeat(AGENT_INDENT))];
+                spans.extend(tail_spans);
+                out.push(Line::from(spans));
             }
+            out.extend(iter);
         }
     } else {
         // No reasoning, no markdown — text gets the standard left
@@ -620,6 +638,63 @@ fn indent_lines(lines: Vec<Line<'static>>, n: usize) -> Vec<Line<'static>> {
             Line::from(spans)
         })
         .collect()
+}
+
+/// Slice a styled span sequence so the head totals at most `max_width`
+/// columns. If the spans already fit, returns `(spans, None)`. Otherwise
+/// breaks on the last whitespace boundary inside the budget (or at the
+/// hard limit if no whitespace exists), preserving each span's style on
+/// both halves. Used by the markdown agent renderer so the right-edge
+/// timestamp stays anchored on row 1 when the agent's first line would
+/// otherwise overflow into the timestamp's reserved column.
+fn slice_spans_at_width(
+    spans: Vec<Span<'static>>,
+    max_width: usize,
+) -> (Vec<Span<'static>>, Option<Vec<Span<'static>>>) {
+    let total: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+    if total <= max_width || max_width == 0 {
+        return (spans, None);
+    }
+    let flat: Vec<(char, Style)> = spans
+        .iter()
+        .flat_map(|s| s.content.chars().map(move |c| (c, s.style)))
+        .collect();
+    // Prefer breaking right after the last whitespace that lands inside
+    // the budget; fall back to a hard cut at max_width if the head has
+    // no whitespace at all (e.g. a single very long token).
+    let split_at = (0..max_width)
+        .rev()
+        .find(|&i| flat[i].0.is_whitespace())
+        .map(|i| i + 1)
+        .unwrap_or(max_width);
+    let head = group_into_spans(&flat[..split_at]);
+    let tail = group_into_spans(&flat[split_at..]);
+    let tail = if tail.is_empty() { None } else { Some(tail) };
+    (head, tail)
+}
+
+fn group_into_spans(chars: &[(char, Style)]) -> Vec<Span<'static>> {
+    let mut out: Vec<Span<'static>> = Vec::new();
+    let mut cur_style: Option<Style> = None;
+    let mut cur_text = String::new();
+    for &(c, style) in chars {
+        match cur_style {
+            Some(s) if s == style => cur_text.push(c),
+            _ => {
+                if let Some(s) = cur_style.take() {
+                    out.push(Span::styled(std::mem::take(&mut cur_text), s));
+                }
+                cur_style = Some(style);
+                cur_text.push(c);
+            }
+        }
+    }
+    if let Some(s) = cur_style {
+        if !cur_text.is_empty() {
+            out.push(Span::styled(cur_text, s));
+        }
+    }
+    out
 }
 
 fn blank_bg_line(width: usize, bg: Color) -> Line<'static> {
@@ -894,5 +969,90 @@ mod tests {
         let chunks = wrap_with_reserved_first_line("hello world how are you today", 20, 6);
         // First chunk fits in 14, rest wraps to 20-wide.
         assert!(chunks[0].chars().count() <= 14);
+    }
+
+    fn line_width(line: &Line<'static>) -> usize {
+        line.spans.iter().map(|s| s.content.chars().count()).sum()
+    }
+
+    fn fixed_ts() -> DateTime<Local> {
+        // Any concrete instant works — only the formatted "HH:MM"
+        // width matters for these tests.
+        Local::now()
+    }
+
+    #[test]
+    fn agent_timestamp_stays_anchored_when_text_would_overlap() {
+        // A long single-paragraph reply with no reasoning + no markdown.
+        // Width 60 → text budget for first line is 60 - 2 (indent) - 5
+        // (timestamp) - 1 (gap) = 52. The renderer must wrap before
+        // that so the first row never exceeds the area width.
+        let text = "x".repeat(200);
+        let width: u16 = 60;
+        let rendered = render_agent(
+            "coder",
+            &text,
+            "",
+            fixed_ts(),
+            false,
+            None,
+            width,
+            false,
+        );
+        assert!(!rendered.lines.is_empty());
+        // The first line carries the timestamp and must fit in `width`
+        // so ratatui's auto-wrap can't push the timestamp to row 2.
+        assert!(
+            line_width(&rendered.lines[0]) <= width as usize,
+            "row 1 width = {}, area = {}",
+            line_width(&rendered.lines[0]),
+            width
+        );
+    }
+
+    #[test]
+    fn collapsed_chip_does_not_push_timestamp_off_row_one() {
+        // Reasoning present + collapsed → chip label + " " + first
+        // chunk + " " + timestamp must all fit in `width`.
+        let width: u16 = 80;
+        let rendered = render_agent(
+            "coder",
+            &"a ".repeat(200),
+            "some hidden reasoning",
+            fixed_ts(),
+            /* expanded */ false,
+            Some(Duration::from_secs(3)),
+            width,
+            /* markdown */ false,
+        );
+        assert!(line_width(&rendered.lines[0]) <= width as usize);
+    }
+
+    #[test]
+    fn slice_spans_breaks_on_whitespace_when_possible() {
+        let spans = vec![Span::raw("hello world how are you today".to_string())];
+        let (head, tail) = slice_spans_at_width(spans, 14);
+        let head_text: String = head.iter().map(|s| s.content.to_string()).collect();
+        assert!(head_text.chars().count() <= 14);
+        // "hello world " is 12 chars and breaks on a whitespace ≤ 14.
+        assert!(head_text.ends_with(' '));
+        assert!(tail.is_some());
+    }
+
+    #[test]
+    fn slice_spans_preserves_styles_across_split() {
+        let bold = Style::default().add_modifier(Modifier::BOLD);
+        // No whitespace inside the bold span and the split lands in
+        // the middle of it, so the bold style must appear on both
+        // halves after grouping.
+        let spans = vec![
+            Span::raw("ab".to_string()),
+            Span::styled("BOLDEDTOKEN".to_string(), bold),
+            Span::raw("cd".to_string()),
+        ];
+        let (head, tail) = slice_spans_at_width(spans, 6);
+        let tail = tail.expect("has tail");
+        assert!(head.iter().any(|s| s.style == bold));
+        assert!(tail.iter().any(|s| s.style == bold));
     }
 }

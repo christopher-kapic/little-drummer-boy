@@ -459,11 +459,40 @@ MIT, matching ralph-rs / kctx-local / mcp2cli-rs. Include the same
 
 ---
 
+## 10a. Provider-auth posture: sanctioned vs passthrough
+
+See **GOALS §20** for the full policy. Cross-cutting summary:
+
+- **Sanctioned flows** (every API-key provider; GitHub Copilot's
+  documented device-code flow) are the default in the Add-Provider
+  wizard and require no special UX warning.
+- **Passthrough flows** re-use a first-party client's OAuth client id
+  to spend that vendor's subscription quota from cockpit. They are
+  not officially supported by the vendor and may stop working
+  without notice. Currently in this category:
+  - **Codex / ChatGPT Plus/Pro** (`src/auth/codex.rs`, re-using the
+    Codex CLI's `CLIENT_ID = app_EMoamEEZ73f0CkXaXp7hrann`).
+  - **Anthropic Pro/Max** — *if* added; under discussion in
+    `design-need-to-discuss-or-test.md`.
+
+Passthrough flows must:
+1. Not be the default in the Add-Provider wizard.
+2. Display a one-line warning in the wizard and in `cockpit
+   providers status`: *"Uses your <vendor> quota via <first-party
+   tool>'s OAuth client. Not officially supported by <vendor>; may
+   stop working without notice."*
+3. Each live under its own `src/auth/<vendor>.rs`; no client-id
+   sharing across modules.
+
+---
+
 ## 11. What we explicitly will not do
 
 A list to point at when feature requests come in:
 
-- No MCP support. Use `mcp2cli-rs`.
+- ~~No MCP support. Use `mcp2cli-rs`.~~ **Reversed 2026-05-27** —
+  cockpit ships first-class MCP via lazy discovery (GOALS §18).
+  mcp2cli remains supported as an alternative shell-wrap path.
 - No bundled JS runtime / npm plugins.
 - No hosted session sharing.
 - No self-update.

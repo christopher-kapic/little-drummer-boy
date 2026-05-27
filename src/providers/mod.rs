@@ -119,6 +119,57 @@ pub const TEMPLATES: &[ProviderTemplate] = &[
         ),
         use_id_as_default: true,
     },
+    ProviderTemplate {
+        id: "openrouter",
+        display: "OpenRouter",
+        url: "https://openrouter.ai/api/v1",
+        auth: AuthKind::ApiKey,
+        default_env_var: Some("OPENROUTER_API_KEY"),
+        default_headers: &[("Authorization", "Bearer $OPENROUTER_API_KEY")],
+        supports_models_endpoint: true,
+        hint: Some("Generate a key at https://openrouter.ai/keys"),
+        use_id_as_default: true,
+    },
+    ProviderTemplate {
+        id: "deepseek",
+        display: "DeepSeek",
+        url: "https://api.deepseek.com/v1",
+        auth: AuthKind::ApiKey,
+        default_env_var: Some("DEEPSEEK_API_KEY"),
+        default_headers: &[("Authorization", "Bearer $DEEPSEEK_API_KEY")],
+        supports_models_endpoint: true,
+        hint: Some("Generate a key at https://platform.deepseek.com/api_keys"),
+        use_id_as_default: true,
+    },
+    ProviderTemplate {
+        id: "anthropic",
+        display: "Anthropic (Claude API)",
+        url: "https://api.anthropic.com/v1",
+        auth: AuthKind::ApiKey,
+        default_env_var: Some("ANTHROPIC_API_KEY"),
+        default_headers: &[
+            ("x-api-key", "$ANTHROPIC_API_KEY"),
+            ("anthropic-version", "2023-06-01"),
+        ],
+        supports_models_endpoint: true,
+        hint: Some(
+            "Sanctioned API-key path. Generate a key at https://console.anthropic.com/settings/keys. Anthropic Pro/Max OAuth passthrough is intentionally not offered (see GOALS §20).",
+        ),
+        use_id_as_default: true,
+    },
+    ProviderTemplate {
+        id: "xiaomi-mimo",
+        display: "Xiaomi MiMo",
+        url: "https://platform.xiaomimimo.com/api/v1",
+        auth: AuthKind::ApiKey,
+        default_env_var: Some("XIAOMI_MIMO_API_KEY"),
+        default_headers: &[("Authorization", "Bearer $XIAOMI_MIMO_API_KEY")],
+        supports_models_endpoint: true,
+        hint: Some(
+            "Xiaomi MiMo open platform. Generate a key at https://platform.xiaomimimo.com/. Flagship is MiMo-V2.5-Pro (1M context); MiMo-V2-Flash is the cheap-fast tier.",
+        ),
+        use_id_as_default: true,
+    },
 ];
 
 pub fn template_by_id(id: &str) -> Option<&'static ProviderTemplate> {
@@ -157,6 +208,10 @@ mod tests {
     fn lookup_by_id() {
         assert!(template_by_id("z-ai").is_some());
         assert!(template_by_id("minimax").is_some());
+        assert!(template_by_id("openrouter").is_some());
+        assert!(template_by_id("deepseek").is_some());
+        assert!(template_by_id("anthropic").is_some());
+        assert!(template_by_id("xiaomi-mimo").is_some());
         assert!(template_by_id("nope").is_none());
     }
 

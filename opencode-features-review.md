@@ -41,7 +41,7 @@ opencode server API, ACP protocol, web UI, or plugin SDK internals.
 | `opencode stats` | **COPY** | Token/cost stats per project, per model, per tool. Useful for users on metered providers. |
 | `opencode debug {config,paths,scrap,skill,agent,file,wait,snapshot,lsp,rg}` | **COPY most** | `cockpit debug config\|paths\|skill\|agent\|file\|wait` map directly. Skip `lsp` (see §6) and `rg` (orthogonal). Add `cockpit debug redact` to dump the redaction table for §7, and `cockpit debug repair` to summarize tool-input repair events per `(model, tool, kind)` (see §16). |
 | `opencode completion` | **COPY** | Shell completion via `clap_complete`. |
-| `opencode mcp {add,list,auth,logout,debug}` | **SKIP** | Per `GOALS.md` non-goals: redirect to mcp2cli-rs. `cockpit mcp` should print a one-line pointer and exit non-zero. |
+| `opencode mcp {add,list,auth,logout,debug}` | **COPY (lazy-discovery)** | Reversed 2026-05-27 — see `GOALS.md` §18. `cockpit mcp {add,list,test,refresh}` manages MCP servers natively. Tools surface to the model via a one-line catalog; full schemas load on `mcp_invoke`, preserving §10 token economy. |
 | `opencode plugin <module>` | **SKIP** | npm-based plugin install. We have no npm runtime and the meta-harness covers extension needs. |
 | `opencode github {install,run}` | **SKIP** | GitHub Actions agent. Out of scope. |
 | `opencode pr <number>` | **DELIBERATE** | Convenience: `gh pr checkout` + `opencode`. **Recommended: COPY** — it's a 30-line wrapper and very useful. |
@@ -187,7 +187,9 @@ Confirmed-or-likely set from opencode + codex influence:
   `GOALS.md` §3a.
 - `/skills` — list skills. **COPY** (extends opencode by including
   `~/.claude/skills/`).
-- `/mcp` — **SKIP**, redirect to mcp2cli.
+- `/mcp` — **COPY (lazy-discovery)** — see `GOALS.md` §18. Lists
+  configured MCP servers and their tool catalogs; `mcp_invoke` is
+  what the model actually calls.
 - `/vim` — toggle vim composer. In `cockpit`, vim is **on by default**, but
   this slash command still exists to toggle off. **COPY (with new default).**
 - `/statusline`, `/terminaltitle` — codex has these; opencode does not.
@@ -278,13 +280,18 @@ permission categories:
 
 ### 6b. MCP servers
 
-**Status: SKIP entirely.** See `GOALS.md` non-goals. `cockpit mcp` exits
-with `mcp2cli is the recommended replacement; install with: cargo
-install mcp2cli`.
+**Status: COPY (lazy-discovery).** Reversed 2026-05-27 — see
+`GOALS.md` §18 for the full design. The earlier "skip MCP, point at
+mcp2cli" policy was driven by the §10 token-economy concern that
+MCP servers' per-tool schemas sum to thousands of system-prompt
+tokens. The lazy-discovery design removes that cost from the hot
+path: the model sees only a one-line catalog; full schemas load on
+the first `mcp_invoke(server, tool, args)` call.
 
-(Previously this section described silent-ignore of an `mcp:` block
-in `opencode.json` for drop-in compatibility. With compat dropped,
-this is moot — cockpit doesn't read `opencode.json` at all.)
+cockpit owns its MCP config file at `.cockpit/mcp.json` (layered,
+walk-up, per GOALS §2). It does **not** read `opencode.json`'s
+`mcp:` block — but the first-launch tour can detect MCP entries in
+discovered `opencode`/`claude` configs and offer to import them.
 
 ### 6c. LSP servers
 

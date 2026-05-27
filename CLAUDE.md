@@ -10,9 +10,14 @@ for any of them.
 ## Required reading before changing code
 
 1. `GOALS.md` — authoritative statement of scope and intent.
-2. `opencode-features-review.md` — what we're copying / debating / skipping.
-3. `miscellaneous.md` — Windows, packaging, exit codes, secret-handling
+2. `plan.md` — phased implementation plan (T-numbered tasks).
+3. `opencode-features-review.md` — what we're copying / debating / skipping.
+4. `miscellaneous.md` — Windows, packaging, exit codes, secret-handling
    policies, cross-cutting design notes.
+5. `design-need-to-discuss-or-test.md` — open design questions.
+   Before adding or changing a feature, check whether the relevant
+   question is open here — if so, resolve it first (in conversation
+   with the user) and graduate the entry to GOALS/plan.
 
 If a feature isn't in one of those docs, it isn't in scope yet. Update
 the docs first; then code.
@@ -117,9 +122,11 @@ out new deps in PR descriptions.
   paths the validator disagreed at, and re-validates. Preprocessing
   is a silent-corruption hazard.
 - **Built-in v1 tool surface is fixed:** `read, readlock, write,
-  writeunlock, edit, bash, glob, grep, task, skill, webfetch`.
-  Anything outside that list needs a design discussion before it's
-  added (GOALS §10).
+  writeunlock, edit, bash, glob, grep, task, skill, webfetch,
+  mcp_invoke`. Anything outside that list needs a design discussion
+  before it's added (GOALS §10). `mcp_invoke` dispatches to MCP
+  servers via lazy discovery (catalog of name + one-line description;
+  schema loaded on first call) — see GOALS §18.
 - **Wire vs user transcript split** (GOALS §14). One tool-call row
   carries `wire_input` + `original_input` + `recovery`. The model
   sees the canonical form; the user sees the original with a recovery
@@ -129,7 +136,12 @@ out new deps in PR descriptions.
   hatch is `redact.enabled = false` at the config level.
 - **TUI chrome is fixed:** cwd + git branch + context indicator +
   active agent are always shown (GOALS §1a). Not configurable off.
-- **No MCP.** `cockpit mcp …` prints the mcp2cli pointer and exits.
+- **MCP via lazy discovery** (GOALS §18 — reversed from earlier "no
+  MCP" policy). The model sees a catalog of `(server.tool, one-line
+  description)` pairs only; full schemas load on the first
+  `mcp_invoke(server, tool, args)` call. Token economy (§10) holds
+  because no MCP server's per-tool schema is ever injected into the
+  system prompt. `cockpit mcp {add,list,test}` manages servers.
 - **Vim mode is default-on** in the composer.
 - **Cross-platform:** Linux, macOS, Windows. CI runs the matrix.
 - **Token economy is non-negotiable** (GOALS §10). Tool descriptions

@@ -41,10 +41,13 @@ debating / skipping, and `miscellaneous.md` for cross-cutting concerns
 ## Project docs
 
 - [`GOALS.md`](./GOALS.md) — what `cockpit` is for.
+- [`plan.md`](./plan.md) — phased implementation plan (T-numbered tasks).
 - [`opencode-features-review.md`](./opencode-features-review.md) — every
   opencode CLI feature, classified.
 - [`miscellaneous.md`](./miscellaneous.md) — Windows, packaging, telemetry,
   exit codes, etc.
+- [`design-need-to-discuss-or-test.md`](./design-need-to-discuss-or-test.md)
+  — open design questions still to be resolved.
 
 ## Tech stack
 
@@ -56,14 +59,22 @@ debating / skipping, and `miscellaneous.md` for cross-cutting concerns
 - `reqwest` (rustls) for provider HTTP.
 - `aho-corasick` + `dotenvy` for secret redaction.
 
+## MCP support
+
+cockpit ships first-class MCP support via a **lazy-discovery** design
+— the model sees a one-line catalog of available MCP tools; the full
+JSON schema for any given tool is loaded on the first invocation, so
+no MCP server's per-tool schemas ever bloat the system prompt. See
+`GOALS.md` §18.
+
+[`mcp2cli-rs`](https://github.com/christopher-kapic/mcp2cli-rs)
+remains supported as an alternative for users who specifically want
+MCP tools wrapped as shell commands under `bash`.
+
 ## Non-goals
 
-We deliberately do **not** support MCP. Install
-[`mcp2cli-rs`](https://github.com/christopher-kapic/mcp2cli-rs) and let the
-model invoke MCP tools through `bash`.
-
-Other non-goals: hosted session sharing, plugin marketplace, self-update,
-GitHub Actions agent. See `GOALS.md` for the full list.
+Hosted session sharing, plugin marketplace, self-update, GitHub
+Actions agent. See `GOALS.md` for the full list.
 
 ## License
 

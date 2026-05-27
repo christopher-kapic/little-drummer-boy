@@ -1292,18 +1292,49 @@ that touches every subsystem.
   fresh-thread handoff model — it avoids compaction sediment (no
   summarizing summaries) and is friendlier to provider caches (the new
   thread starts with a clean cache rather than mutating the old one).
+- **Auto-prune is cache-aware.** The auto-prune predicate fires
+  whenever the expected cache-hit on the next call is zero. Three
+  cases unified under one rule: (a) provider with no cache support
+  (`provider.cache.mode = "none"`); (b) cache TTL has elapsed since
+  the last send (default 5 min, overridable per-provider and
+  per-model); (c) the next call already busts the cache upstream
+  (e.g., a tool-result edit before the cache breakpoint). When the
+  predicate evaluates true, `/prune` runs before the inference call
+  with no user prompt — cache cost is already zero, so the savings
+  are pure. The per-session "last prune watermark" short-circuits the
+  walk when nothing new is prunable. Threshold-based auto-prune
+  (`prune.auto_threshold` in `plan.md` T6.f) remains in force as a
+  secondary trigger.
+- **`/compact` always prunes first.** Pruning is lossless and cheap;
+  pruning before compaction means the compaction summarizer sees a
+  smaller, denser input and produces a tighter handoff. The order is
+  fixed in the engine — there is no `--no-prune` flag.
+- **Seed-tool handoff** (`plan.md` T6.e, §3d). When the parent
+  invokes a subagent (`task`) or fires `/compact`, it may attach a
+  list of `seed_tools: [{name, args}, ...]` that are dispatched
+  **before** the new conversation starts; the results land in the new
+  agent's initial context as if it had just run them. Restricted to
+  **read-only, idempotent** tools (`read`, `glob`, `grep`, `ls`,
+  `git status`). No `bash`, no `write`, no `edit`. Re-execute, never
+  replay cached output — the seed exists to save the new agent a
+  round-trip, not to hand off stale snapshots. The TUI surfaces
+  seed-tool token cost on the receiving agent's first turn so an
+  over-eager parent is debuggable.
 - **Built-in tool surface is small.** v1 ships `read, readlock, write,
-  writeunlock, edit, bash, glob, grep, task, skill, webfetch`. The
-  lock-aware tool set (`readlock` / `write` / `writeunlock`) is
-  required for the multi-agent file-locking model (see `plan.md`
-  §4.1); plain `read` is the unlocked snapshot variant for exploration
-  that doesn't intend to modify. No `websearch` (provider-side search
-  exists; if a user wants `cockpit`-side, they pipe `curl` through
-  `bash`). No tool we couldn't justify removing.
-- **No MCP** (already a non-goal). MCP servers' tool descriptions
-  routinely run thousands of tokens each; this is the largest single
-  win for context economy and the original reason for §11's MCP
-  exclusion.
+  writeunlock, edit, bash, glob, grep, task, skill, webfetch,
+  mcp_invoke`. The lock-aware tool set (`readlock` / `write` /
+  `writeunlock`) is required for the multi-agent file-locking model
+  (see `plan.md` §4.1); plain `read` is the unlocked snapshot variant
+  for exploration that doesn't intend to modify. No `websearch`
+  (provider-side search exists; if a user wants `cockpit`-side, they
+  pipe `curl` through `bash`). No tool we couldn't justify removing.
+- **MCP via lazy discovery** (§18 — reversed from the prior "no MCP"
+  policy). The original §10 objection to MCP was token cost: a typical
+  MCP server's per-tool schemas inject thousands of tokens into every
+  system prompt. The lazy-discovery design (catalog of `(server.tool,
+  one-line description)` only; schemas load on `mcp_invoke`)
+  neutralizes that objection by construction — the §10 budget holds.
+  See §18 for the full design.
 - **Subagent reports, not transcripts.** When a `task` finishes in
   subagent mode, the parent receives the subagent's **final reply
   only**, not the subagent's full conversation — and the subagent
@@ -2674,16 +2705,164 @@ of the v1 architecture without protocol churn.
 
 ---
 
+## 18. MCP support — lazy discovery
+
+cockpit supports the Model Context Protocol. The earlier "no MCP"
+policy was driven by the §10 token-economy concern that MCP servers'
+per-tool schemas routinely sum to thousands of tokens of system-prompt
+overhead. The lazy-discovery design below removes that cost from the
+hot path while preserving the user-facing "MCP just works" experience.
+
+### 18a. Design
+
+- **Two-stage tool exposure.** The model sees a single built-in tool:
+  `mcp_invoke(server, tool, args)`. Alongside it, the system prompt
+  carries a **catalog** of `(server.tool_name, one-line description)`
+  pairs — one line per available MCP tool, regardless of how many
+  servers are configured. The full JSON schema for any given tool is
+  never in the system prompt.
+- **On-demand schema load.** When the model calls
+  `mcp_invoke("github", "create_issue", { … })`, the dispatcher
+  fetches the tool's schema (cached after first fetch), runs the
+  existing tool-input repair pipeline (§12) against it, and
+  dispatches.
+- **Catalog refresh cadence.** Catalogs are pulled at daemon startup
+  and on demand via `cockpit mcp refresh`; they are not re-pulled per
+  inference call. A tool that has been removed from the upstream
+  server but is still in the catalog fails on `mcp_invoke` with the
+  same `[error: unknown tool …]` shape as a stale skill reference.
+- **Server config lives in `.cockpit/mcp.json`** (layered, walk-up,
+  per §2). Each entry: `name`, `transport` (`stdio` | `http-sse`),
+  `command` (for stdio) or `url` (for sse), optional `env`,
+  `headers`, `timeout_secs`. The shape is opencode-compatible but
+  cockpit owns the file.
+- **`cockpit mcp` subcommand.** `add`, `list`, `test` (smoke-test the
+  server and dump its tool catalog), `refresh` (re-pull catalogs).
+  No `cockpit mcp run` — invocation happens via `mcp_invoke`.
+
+### 18b. v1 scope
+
+cockpit's MCP support covers **tools, resources, and subscriptions**
+in v1 (decided 2026-05-27). Prompts and sampling are deferred until
+there's concrete user demand.
+
+- **Tools.** Lazy-discovery as described in §18a. Model sees
+  `(server.tool, one-line description)`; full schema loads on
+  `mcp_invoke`.
+- **Resources.** URI-addressable content the server exposes (files,
+  database rows, web content). Discovery is lazy on the same model
+  as tools: the catalog carries `(server, uri_template, one-line
+  description)` only. The model accesses a resource via
+  `mcp_resource_read(server, uri)`; the result body and any MIME
+  metadata land as a normal tool-result. Resources that map cleanly
+  onto a local file (`file://` URIs from a filesystem server, for
+  example) are still routed through `mcp_resource_read` rather than
+  being silently aliased to `read`, so the wire/user transcript
+  split (§14) preserves provenance.
+- **Subscriptions.** When the model issues
+  `mcp_resource_subscribe(server, uri)`, the daemon registers the
+  subscription with the upstream server. Notifications are surfaced
+  as **per-turn prelude notes** on the next user message in the
+  affected session — same shape as T6.a's read-staleness note:
+  `[note: resource <uri> changed since you subscribed]`. This keeps
+  subscriptions inside the turn-boundary model (no mid-tool-call
+  notification handling). The daemon retains the subscription across
+  TUI client reconnects; explicit `mcp_resource_unsubscribe` or
+  session-end tears it down. See
+  `design-need-to-discuss-or-test.md` for the open questions on
+  notification fan-out and rate-limiting.
+- **Prompts and sampling.** Deferred. No concrete user demand and
+  both interact awkwardly with cockpit's existing primitives
+  (prompts overlap with skills; sampling overlaps with delegation).
+- **Stdio + http-sse transports.** WebSocket and custom transports
+  deferred.
+- **Per-daemon server processes.** The daemon spawns and manages MCP
+  stdio servers; clients (TUI, future web) do not. One server
+  process per `mcp.json` entry, reused across sessions.
+- **No per-session OAuth state.** OAuth-bearing MCP servers use a
+  shared token store at the daemon level; per-session credential
+  isolation is deferred until we have a multi-tenant story.
+
+### 18c. Why this isn't a regression
+
+The §10 token-economy bullet that previously forbade MCP cited
+"thousands of tokens per server" — that was the right diagnosis of
+the wrong design. The lazy catalog reduces per-tool overhead to one
+line; a 50-tool MCP server adds ~50 lines (≈400 tokens) to the
+system prompt, comparable to one skill. The full schema cost is paid
+once per `mcp_invoke` call, exactly where the model needs it.
+
+`mcp2cli-rs` remains a valid escape hatch for users who specifically
+want to wrap MCP tools as CLI invocations under `bash`, but it is
+no longer the recommended path.
+
+---
+
+## 19. Future paid surfaces (roadmap, not v1)
+
+cockpit is OSS-core. A small set of paid surfaces are on the roadmap
+and constrain the v1 architecture even though they don't ship in v1.
+None of these are committed; they are listed here so that v1 design
+decisions don't foreclose them.
+
+- **Mobile / browser client.** The §8d `cockpit connect` outbound
+  WebSocket is the mechanism; the hosted relay + mobile/web client is
+  the surface. **Constraint on v1:** the NDJSON wire schema (§8c) must
+  stay client-agnostic. TUI-specific assumptions (cursor positions,
+  terminal capabilities) must not leak into the protocol.
+- **Account-synced configs.** Save/restore the user-level config
+  layers (§2) to a cockpit account for easy import on new machines.
+  **Constraint on v1:** layer identity must be stable (so a sync
+  target is well-defined); machine-local layers (`/srv`, `/opt`) and
+  `credentials.json` are categorically not syncable. Conflict
+  resolution is unresolved (see `design-need-to-discuss-or-test.md`).
+- **Games while agent works.** Entertainment surface in the TUI / web
+  client for long-running agent tasks. **Constraint on v1:** the
+  fullscreen TUI layout (§1) must leave structural room for a
+  sidebar or modal so this isn't foreclosed.
+
+---
+
+## 20. Provider auth — sanctioned vs passthrough
+
+Provider authentication paths in cockpit fall into two categories.
+This distinction must be surfaced in the Add-Provider wizard and in
+`cockpit providers status`.
+
+- **Sanctioned.** The vendor publishes an OAuth client-registration
+  program or documents the auth flow for third-party clients.
+  Examples: every API-key flow (Anthropic, OpenAI Platform, Mistral,
+  DeepSeek, OpenRouter, etc.); GitHub Copilot's editor device-code
+  flow (the published `01ab8ac9400c4e429b23` client id).
+- **Passthrough.** cockpit re-uses a first-party client's own OAuth
+  client id to access the vendor's subscription service from a
+  non-first-party tool. The vendor neither publishes nor sanctions
+  this path; it works because the source for the first-party client
+  is open. Examples:
+  - **Codex (ChatGPT Plus/Pro).** `src/auth/codex.rs` re-uses the
+    Codex CLI's `CLIENT_ID = app_EMoamEEZ73f0CkXaXp7hrann` to spend
+    ChatGPT subscription quota.
+  - **Claude (Pro/Max).** *If* we add it — same posture; under
+    discussion.
+
+**Policy.**
+1. Passthrough flows must not be the default in the Add-Provider
+   wizard. API-key paths are first.
+2. The wizard and `cockpit providers status` must label passthrough
+   flows with a one-line warning: *"Uses your ChatGPT Plus quota via
+   the Codex CLI's OAuth client. Not officially supported by OpenAI;
+   may stop working without notice."*
+3. Implementation lives under `src/auth/<vendor>.rs`; never share an
+   OAuth client id across `auth/` modules.
+
+---
+
 ## Non-goals
 
-- **MCP support is out of scope.** opencode supports MCP natively
-  (stdio + remote, OAuth, etc.). `cockpit` deliberately does **not**.
-  MCP servers add to the model's context window per call and are
-  token-expensive. Users who want MCP should install
-  [`mcp2cli-rs`](https://github.com/christopher-kapic/mcp2cli-rs) (`mcp2cli`
-  on `crates.io`) and let the model invoke MCP tools through the much
-  cheaper `bash` tool. The recommended onboarding flow when a user reaches
-  for `cockpit mcp ...` is to print a one-line pointer to mcp2cli and exit.
+- **(Removed)** *MCP support* was previously a non-goal. As of
+  2026-05-27 this is reversed — cockpit ships first-class MCP support
+  via a lazy-discovery design that preserves the §10 token-economy
+  invariant. See §18.
 - **Web UI / remote-accessible HTTP server** (`opencode serve`,
   `opencode web`, `opencode acp`). v1 ships a local daemon (§8)
   with a TUI client, no web UI. The daemon's socket is

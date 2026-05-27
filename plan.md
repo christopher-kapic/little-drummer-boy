@@ -356,6 +356,10 @@ automatically.
 cockpit's `/compact` is not opencode-style inline summarization. It
 implements a **handoff to a fresh thread**:
 
+0. **Prune-first.** Always run `/prune` (T6.d) before invoking the
+   summarizer. Pruning is lossless; running it first means the
+   summarizer sees a smaller, denser transcript and produces a
+   tighter brief. No `--no-prune` flag — the ordering is fixed.
 1. Send the model a final prompt: "Generate a self-contained brief
    for a fresh agent that lets it continue this work from where we
    left off."
@@ -365,11 +369,24 @@ implements a **handoff to a fresh thread**:
    read/edited (with current hashes), commands run (with exit codes
    and brief result summaries), git branch, dirty file list, open
    todos, pinned-message contents verbatim.
-3. Show the assembled handoff in the composer; user can edit or
-   append before commit.
-4. On user confirmation, start a new session seeded with that
-   handoff as the first user message. The old session is preserved
-   in SQLite and recoverable (`cockpit session show <id>`,
+3. **Compute the seed-tools list.** The runtime walks the prior
+   session's read history and the current lock table to derive a
+   list of read-only tool calls (`read`, `glob`, `grep`, `ls`,
+   `git status`) whose results the model was actively using just
+   before compaction. These calls are dispatched at the start of the
+   new thread and their results land as if the new agent had just
+   run them — the new agent doesn't pay a fresh round-trip to
+   re-discover the live working set. Restricted to read-only,
+   idempotent tools (no `bash`, `write`, `edit`); results are
+   **re-executed**, not replayed from the prior transcript, so the
+   new agent never sees stale snapshots. The TUI shows the
+   seed-tool token cost on the new agent's first turn.
+4. Show the assembled handoff (brief + appendix + seed-tools list)
+   in the composer; user can edit or append before commit.
+5. On user confirmation, start a new session seeded with that
+   handoff as the first user message; seed-tools dispatch before the
+   first inference call. The old session is preserved in SQLite and
+   recoverable (`cockpit session show <id>`,
    `cockpit session resume <id>`).
 
 **Properties.**
@@ -403,6 +420,25 @@ preemptive-compaction model — when the predicted next-turn size
 crosses the model's context limit, fire `/compact` automatically.
 The user can disable auto-compact in `config.json` and invoke
 manually instead.
+
+**Safe-boundary predicate.** Auto-compact only fires when
+`engine::is_at_safe_compaction_boundary()` returns true. The
+predicate is:
+
+```rust
+tool_call_in_flight.is_none()
+    && active_subagents.is_empty()
+    && !pending_user_interaction
+```
+
+When the trigger fires but the boundary is not safe, the auto-compact
+request is **queued** and re-evaluated after each significant state
+change (tool result returned, subagent reported, user prompt
+resolved). This prevents mid-tool-call compaction (which would
+corrupt the wire/user transcript split) and mid-subagent compaction
+(which would orphan the subagent's reportable state). Same predicate
+is consulted by the cache-aware auto-prune trigger (T6.f) before
+firing, for the same reason.
 
 #### T6.f — Reasoning-block elision (mode-dependent; ships in M2)
 
@@ -470,15 +506,38 @@ call. It filters any settled-turn thinking the backward pass
 missed (race window: turn closed between two requests).
 Single chokepoint, alongside `redact::scrub()`.
 
-**Auto-`/prune` trigger.** When `ctx ≥
-prune.auto_threshold.ctx` (default 0.80) **and** `prunable ≥
-prune.auto_threshold.prunable` (default 0.40 of the full
-window), `/prune` fires once before the next inference call. A
-single status-line line surfaces the result
-(`auto-pruned: 47% → 12%`). Hysteresis: after firing, suppress
-re-fire until `prunable` drops below the trigger by at least
-`prune.auto_hysteresis` (default 0.10) and climbs back above
-it. Otherwise sessions hovering around the threshold thrash.
+**Auto-`/prune` triggers (two, OR'd).** `/prune` fires before the
+next inference call when **either** of the following holds:
+
+1. **Threshold trigger.** `ctx ≥ prune.auto_threshold.ctx` (default
+   0.80) **and** `prunable ≥ prune.auto_threshold.prunable` (default
+   0.40 of the full window). Hysteresis: after firing, suppress
+   re-fire until `prunable` drops below the trigger by at least
+   `prune.auto_hysteresis` (default 0.10) and climbs back above it.
+   Otherwise sessions hovering around the threshold thrash.
+
+2. **Cache-aware trigger.** Expected cache-hit on the next call is
+   zero. Three cases unified under one predicate, evaluated by the
+   daemon's per-send hook:
+   - **No-cache provider.** `provider.cache.mode = "none"`. Pruning
+     has zero cache cost; the savings are pure context. Default
+     `mode` per provider: Anthropic/OpenAI Platform = `"automatic"`,
+     Anthropic with explicit breakpoints = `"explicit"`, OpenRouter
+     routes / raw vLLM / llama.cpp / most local = `"none"`. **Do not
+     autodetect** — require explicit config.
+   - **Cache TTL elapsed.** `time_since_last_send > provider.cache.ttl_secs`
+     (default 300; per-provider and per-model overrides). The
+     provider has dropped the cache; pruning has zero cost from
+     here on.
+   - **Upstream cache-bust this turn.** An edit, redaction change,
+     or system-block mutation has already invalidated the cache
+     anchor for this send; prune freely from there.
+
+A single status-line line surfaces the result (`auto-pruned: 47% →
+12% (cache-aware)`) so the user can see which trigger fired.
+**Short-circuit:** the per-session "last prune watermark" (the most
+recent `(turn_index, dedup_count)` snapshot) skips the walk when
+nothing new is prunable, even when the predicate is true.
 
 **Provider abstraction.** Per-provider preservation rules hide
 behind a small trait on the provider layer:
@@ -1161,6 +1220,21 @@ The `mode` defaults to `"subagent"` (noninteractive) when omitted
 unless the spawning agent specifies otherwise; the active
 orchestrator chooses interactively when handing off coding work
 that the user is likely to want to steer mid-flight.
+
+**Seed-tools on subagent invocation.** A `task` invocation may
+include an optional `seed_tools: [{name, args}, ...]` list. Each
+entry is dispatched **before** the subagent's first inference call;
+results land in the subagent's initial context as if it had just run
+them. Restricted to read-only, idempotent tools (`read`, `glob`,
+`grep`, `ls`, `git status`); `bash`/`write`/`edit` are rejected at
+schema validation. Tools are **re-executed**, not replayed from the
+parent's transcript, so the subagent never inherits stale snapshots.
+Purpose: a parent that already knows the subagent will need
+`src/foo.rs` can save the round-trip by pre-loading it; combined
+with the subagent-report token cap (GOALS §10), this lets fan-out
+patterns be tight in both directions. The TUI shows the seed-tool
+token cost on the subagent's first turn so an over-eager parent is
+debuggable. Same mechanism powers `/compact` handoff (T6.e step 3).
 
 **Fork — branch the conversation thread.**
 
@@ -2406,25 +2480,27 @@ doesn't want the rest.
 
 ### 5c. `mcp2cli-rs`
 
-MCP is a non-goal for cockpit (GOALS non-goals). mcp2cli is how users
-who need MCP get it.
+**Status changed 2026-05-27.** MCP is no longer a non-goal — see
+GOALS §18 for the first-class, lazy-discovery design that cockpit
+now ships natively. mcp2cli remains supported as an alternative for
+users who specifically want MCP tools wrapped as shell commands.
 
 Touchpoints:
 
-- `cockpit mcp` prints a one-line pointer to `mcp2cli` and exits non-zero.
-  (Already implemented; this plan ratifies it.)
-- The recommended user pattern is to install `mcp2cli`, then invoke
-  MCP tools from inside cockpit via the `bash` tool:
+- `cockpit mcp {add,list,test,refresh}` manages MCP servers natively
+  (GOALS §18). Server configs live in layered `.cockpit/mcp.json`.
+- For users who prefer the shell-wrap pattern, `mcp2cli` is still
+  available and can be invoked from `bash`:
   ```
   bash> mcp2cli --mcp http://… get-user --id 42
   ```
-- Users with many MCP tools can `mcp2cli bake` them into named shell
-  commands; the agent then sees a small handful of named CLIs in
-  `bash` instead of dozens of MCP tool descriptions.
+- `mcp2cli bake` (precompile to named shell commands) remains a valid
+  pattern for very large MCP catalogs where even the one-line
+  per-tool catalog (GOALS §18a) becomes noisy.
 
-The TUI's first-launch tour can include a "you have MCP servers
-configured in opencode/claude — install `mcp2cli` to use them" toast,
-if we detect any in the discovered configs.
+The TUI's first-launch tour can detect MCP servers in discovered
+`opencode`/`claude` configs and offer to import them into
+`.cockpit/mcp.json`.
 
 ---
 
