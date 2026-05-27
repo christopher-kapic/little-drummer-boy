@@ -51,6 +51,18 @@ pub fn try_spawn(cwd: &Path) -> Result<AgentRunner, String> {
             let daemon = probe_or_spawn(LifecycleMode::AttachOrAutoPromote)
                 .await
                 .map_err(|e| format!("daemon probe: {e}"))?;
+            // Push our env into the daemon before attaching so any vars
+            // the user added to their shell rc since the daemon was
+            // spawned (API keys, COPILOT_API_URL, etc.) become visible
+            // to the next inference call. Fire-and-forget — a daemon
+            // that doesn't yet speak `RefreshEnv` just errors back, and
+            // we proceed as before.
+            let env: std::collections::HashMap<String, String> =
+                std::env::vars().collect();
+            let _ = daemon
+                .client
+                .request(Request::RefreshEnv { vars: env })
+                .await;
             let project_root = cwd.to_string_lossy().into_owned();
             let attached = daemon
                 .client

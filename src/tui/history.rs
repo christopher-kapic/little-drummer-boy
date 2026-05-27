@@ -173,7 +173,7 @@ pub struct Rendered {
 /// background to the full width.
 ///
 /// `thinking` controls how reasoning is surfaced:
-/// - [`ThinkingDisplay::Condensed`] (default) — chip, expands on `Ctrl+R`
+/// - [`ThinkingDisplay::Condensed`] (default) — chip, expands on `Ctrl+J`
 /// - [`ThinkingDisplay::Hidden`] — drop the chip and reasoning entirely
 /// - [`ThinkingDisplay::Verbose`] — force expanded regardless of the stored flag
 pub fn render_entry(
@@ -415,9 +415,9 @@ fn render_agent(
     if has_reasoning {
         let arrow = if expanded { "▼" } else { "▶" };
         let action_hint = if expanded {
-            "ctrl+r to collapse"
+            "ctrl+j to collapse"
         } else {
-            "ctrl+r to expand"
+            "ctrl+j to expand"
         };
         let label = match think_duration {
             Some(d) => format!(
@@ -466,7 +466,7 @@ fn render_agent(
             // left indent — otherwise ratatui's auto-wrap drops them
             // to column 0 and the block looks ragged.
             out.push(render_first_line_timestamped(
-                chip_spans, timestamp, width, false,
+                chip_spans, timestamp, width, true,
             ));
             let reasoning_indent = AGENT_INDENT + 2;
             let reasoning_w = (width as usize).saturating_sub(reasoning_indent).max(1);
@@ -489,7 +489,7 @@ fn render_agent(
             // markdown spans onto the chip line is more visual jank than
             // it's worth), body markdown lines follow.
             out.push(render_first_line_timestamped(
-                chip_spans, timestamp, width, false,
+                chip_spans, timestamp, width, true,
             ));
             out.extend(body_lines);
         } else {
@@ -504,7 +504,7 @@ fn render_agent(
                 first_line_spans,
                 timestamp,
                 width,
-                false,
+                true,
             ));
             for chunk in wrapped.iter().skip(1) {
                 out.push(Line::from(vec![Span::raw(format!("{indent}{chunk}"))]));

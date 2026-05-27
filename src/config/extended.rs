@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExtendedConfig {
     #[serde(default)]
     pub harnesses: HashMap<String, HarnessConfig>,
@@ -330,6 +330,26 @@ where
     }
 }
 
+impl Default for ExtendedConfig {
+    fn default() -> Self {
+        Self {
+            harnesses: HashMap::new(),
+            agent_guidance_files: default_agent_guidance_files(),
+            concurrency: Concurrency::default(),
+            agent_dirs: Vec::new(),
+            redact: RedactConfig::default(),
+            tui: TuiConfig::default(),
+            name: None,
+            packages_directory: None,
+            tools: HashMap::new(),
+            allow_remote_config: false,
+            utility_model: None,
+            prompt_injection_guard: PromptInjectionGuardConfig::default(),
+            system_prompt: SystemPromptConfig::default(),
+        }
+    }
+}
+
 impl Default for TuiConfig {
     fn default() -> Self {
         Self {
@@ -346,7 +366,7 @@ impl Default for TuiConfig {
 }
 
 fn default_agent_guidance_files() -> Vec<String> {
-    vec!["AGENTS.md".into(), "CLAUDE.md".into()]
+    vec!["AGENTS.md".into()]
 }
 
 /// Round-trip loader/saver for `extended-config.json` that preserves

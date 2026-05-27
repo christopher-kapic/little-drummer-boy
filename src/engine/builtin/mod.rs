@@ -46,7 +46,12 @@ pub struct SpawnArgs {
 /// prompt before handing it to [`Agent::system`]. Per GOALS §17g these
 /// stay inside the cached system block — both fields are stable for
 /// the session's lifetime so prompt-cache hits aren't disturbed.
-fn compose_system_prompt(role_prompt: &str, session_short_id: &str) -> String {
+///
+/// Also injects the first matching project-guidance file
+/// (`extended.agent_guidance_files`, default `AGENTS.md`) found by
+/// walking from `cwd` up to the git root. Picking the first match keeps
+/// the injection deterministic when multiple legacy names exist.
+fn compose_system_prompt(role_prompt: &str, session_short_id: &str, cwd: &Path) -> String {
     let os = crate::sysinfo::os_string();
     let mut out = String::with_capacity(role_prompt.len() + 96);
     out.push_str(role_prompt);
@@ -62,7 +67,52 @@ fn compose_system_prompt(role_prompt: &str, session_short_id: &str) -> String {
         out.push_str(session_short_id);
         out.push('\n');
     }
+
+    if let Some((found_path, body)) = load_agent_guidance(cwd) {
+        out.push('\n');
+        out.push_str("Project guidance (");
+        out.push_str(&found_path.display().to_string());
+        out.push_str("):\n");
+        out.push_str(&body);
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+    }
     out
+}
+
+/// Locate the first existing project-guidance file by name, searching
+/// `cwd` then its ancestors up to (and including) the git worktree root
+/// when there is one — otherwise stop at the filesystem root. Returns
+/// the absolute path + file body.
+fn load_agent_guidance(cwd: &Path) -> Option<(std::path::PathBuf, String)> {
+    let cfg = discover_config_dirs(cwd)
+        .into_iter()
+        .find_map(|d| ExtendedConfigDoc::load(&d.path.join("extended-config.json")).ok())
+        .map(|d| d.config())
+        .unwrap_or_default();
+    if cfg.agent_guidance_files.is_empty() {
+        return None;
+    }
+    let stop_at = crate::git::find_worktree_root(cwd);
+    let mut dir: Option<&Path> = Some(cwd);
+    while let Some(d) = dir {
+        for name in &cfg.agent_guidance_files {
+            let candidate = d.join(name);
+            if candidate.is_file()
+                && let Ok(body) = std::fs::read_to_string(&candidate)
+            {
+                return Some((candidate, body));
+            }
+        }
+        if let Some(root) = &stop_at
+            && d == root.as_path()
+        {
+            break;
+        }
+        dir = d.parent();
+    }
+    None
 }
 
 /// Load user-defined custom-bash tools from the first `extended-config.json`
@@ -120,7 +170,8 @@ mod tests {
 
     #[test]
     fn compose_system_prompt_appends_os_and_session() {
-        let out = compose_system_prompt("ROLE PROMPT", "abc123");
+        let tmp = tempfile::tempdir().unwrap();
+        let out = compose_system_prompt("ROLE PROMPT", "abc123", tmp.path());
         assert!(out.starts_with("ROLE PROMPT"));
         assert!(out.contains("Operating system:"));
         assert!(out.contains("Session: abc123"));
@@ -128,19 +179,30 @@ mod tests {
 
     #[test]
     fn compose_system_prompt_omits_session_when_empty() {
-        let out = compose_system_prompt("ROLE PROMPT", "");
+        let tmp = tempfile::tempdir().unwrap();
+        let out = compose_system_prompt("ROLE PROMPT", "", tmp.path());
         assert!(out.contains("Operating system:"));
         assert!(!out.contains("Session:"));
     }
 
     #[test]
     fn compose_system_prompt_normalizes_trailing_newline() {
-        let with_nl = compose_system_prompt("ROLE\n", "abc123");
-        let without_nl = compose_system_prompt("ROLE", "abc123");
+        let tmp = tempfile::tempdir().unwrap();
+        let with_nl = compose_system_prompt("ROLE\n", "abc123", tmp.path());
+        let without_nl = compose_system_prompt("ROLE", "abc123", tmp.path());
         // The role-prompt's own newline is preserved either way; the
         // appended lines are identical in both cases.
         assert!(with_nl.contains("\nOperating system:"));
         assert!(without_nl.contains("\nOperating system:"));
+    }
+
+    #[test]
+    fn compose_system_prompt_injects_first_matching_guidance_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("AGENTS.md"), "RULES").unwrap();
+        let out = compose_system_prompt("ROLE", "abc", tmp.path());
+        assert!(out.contains("Project guidance"));
+        assert!(out.contains("RULES"));
     }
 }
 
@@ -160,7 +222,11 @@ pub fn orchestrator_build(args: &SpawnArgs) -> Agent {
 
     Agent {
         name: "orchestrator-build".to_string(),
-        system: compose_system_prompt(ORCHESTRATOR_BUILD_PROMPT, &args.session_short_id),
+        system: compose_system_prompt(
+            ORCHESTRATOR_BUILD_PROMPT,
+            &args.session_short_id,
+            &args.cwd,
+        ),
         tools,
         model: args.model.clone(),
         params: args.params.clone(),
@@ -182,7 +248,7 @@ pub fn coder(args: &SpawnArgs) -> Agent {
 
     Agent {
         name: "coder".to_string(),
-        system: compose_system_prompt(CODER_PROMPT, &args.session_short_id),
+        system: compose_system_prompt(CODER_PROMPT, &args.session_short_id, &args.cwd),
         tools,
         model: args.model.clone(),
         params: args.params.clone(),
@@ -206,7 +272,7 @@ pub fn explore(args: &SpawnArgs) -> Agent {
 
     Agent {
         name: "explore".to_string(),
-        system: compose_system_prompt(EXPLORE_PROMPT, &args.session_short_id),
+        system: compose_system_prompt(EXPLORE_PROMPT, &args.session_short_id, &args.cwd),
         tools,
         model: args.model.clone(),
         params: args.params.clone(),

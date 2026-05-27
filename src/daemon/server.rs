@@ -342,6 +342,21 @@ async fn handle_request(
             socket_path: ctx.paths.socket.display().to_string(),
         }),
 
+        Request::RefreshEnv { vars } => {
+            // SAFETY: `std::env::set_var` mutates process-global state.
+            // The daemon is multi-threaded but only the model-call /
+            // header-resolution paths read these vars, and a stale read
+            // mid-overwrite is bounded — at worst the next inference
+            // call uses the pre-update value, which is the same situation
+            // we'd be in had the refresh never happened.
+            for (k, v) in vars {
+                unsafe {
+                    std::env::set_var(&k, &v);
+                }
+            }
+            Ok(Response::Ack)
+        }
+
         Request::StopDaemon => {
             tracing::info!("StopDaemon requested via client");
             // The shutdown watcher in `run_accept_loop` is signalled

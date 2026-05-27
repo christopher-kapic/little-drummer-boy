@@ -217,6 +217,10 @@ pub struct App {
     /// Preferred over the local tiktoken estimate in the context
     /// indicator; `None` until the first call returns.
     last_usage: Option<crate::tokens::TokenUsage>,
+    /// Ctrl+G was pressed — the event loop suspends ratatui, runs
+    /// `$EDITOR` against the composer text, then reloads the file back
+    /// into the composer.
+    pending_external_edit: bool,
 }
 
 /// Args cached at `ToolStart` for an `edit` / `editunlock` call so the
@@ -304,6 +308,7 @@ impl App {
             at_dismissed: false,
             pending_new_session: false,
             last_usage: None,
+            pending_external_edit: false,
         };
         app.pane_height = app.geometry().desired_pane_height();
         // First-run convenience: if the daemon prompt doesn't gate
@@ -379,7 +384,7 @@ impl App {
         // scroll-wheel events from the terminal (no native scrollback
         // scroll) and breaks native text selection / copy-on-release.
         // Users care more about scroll + select than about click-to-
-        // expand, so we keep mouse off and rely on the `Ctrl+R`
+        // expand, so we keep mouse off and rely on the `Ctrl+J`
         // shortcut for expanding the most-recent reasoning block (see
         // [`Self::toggle_recent_reasoning`]).
 
@@ -471,6 +476,7 @@ impl App {
             // old hand-rolled spill path's flicker source).
             self.maybe_spill_history(terminal)?;
             self.maybe_service_new_session(terminal)?;
+            self.maybe_service_external_edit(terminal)?;
             terminal.draw(|frame| self.render(frame))?;
             self.sync_cursor_shape();
 
@@ -645,6 +651,78 @@ impl App {
         Ok(())
     }
 
+    /// Ctrl+G was pressed: pop the composer text out into `$EDITOR`,
+    /// then reload whatever the user wrote back into the buffer. Quits
+    /// raw mode for the duration so the editor owns the terminal.
+    fn maybe_service_external_edit(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
+        if !self.pending_external_edit {
+            return Ok(());
+        }
+        self.pending_external_edit = false;
+
+        let Some(editor) = std::env::var_os("EDITOR") else {
+            // Defensive — we re-check here because env state can shift
+            // between the keypress and now. The handler already
+            // surfaced a toast when EDITOR was unset, so just bail.
+            return Ok(());
+        };
+
+        // Stash the buffer in a sibling-tempfile-named so the editor's
+        // syntax detection (if any) picks Markdown.
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("cockpit-prompt-{}.md", std::process::id()));
+        if let Err(e) = std::fs::write(&path, self.composer.text()) {
+            self.history.push(HistoryEntry::Plain {
+                line: format!("editor: failed to write temp file: {e}"),
+            });
+            return Ok(());
+        }
+
+        // Suspend ratatui's input handling for the editor invocation.
+        // We disable the keyboard-enhancement flags / cursor styles
+        // crossterm pushed for us, leave raw mode, and let the editor
+        // own the TTY. Re-enable everything after it exits.
+        use crossterm::terminal::{
+            EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+        };
+        let _ = crossterm::execute!(stdout(), LeaveAlternateScreen);
+        let _ = disable_raw_mode();
+
+        let status = std::process::Command::new(&editor).arg(&path).status();
+
+        let _ = enable_raw_mode();
+        let _ = crossterm::execute!(stdout(), EnterAlternateScreen);
+        terminal.clear()?;
+
+        match status {
+            Ok(s) if s.success() => match std::fs::read_to_string(&path) {
+                Ok(text) => {
+                    // Drop a single trailing newline — most editors
+                    // write one even when the user didn't add one.
+                    let text = text.strip_suffix('\n').unwrap_or(&text).to_string();
+                    self.composer.set(text);
+                }
+                Err(e) => {
+                    self.history.push(HistoryEntry::Plain {
+                        line: format!("editor: failed to read temp file back: {e}"),
+                    });
+                }
+            },
+            Ok(s) => {
+                self.history.push(HistoryEntry::Plain {
+                    line: format!("editor: exited with {s}"),
+                });
+            }
+            Err(e) => {
+                self.history.push(HistoryEntry::Plain {
+                    line: format!("editor: invoking `{}`: {e}", editor.to_string_lossy()),
+                });
+            }
+        }
+        let _ = std::fs::remove_file(&path);
+        Ok(())
+    }
+
     fn handle_key(&mut self, key: KeyEvent) -> bool {
         if key.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('d'))
@@ -733,12 +811,33 @@ impl App {
             return false;
         }
 
-        // Ctrl+R toggles the most-recent agent message's reasoning
-        // block expand/collapse. (See the doc comment on
-        // `toggle_recent_reasoning` for why this is a keybind rather
-        // than a click handler.)
-        if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('r')) {
+        // Ctrl+J toggles every agent reasoning block's expand/collapse
+        // state. (See the doc comment on `toggle_recent_reasoning` for
+        // why this is a keybind rather than a click handler.) Only
+        // intercepted when at least one entry actually has a reasoning
+        // block — otherwise Ctrl+J falls through to its newline-insert
+        // role in the composer.
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('j'))
+            && self.history.iter().any(|e| matches!(e,
+                HistoryEntry::Agent { reasoning, .. } if !reasoning.trim().is_empty()))
+        {
             self.toggle_recent_reasoning();
+            return false;
+        }
+
+        // Ctrl+G — pop the composer text out into `$EDITOR`. We can't
+        // suspend ratatui from inside the key handler (the terminal
+        // handle lives in `event_loop`), so just request the action;
+        // the loop services it before the next draw.
+        if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('g')) {
+            if std::env::var_os("EDITOR").is_none() {
+                self.history.push(HistoryEntry::Plain {
+                    line: "No $EDITOR environment variable".to_string(),
+                });
+            } else {
+                self.pending_external_edit = true;
+            }
             return false;
         }
 
@@ -996,9 +1095,19 @@ impl App {
             }
             KeyCode::Char(ch) => {
                 let was_pending_g = self.composer.pending_g();
-                // Default: any char key clears the pending `g`; the
-                // `g` arm below re-arms it if applicable.
+                let pending_find = self.composer.pending_find();
+                // Default: any char key clears the pending `g`/`f`/`F`;
+                // the `g`/`f`/`F` arms below re-arm them if applicable.
                 self.composer.set_pending_g(false);
+                self.composer.set_pending_find(None);
+                if let Some(forward) = pending_find {
+                    if forward {
+                        self.composer.find_char_forward(ch);
+                    } else {
+                        self.composer.find_char_backward(ch);
+                    }
+                    return false;
+                }
                 match ch {
                     'h' => self.composer.move_left(),
                     'l' => self.composer.move_right(),
@@ -1018,6 +1127,8 @@ impl App {
                             self.composer.set_pending_g(true);
                         }
                     }
+                    'f' => self.composer.set_pending_find(Some(true)),
+                    'F' => self.composer.set_pending_find(Some(false)),
                     'i' => self.composer.set_vim_mode(VimMode::Insert),
                     'I' => {
                         self.composer.move_line_start();
@@ -1402,11 +1513,16 @@ impl App {
         // ThinkingOnly variant later is cheap.
     }
 
-    /// Toggle the most-recent agent message's `expanded` flag. The
-    /// equivalent of clicking the chip; bound to `Ctrl+R` for
-    /// keyboard-only use.
+    /// Toggle every agent message's `expanded` flag. Bound to `Ctrl+J`
+    /// for keyboard-only use. If any entry is currently collapsed we
+    /// expand them all; otherwise we collapse them all.
     fn toggle_recent_reasoning(&mut self) {
-        for entry in self.history.iter_mut().rev() {
+        let any_collapsed = self.history.iter().any(|e| {
+            matches!(e,
+                HistoryEntry::Agent { reasoning, expanded, .. }
+                    if !reasoning.trim().is_empty() && !*expanded)
+        });
+        for entry in self.history.iter_mut() {
             if let HistoryEntry::Agent {
                 expanded,
                 reasoning,
@@ -1414,8 +1530,7 @@ impl App {
             } = entry
                 && !reasoning.trim().is_empty()
             {
-                *expanded = !*expanded;
-                return;
+                *expanded = any_collapsed;
             }
         }
     }
@@ -1999,10 +2114,21 @@ impl App {
         } else {
             Borders::ALL
         };
+        // Light grey border while the agent loop is in flight; white
+        // when we're idle and waiting for the user. The signal is the
+        // same `pending` slot the renderer uses to drive the "Thinking…"
+        // placeholder, so the border stays grey across reasoning,
+        // streaming, and tool dispatch and flips back to white the
+        // moment the turn finalizes.
+        let border_color = if self.pending.is_some() {
+            Color::Indexed(MUTED_COLOR_INDEX)
+        } else {
+            Color::White
+        };
         let input_block = Block::default()
             .borders(borders)
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(Color::White));
+            .border_style(Style::default().fg(border_color));
         let input_inner = input_block.inner(area);
 
         let prefix_width = input_prefix_width();
@@ -2422,13 +2548,9 @@ fn entry_to_plain_lines(entry: &HistoryEntry) -> Vec<String> {
         }
         HistoryEntry::User { text, timestamp } => {
             let ts = timestamp.format("%H:%M").to_string();
-            let mut out: Vec<String> = Vec::new();
-            for (i, line) in text.split('\n').enumerate() {
-                if i == 0 {
-                    out.push(format!("{line}  [{ts}]"));
-                } else {
-                    out.push(line.to_string());
-                }
+            let mut out: Vec<String> = vec![format!("[{ts}] you:")];
+            for line in text.split('\n') {
+                out.push(format!("  {line}"));
             }
             out
         }
@@ -2441,20 +2563,16 @@ fn entry_to_plain_lines(entry: &HistoryEntry) -> Vec<String> {
             ..
         } => {
             let ts = timestamp.format("%H:%M").to_string();
-            let mut out = Vec::new();
-            for (i, line) in text.split('\n').enumerate() {
-                if i == 0 {
-                    out.push(format!("{name}: {line}  [{ts}]"));
-                } else {
-                    let pad = " ".repeat(name.chars().count() + 2);
-                    out.push(format!("{pad}{line}"));
-                }
-            }
+            let mut out: Vec<String> = vec![format!("[{ts}] {name}:")];
             if !reasoning.trim().is_empty() && *expanded {
                 out.push("  thinking:".to_string());
                 for raw in reasoning.lines() {
                     out.push(format!("    {raw}"));
                 }
+                out.push(String::new());
+            }
+            for line in text.split('\n') {
+                out.push(format!("  {line}"));
             }
             out
         }

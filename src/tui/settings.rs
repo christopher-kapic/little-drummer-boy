@@ -91,6 +91,17 @@ enum Page {
     Tools(ToolsPage),
     Providers(ProvidersPage),
     Ui(UiPage),
+    Instructions(InstructionsPage),
+}
+
+/// `/settings → UI → Instructions File` state. Edits the
+/// `extended.agent_guidance_files` list.
+struct InstructionsPage {
+    cursor: usize,
+    /// `Some(idx)` when the user is editing row `idx`'s filename inline.
+    editing: Option<usize>,
+    buf: TextField,
+    status: Option<String>,
 }
 
 /// `/settings → UI` state.
@@ -209,6 +220,12 @@ enum AddStep {
     EditUrl,
     /// Add/remove HTTP headers (`Authorization: Bearer $TOKEN`, etc.).
     EditHeaders,
+    /// GitHub Copilot's auth-setup step — surfaces the "append
+    /// `export GH_TOKEN=$(gh auth token)` to your shell rc" action (or
+    /// the manual-instructions fallback) before saving. Replaces the
+    /// EditHeaders step for the Copilot template; the canonical
+    /// Authorization header is fixed by the template anyway.
+    CopilotAuth(CopilotSetupState),
     /// Run a device-code OAuth flow. Lives in `s.codex_login`. Reached
     /// directly after EditId when the template's auth is `DeviceFlow`.
     CodexLogin,
@@ -911,6 +928,7 @@ impl SettingsDialog {
             }
             Page::Tools(_) => self.handle_tools_key(key),
             Page::Ui(_) => self.handle_ui_key(key),
+            Page::Instructions(_) => self.handle_instructions_key(key),
             Page::Providers(_) => self.handle_providers_key(key),
             Page::Root { .. } => unreachable!("handled above"),
         }
@@ -995,10 +1013,7 @@ impl SettingsDialog {
                 delete_pending,
             } => {
                 let ids: Vec<String> = self.config.providers.keys().cloned().collect();
-                let copilot_row_visible = !copilot_setup::copilot_env_already_set();
-                let copilot_row_idx = copilot_row_visible.then_some(ids.len());
-                let max_cursor = ids.len() + usize::from(copilot_row_visible);
-                let max_cursor = max_cursor.saturating_sub(1);
+                let max_cursor = ids.len().saturating_sub(1);
                 let pressed_d = matches!(key.code, KeyCode::Char('d'));
                 match key.code {
                     KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') | KeyCode::Backspace => {
@@ -1015,11 +1030,6 @@ impl SettingsDialog {
                         return Nav::Replace(Page::Providers(ProvidersPage::Add(AddState::new())));
                     }
                     KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
-                        if Some(*cursor) == copilot_row_idx {
-                            return Nav::Replace(Page::Providers(ProvidersPage::CopilotSetup(
-                                CopilotSetupState::new(),
-                            )));
-                        }
                         if let Some(id) = ids.get(*cursor).cloned()
                             && let Some(entry) = self.config.providers.get(&id)
                         {
@@ -1068,6 +1078,42 @@ impl SettingsDialog {
             ProvidersPage::Edit(state) => self.handle_edit_key(key, state),
             ProvidersPage::FetchAll(state) => self.handle_fetch_all_key(key, state),
             ProvidersPage::CopilotSetup(state) => self.handle_copilot_setup_key(key, state),
+        }
+    }
+
+    /// Shared "save the provider, then spawn a /models fetch" sequence.
+    /// Pulled out so the Headers step and the Copilot-auth step can
+    /// both finalize without duplicating the error-handling.
+    fn save_and_fetch_provider(
+        &mut self,
+        s: &mut AddState,
+        id: String,
+        entry: ProviderEntry,
+        template: &'static ProviderTemplate,
+    ) {
+        self.config.providers.insert(id.clone(), entry.clone());
+        match self.save_config() {
+            Ok(()) => {
+                s.saved_provider_id = Some(id.clone());
+                s.error = Some("saved. Fetching /models…".into());
+                match models_fetch::resolve_provider_request(&id, &entry) {
+                    Err(e) => {
+                        s.error = Some(format!("saved. /models fetch skipped — {e}"));
+                        s.step = AddStep::Done;
+                    }
+                    Ok(_) if !template.supports_models_endpoint => {
+                        s.error = Some("saved. provider has no /models endpoint".into());
+                        s.step = AddStep::Done;
+                    }
+                    Ok(_) => {
+                        s.fetch = Some(FetchHandle::spawn(id, entry));
+                        s.step = AddStep::Fetching;
+                    }
+                }
+            }
+            Err(e) => {
+                s.error = Some(format!("save failed: {e}"));
+            }
         }
     }
 
@@ -1143,7 +1189,16 @@ impl SettingsDialog {
                         s.error = Some("url must start with http:// or https://".into());
                     } else {
                         s.error = None;
-                        s.step = AddStep::EditHeaders;
+                        // GitHub Copilot's auth is documented env-var
+                        // tokens, not custom headers — route to the
+                        // dedicated Copilot-auth screen so the
+                        // GH_TOKEN setup button lives next to the
+                        // provider it actually configures.
+                        if matches!(s.template.map(|t| t.id), Some("copilot")) {
+                            s.step = AddStep::CopilotAuth(CopilotSetupState::new());
+                        } else {
+                            s.step = AddStep::EditHeaders;
+                        }
                     }
                 }
                 _ => {
@@ -1163,53 +1218,91 @@ impl SettingsDialog {
                     }
                 }
 
-                {
-                    // Finalize and kick off the fetch.
+                let template = s.template.expect("template chosen");
+                let id = s.id_field.text().trim().to_string();
+                let headers: Vec<HeaderSpec> = s.headers.rows().to_vec();
+                let entry = ProviderEntry {
+                    name: Some(template.display.to_string()),
+                    url: s.url_field.text().trim_end_matches('/').to_string(),
+                    headers,
+                    models_fetched_at: None,
+                    favorite: None,
+                    credential_ref: None,
+                    auth: Some(template.auth),
+                    models: vec![],
+                };
+                self.save_and_fetch_provider(s, id, entry, template);
+            }
+            AddStep::CopilotAuth(state) => match key.code {
+                KeyCode::Enter => {
+                    if state.outcome.is_some() {
+                        // Outcome already shown — Enter advances to
+                        // save + fetch.
+                        let template = s.template.expect("template chosen");
+                        let id = s.id_field.text().trim().to_string();
+                        let headers = templates::default_headers_for(template);
+                        let entry = ProviderEntry {
+                            name: Some(template.display.to_string()),
+                            url: s.url_field.text().trim_end_matches('/').to_string(),
+                            headers,
+                            models_fetched_at: None,
+                            favorite: None,
+                            credential_ref: None,
+                            auth: Some(template.auth),
+                            models: vec![],
+                        };
+                        self.save_and_fetch_provider(s, id, entry, template);
+                        return Nav::Stay;
+                    }
+                    // No outcome yet. Apply the action if we can; else
+                    // jump straight to save + fetch (manual / already-
+                    // configured paths are informational only).
+                    let can_apply = state.shell.is_some()
+                        && state.rc_path.is_some()
+                        && !state.already_configured;
+                    if can_apply {
+                        let shell = state.shell.unwrap();
+                        let rc_path = state.rc_path.clone().unwrap();
+                        state.outcome = Some(apply_copilot_setup(shell, &rc_path));
+                    } else {
+                        // Skip — move to save + fetch.
+                        let template = s.template.expect("template chosen");
+                        let id = s.id_field.text().trim().to_string();
+                        let headers = templates::default_headers_for(template);
+                        let entry = ProviderEntry {
+                            name: Some(template.display.to_string()),
+                            url: s.url_field.text().trim_end_matches('/').to_string(),
+                            headers,
+                            models_fetched_at: None,
+                            favorite: None,
+                            credential_ref: None,
+                            auth: Some(template.auth),
+                            models: vec![],
+                        };
+                        self.save_and_fetch_provider(s, id, entry, template);
+                    }
+                }
+                KeyCode::Char('s') => {
+                    // Skip the GH_TOKEN action and go straight to save
+                    // + fetch — useful when the env var is already set
+                    // elsewhere (e.g. via direnv).
                     let template = s.template.expect("template chosen");
                     let id = s.id_field.text().trim().to_string();
-                    let headers: Vec<HeaderSpec> = s.headers.rows().to_vec();
-
+                    let headers = templates::default_headers_for(template);
                     let entry = ProviderEntry {
                         name: Some(template.display.to_string()),
                         url: s.url_field.text().trim_end_matches('/').to_string(),
-                        headers: headers.clone(),
+                        headers,
                         models_fetched_at: None,
                         favorite: None,
                         credential_ref: None,
                         auth: Some(template.auth),
                         models: vec![],
                     };
-
-                    self.config.providers.insert(id.clone(), entry.clone());
-                    match self.save_config() {
-                        Ok(()) => {
-                            s.saved_provider_id = Some(id.clone());
-                            s.error = Some("saved. Fetching /models…".into());
-                            // Don't fetch if the provider can't even produce
-                            // an Authorization (e.g. missing env vars) —
-                            // surface the warning instead.
-                            match models_fetch::resolve_provider_request(&id, &entry) {
-                                Err(e) => {
-                                    s.error = Some(format!("saved. /models fetch skipped — {e}"));
-                                    s.step = AddStep::Done;
-                                }
-                                Ok(_) if !template.supports_models_endpoint => {
-                                    s.error =
-                                        Some("saved. provider has no /models endpoint".into());
-                                    s.step = AddStep::Done;
-                                }
-                                Ok(_) => {
-                                    s.fetch = Some(FetchHandle::spawn(id, entry));
-                                    s.step = AddStep::Fetching;
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            s.error = Some(format!("save failed: {e}"));
-                        }
-                    }
+                    self.save_and_fetch_provider(s, id, entry, template);
                 }
-            }
+                _ => {}
+            },
             AddStep::CodexLogin => {
                 // Input handling for the device-code screen. Most
                 // movement is automatic (driven by the background
@@ -1565,6 +1658,7 @@ impl SettingsDialog {
             }
             Page::Tools(p) => self.render_tools_page(frame, layout[0], p),
             Page::Ui(p) => self.render_ui_page(frame, layout[0], p),
+            Page::Instructions(p) => self.render_instructions_page(frame, layout[0], p),
             Page::Providers(p) => self.render_providers_page(frame, layout[0], p),
         }
         frame.render_widget(help_line(self.help_text()), layout[1]);
@@ -1576,6 +1670,7 @@ impl SettingsDialog {
             Page::Agents => " › Agents".into(),
             Page::Tools(_) => " › Tools".into(),
             Page::Ui(_) => " › UI".into(),
+            Page::Instructions(_) => " › UI › Instructions File".into(),
             Page::Providers(ProvidersPage::List { .. }) => " › Providers".into(),
             Page::Providers(ProvidersPage::Add(_)) => " › Providers › Add".into(),
             Page::Providers(ProvidersPage::Edit(s)) => {
@@ -1593,6 +1688,13 @@ impl SettingsDialog {
         match &self.page {
             Page::Root { .. } => "↑/↓  enter: open  esc: close",
             Page::Agents => "←/h/backspace: back  esc: close",
+            Page::Instructions(p) => {
+                if p.editing.is_some() {
+                    "type to edit  enter: apply  esc: cancel"
+                } else {
+                    "↑/↓  a: add  enter: edit  x: delete  ←: back  esc: close"
+                }
+            }
             Page::Tools(p) => {
                 if p.editing.is_some() {
                     "type to edit  enter: apply  esc: cancel"
@@ -1623,6 +1725,7 @@ impl SettingsDialog {
                 AddStep::CodexLogin => {
                     "open URL + enter code in browser  r: retry on error  esc: cancel"
                 }
+                AddStep::CopilotAuth(_) => "enter: apply  s: skip  esc: cancel",
                 AddStep::Saving | AddStep::Fetching => "(in progress)  esc: cancel",
                 AddStep::Done => "enter: back to list",
             },
@@ -1716,30 +1819,6 @@ impl SettingsDialog {
                 ]));
             }
         }
-        // Conditional "Set up GitHub Copilot auth" row. Hidden once any
-        // of the documented Copilot env vars is set non-empty.
-        if !copilot_setup::copilot_env_already_set() {
-            let row_idx = ids.len();
-            let selected = cursor == row_idx;
-            let marker = if selected { "▸ " } else { "  " };
-            let style = if selected {
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::Cyan)
-            };
-            lines.push(Line::default());
-            lines.push(Line::from(vec![
-                Span::raw(marker),
-                Span::styled("[ Set up GitHub Copilot auth ]".to_string(), style),
-                Span::raw("  "),
-                Span::styled(
-                    "writes `export GH_TOKEN=$(gh auth token)` to your shell rc".to_string(),
-                    muted,
-                ),
-            ]));
-        }
         if let Some(msg) = status {
             lines.push(Line::default());
             lines.push(Line::from(Span::styled(
@@ -1751,38 +1830,45 @@ impl SettingsDialog {
     }
 
     fn render_copilot_setup(&self, frame: &mut Frame, area: Rect, s: &CopilotSetupState) {
-        let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
-        let yellow = Style::default().fg(Color::Yellow);
-        let red = Style::default().fg(Color::Red);
-        let green = Style::default().fg(Color::Green);
-        let cyan = Style::default().fg(Color::Cyan);
-        let bold = Style::default().add_modifier(Modifier::BOLD);
         let mut lines: Vec<Line<'static>> = Vec::new();
-
         lines.push(Line::from(Span::styled(
             "Set up GitHub Copilot auth".to_string(),
-            bold,
+            Style::default().add_modifier(Modifier::BOLD),
         )));
         lines.push(Line::default());
+        render_copilot_setup_body(&mut lines, s);
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+    }
 
-        if let Some(outcome) = &s.outcome {
-            // Post-action result screen.
-            match outcome {
-                Ok(msg) => {
-                    lines.push(Line::from(Span::styled(msg.clone(), green)));
-                }
-                Err(e) => {
-                    lines.push(Line::from(Span::styled(format!("Failed: {e}"), red)));
-                }
+}
+
+/// Render the body of the Copilot auth-setup affordance (everything
+/// after the bold title). Used both by the standalone CopilotSetup
+/// page and by the embedded panel inside the Add-Provider Copilot flow.
+fn render_copilot_setup_body(lines: &mut Vec<Line<'static>>, s: &CopilotSetupState) {
+    let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+    let yellow = Style::default().fg(Color::Yellow);
+    let red = Style::default().fg(Color::Red);
+    let green = Style::default().fg(Color::Green);
+    let cyan = Style::default().fg(Color::Cyan);
+
+    if let Some(outcome) = &s.outcome {
+        // Post-action result screen.
+        match outcome {
+            Ok(msg) => {
+                lines.push(Line::from(Span::styled(msg.clone(), green)));
             }
-            lines.push(Line::default());
-            lines.push(Line::from(Span::styled(
-                "Press Enter to return to the providers list.".to_string(),
-                muted,
-            )));
-            frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
-            return;
+            Err(e) => {
+                lines.push(Line::from(Span::styled(format!("Failed: {e}"), red)));
+            }
         }
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled(
+            "Press Enter to continue.".to_string(),
+            muted,
+        )));
+        return;
+    }
 
         match (s.shell, &s.rc_path, s.already_configured) {
             (Some(shell), Some(rc_path), false) => {
@@ -1886,17 +1972,16 @@ impl SettingsDialog {
                         cyan,
                     )));
                 }
-                lines.push(Line::default());
-                lines.push(Line::from(Span::styled(
-                    "Press Enter or Esc to return.".to_string(),
-                    yellow,
-                )));
-            }
+            lines.push(Line::default());
+            lines.push(Line::from(Span::styled(
+                "Press Enter or Esc to return.".to_string(),
+                yellow,
+            )));
         }
-
-        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
     }
+}
 
+impl SettingsDialog {
     fn render_add(&self, frame: &mut Frame, area: Rect, s: &AddState) {
         let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
         let yellow = Style::default().fg(Color::Yellow);
@@ -1960,6 +2045,38 @@ impl SettingsDialog {
                     lines.push(Line::default());
                     lines.push(Line::from(Span::styled(hint.to_string(), muted)));
                 }
+            }
+            AddStep::CopilotAuth(state) => {
+                let t = s.template.expect("template chosen");
+                lines.push(Line::from(vec![
+                    Span::styled("Template: ", muted),
+                    Span::styled(t.display.to_string(), Style::default().fg(Color::White)),
+                ]));
+                lines.push(Line::default());
+                lines.push(Line::from(vec![
+                    Span::styled("id:  ", muted),
+                    Span::styled(
+                        s.id_field.text().to_string(),
+                        Style::default().fg(Color::White),
+                    ),
+                ]));
+                lines.push(Line::from(vec![
+                    Span::styled("API url: ", muted),
+                    Span::styled(
+                        s.url_field.text().to_string(),
+                        Style::default().fg(Color::White),
+                    ),
+                ]));
+                lines.push(Line::default());
+                render_copilot_setup_body(&mut lines, state);
+                lines.push(Line::default());
+                lines.push(Line::from(Span::styled(
+                    "After this step we'll fetch the model list automatically. \
+                     Press `s` to skip the GH_TOKEN setup if your token is \
+                     already in the environment."
+                        .to_string(),
+                    muted,
+                )));
             }
             AddStep::CodexLogin => {
                 let snap = s
@@ -2331,6 +2448,15 @@ impl SettingsDialog {
                     p.buf = TextField::new(cur);
                     p.editing = Some(UiField::PackagesDir);
                 }
+                6 => {
+                    self.page = Page::Instructions(InstructionsPage {
+                        cursor: 0,
+                        editing: None,
+                        buf: TextField::default(),
+                        status: None,
+                    });
+                    return false;
+                }
                 _ => {}
             },
             _ => {}
@@ -2349,7 +2475,7 @@ impl SettingsDialog {
         )));
         lines.push(Line::default());
 
-        let rows: [(&str, String); 6] = [
+        let rows: [(&str, String); 7] = [
             (
                 "vim mode",
                 vim_label(self.extended.tui.vim_mode).to_string(),
@@ -2390,6 +2516,14 @@ impl SettingsDialog {
                     .map(|p| p.display().to_string())
                     .unwrap_or_else(|| "(unset)".to_string()),
             ),
+            (
+                "instructions file",
+                if self.extended.agent_guidance_files.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    self.extended.agent_guidance_files.join(", ")
+                },
+            ),
         ];
 
         let label_w = rows
@@ -2423,6 +2557,186 @@ impl SettingsDialog {
                 Span::styled(prompt.to_string(), muted),
                 Span::styled(p.buf.text().to_string(), Style::default().fg(Color::White)),
                 Span::styled("▎".to_string(), Style::default().fg(Color::Yellow)),
+            ]));
+        }
+
+        if let Some(status) = &p.status {
+            lines.push(Line::default());
+            lines.push(Line::from(Span::styled(status.clone(), yellow)));
+        }
+
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+    }
+
+    // ── Instructions page ────────────────────────────────────────────────
+
+    fn handle_instructions_key(&mut self, key: KeyEvent) -> bool {
+        let placeholder = Page::Instructions(InstructionsPage {
+            cursor: 0,
+            editing: None,
+            buf: TextField::default(),
+            status: None,
+        });
+        let mut page = std::mem::replace(&mut self.page, placeholder);
+        let close = if let Page::Instructions(p) = &mut page {
+            self.handle_instructions_page_key(key, p)
+        } else {
+            false
+        };
+        self.page = page;
+        close
+    }
+
+    fn handle_instructions_page_key(&mut self, key: KeyEvent, p: &mut InstructionsPage) -> bool {
+        if let Some(idx) = p.editing {
+            match key.code {
+                KeyCode::Enter => {
+                    let new = p.buf.text().trim().to_string();
+                    if new.is_empty() {
+                        // Treat blank as delete.
+                        if idx < self.extended.agent_guidance_files.len() {
+                            self.extended.agent_guidance_files.remove(idx);
+                        }
+                    } else if idx >= self.extended.agent_guidance_files.len() {
+                        self.extended.agent_guidance_files.push(new);
+                    } else {
+                        self.extended.agent_guidance_files[idx] = new;
+                    }
+                    p.editing = None;
+                    let total = self.extended.agent_guidance_files.len();
+                    p.cursor = p.cursor.min(total.saturating_sub(1).max(0));
+                    p.status = save_status(self.save_extended());
+                }
+                KeyCode::Esc => {
+                    p.editing = None;
+                    p.status = None;
+                }
+                _ => {
+                    p.buf.handle_key(key);
+                }
+            }
+            return false;
+        }
+
+        let rows = self.extended.agent_guidance_files.len();
+        // Max cursor = rows (the `[+ add]` synthetic row at the bottom).
+        let max_cursor = rows;
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => return true,
+            KeyCode::Left | KeyCode::Backspace | KeyCode::Char('h') => {
+                self.page = Page::Ui(UiPage {
+                    cursor: 6,
+                    editing: None,
+                    buf: TextField::default(),
+                    status: None,
+                });
+                return false;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                p.cursor = p.cursor.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                p.cursor = (p.cursor + 1).min(max_cursor);
+            }
+            KeyCode::Char('a') => {
+                let idx = self.extended.agent_guidance_files.len();
+                p.cursor = idx;
+                p.buf = TextField::default();
+                p.editing = Some(idx);
+            }
+            KeyCode::Char('x') | KeyCode::Delete => {
+                if p.cursor < self.extended.agent_guidance_files.len() {
+                    self.extended.agent_guidance_files.remove(p.cursor);
+                    let total = self.extended.agent_guidance_files.len();
+                    p.cursor = p.cursor.min(total.saturating_sub(1).max(0));
+                    p.status = save_status(self.save_extended());
+                }
+            }
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                if p.cursor < self.extended.agent_guidance_files.len() {
+                    let cur = self.extended.agent_guidance_files[p.cursor].clone();
+                    p.buf = TextField::new(cur);
+                    p.editing = Some(p.cursor);
+                } else if p.cursor == rows {
+                    p.buf = TextField::default();
+                    p.editing = Some(rows);
+                }
+            }
+            _ => {}
+        }
+        false
+    }
+
+    fn render_instructions_page(&self, frame: &mut Frame, area: Rect, p: &InstructionsPage) {
+        let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+        let yellow = Style::default().fg(Color::Yellow);
+        let mut lines: Vec<Line<'static>> = vec![
+            Line::from(Span::styled(
+                "Instructions File".to_string(),
+                Style::default().add_modifier(Modifier::BOLD),
+            )),
+            Line::default(),
+            Line::from(Span::styled(
+                "Filenames injected into orchestrator/coder/explore. First \
+                 match found by walking up from cwd to the git root wins."
+                    .to_string(),
+                muted,
+            )),
+            Line::default(),
+        ];
+
+        for (i, name) in self.extended.agent_guidance_files.iter().enumerate() {
+            let marker = if i == p.cursor { "▸ " } else { "  " };
+            let is_editing = matches!(p.editing, Some(j) if j == i);
+            let style = if is_editing || i == p.cursor {
+                yellow.add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            let display = if is_editing {
+                p.buf.text().to_string()
+            } else {
+                name.clone()
+            };
+            let mut spans = vec![Span::raw(marker), Span::styled(display, style)];
+            if is_editing {
+                spans.push(Span::styled(
+                    "▎".to_string(),
+                    Style::default().fg(Color::Yellow),
+                ));
+            }
+            lines.push(Line::from(spans));
+        }
+
+        let add_idx = self.extended.agent_guidance_files.len();
+        let add_selected = p.cursor == add_idx;
+        let editing_new = matches!(p.editing, Some(i) if i == add_idx);
+        let marker = if add_selected { "▸ " } else { "  " };
+        if editing_new {
+            let mut spans = vec![
+                Span::raw(marker),
+                Span::styled(
+                    p.buf.text().to_string(),
+                    yellow.add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("▎".to_string(), Style::default().fg(Color::Yellow)),
+            ];
+            if p.buf.text().is_empty() {
+                spans.insert(
+                    1,
+                    Span::styled("(type filename) ".to_string(), muted),
+                );
+            }
+            lines.push(Line::from(spans));
+        } else {
+            let style = if add_selected {
+                yellow.add_modifier(Modifier::BOLD)
+            } else {
+                muted
+            };
+            lines.push(Line::from(vec![
+                Span::raw(marker),
+                Span::styled("[+ add filename]".to_string(), style),
             ]));
         }
 
@@ -2673,8 +2987,8 @@ struct NavNode {
 const AGENTS_STUB: &str = "(stub) Agent editor — list agent definitions, edit their system prompts, tool grants, and model overrides.";
 
 /// Rows on the UI page (vim mode, thinking, render-agent-markdown,
-/// render-user-markdown, name, packages dir).
-const UI_ROWS: usize = 6;
+/// render-user-markdown, name, packages dir, instructions file).
+const UI_ROWS: usize = 7;
 
 fn bool_label(on: bool, on_label: &str, off_label: &str) -> String {
     if on {
@@ -2710,7 +3024,7 @@ fn cycle_thinking(t: ThinkingDisplay) -> ThinkingDisplay {
 
 fn thinking_label(t: ThinkingDisplay) -> &'static str {
     match t {
-        ThinkingDisplay::Condensed => "condensed (default — clickable chip, expands on click)",
+        ThinkingDisplay::Condensed => "condensed (default — chip, ctrl+j expands every block)",
         ThinkingDisplay::Hidden => "hidden (only `Thinking…` while in flight; nothing after)",
         ThinkingDisplay::Verbose => "verbose (always show reasoning inline)",
     }
@@ -3425,6 +3739,7 @@ mod tests {
                 Page::Tools(_) => f.write_str("Tools"),
                 Page::Providers(_) => f.write_str("Providers"),
                 Page::Ui(_) => f.write_str("Ui"),
+                Page::Instructions(_) => f.write_str("Instructions"),
             }
         }
     }

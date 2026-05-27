@@ -24,6 +24,7 @@
 //! can be detected on a per-line basis without buffering. Clients
 //! refuse envelopes whose `v` is outside the supported range.
 
+use std::collections::HashMap;
 use std::io;
 
 use anyhow::{Context, Result};
@@ -214,6 +215,13 @@ pub enum Request {
 
     /// Cheap liveness probe. Replaces the legacy `"ok\n"` greeting.
     DaemonStatus,
+
+    /// Refresh the daemon's view of selected environment variables.
+    /// The TUI sends a curated snapshot of *its* env on every launch so
+    /// API tokens / API-URL overrides the user just exported in their
+    /// shell rc become visible to a long-running daemon without
+    /// requiring `cockpit daemon restart`.
+    RefreshEnv { vars: HashMap<String, String> },
 
     /// Request orderly shutdown. The daemon flushes in-flight writes
     /// (session DB, lock state) before exiting.

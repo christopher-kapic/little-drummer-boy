@@ -47,6 +47,10 @@ pub struct Composer {
     /// other key. Lives here so app.rs can stay stateless about chord
     /// sequencing.
     pending_g: bool,
+    /// Pending `f`/`F` find motion — the next char key is the search
+    /// target (`Some(true)` = forward `f`, `Some(false)` = backward `F`).
+    /// Cleared on any non-char key.
+    pending_find: Option<bool>,
 }
 
 impl Composer {
@@ -61,6 +65,7 @@ impl Composer {
             },
             vim_enabled,
             pending_g: false,
+            pending_find: None,
         }
     }
 
@@ -69,6 +74,7 @@ impl Composer {
         if !enabled {
             self.vim_mode = VimMode::Insert;
             self.pending_g = false;
+            self.pending_find = None;
         }
     }
 
@@ -78,6 +84,56 @@ impl Composer {
 
     pub fn set_pending_g(&mut self, on: bool) {
         self.pending_g = on;
+    }
+
+    pub fn pending_find(&self) -> Option<bool> {
+        self.pending_find
+    }
+
+    pub fn set_pending_find(&mut self, dir: Option<bool>) {
+        self.pending_find = dir;
+    }
+
+    /// Vim `f<char>` — move forward on the current line to the next
+    /// occurrence of `target`. No-op if not found.
+    pub fn find_char_forward(&mut self, target: char) {
+        let line_end = self.buffer[self.cursor..]
+            .find('\n')
+            .map(|i| self.cursor + i)
+            .unwrap_or(self.buffer.len());
+        // Start searching from one byte past the cursor so a repeated
+        // `f<c>` advances rather than re-landing on the same character.
+        let start = self.buffer[self.cursor..line_end]
+            .chars()
+            .next()
+            .map(|c| self.cursor + c.len_utf8())
+            .unwrap_or(self.cursor);
+        if start >= line_end {
+            return;
+        }
+        let slice = &self.buffer[start..line_end];
+        for (off, ch) in slice.char_indices() {
+            if ch == target {
+                self.cursor = start + off;
+                return;
+            }
+        }
+    }
+
+    /// Vim `F<char>` — move backward on the current line to the previous
+    /// occurrence of `target`. No-op if not found.
+    pub fn find_char_backward(&mut self, target: char) {
+        let line_start = self.buffer[..self.cursor]
+            .rfind('\n')
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let slice = &self.buffer[line_start..self.cursor];
+        for (off, ch) in slice.char_indices().rev() {
+            if ch == target {
+                self.cursor = line_start + off;
+                return;
+            }
+        }
     }
 
     pub fn text(&self) -> &str {
@@ -652,5 +708,44 @@ mod tests {
         c.move_buffer_end();
         // Start of "ccc".
         assert_eq!(c.cursor, 4);
+    }
+
+    #[test]
+    fn find_forward_lands_on_next_occurrence() {
+        let mut c = at("hello world", 0);
+        c.find_char_forward('o');
+        assert_eq!(c.cursor, 4);
+    }
+
+    #[test]
+    fn find_forward_advances_past_current_char() {
+        // Cursor sits on the 'o' in "hello"; repeating `f o` should
+        // skip to the second occurrence (in "world").
+        let mut c = at("hello world", 4);
+        c.find_char_forward('o');
+        assert_eq!(c.cursor, 7);
+    }
+
+    #[test]
+    fn find_forward_stops_at_newline() {
+        let mut c = at("hello\nworld", 0);
+        c.find_char_forward('w');
+        // 'w' is on the next line — `f` must not cross newlines.
+        assert_eq!(c.cursor, 0);
+    }
+
+    #[test]
+    fn find_backward_lands_on_prev_occurrence() {
+        let mut c = at("hello world", 10);
+        c.find_char_backward('o');
+        assert_eq!(c.cursor, 7);
+    }
+
+    #[test]
+    fn find_backward_stops_at_newline() {
+        let mut c = at("foo\nbar", 6);
+        c.find_char_backward('f');
+        // 'f' lives on the previous line.
+        assert_eq!(c.cursor, 6);
     }
 }
