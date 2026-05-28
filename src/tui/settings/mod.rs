@@ -984,6 +984,7 @@ mod tests {
                     inputs: None,
                     context_length: None,
                     favorite: false,
+                    cache: None,
                     extra: Default::default(),
                 })
                 .collect(),
@@ -1012,6 +1013,7 @@ mod tests {
                 inputs: None,
                 context_length: None,
                 favorite: false,
+                cache: None,
                 extra: Default::default(),
             },
             ModelEntry {
@@ -1021,6 +1023,7 @@ mod tests {
                 inputs: None,
                 context_length: None,
                 favorite: false,
+                cache: None,
                 extra: Default::default(),
             },
         ]);

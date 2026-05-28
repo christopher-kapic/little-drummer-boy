@@ -210,8 +210,10 @@ after a few cycles.
   tree-sitter outline index in the cockpit SQLite DB (project-scoped,
   six tables). **On-demand invalidation** (mtime+size+hash via one
   central indexing helper); **no file watcher**. **No `grep`/`glob`
-  tool** — raw search is `bash` + `rg`/`fd`, `search` is the budgeted
-  path. Role-scoped per-agent assignment. Graduated to GOALS §21, plan
+  intel tool** — raw search is `bash` + `rg`/`fd`, `search` is the
+  budgeted path. (Separate sandboxed `grep`/`glob` *tools* later landed
+  on the `docs` answerer only — see D16; they are not part of this
+  index.) Role-scoped per-agent assignment. Graduated to GOALS §21, plan
   M2; build spec `prompts/codebase-intelligence-tools.md`. **LANDED
   2026-05-28**: Phase 1 implemented in `src/intel/` (index + tree-sitter
   extraction + import resolver + budgeted writer) and `src/tools/intel.rs`
@@ -220,17 +222,27 @@ after a few cycles.
   (`impact` + trigram search index remain Phase 2.)
 
 - **D14. Async jobs (loop/timer/background) + mid-conversation tool
-  growth.** → **DECIDED 2026-05-28**: One `jobs` **meta-tool** with a
-  fixed minimal schema (`action`+`args`); branches enabled mid-session
-  by appending a hint message + accepting the action at dispatch — the
-  cache-safe way to grow a tool surface (mutating the `tools` array
-  busts the prompt cache). `timer` = `loop.start(limit=1)`.
+  growth.** → **DECIDED + LANDED 2026-05-28**: One `jobs` **meta-tool**
+  with a fixed minimal schema (`action`+`args`); branches enabled
+  mid-session by appending a hint message + accepting the action at
+  dispatch — the cache-safe way to grow a tool surface (mutating the
+  `tools` array busts the prompt cache). `timer` = `loop.start(limit=1)`.
   Ephemeral-fork loops with `note` as the only fork→main channel;
   **single async-job authority** (forks can't spawn jobs — they
-  request, main decides). `background` shell-only in v1. Graduated to
-  GOALS §22, plan M3; build spec `prompts/async-jobs-subsystem.md`.
-  Related: D11 (the meta-tool is a *different* pattern from the
-  lazy-discovery catalog).
+  request, main decides). `background` shell-only in v1; configurable
+  `extended.jobs.max_concurrent` cap; jobs live for the daemon/session
+  lifetime (surviving a daemon restart is out of scope for v1 — the
+  registry is in-memory). Graduated to GOALS §22, plan M3; build spec
+  `prompts/async-jobs-subsystem.md`. Implemented in
+  `src/engine/jobs/{mod,authority,background,loop_runner,spec}.rs`
+  (driver-owned authority + scheduler), `src/tools/jobs.rs` (the `jobs`
+  meta-tool + fork-only `note`/`jobs`), `src/engine/driver.rs`
+  (`JobAction` routing, turn-boundary result injection,
+  human-cancel command channel), new `TurnEvent`/`proto::Event` job
+  lifecycle variants, and the TUI jobs strip + `/jobs`
+  (`src/tui/{chrome,app}`). On job end/failure the daemon flags
+  `needs_attention`. Related: D11 (the meta-tool is a *different*
+  pattern from the lazy-discovery catalog).
 
 - **D15. Compact-after-delegation.** → **DECIDED 2026-05-28**: On
   delegation, prepare a smaller main context so a cache-cold resume is
@@ -241,3 +253,29 @@ after a few cycles.
   predicate (plan T6.f). Per-provider/model thresholds deferred (hook
   in the per-model config layer, cf. D8). Graduated to GOALS §23; build
   spec `prompts/compact-after-delegation.md`.
+
+- **D16. `docs` agent — shape, search surface, package registry.** →
+  **DECIDED + LANDED 2026-05-28**: `docs` is a **fixed two-stage
+  noninteractive pipeline**, not a single read/bash investigator over a
+  manual docs directory (the earlier `agents.docs_dir` model is retired).
+  Docs.1 (resolver, caller cwd) confirms/shallow-clones a dependency into
+  a cockpit-owned **user-global package registry** (`packages` table,
+  migration 0006) and sees only the package name; Docs.2 (answerer,
+  resolved package dir) reads the source with `read` + new **sandboxed
+  `grep`/`glob`** tools and returns `file:line` citations. This
+  **reverses the "no `grep`/`glob` tool" rule** — but only for Docs.2:
+  the tools are Rust-native (ripgrep libraries + `globset`, never
+  shelling to `rg`/`fd`) and hard-confine every path to the answerer's
+  package-root cwd, which is *why* Docs.2 can be denied `bash`/network/
+  write (it runs inside untrusted third-party source). Auto-clone
+  resolves repo URLs only from official registry metadata
+  (crates.io/npm/PyPI) — never a guessed URL (priority #1). Registry
+  importable one-way from kcl (`cockpit kcl import`); manual surface
+  `cockpit packages {list,add}`. Leaf-termination preserved (the two
+  stages are internal, not exposed as delegation). Graduated to GOALS
+  §3a/§4d-bis/§10/§21, CLAUDE.md, plan §3i/§5b; spec
+  `prompts/docs-agent.md`. Implemented in `src/{db/packages.rs,
+  packages/,tools/{sandbox,grep,glob,docs}.rs,engine/docs_pipeline.rs,
+  commands/{packages,kcl}.rs}`. User-approval gating for new-package
+  clones is left as a clean seam (out of scope; a future tool-approval
+  task adds it).

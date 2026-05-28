@@ -29,6 +29,7 @@ use crate::engine::message::{
 };
 use crate::engine::model::{Model, ModelParams};
 use crate::engine::repair::{Recovery, repair};
+use crate::engine::tool::invalid_input;
 use crate::engine::tool::{ToolBox, ToolCtx, ToolOutput};
 use crate::redact::RedactionTable;
 use crate::session::{Session, ToolCallRow};
@@ -40,11 +41,6 @@ pub struct Agent {
     pub tools: ToolBox,
     pub model: Arc<Model>,
     pub params: ModelParams,
-    /// Which argument fields the repair catalog should consider as
-    /// `array<string>` for the `wrap_bare_string` repair. v0 tools all
-    /// take object args with no array fields; this is a forward-looking
-    /// knob.
-    pub array_fields: Vec<&'static str>,
 }
 
 /// Events the agent emits during a turn. The driver forwards these to
@@ -121,6 +117,74 @@ pub enum TurnEvent {
     /// TUI's span-long working indicator. No agent name — it's a
     /// whole-stack signal, not a per-agent one.
     AgentIdle,
+
+    /// An async job (loop / timer / background, GOALS §22) started. UI
+    /// only — drives the transient jobs strip. `kind` is `loop` /
+    /// `timer` / `background`.
+    JobStarted {
+        job_id: String,
+        label: String,
+        kind: String,
+    },
+    /// A background job produced an output line (it's in the ring buffer
+    /// now). UI-only progress tick so the strip can show liveness; the
+    /// output itself reaches the model only via `background.tail` or the
+    /// budget-capped completion.
+    JobProgress { job_id: String },
+    /// A note from an ephemeral-fork loop iteration. Shown live in the
+    /// UI; enters main context only at loop termination (bundled with the
+    /// terminal result) — token economy (§22).
+    JobNote { job_id: String, text: String },
+    /// An async job reached a terminal state. UI-only marker; the
+    /// model-facing result is injected separately as a late-arriving turn
+    /// by the driver. `failed` drives the red treatment + needs_attention
+    /// wording.
+    JobCompleted {
+        job_id: String,
+        label: String,
+        kind: String,
+        failed: bool,
+    },
+
+    /// How many wire tokens `/prune` would drop from the **foreground**
+    /// agent's context right now (GOALS §1a / §10). Recomputed by the
+    /// driver from the same `dedup_plan` `/prune` executes, so the
+    /// status-line `ctx X% → Y% prunable` figure equals what `/prune`
+    /// then removes. Emitted after every turn settles and after a prune.
+    /// `cache_cold` carries the cache-cold predicate's verdict so the
+    /// `/prune` confirm copy reports hot-vs-cold without guessing.
+    ContextProjection {
+        prunable_tokens: u64,
+        cache_cold: bool,
+    },
+
+    /// A `/prune` (manual or auto) completed on the foreground agent.
+    /// `auto` distinguishes the cache-aware auto-fire from a user
+    /// invocation. `bodies` is how many snapshot bodies were elided this
+    /// prune; `tokens_saved` is the wire-token drop. `elided` is the
+    /// **current** full set of `original_event_id`s whose tool-result body
+    /// is now an elision marker in the wire history (cumulative across
+    /// prunes, not just this one). The TUI dims the matching scrollback
+    /// tool-result bodies by their `call_id`; full text stays visible
+    /// (GOALS §14 wire-vs-user split). UI marker for the transcript.
+    Pruned {
+        auto: bool,
+        bodies: usize,
+        tokens_saved: u64,
+        elided: Vec<String>,
+    },
+
+    /// `/compact` assembled a fresh-thread handoff. Carries the
+    /// review-ready handoff text (brief + deterministic appendix +
+    /// seed-tool plan) for the TUI to drop into the composer, plus the
+    /// new session id the daemon created and the seed-tool count. The
+    /// old session stays recoverable in SQLite.
+    CompactReady {
+        new_session_id: uuid::Uuid,
+        handoff: String,
+        seed_tool_count: usize,
+        seed_tool_tokens: u64,
+    },
 }
 
 /// Outcome of one [`turn`] call. The driver loops on the result.
@@ -158,6 +222,17 @@ pub enum TurnOutcome {
         task_call_id: String,
         task_function_call_id: Option<String>,
     },
+    /// Agent invoked the `jobs` meta-tool (GOALS §22). Like `task`, this
+    /// is intercepted by the engine and routed to the driver, which owns
+    /// the single async-job authority. The driver dispatches the action,
+    /// builds the tool result, and delivers it back as this call's
+    /// tool_result — same shape as a noninteractive tool call.
+    JobAction {
+        /// Repaired `{action, args}` payload.
+        args: Value,
+        task_call_id: String,
+        task_function_call_id: Option<String>,
+    },
 }
 
 /// Drive one round-trip with the model + dispatch any tool calls. The
@@ -189,6 +264,12 @@ pub async fn turn(
             agent: agent.name.clone(),
         })
         .await;
+
+    // Stamp the send time for the cache-cold predicate's TTL arm
+    // (GOALS §10). Done right before the round-trip so "time since last
+    // send" measures from when the provider last saw (and cached) the
+    // prefix.
+    session.note_send();
 
     let (msg_id, choice, usage) = agent
         .model
@@ -320,10 +401,52 @@ pub async fn turn(
             });
         }
 
+        // `jobs` is structural in the **main** conversation: the driver
+        // owns the single async-job authority (GOALS §22), so the action
+        // is routed there via [`TurnOutcome::JobAction`]. Inside an
+        // ephemeral-fork loop iteration the toolbox instead carries the
+        // in-process `ForkJobTool` (alongside `note`) — there, `jobs` is
+        // dispatched normally and re-routes create-actions to requests
+        // (forks cannot spawn jobs). We tell the two apart by the
+        // fork-only `note` tool: present only inside a loop fork.
+        if tc.function.name == "jobs" && agent.tools.get("note").is_none() {
+            let mut args = tc.function.arguments.clone();
+            // Validate + repair the loose outer object against the `jobs`
+            // tool's own minimal `{action, args}` schema; per-action
+            // validation runs in the driver through the same repair
+            // contract (§12). The outer schema is permissive (`args` is a
+            // free-form object), so this only catches a malformed `action`.
+            let jobs_schema = agent
+                .tools
+                .get("jobs")
+                .map(|t| t.parameters())
+                .unwrap_or(Value::Null);
+            let _ = repair(&mut args, &jobs_schema, "jobs");
+            return Ok(TurnOutcome::JobAction {
+                args,
+                task_call_id: tc.id.clone(),
+                task_function_call_id: tc.call_id.clone(),
+            });
+        }
+
         let start = Instant::now();
         let mut args = tc.function.arguments.clone();
         let original = args.clone();
-        let recovery = repair(&mut args, &agent.array_fields);
+
+        // Validate-then-repair against the tool's own JSON Schema (§12).
+        // Clean input is returned untouched; a repairable malformation is
+        // fixed at the disagreeing path and re-validated; an unrecoverable
+        // call short-circuits to a model-readable hard-fail *without*
+        // dispatching the tool. An unknown tool name has no schema, so it
+        // validates trivially and surfaces its "unknown tool" error in
+        // `dispatch_one` as before.
+        let schema = agent
+            .tools
+            .get(&tc.function.name)
+            .map(|t| t.parameters())
+            .unwrap_or(Value::Null);
+        let repair_outcome = repair(&mut args, &schema, &tc.function.name);
+        let recovery = repair_outcome.recovery;
 
         let _ = tx
             .send(TurnEvent::ToolStart {
@@ -334,7 +457,18 @@ pub async fn turn(
             })
             .await;
 
-        let result = dispatch_one(&agent.tools, &tc.function.name, args.clone(), &ctx).await;
+        // Dispatch only when validate-then-repair produced a schema-valid
+        // call. Otherwise skip dispatch and treat the model-readable schema
+        // diagnostic as an invocation failure — same downstream
+        // audit/telemetry/history path a tool's own `invalid_input` takes.
+        let result = if repair_outcome.valid {
+            dispatch_one(&agent.tools, &tc.function.name, args.clone(), &ctx).await
+        } else {
+            let msg = repair_outcome.error.unwrap_or_else(|| {
+                format!("`{}` arguments failed schema validation", tc.function.name)
+            });
+            Err(invalid_input(msg))
+        };
 
         // Per §13c: if the tool returned a recovery + canonical args
         // (today only `editunlock` does), prefer the tool's recovery
@@ -455,6 +589,11 @@ async fn dispatch_one(
 /// Walks backwards because the assistant turn we just pushed is the
 /// last element. Silent no-op if the message or the matching tool-call
 /// isn't found — the audit row still has the canonical form.
+///
+/// Tripwire for native Anthropic: this mutates the *most recent*
+/// assistant turn in place. If that turn carries a signed thinking
+/// block, mutating any sibling block risks a "latest assistant message
+/// cannot be modified" 400. See `miscellaneous.md` §10b.
 fn rewrite_assistant_tool_call(history: &mut [Message], call_id: &str, canonical_args: &Value) {
     use rig::message::AssistantContent;
     for msg in history.iter_mut().rev() {

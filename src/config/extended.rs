@@ -75,6 +75,31 @@ pub struct ExtendedConfig {
     /// System-prompt injection knobs (GOALS §17g, §4k).
     #[serde(default)]
     pub system_prompt: SystemPromptConfig,
+
+    /// Async-jobs subsystem knobs (GOALS §22).
+    #[serde(default)]
+    pub jobs: JobsConfig,
+}
+
+/// Async-jobs subsystem config (GOALS §22).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobsConfig {
+    /// Cap on concurrently-running async jobs per session. Guards against
+    /// accidental fan-out (the fork-can't-spawn rule prevents recursion).
+    #[serde(default = "default_max_concurrent_jobs")]
+    pub max_concurrent: usize,
+}
+
+impl Default for JobsConfig {
+    fn default() -> Self {
+        Self {
+            max_concurrent: default_max_concurrent_jobs(),
+        }
+    }
+}
+
+fn default_max_concurrent_jobs() -> usize {
+    crate::engine::jobs::DEFAULT_MAX_CONCURRENT_JOBS
 }
 
 /// Prompt-injection guard config. The substance is deferred (see
@@ -374,6 +399,7 @@ impl Default for ExtendedConfig {
             utility_model: None,
             prompt_injection_guard: PromptInjectionGuardConfig::default(),
             system_prompt: SystemPromptConfig::default(),
+            jobs: JobsConfig::default(),
         }
     }
 }

@@ -28,7 +28,7 @@ impl Tool for ReadlockTool {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "path":   { "type": "string", "description": "Path to lock and read" },
+                "path":   { "type": "string", "x-cockpit-kind": "path", "description": "Path to lock and read" },
                 "offset": { "type": "integer", "description": "1-indexed start line (default 1)" },
                 "limit":  { "type": "integer", "description": "Max lines (default 2000)" }
             },

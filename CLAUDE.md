@@ -77,10 +77,11 @@ out new deps in PR descriptions.
 | `main.rs` | Entry point — clap dispatch, logging init. |
 | `cli.rs` | Clap definitions for every subcommand. |
 | `commands/` | One file per top-level subcommand (`run`, `tui`, `daemon`, `meta`, `session`, `stats`, `debug`, `init`, `pr`, …). |
-| `engine/` | Agent loop (manual rig conversation), tool dispatch, repair layer (§12), built-in agent prompts under `builtin/`. |
-| `tools/` | Concrete tool implementations (`bash`, `read`, `readlock`, `writeunlock`, `editunlock`, `unlock`, `task`, `custom`). All take `Args = serde_json::Value` so the repair layer can intercept. |
+| `engine/` | Agent loop (manual rig conversation), tool dispatch, repair layer (§12), built-in agent prompts under `builtin/`, the two-stage `docs` pipeline (`docs_pipeline.rs`, GOALS §3a). |
+| `tools/` | Concrete tool implementations (`bash`, `read`, `readlock`, `writeunlock`, `editunlock`, `unlock`, `task`, `custom`, `docs` registry tools, the sandboxed `grep`/`glob` + `sandbox` confinement helper). All take `Args = serde_json::Value` so the repair layer can intercept. |
+| `packages/` | Cockpit-owned package registry side-effects: clone-dir resolution, ecosystem slug + percent-encoding, registry-metadata repo resolution (`resolve.rs` — crates.io/npm/PyPI), shallow Git clone, one-way `cockpit kcl import`. Pure CRUD lives in `db/packages.rs`. |
 | `daemon/` | Long-lived daemon process (GOALS §8): server, client, session_worker, NDJSON proto, registry. |
-| `db/` | `rusqlite`-backed session DB: `sessions`, `tool_calls`, `inference_calls`, `locks`, `lang`, `needs_attention`; migrations under `migrations/`. |
+| `db/` | `rusqlite`-backed global DB: `sessions`, `tool_calls`, `inference_calls`, `locks`, `lang`, `needs_attention`, `intel_*`, `packages` (user-global dependency registry); migrations under `migrations/`. |
 | `session/` | Session lifecycle on top of `db/`. |
 | `locks/` | File-lock manager (GOALS §3a, plan §4.1). Single in-daemon authority; only `coder` writes. |
 | `config/` | cockpit-native config (walk-up `.cockpit/` discovery, GOALS §2). |
@@ -119,6 +120,21 @@ out new deps in PR descriptions.
   `docs`. Only `coder` holds file locks and writes/edits (GOALS §3a).
   Adding a new write-capable tool requires a design conversation —
   the lock manager assumes one writer per delegation tree.
+- **`docs` is a fixed two-stage internal pipeline, not general
+  delegation** (GOALS §3a). A caller delegates `task(agent="docs",
+  prompt=<JSON {package, question}>)` and it behaves like one leaf
+  invocation. Internally the driver routes it to
+  `engine::docs_pipeline`: Docs.1 (resolver) runs in the caller's cwd
+  with `list-packages`/`add-package`/`bash`/`webfetch`/`websearch` and
+  sees **only** `package` (the question never enters its context —
+  token economy); once the package is registered with an on-disk path
+  the pipeline launches Docs.2 (answerer) in the **package directory**
+  (cwd-parameterized spawn) with `read`+`grep`+`glob` only — no bash,
+  no network, no write — and injects `question`. Auto-clone resolves
+  the repo URL **only** from official registry metadata
+  (crates.io/npm/PyPI); never a guessed URL (defensive against weak
+  models). The two stages are not exposed as delegations; leaf-
+  termination holds.
 - **Tool-input repair: validate first, repair on failure — never
   preprocess** (GOALS §12). Tools take `Args = serde_json::Value`;
   the dispatcher runs schema validation, walks the catalog at the
@@ -127,12 +143,19 @@ out new deps in PR descriptions.
 - **Built-in v1 tool surface:** `read` (paginated + line-range),
   `readlock, write, writeunlock, edit, bash, task, skill, webfetch,
   mcp_invoke`, the codebase-intelligence tools (`tree, outline,
-  symbol_find, word, deps, hot, circular, search` — GOALS §21), and
-  the `jobs` meta-tool (`loop`/`timer`/`background` — GOALS §22).
-  There is **no** `grep`/`glob` tool: raw search is `bash` + `rg`/`fd`;
-  budgeted/structured search is the `search` intel tool. Anything
-  outside this set needs a design discussion before it's added (GOALS
-  §10). `mcp_invoke` dispatches to MCP servers via lazy discovery
+  symbol_find, word, deps, hot, circular, search` — GOALS §21), the
+  `jobs` meta-tool (`loop`/`timer`/`background` — GOALS §22), and the
+  sandboxed `grep`/`glob` tools (`docs`-answerer-only — see below). For
+  agents other than the `docs` answerer there is **no** `grep`/`glob`
+  tool: raw search is `bash` + `rg`/`fd`; budgeted/structured search is
+  the `search` intel tool. `grep`/`glob` exist solely so the `docs`
+  answerer (Docs.2, GOALS §3a) can explore a cloned dependency *without*
+  shell access — they are Rust-native (ripgrep libraries + `globset`,
+  never shelling to `rg`/`fd`) and hard-confine every path to the
+  answerer's package-root cwd (`src/tools/sandbox.rs`). Do **not** add
+  them to explore/coder/orchestrators. Anything outside this set needs a
+  design discussion before it's added (GOALS §10). `mcp_invoke`
+  dispatches to MCP servers via lazy discovery
   (catalog of name + one-line description; schema loaded on first
   call) — see GOALS §18.
 - **Wire vs user transcript split** (GOALS §14). One tool-call row

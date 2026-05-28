@@ -74,6 +74,15 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
 
+# JSON Schema validation — drives the §12 validate-then-repair layer.
+# Each tool's `parameters()` schema is compiled once and reused to
+# localize a malformed tool call to the exact failing instance paths
+# before the repair catalog spends any budget. `default-features =
+# false` drops the optria/format-assertion + CLI extras we don't use,
+# keeping the dependency surface (and the schemas we validate against,
+# all hand-authored object schemas) minimal.
+jsonschema = { version = "0.46", default-features = false }
+
 # Filesystem helpers
 dirs = "6"
 shellexpand = "3"
@@ -81,6 +90,16 @@ walkdir = "2"
 ignore = "0.4"
 globset = "0.4"
 notify = "8"
+
+# Native (no-subprocess) content search for the sandboxed `grep` tool
+# (docs-agent decision 2). The ripgrep library crates run a regex search
+# over an in-process file handle so the `docs` answerer never gets shell
+# access: `grep-regex` builds the matcher, `grep-searcher` drives the
+# line-by-line search, `grep-matcher` is the shared matcher trait the
+# Sink consumes.
+grep-searcher = "0.1"
+grep-regex = "0.1"
+grep-matcher = "0.1"
 
 # Secret scanning / redaction
 aho-corasick = "1"
@@ -116,6 +135,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"]
 tempfile = "3"
 regex = "1"
 unicode-width = "0.2"
+# CSV output for `cockpit stats --format=csv` (GOALS §15f). Used only as
+# a writer over an in-memory buffer; no parsing or serde-record paths.
+csv = "1"
 # Diff rendering for the edit/write tool entries in the TUI history
 # pane (tui.diff_style). Provides line+intraline diff primitives.
 similar = "3"
@@ -144,6 +166,10 @@ libc = "0.2"
 assert_cmd = "2"
 predicates = "3"
 tempfile = "3"
+# `test-util` enables `tokio::time::{pause, advance}` for deterministic
+# timer tests (e.g. the ephemeral idle watchdog) without sleeping real
+# wall-clock. Dev-only: it never reaches the released binary.
+tokio = { version = "1.52", features = ["test-util"] }
 
 [profile.release]
 lto = "thin"

@@ -71,7 +71,7 @@ impl Tool for TreeTool {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "path": { "type": "string", "description": "Subtree path filter relative to project root" }
+                "path": { "type": "string", "x-cockpit-kind": "path", "description": "Subtree path filter relative to project root" }
             }
         })
     }
@@ -140,7 +140,7 @@ impl Tool for OutlineTool {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "path": { "type": "string", "description": "File path to outline" }
+                "path": { "type": "string", "x-cockpit-kind": "path", "description": "File path to outline" }
             },
             "required": ["path"]
         })
@@ -358,7 +358,7 @@ impl Tool for DepsTool {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "path":      { "type": "string", "description": "File whose dependencies to walk" },
+                "path":      { "type": "string", "x-cockpit-kind": "path", "description": "File whose dependencies to walk" },
                 "direction": { "type": "string", "description": "forward, reverse, or both (default both)" },
                 "hops":      { "type": "integer", "description": "Max hops, 1-10 (default 1)" }
             },
@@ -704,7 +704,7 @@ impl Tool for SearchTool {
             "type": "object",
             "properties": {
                 "pattern":          { "type": "string", "description": "Regex to search for" },
-                "path":             { "type": "string", "description": "Path filter relative to project root" },
+                "path":             { "type": "string", "x-cockpit-kind": "path", "description": "Path filter relative to project root" },
                 "ignore_case":      { "type": "boolean", "description": "Case-insensitive match toggle" },
                 "context":          { "type": "integer", "description": "Context lines around each match" },
                 "glob":             { "type": "string", "description": "Glob include filter (e.g. *.rs)" }

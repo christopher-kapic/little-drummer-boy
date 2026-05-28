@@ -16,6 +16,7 @@
 //! - [`locks`] — crash-recovery mirror of the in-memory `LockManager`.
 //! - [`needs_attention`] — interrupt queue (GOALS §3b).
 //! - [`lang`] — file-extension → language attribution (§15c).
+//! - [`stats`] — `/stats` roll-up query layer + pricing (§15).
 //!
 //! Database path: `~/.local/share/cockpit/cockpit.db`
 //! (XDG-canonical via [`crate::config::resolve::cockpit_data_dir`]).
@@ -24,7 +25,10 @@ pub mod inference_calls;
 pub mod lang;
 pub mod locks;
 pub mod needs_attention;
+pub mod packages;
+pub mod seed_tools;
 pub mod sessions;
+pub mod stats;
 pub mod tokenizer_calibration;
 pub mod tool_calls;
 pub mod usage_events;
@@ -173,6 +177,8 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0003_usage_events.sql"),
     include_str!("migrations/0004_tokenizer_calibration.sql"),
     include_str!("migrations/0005_intel_index.sql"),
+    include_str!("migrations/0006_packages.sql"),
+    include_str!("migrations/0007_seed_tools.sql"),
 ];
 
 fn migrate(conn: &Connection) -> Result<()> {

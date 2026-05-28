@@ -132,7 +132,7 @@ Frontmatter fields: `description`, `mode` (`primary`/`subagent`/`all`),
 | `permission` overrides per agent | **COPY** |
 | Hidden subagents (`hidden: true`) | **COPY** |
 | Agent generation via `agent create` | **COPY** with the same flags (`--path`, `--description`, `--mode`, `--tools`, `-m`). |
-| Built-in agents | **DIVERGE.** cockpit ships its own five-agent cast — `orchestrator-build`, `orchestrator-plan`, `explore`, `coder`, `docs` (see `GOALS.md` §3a). The two-orchestrator split (build vs plan) replaces opencode's mode-toggle model with separate agent identities; `docs` is cockpit-specific (read-only over a configured dependency-clone directory). |
+| Built-in agents | **DIVERGE.** cockpit ships its own five-agent cast — `orchestrator-build`, `orchestrator-plan`, `explore`, `coder`, `docs` (see `GOALS.md` §3a). The two-orchestrator split (build vs plan) replaces opencode's mode-toggle model with separate agent identities; `docs` is cockpit-specific — a fixed two-stage noninteractive pipeline (resolver → answerer) that auto-clones a dependency into cockpit's package registry and answers usage questions from its real source via sandboxed `grep`/`glob`. |
 | Background plan execution / "background agents" | **NEW (cockpit)** — see `GOALS.md` §3b. opencode has no equivalent. cockpit's ralph executor runs plans in the daemon (§8) decoupled from the user's interactive conversation; `coder` instances spawned by the executor can raise typed questions onto a needs-attention queue without blocking other work. This is the primitive that unlocks the future remote-dashboard surface (§8d). |
 | Caller-based interactive/noninteractive mode for `coder` | **NEW (cockpit)** — `coder` runs interactive when invoked by `orchestrator-build`, noninteractive when invoked by the ralph executor. The agent file is one; the mode is set by the caller. |
 
@@ -268,6 +268,15 @@ permission categories:
     pipeline as `write`.
   Permission categories: `read`, `readlock`, `write`, `edit`
   (a single permission covers the `*unlock` variant of each).
+- **`grep`/`glob` are docs-sandbox-only, not opencode's general
+  search tools.** opencode exposes `grep`/`glob` to every agent;
+  cockpit assigns them **only** to the `docs` answerer (Docs.2,
+  GOALS §3a), where they replace `bash` entirely so the answerer
+  can read untrusted dependency source without a shell. They are
+  Rust-native (ripgrep libraries + `globset`) and hard-confine every
+  path to the package-root cwd. General agents keep `bash` + `rg`/`fd`
+  + the `search` intel tool. No standalone permission category beyond
+  the `docs` pipeline gating its own surface.
 - **New key `redact_bypass`** (deny by default) — disables §7
   redaction for a single tool call. We never want to allow this
   but we want to be able to deny it *explicitly*.

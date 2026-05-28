@@ -213,6 +213,24 @@ pub enum Request {
     /// Swap which built-in or user agent owns the conversation.
     SetAgent { name: String },
 
+    /// Cancel a live async job (loop / timer / background, GOALS §22) by
+    /// id, on behalf of the human (the `/jobs cancel <id>` affordance).
+    CancelJob { job_id: String },
+
+    /// Run `/prune` (snapshot dedup) on the attached session's foreground
+    /// agent. Acked immediately; the `Pruned` + refreshed
+    /// `ContextProjection` events flow over the stream. The confirm UX
+    /// lives in the TUI — this request means the user already accepted.
+    Prune,
+
+    /// Run `/compact` (fresh-thread handoff) on the attached session's
+    /// foreground agent. Acked immediately; the assembled handoff arrives
+    /// as a `CompactReady` event for review-then-commit.
+    Compact,
+
+    /// Pin a user message verbatim for the next `/compact` (`/pin`).
+    Pin { text: String },
+
     /// Cheap liveness probe. Replaces the legacy `"ok\n"` greeting.
     DaemonStatus,
 
@@ -296,6 +314,11 @@ pub enum Response {
 
     Attached {
         session_id: Uuid,
+        /// 6-char display id (GOALS §17b). Used by the TUI as the
+        /// predecessor short-id when this session later spawns a
+        /// `/compact` handoff. Empty for pre-§17 rows not yet backfilled.
+        #[serde(default)]
+        short_id: String,
         project_root: String,
         project_id: String,
         active_agent: String,
@@ -488,6 +511,70 @@ pub enum Event {
     /// The session ended (user requested, daemon shutting down,
     /// crash recovery couldn't restore it, …).
     SessionEnded { session_id: Uuid, reason: String },
+
+    /// An async job (loop / timer / background, GOALS §22) started.
+    /// Drives the transient jobs strip. `kind` is `loop` / `timer` /
+    /// `background`.
+    JobStarted {
+        session_id: Uuid,
+        job_id: String,
+        label: String,
+        kind: String,
+    },
+    /// A background job produced output (liveness tick for the strip).
+    JobProgress { session_id: Uuid, job_id: String },
+    /// A note from an ephemeral-fork loop iteration. Shown live in the
+    /// transcript; the model sees it in main context only at loop end.
+    JobNote {
+        session_id: Uuid,
+        job_id: String,
+        text: String,
+    },
+    /// An async job reached a terminal state (completed / failed /
+    /// cancelled). Clears the strip entry + posts an inline marker; the
+    /// model-facing result arrives separately as a late-arriving turn.
+    JobCompleted {
+        session_id: Uuid,
+        job_id: String,
+        label: String,
+        kind: String,
+        failed: bool,
+    },
+
+    /// Live "% prunable" projection for the foreground agent (GOALS §1a).
+    /// `prunable_tokens` is the wire-token drop `/prune` would achieve
+    /// right now, computed by the same `dedup_plan` `/prune` executes.
+    /// The TUI divides by the model's max context for the status line.
+    ContextProjection {
+        session_id: Uuid,
+        prunable_tokens: u64,
+        cache_cold: bool,
+    },
+
+    /// A `/prune` completed (manual or cache-aware auto). UI marker.
+    /// `elided` is the **current** full set of `original_event_id`s whose
+    /// tool-result body is now a wire-side elision marker; the TUI dims the
+    /// matching scrollback tool-result bodies by `call_id`. Render-time
+    /// view of live wire state, not a persisted transcript flag (§14).
+    Pruned {
+        session_id: Uuid,
+        auto: bool,
+        bodies: usize,
+        tokens_saved: u64,
+        #[serde(default)]
+        elided: Vec<String>,
+    },
+
+    /// A `/compact` handoff is assembled and a fresh session created.
+    /// The TUI drops `handoff` into the composer for review, then
+    /// re-attaches to `new_session_id` to commit.
+    CompactReady {
+        session_id: Uuid,
+        new_session_id: Uuid,
+        handoff: String,
+        seed_tool_count: usize,
+        seed_tool_tokens: u64,
+    },
 }
 
 // ---- Errors ----------------------------------------------------------------

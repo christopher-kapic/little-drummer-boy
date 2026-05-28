@@ -23,11 +23,39 @@
 
 pub mod agent;
 pub mod builtin;
+pub mod compact;
+pub mod docs_pipeline;
 pub mod driver;
+pub mod jobs;
 pub mod message;
 pub mod model;
+pub mod prune;
 pub mod repair;
 pub mod tool;
 
 pub use agent::TurnEvent;
 pub use driver::Driver;
+
+/// Whether the conversation is at a point where context-reduction
+/// (`/prune` auto-fire, auto-`/compact`) may run without corrupting the
+/// wire/user transcript split (`plan.md` T6.e). The boundary is safe
+/// when no tool call is mid-flight, no interactive subagent is active,
+/// and no user interaction is pending:
+///
+/// ```text
+/// tool_call_in_flight.is_none()
+///     && active_subagents.is_empty()
+///     && !pending_user_interaction
+/// ```
+///
+/// The driver evaluates this at the inference boundary (between tool
+/// loops). Mid-tool-call or mid-subagent state must defer the reduction
+/// and re-evaluate after the next significant state change, never prune
+/// in place. A `false` here means "queue and retry."
+pub fn is_at_safe_compaction_boundary(
+    tool_call_in_flight: bool,
+    active_subagents: bool,
+    pending_user_interaction: bool,
+) -> bool {
+    !tool_call_in_flight && !active_subagents && !pending_user_interaction
+}

@@ -716,7 +716,7 @@ else is a user-authored agent.
 | `orchestrator-plan`   | primary  | project root | Ralph-style planner. Owns the user's conversation when the focus is *deciding what to do*. Tools: `read` (shallow inspection), `task`, `skill`, plus plan-graph tools (create / append / update / delete / trigger). Sees in-progress and not-yet-implemented plans (completed plans are hidden by default; see "plan visibility" below). Triggering hands the plan off to the ralph executor (see §3b "Background agents") — `orchestrator-plan` does **not** hold the user's conversation while the plan runs; the user keeps talking to `orchestrator-plan` about other plans. Delegates to `explore` (interactive one-at-a-time, or background multi-parallel). Does not write code. |
 | `explore`             | subagent | project root | Read-only investigator over the **current project**. Tools: `read`, `bash` (raw `rg`/`fd`), and the read-only codebase-intelligence tools (§21). Cannot invoke subagents. Returns `file:line` citations, not prose summaries. |
 | `coder`               | subagent | project root | The only agent that holds file locks and writes/edits. Tools: `read`/`readlock`/`write`/`writeunlock`/`unlock`/`edit`/`bash`/`task` plus the codebase-intelligence tools (§21). The `task` permission is scoped to `docs` only (noninteractive, may run multiple in parallel). Receives a scoped task from its caller, makes the changes, returns a structured report. Mode is set by caller: interactive when invoked by `orchestrator-build`, noninteractive when invoked by the ralph executor (see §3b). |
-| `docs`                | subagent | `agents.docs_dir` (configurable; see §4) | Read-only investigator over the **docs directory** — a user-configured location with dependency source code cloned into subdirectories. Same `read` / `bash` / intel-tool surface as `explore` (§21), same citation-style output. Cannot invoke subagents. |
+| `docs`                | subagent | (pipeline; see below) | A **fixed two-stage, fully-noninteractive pipeline** that answers a caller's question about how to use a third-party dependency, by reading that dependency's *actual source code*. Not a single read/bash investigator and not general delegation — the driver routes it (`engine::docs_pipeline`). **Docs.1 (resolver)** runs in the caller's cwd with `list-packages` / `add-package` / `bash` / `webfetch` / `websearch`; it confirms or shallow-clones the dependency into cockpit's package registry (§4d-bis) and sees **only** the package name (the question never enters its context — token economy §10). **Docs.2 (answerer)** then runs in the resolved package directory with `read` + the sandboxed `grep` / `glob` only — no bash, no network, no write — and produces `file:line`-cited output from the dependency source. Cannot invoke subagents. |
 
 **Why two orchestrators.** "Plan" and "build" are different
 cognitive modes, not different priorities of the same mode. A
@@ -747,7 +747,11 @@ docs               → (leaf, cannot spawn)
 
 The leaf-termination rule (explore and docs cannot spawn) is what
 keeps context aggregation tractable: every delegation tree has a
-bounded depth and a single writer.
+bounded depth and a single writer. `docs` is itself a fixed
+two-stage internal pipeline (Docs.1 resolver → Docs.2 answerer; see
+the cast table and §4d-bis), but to its caller it is a single
+noninteractive leaf — the two stages are an implementation detail of
+the `docs` unit, not additional delegation, so leaf-termination holds.
 
 **Orchestrators may read, but should delegate searches.** Both
 orchestrators get `read` so the user can `@`-tag a file (see §1e)
@@ -979,7 +983,7 @@ merge mode the resolver uses when combining layers:
 | `agent_guidance_files`                                | `replace` |
 | `default_delegation`                                  | `replace` |
 | `agent_dirs`                                          | `concat` |
-| `agents.docs_dir`                                     | `replace` |
+| `packages_directory`                                  | `replace` |
 | `redact.{enabled, scan_environment, scan_dotenv, min_secret_length, placeholder}` | `replace` |
 | `redact.extra_dotenv_paths`                           | `concat` |
 | `redact.allowlist`                                    | `concat`; subtracted by `redact.denylist` |
@@ -1069,15 +1073,23 @@ Initial schema:
     "/srv/team-agents"
   ],
 
-  // 4d-bis. Docs directory — read-only source-code clones of
-  // dependencies, scoped to the `docs` bundled agent (see §3a,
-  // plan.md §4.6.d). Convention is `<docs_dir>/<repohost>/<org>/<repo>`
-  // (e.g., `~/packages/github.com/tokio-rs/tokio`). Population is the
-  // user's responsibility (manual `git clone`, or a future
-  // `cockpit docs add <repo>` helper).
-  "agents": {
-    "docs_dir": "~/packages"
-  },
+  // 4d-bis. Package registry — cockpit's own user-global registry of
+  // dependency source clones the `docs` answerer (Docs.2, §3a) reads
+  // from. The registry is a `packages` table in the global cockpit DB
+  // (same store as `intel_*`; NOT project-scoped). Git clones land in
+  // `packages_directory` (default `~/src/cockpit-packages/`) under a
+  // percent-encoded identifier; identifiers are ecosystem-prefixed for
+  // autonomous adds (`cargo:tokio`, `npm:@tanstack/query`, `pip:requests`)
+  // to dodge cross-ecosystem collisions. Population is autonomous (Docs.1
+  // shallow-clones from registry-declared repos — never a guessed URL),
+  // or manual: `cockpit packages add <id> [--git <url>] [--path <dir>]
+  // [--branch] [--shallow]`, `cockpit packages list`, and the one-way
+  // `cockpit kcl import` (copies a local kcl install's `packages` rows
+  // cockpit lacks, referencing kcl's on-disk clone paths as-is; never
+  // writes back to kcl). v1 does not auto-pull on every query (cost);
+  // `source_url`/`branch` are recorded so a future `cockpit packages
+  // update` could.
+  "packages_directory": "~/src/cockpit-packages",
 
   // 4e. Secret redaction (see §7) — toggles and additional sources.
   "redact": {
@@ -1332,6 +1344,30 @@ detect the running daemon and attach as additional clients.
   fresh daemon that reconnects to in-progress sessions and
   resumes plan executions from the last completed node.
 
+**Ephemeral run daemons.** `cockpit run` (and `cockpit run
+--ephemeral`) do **not** promote a persistent daemon. They spawn an
+*ephemeral* daemon scoped to the single run, on a **unique per-pid
+path** — `cockpit-eph-<pid>.sock` + `cockpit-eph-<pid>.pid` in the same
+directory as the canonical socket/pid. Because the ephemeral daemon
+never touches the canonical path, it coexists with a persistent daemon,
+and `cockpit daemon {stop,status}` (canonical-only) never sees it. The
+TUI's `--ephemeral`-free default still auto-promotes a *persistent*
+daemon at the canonical path. Three independent layers guarantee an
+ephemeral daemon never outlives its run:
+
+  - **A — foreground guard.** The `run` process holds an RAII guard
+    (tied to `owns_daemon`) that sends `StopDaemon` to the daemon it
+    spawned on *every* exit path: normal completion, early `?` error,
+    panic/unwind, and SIGINT/SIGTERM. A run that attached to a
+    pre-existing persistent daemon owns no guard and shuts nothing down.
+  - **B — path isolation.** The unique per-pid socket/pid scheme above.
+  - **C — self-reaping watchdog.** The ephemeral daemon exits on its own
+    when it has had no connected client for a ~30s idle grace
+    (`EPHEMERAL_IDLE_GRACE`); a reconnect inside the window cancels the
+    countdown. This catches uncatchable foreground deaths (SIGKILL,
+    power loss) that Layer A cannot. The persistent daemon never arms
+    this watchdog.
+
 ### 8c. IPC: same wire protocol, different transports
 
 cockpit defines **one** message schema for client↔daemon
@@ -1442,11 +1478,17 @@ that touches every subsystem.
   surfaces at the tail (stderr, a non-zero `exit:` line, a panic) —
   is never lost to head-only truncation.
 - **Two complementary context-reduction commands.** `/prune` is
-  deterministic, mechanical, and reviewable — it collapses superseded
-  snapshot results (older `read` calls and read-only `bash` snapshots
-  like `ls` / `rg` / `git status` that a newer call has obsoleted) into
-  one-line markers, with no LLM
-  in the loop. `/compact` is the heavyweight option: it asks the model
+  deterministic, mechanical, and reviewable. Current shipped scope is
+  **snapshot dedup only**: it collapses all-but-the-most-recent result
+  body for snapshot-class calls of exact identity (same canonical path
+  + identical args) for `read` and the read-only intel tools
+  (`outline` / `symbol_find` / `word` / `deps` / `circular` / `tree` /
+  `search`) into a `Part::Elided` marker, with no LLM in the loop.
+  Elision is wire-only (§14): the on-disk transcript and TUI scrollback
+  stay full-fidelity; only the model-bound message list shrinks. Older
+  read-only `bash` snapshot dedup, bash-result truncation, and the
+  interactive picker are deferred (see `plan.md` T6.d). `/compact` is
+  the heavyweight option: it asks the model
   to draft a handoff prompt summarizing the work so far, then starts a
   fresh thread seeded with that prompt (the old thread is preserved on
   disk and recoverable). Automatic background staleness/dedup (T6.a/b
@@ -1489,16 +1531,23 @@ that touches every subsystem.
 - **Built-in tool surface is small.** v1 ships `read, readlock, write,
   writeunlock, edit, bash, task, skill, webfetch, mcp_invoke`, the
   codebase-intelligence tools (`tree, outline, symbol_find, word, deps,
-  hot, circular, search`; §21), and the `jobs` meta-tool (§22). The
+  hot, circular, search`; §21), the `jobs` meta-tool (§22), and the
+  sandboxed `grep`/`glob` tools (`docs`-answerer-only). The
   lock-aware tool set (`readlock` / `write` / `writeunlock`) is
   required for the multi-agent file-locking model (see `plan.md`
   §4.1); plain `read` is the unlocked snapshot variant for exploration
-  that doesn't intend to modify. **No `grep`/`glob` tool** — raw search
-  is `bash` + `rg`/`fd`; the budgeted/structured path is the `search`
-  intel tool, which post-processes into token-capped results (a raw
-  `bash rg` dump has no budget awareness). No `websearch` (provider-
-  side search exists; if a user wants `cockpit`-side, they pipe `curl`
-  through `bash`). No tool we couldn't justify removing.
+  that doesn't intend to modify. **No `grep`/`glob` tool for general
+  agents** — raw search is `bash` + `rg`/`fd`; the budgeted/structured
+  path is the `search` intel tool, which post-processes into
+  token-capped results (a raw `bash rg` dump has no budget awareness).
+  `grep`/`glob` exist *only* on the `docs` answerer (Docs.2, §3a),
+  which is denied `bash`: they are Rust-native (ripgrep libraries +
+  `globset`, never shelling to `rg`/`fd`) and hard-confine every path
+  to the answerer's package-root cwd, so Docs.2 can explore an
+  untrusted cloned dependency without shell access. No `websearch`
+  on general agents (provider-side search exists; if a user wants
+  `cockpit`-side, they pipe `curl` through `bash`). No tool we
+  couldn't justify removing.
 - **MCP via lazy discovery** (§18 — reversed from the prior "no MCP"
   policy). The original §10 objection to MCP was token cost: a typical
   MCP server's per-tool schemas inject thousands of tokens into every
@@ -3062,15 +3111,20 @@ radius) and a trigram search index are Phase 2.
   `identifiers`, `deps`, `callsites`).
 - **Budgeted output** via `tokens.rs` (`search` default 4 000-token
   cap), dropping whole writes atomically to keep a valid prefix (§10).
-- **No `grep`/`glob` tool.** Raw search is `bash` + `rg`/`fd`;
-  `search` is the budgeted/structured path.
+- **No `grep`/`glob` intel tool.** Raw search is `bash` + `rg`/`fd`;
+  `search` is the budgeted/structured path. (The separate sandboxed
+  `grep`/`glob` *tools* on the `docs` answerer — §3a — are not intel
+  tools and are not part of this index; they run the ripgrep
+  libraries directly over a confined dependency-clone cwd.)
 
 **Per-agent assignment (starting default; revisit later).** `explore`:
 all. `coder`: `read`(line-range), `outline`, `symbol_find`, `deps`,
-`circular`, `word`, `search` (+ its write tools; `impact` joins in
-Phase 2). `orchestrator-plan`: `tree`, `deps`, `circular`, `hot`.
-`orchestrator-build`: `tree`, `hot`. `docs`: `tree`, `outline`,
-`symbol_find`, `read`(line-range).
+`circular`, `word`, `search` (+ its write tools and `task→docs`;
+`impact` joins in Phase 2). `orchestrator-plan`: `tree`, `deps`,
+`circular`, `hot`. `orchestrator-build`: `tree`, `hot`. The `docs`
+answerer (Docs.2) does **not** use the intel index — it uses
+`read` + the sandboxed `grep`/`glob` (a clean seam is left to add the
+intel tools to Docs.2 later, but they are not wired here).
 
 ---
 

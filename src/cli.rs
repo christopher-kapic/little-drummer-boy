@@ -103,6 +103,14 @@ pub enum Command {
     /// Fetch and check out a GitHub PR, then launch cockpit in the worktree.
     Pr(PrArgs),
 
+    /// Manage the package registry the `docs` agent reads from.
+    #[command(subcommand)]
+    Packages(PackagesCommand),
+
+    /// One-way import of packages from a local `kcl` install's registry.
+    #[command(subcommand)]
+    Kcl(KclCommand),
+
     /// Initialize cockpit in this project (writes AGENTS.md and an
     /// extended-config.json skeleton).
     Init(InitArgs),
@@ -268,16 +276,55 @@ pub struct ImportArgs {
     pub file: PathBuf,
 }
 
+/// Scope toggle for `cockpit stats` (GOALS §15a / §15f).
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+pub enum StatsProjectScope {
+    /// The project rooted at the current working directory (default).
+    Current,
+    /// Every project recorded on this machine.
+    All,
+}
+
+/// Range toggle for `cockpit stats` (GOALS §15a / §15f).
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+pub enum StatsRangeArg {
+    /// The last 7 days (default).
+    #[value(name = "7d")]
+    SevenDays,
+    /// All recorded history.
+    All,
+}
+
+/// Output format for `cockpit stats` (GOALS §15f).
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+pub enum StatsFormat {
+    /// Human-readable aligned columns (default).
+    Table,
+    /// Machine-readable JSON (the full roll-up struct).
+    Json,
+    /// One CSV stream per section, for scripting.
+    Csv,
+}
+
 #[derive(Debug, clap::Args)]
 pub struct StatsArgs {
+    /// Which projects to include. (Field id is `project_scope` to avoid
+    /// colliding with the global positional `project` path arg; the
+    /// user-facing flag stays `--project` per GOALS §15f.)
+    #[arg(long = "project", value_enum, default_value_t = StatsProjectScope::Current)]
+    pub project_scope: StatsProjectScope,
+
+    /// Time window.
+    #[arg(long, value_enum, default_value_t = StatsRangeArg::SevenDays)]
+    pub range: StatsRangeArg,
+
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = StatsFormat::Table)]
+    pub format: StatsFormat,
+
+    /// Add a per-role (agent) token/cost breakdown.
     #[arg(long)]
-    pub days: Option<u32>,
-    #[arg(long)]
-    pub tools: Option<u32>,
-    #[arg(long)]
-    pub models: Option<u32>,
-    #[arg(long, value_name = "PATH")]
-    pub project: Option<String>,
+    pub by_role: bool,
 }
 
 // ---- debug ----
@@ -347,6 +394,43 @@ pub struct MetaArgs {
     /// Use a specific harness as the meta agent's executor (defaults to cockpit).
     #[arg(long)]
     pub harness: Option<String>,
+}
+
+// ---- packages / kcl import ----
+
+#[derive(Debug, Subcommand)]
+pub enum PackagesCommand {
+    /// List every registered package.
+    #[command(alias = "ls")]
+    List,
+    /// Register a package: `--git <url>` clones (shallow by default);
+    /// `--path <dir>` registers a local directory in place.
+    Add(PackagesAddArgs),
+}
+
+#[derive(Debug, clap::Args)]
+pub struct PackagesAddArgs {
+    /// Canonical identifier (e.g. `tokio`, `cargo:tokio`, `@scope/pkg`).
+    pub identifier: String,
+    /// Clone this Git repo into the cockpit clone dir.
+    #[arg(long, value_name = "URL")]
+    pub git: Option<String>,
+    /// Register this existing local directory (no clone).
+    #[arg(long, value_name = "PATH")]
+    pub path: Option<PathBuf>,
+    /// Branch to clone (Git only).
+    #[arg(long)]
+    pub branch: Option<String>,
+    /// Full (non-shallow) clone. Default is `--depth 1`.
+    #[arg(long)]
+    pub shallow: bool,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum KclCommand {
+    /// Import every package cockpit lacks from kcl's registry,
+    /// referencing kcl's on-disk clone paths as-is.
+    Import,
 }
 
 #[derive(Debug, clap::Args)]

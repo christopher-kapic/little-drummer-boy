@@ -85,6 +85,17 @@ impl App {
             self.toast = None;
         }
 
+        // `/prune` confirm armed (T6.d): `y` / Enter commits, any other
+        // non-modifier key cancels. Ahead of composer routing so the
+        // keystroke doesn't leak into the textbox.
+        if self.pending_prune_confirm && !is_modifier_only(&key) {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => self.commit_prune(),
+                _ => self.cancel_prune(),
+            }
+            return false;
+        }
+
         // Context menu intercepts keys while open. Arrows / j-k move
         // the focus, Enter executes, Esc dismisses, any other
         // printable key dismisses without executing (so the user can
@@ -217,6 +228,16 @@ impl App {
             }
             // See the "modal dialog rule" comment above — always
             // consume the key while the picker is open.
+            return false;
+        }
+
+        // `/stats` pane (GOALS §15). Same modal rule: route the key to
+        // the pane, close on its request, and always consume so nothing
+        // leaks into the composer underneath.
+        if let Some(pane) = self.stats_pane.as_mut() {
+            if pane.handle_key(key) {
+                self.stats_pane = None;
+            }
             return false;
         }
 
@@ -882,6 +903,15 @@ impl App {
         let submitted = self.composer.text().trim().to_string();
         if submitted.is_empty() {
             return false;
+        }
+
+        // `/compact` review-then-commit (T6.e): the composer holds the
+        // assembled handoff (user may have edited it). On submit, re-attach
+        // to the fresh session the daemon created and send the handoff as
+        // its first message. The old session stays whole in SQLite,
+        // recoverable via `cockpit session show/resume`.
+        if self.pending_compact.is_some() {
+            return self.commit_compact(submitted);
         }
 
         // Submitting a new turn implies the user has finished reading

@@ -27,7 +27,7 @@ impl Tool for WriteunlockTool {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "path":    { "type": "string", "description": "Path to write" },
+                "path":    { "type": "string", "x-cockpit-kind": "path", "description": "Path to write" },
                 "content": { "type": "string", "description": "Entire new file content" }
             },
             "required": ["path", "content"]

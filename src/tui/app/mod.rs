@@ -88,6 +88,24 @@ struct SlashCommand {
     description: &'static str,
 }
 
+/// A `/compact` handoff awaiting the user's review-then-commit. Held
+/// while the assembled handoff sits in the composer; consumed when the
+/// user submits (re-attach to `new_session_id` + send the edited
+/// handoff) or discards.
+#[derive(Clone)]
+pub(super) struct PendingCompact {
+    pub(super) new_session_id: uuid::Uuid,
+    pub(super) seed_tool_count: usize,
+    /// Approx wire tokens the seed-tools cost on the fresh session's
+    /// first turn (from `CompactReady`). Surfaced in the boundary marker.
+    pub(super) seed_tool_tokens: u64,
+    /// The predecessor (current) session's short id, captured at
+    /// `CompactReady` time so the fresh session can draw a `compacted
+    /// from <short-id>` boundary marker once committed. Empty when the
+    /// runner had no short id.
+    pub(super) predecessor_short_id: String,
+}
+
 const SLASH_COMMANDS: &[SlashCommand] = &[
     SlashCommand {
         name: "compact",
@@ -118,6 +136,10 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "Run a git command and share its output with the agent",
     },
     SlashCommand {
+        name: "jobs",
+        description: "List active async jobs (arg: cancel <job-id> to cancel one)",
+    },
+    SlashCommand {
         name: "lazygit",
         description: "Open lazygit in an embedded pane",
     },
@@ -134,8 +156,12 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "Clear the chat and start a fresh session",
     },
     SlashCommand {
+        name: "pin",
+        description: "Pin a message so it survives /compact verbatim (arg: text)",
+    },
+    SlashCommand {
         name: "prune",
-        description: "Drop the oldest messages",
+        description: "Collapse superseded snapshot reads to reclaim context",
     },
     SlashCommand {
         name: "resume",
@@ -152,6 +178,10 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
     SlashCommand {
         name: "settings",
         description: "Open the settings dialog",
+    },
+    SlashCommand {
+        name: "stats",
+        description: "On-device model and project performance (tokens, recovery, languages)",
     },
 ];
 
@@ -273,6 +303,10 @@ pub struct App {
     /// both); kept separate so the picker doesn't clutter the settings
     /// state machine.
     pub(super) model_picker: Option<crate::tui::model_picker::ModelPickerDialog>,
+    /// `/stats` pane (GOALS §15). A full-body interactive overlay over
+    /// the part-1 roll-up layer; `None` when closed. Routed input/render
+    /// alongside `dialog` / `model_picker`.
+    pub(super) stats_pane: Option<crate::tui::stats_pane::StatsPane>,
     /// "Daemon not running" prompt shown at startup. Once the user picks,
     /// this is taken and the prompt closes.
     pub(super) daemon_prompt: Option<crate::tui::daemon_prompt::DaemonPromptDialog>,
@@ -411,6 +445,31 @@ pub struct App {
     /// indicator (`X tokens in <file>`). `None` when the daemon wasn't
     /// running at launch or the project has no guidance file.
     pub(super) guidance_estimate: Option<(String, u64)>,
+    /// Wire tokens `/prune` would drop from the foreground agent right
+    /// now (GOALS §1a). Pushed by the daemon's `ContextProjection` event
+    /// — the authoritative figure from the same `dedup_plan` `/prune`
+    /// executes, so the status-line `→ Y% prunable` always matches what
+    /// `/prune` removes. `0` until the first projection arrives.
+    pub(super) prunable_tokens: u64,
+    /// Whether the provider cache is expected cold on the next call (from
+    /// the daemon's cache-cold predicate). Drives the `/prune` confirm's
+    /// hot-vs-cold warning. Defaults true (no warm cache to lose).
+    pub(super) cache_cold: bool,
+    /// The live set of wire-side elided tool-result `call_id`s on the
+    /// foreground agent (from the daemon's `Pruned` event). The scrollback
+    /// renderer dims any boxed tool call whose `call_id` is in here —
+    /// full text stays visible (GOALS §14). A render-time view of live
+    /// prune state, replaced wholesale on each `Pruned`, not a persisted
+    /// flag. Cleared on a fresh thread (`/compact` commit, `/clear`).
+    pub(super) elided_event_ids: std::collections::HashSet<String>,
+    /// A `/compact` handoff awaiting review-then-commit (T6.e). `Some`
+    /// while the assembled handoff sits in the composer for editing.
+    pub(super) pending_compact: Option<PendingCompact>,
+    /// `/prune` confirm armed: the user ran `/prune`, saw the before→after
+    /// numbers + cache warning, and the next `y`/Enter commits (anything
+    /// else cancels). `Some` holds nothing meaningful — its presence is
+    /// the armed flag; the numbers were already pushed to history.
+    pub(super) pending_prune_confirm: bool,
     /// `RecordUsage` requests made before the daemon runner exists.
     /// Flushed (with tag project ids backfilled) once it's created.
     pub(super) pending_usage: Vec<crate::daemon::proto::Request>,
@@ -468,6 +527,23 @@ pub struct App {
     /// attached to the next user message's wire text and cleared on
     /// send (and on `/new`).
     pub(super) pending_git_blocks: Vec<String>,
+    /// Live async jobs (GOALS §22), keyed by job id. Drives the transient
+    /// jobs strip (rendered only when non-empty) and `/jobs`. Maintained
+    /// from `JobStarted` / `JobNote` / `JobProgress` / `JobCompleted`
+    /// events.
+    pub(super) active_jobs: std::collections::BTreeMap<String, ActiveJob>,
+}
+
+/// A live async job tracked by the TUI for the jobs strip / `/jobs`.
+#[derive(Debug, Clone)]
+pub(super) struct ActiveJob {
+    pub(super) label: String,
+    /// `loop` / `timer` / `background`.
+    pub(super) kind: String,
+    /// Iterations observed so far (loops; bumped per note).
+    pub(super) iteration: u64,
+    /// Last time the job showed activity — drives an idle/elapsed readout.
+    pub(super) last_activity: Instant,
 }
 
 /// Toast intent — drives the message's foreground color.
@@ -601,6 +677,7 @@ impl App {
             repo_status,
             dialog: Dialog::None,
             model_picker: None,
+            stats_pane: None,
             daemon_prompt,
             daemon_connected,
             fetch_models_progress: Arc::new(Mutex::new(Vec::new())),
@@ -631,6 +708,11 @@ impl App {
             usage_tags: HashMap::new(),
             project_id: None,
             guidance_estimate: None,
+            prunable_tokens: 0,
+            cache_cold: true,
+            elided_event_ids: std::collections::HashSet::new(),
+            pending_compact: None,
+            pending_prune_confirm: false,
             pending_usage: Vec::new(),
             pending_external_edit: false,
             mouse_capture,
@@ -647,6 +729,7 @@ impl App {
             pane_body: None,
             dragging_divider: false,
             pending_git_blocks: Vec::new(),
+            active_jobs: std::collections::BTreeMap::new(),
         };
         // First-run convenience: if the daemon prompt doesn't gate
         // startup, open the Add-Provider wizard immediately when no
@@ -987,6 +1070,12 @@ impl App {
         // Drop any buffered `/git` blocks — they belong to the old
         // session's next-message that will never be sent now.
         self.pending_git_blocks.clear();
+        // The new session starts with no async jobs; the daemon's fresh
+        // session has its own (empty) authority.
+        self.active_jobs.clear();
+        // Fresh thread → no wire-side elisions yet.
+        self.elided_event_ids.clear();
+        self.prunable_tokens = 0;
         // Reload from disk in case settings changed.
         self.reload_launch_info();
         self.reload_tui_config();
@@ -1216,6 +1305,225 @@ impl App {
             xml_escape(args),
             capped
         ));
+    }
+
+    /// `/jobs` (GOALS §22): list active async jobs, or `/jobs cancel
+    /// <job-id>` to cancel one (the human-side cancel affordance — these
+    /// run on the user's dime). Cancellation rides the same fire-and-forget
+    /// request channel the autocomplete tally uses.
+    pub(super) fn handle_jobs_command(&mut self, args: &str) {
+        let args = args.trim();
+        if let Some(rest) = args.strip_prefix("cancel") {
+            let job_id = rest.trim();
+            if job_id.is_empty() {
+                self.history.push(HistoryEntry::Plain {
+                    line: "/jobs: usage `/jobs cancel <job-id>`".to_string(),
+                });
+                return;
+            }
+            let sent = match self.agent_runner.as_ref() {
+                Some(Ok(runner)) => runner
+                    .record_tx
+                    .try_send(crate::daemon::proto::Request::CancelJob {
+                        job_id: job_id.to_string(),
+                    })
+                    .is_ok(),
+                _ => false,
+            };
+            let line = if sent {
+                format!("/jobs: cancel requested for `{job_id}`")
+            } else {
+                format!("/jobs: no daemon connection — cannot cancel `{job_id}`")
+            };
+            self.history.push(HistoryEntry::Plain { line });
+            return;
+        }
+        // Bare `/jobs`: list.
+        if self.active_jobs.is_empty() {
+            self.history.push(HistoryEntry::Plain {
+                line: "/jobs: no active jobs".to_string(),
+            });
+            return;
+        }
+        self.history.push(HistoryEntry::Plain {
+            line: "/jobs: active —".to_string(),
+        });
+        for (job_id, j) in &self.active_jobs {
+            let progress = if j.kind == "background" {
+                String::new()
+            } else {
+                format!(" {} iter", j.iteration)
+            };
+            self.history.push(HistoryEntry::Plain {
+                line: format!(
+                    "  {job_id} [{}]{progress}  {}  (cancel: /jobs cancel {job_id})",
+                    j.kind, j.label
+                ),
+            });
+        }
+    }
+
+    /// Send a fire-and-forget daemon request over the runner's record
+    /// channel (same path `/jobs cancel` uses). Returns whether a runner
+    /// was connected to receive it.
+    pub(super) fn send_daemon_request(&self, req: crate::daemon::proto::Request) -> bool {
+        match self.agent_runner.as_ref() {
+            Some(Ok(runner)) => runner.record_tx.try_send(req).is_ok(),
+            _ => false,
+        }
+    }
+
+    /// `/prune` (T6.d): show the before→after context % and the
+    /// cache-bust warning, then arm the confirm. The numbers come from the
+    /// daemon-authoritative `prunable_tokens` (same `dedup_plan` `/prune`
+    /// executes), so the projection equals the result.
+    pub(super) fn arm_prune_confirm(&mut self) {
+        if self.prunable_tokens == 0 {
+            self.history.push(HistoryEntry::Plain {
+                line: "/prune: 0% prunable — nothing to do.".to_string(),
+            });
+            self.pending_prune_confirm = false;
+            return;
+        }
+        let tokens = self.context_tokens();
+        let prunable = self.prunable_tokens;
+        let numbers = match self.launch.active_model_max_context {
+            Some(max) if max > 0 => {
+                let pct = (tokens as u64 * 100 / max as u64).min(999);
+                let after = (tokens as u64).saturating_sub(prunable);
+                let after_pct = (after * 100 / max as u64).min(999);
+                format!("context {pct}% → {after_pct}% (~{prunable} wire tokens)")
+            }
+            _ => format!("~{prunable} wire tokens"),
+        };
+        // Cache warning derived from the predicate, not a guess.
+        let cache_line = if self.cache_cold {
+            "Cache is cold — pruning is free (auto-prune normally handles this)."
+        } else {
+            "Cache is HOT — pruning breaks it; the cache-bust cost may exceed the savings. \
+             When the cache goes cold, auto-prune handles it for free."
+        };
+        self.history.push(HistoryEntry::Plain {
+            line: format!(
+                "/prune: {numbers}. {cache_line} Press y or Enter to confirm, any other key to cancel."
+            ),
+        });
+        self.pending_prune_confirm = true;
+    }
+
+    /// Commit an armed `/prune`: send the request to the daemon. The
+    /// `Pruned` + refreshed `ContextProjection` events render the result.
+    pub(super) fn commit_prune(&mut self) {
+        self.pending_prune_confirm = false;
+        if !self.send_daemon_request(crate::daemon::proto::Request::Prune) {
+            self.history.push(HistoryEntry::Plain {
+                line: "/prune: no daemon connection — cannot prune.".to_string(),
+            });
+        }
+    }
+
+    /// Cancel an armed `/prune`.
+    pub(super) fn cancel_prune(&mut self) {
+        self.pending_prune_confirm = false;
+        self.history.push(HistoryEntry::Plain {
+            line: "/prune: cancelled.".to_string(),
+        });
+    }
+
+    /// `/compact` (T6.e): request the daemon assemble a fresh-thread
+    /// handoff. The result arrives as a `CompactReady` event that drops
+    /// the handoff into the composer for review-then-commit.
+    pub(super) fn start_compact(&mut self) {
+        if !self.send_daemon_request(crate::daemon::proto::Request::Compact) {
+            self.history.push(HistoryEntry::Plain {
+                line: "/compact: no daemon connection — cannot compact.".to_string(),
+            });
+            return;
+        }
+        self.history.push(HistoryEntry::Plain {
+            line: "/compact: assembling handoff (prune-first, model brief, deterministic appendix, seed tools)…".to_string(),
+        });
+    }
+
+    /// Commit a reviewed `/compact` handoff (T6.e step 5). Re-attaches the
+    /// TUI to the fresh session the daemon created and sends the (edited)
+    /// handoff as its first user message; the fresh session re-executes
+    /// its seed tools before the first inference. The old session is
+    /// preserved in SQLite. Returns the `submit_input` quit signal
+    /// (always `false`).
+    pub(super) fn commit_compact(&mut self, handoff: String) -> bool {
+        let Some(pending) = self.pending_compact.take() else {
+            return false;
+        };
+        self.composer.clear();
+        // Switch the runner onto the fresh session.
+        match agent_runner::attach_to_session(&self.launch.cwd, pending.new_session_id) {
+            Ok(runner) => {
+                // Fresh thread: clear the transcript view + queue + pending.
+                self.history.clear();
+                self.queue.clear();
+                self.pending = None;
+                self.prunable_tokens = 0;
+                // Fresh thread → no wire-side elisions carry over.
+                self.elided_event_ids.clear();
+                self.agent_runner = Some(Ok(runner));
+                // Boundary marker at the top of the fresh session's
+                // scrollback (the divider-equivalent for compaction). Only
+                // when we know the predecessor's short id; otherwise fall
+                // back to the plain status line below.
+                if !pending.predecessor_short_id.is_empty() {
+                    self.history.push(HistoryEntry::CompactBoundary {
+                        predecessor_short_id: pending.predecessor_short_id.clone(),
+                        seed_tool_count: pending.seed_tool_count,
+                        seed_tool_tokens: pending.seed_tool_tokens,
+                    });
+                }
+                self.history.push(HistoryEntry::Plain {
+                    line: format!(
+                        "/compact: committed — fresh session started ({} seed tool(s) re-running). Old session recoverable via `cockpit session resume`.",
+                        pending.seed_tool_count
+                    ),
+                });
+                self.history.push(HistoryEntry::User {
+                    text: handoff.clone(),
+                    timestamp: chrono::Local::now(),
+                });
+                self.begin_working_span();
+                if let Some(Ok(runner)) = self.agent_runner.as_ref() {
+                    let _ = runner.input_tx.try_send(handoff);
+                }
+            }
+            Err(e) => {
+                self.history.push(HistoryEntry::Plain {
+                    line: format!("/compact: could not attach to fresh session: {e}"),
+                });
+            }
+        }
+        false
+    }
+
+    /// `/pin <text>`: mark a message as must-survive for the next
+    /// `/compact` (injected verbatim, never summarized).
+    pub(super) fn handle_pin_command(&mut self, args: &str) {
+        let text = args.trim();
+        if text.is_empty() {
+            self.history.push(HistoryEntry::Plain {
+                line: "/pin: usage `/pin <text>` — pins a message verbatim for /compact"
+                    .to_string(),
+            });
+            return;
+        }
+        if self.send_daemon_request(crate::daemon::proto::Request::Pin {
+            text: text.to_string(),
+        }) {
+            self.history.push(HistoryEntry::Plain {
+                line: format!("/pin: pinned (survives /compact verbatim): {text}"),
+            });
+        } else {
+            self.history.push(HistoryEntry::Plain {
+                line: "/pin: no daemon connection — cannot pin.".to_string(),
+            });
+        }
     }
 
     pub(super) fn ensure_agent_runner(&mut self) {
@@ -1492,6 +1800,119 @@ impl App {
             TurnEvent::AgentIdle => {
                 self.finalize_pending();
                 self.end_working_span();
+            }
+            TurnEvent::JobStarted {
+                job_id,
+                label,
+                kind,
+            } => {
+                self.active_jobs.insert(
+                    job_id.clone(),
+                    ActiveJob {
+                        label: label.clone(),
+                        kind,
+                        iteration: 0,
+                        last_activity: Instant::now(),
+                    },
+                );
+                self.history.push(HistoryEntry::Plain {
+                    line: format!("[job {job_id}] started: {label}"),
+                });
+            }
+            TurnEvent::JobProgress { job_id } => {
+                if let Some(j) = self.active_jobs.get_mut(&job_id) {
+                    j.last_activity = Instant::now();
+                }
+            }
+            TurnEvent::JobNote { job_id, text } => {
+                if let Some(j) = self.active_jobs.get_mut(&job_id) {
+                    j.iteration = j.iteration.saturating_add(1);
+                    j.last_activity = Instant::now();
+                }
+                self.finalize_pending();
+                self.history.push(HistoryEntry::Plain {
+                    line: format!("[job {job_id} note] {text}"),
+                });
+            }
+            TurnEvent::JobCompleted {
+                job_id,
+                label,
+                kind,
+                failed,
+            } => {
+                self.active_jobs.remove(&job_id);
+                self.finalize_pending();
+                let verb = if failed { "failed" } else { "ended" };
+                self.history.push(HistoryEntry::Plain {
+                    line: format!("[job {job_id}] {kind} {verb}: {label}"),
+                });
+            }
+            TurnEvent::ContextProjection {
+                prunable_tokens,
+                cache_cold,
+            } => {
+                // Authoritative "% prunable" basis. Stored, then rendered
+                // by `context_indicator_text` against the model's max
+                // context (GOALS §1a). `cache_cold` drives the /prune
+                // confirm's hot-vs-cold copy.
+                self.prunable_tokens = prunable_tokens;
+                self.cache_cold = cache_cold;
+            }
+            TurnEvent::Pruned {
+                auto,
+                bodies,
+                tokens_saved,
+                elided,
+            } => {
+                self.finalize_pending();
+                // Replace the live elided set wholesale (it's the full
+                // current wire-side set, not a delta) so scrollback dims
+                // exactly what's out of the model's context now. Reversible:
+                // an engine fallback that un-elides a body drops it here, so
+                // it renders normally again.
+                self.elided_event_ids = elided.into_iter().collect();
+                let how = if auto { "auto-pruned" } else { "/prune" };
+                let line = if bodies == 0 {
+                    format!("{how}: nothing to do (0% prunable)")
+                } else {
+                    format!(
+                        "{how}: collapsed {bodies} superseded snapshot{} (~{tokens_saved} wire tokens reclaimed)",
+                        if bodies == 1 { "" } else { "s" }
+                    )
+                };
+                self.history.push(HistoryEntry::Plain { line });
+            }
+            TurnEvent::CompactReady {
+                new_session_id,
+                handoff,
+                seed_tool_count,
+                seed_tool_tokens,
+            } => {
+                self.finalize_pending();
+                // Review-then-commit (T6.e step 4/5): drop the assembled
+                // handoff into the composer for the user to edit/append.
+                // On submit, the TUI re-attaches to the new session and
+                // sends the (edited) handoff as the first message; the
+                // new session re-executes its seed tools first.
+                self.composer.set(handoff);
+                // Capture the predecessor (current) session's short id now,
+                // before the commit re-attaches onto the fresh session and
+                // the runner's short id changes.
+                let predecessor_short_id = match self.agent_runner.as_ref() {
+                    Some(Ok(r)) => r.short_id.clone(),
+                    _ => String::new(),
+                };
+                self.pending_compact = Some(PendingCompact {
+                    new_session_id,
+                    seed_tool_count,
+                    seed_tool_tokens,
+                    predecessor_short_id,
+                });
+                self.history.push(HistoryEntry::Plain {
+                    line: format!(
+                        "/compact: handoff ready for review in the composer — {seed_tool_count} seed tool(s), ~{seed_tool_tokens} tokens will re-run in the fresh session. Edit and submit to commit; the old session stays recoverable.",
+                    ),
+                });
             }
         }
     }
@@ -1825,6 +2246,17 @@ impl App {
             )
         {
             self.toast = None;
+        }
+        // `/stats` pane is a full-body overlay: wheel scrolls it, every
+        // other mouse event is eaten so nothing reaches the chat
+        // underneath. Ahead of the embedded-pane / chat handlers.
+        if let Some(pane) = self.stats_pane.as_mut() {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => pane.scroll_up(),
+                MouseEventKind::ScrollDown => pane.scroll_down(),
+                _ => {}
+            }
+            return;
         }
         // Embedded pane (GOALS §1i/§1e): divider drag-resize, click-to-
         // focus, and PTY mouse forwarding. Consumes the event when it
@@ -2328,8 +2760,26 @@ impl App {
                 self.toggle_mouse_capture_inline();
                 return false;
             }
-            "compact" => "/compact: stub — context compaction not wired yet.",
-            "prune" => "/prune: stub — history pruning not wired yet.",
+            "jobs" => {
+                self.handle_jobs_command(&slash_args(&raw));
+                return false;
+            }
+            "compact" => {
+                self.start_compact();
+                return false;
+            }
+            "prune" => {
+                self.arm_prune_confirm();
+                return false;
+            }
+            "pin" => {
+                self.handle_pin_command(&slash_args(&raw));
+                return false;
+            }
+            "stats" => {
+                self.stats_pane = Some(crate::tui::stats_pane::StatsPane::open(&self.launch.cwd));
+                return false;
+            }
             "sessions" | "resume" => {
                 "/sessions: stub — session-picker UI not wired yet. The wire RPCs \
                  (ListSessions with project_id/parent filters, ForkSession, \
@@ -2878,6 +3328,15 @@ fn entry_to_plain_lines(entry: &HistoryEntry) -> Vec<String> {
                 out.push(format!("  {line}"));
             }
             out
+        }
+        HistoryEntry::CompactBoundary {
+            predecessor_short_id,
+            seed_tool_count,
+            ..
+        } => {
+            vec![format!(
+                "── compacted from {predecessor_short_id} · {seed_tool_count} seed-tool(s) re-run ──"
+            )]
         }
     }
 }

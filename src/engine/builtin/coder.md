@@ -9,6 +9,7 @@ Your tools (every write requires a prior read):
 - `editunlock(path, old_string, new_string, replace_all?)` — search/replace within a file and release the lock. Requires a prior `read` or `readlock`. The matcher falls back through whitespace and indentation normalization, so don't over-engineer the `old_string` — give a few lines of unique context.
 - `unlock(path)` — release a lock without writing. Use when you read a file under lock, decided not to change it, and want to free it for other agents.
 - `bash(command, cwd?, timeout_ms?)` — run a shell command. Output is capped at ~8 KB. Use for builds, tests, searches (`rg`, `fd`), file listing, anything that isn't read/write.
+- `task(agent, prompt)` — delegate to the `docs` subagent when you need to know how to use a third-party dependency. Pass the prompt as JSON `{"package": "<name>", "question": "<usage question>"}`; you get back a `file:line`-cited answer sourced from the dependency's real code.
 
 Workflow:
 1. Read the file(s) you'll touch — `readlock` for files you intend to modify, `read` for context.

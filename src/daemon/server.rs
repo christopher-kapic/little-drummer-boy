@@ -36,18 +36,53 @@ pub struct DaemonContext {
     pub registry: SessionRegistry,
     pub paths: DaemonPaths,
     pub started_at: Instant,
+    /// Live count of connected clients. Each [`handle_client`] task
+    /// increments on accept and decrements on exit. The ephemeral
+    /// self-reaping watchdog (Layer C) watches the receiver side for
+    /// "no clients" transitions; the persistent daemon ignores it.
+    client_count: tokio::sync::watch::Sender<usize>,
 }
 
 impl DaemonContext {
     pub fn new(db: Db, locks: Arc<LockManager>, paths: DaemonPaths) -> Self {
         let registry = SessionRegistry::new(db.clone(), locks.clone());
+        let (client_count, _) = tokio::sync::watch::channel(0usize);
         Self {
             db,
             locks,
             registry,
             paths,
             started_at: Instant::now(),
+            client_count,
         }
+    }
+
+    /// Subscribe to the live connected-client count. Used by the
+    /// ephemeral idle watchdog (Layer C).
+    pub fn client_presence(&self) -> tokio::sync::watch::Receiver<usize> {
+        self.client_count.subscribe()
+    }
+
+    /// RAII guard: bumps the connected-client count on construction and
+    /// decrements it on drop, so the count stays correct on every exit
+    /// path of a client task (clean EOF, decode error, send failure).
+    fn track_client(self: &Arc<Self>) -> ClientGuard {
+        self.client_count.send_modify(|n| *n += 1);
+        ClientGuard { ctx: self.clone() }
+    }
+}
+
+/// Decrements the daemon's connected-client count when a client task
+/// ends, regardless of how it ends.
+struct ClientGuard {
+    ctx: Arc<DaemonContext>,
+}
+
+impl Drop for ClientGuard {
+    fn drop(&mut self) {
+        self.ctx
+            .client_count
+            .send_modify(|n| *n = n.saturating_sub(1));
     }
 }
 
@@ -130,6 +165,9 @@ struct AttachedSession {
 }
 
 async fn handle_client(stream: UnixStream, ctx: Arc<DaemonContext>) -> Result<()> {
+    // Count this client for the lifetime of the task. The guard
+    // decrements on every return below (Layer C presence tracking).
+    let _client_guard = ctx.track_client();
     let mut proto = ProtoStream::new(stream);
 
     // Emit a "hello" envelope immediately so cheap probes
@@ -341,6 +379,42 @@ async fn handle_request(
             Ok(Response::Ack)
         }
 
+        Request::CancelJob { job_id } => {
+            let att = require_attached(state)?;
+            att.handle
+                .send_work(SessionWork::CancelJob { job_id })
+                .await
+                .map_err(internal)?;
+            Ok(Response::Ack)
+        }
+
+        Request::Prune => {
+            let att = require_attached(state)?;
+            att.handle
+                .send_work(SessionWork::Prune)
+                .await
+                .map_err(internal)?;
+            Ok(Response::Ack)
+        }
+
+        Request::Compact => {
+            let att = require_attached(state)?;
+            att.handle
+                .send_work(SessionWork::Compact)
+                .await
+                .map_err(internal)?;
+            Ok(Response::Ack)
+        }
+
+        Request::Pin { text } => {
+            let att = require_attached(state)?;
+            att.handle
+                .send_work(SessionWork::Pin { text })
+                .await
+                .map_err(internal)?;
+            Ok(Response::Ack)
+        }
+
         Request::DaemonStatus => Ok(Response::DaemonStatus {
             pid: std::process::id(),
             uptime_secs: ctx.started_at.elapsed().as_secs(),
@@ -513,16 +587,19 @@ fn attach(
         Err(_) => Vec::new(),
     };
 
-    let project_id = ctx
-        .db
-        .get_session(session_id)
-        .ok()
-        .flatten()
-        .map(|s| s.project_id)
+    let row = ctx.db.get_session(session_id).ok().flatten();
+    let project_id = row
+        .as_ref()
+        .map(|s| s.project_id.clone())
+        .unwrap_or_default();
+    let short_id = row
+        .as_ref()
+        .and_then(|s| s.short_id.clone())
         .unwrap_or_default();
 
     Ok(Response::Attached {
         session_id,
+        short_id,
         project_root,
         project_id,
         active_agent,

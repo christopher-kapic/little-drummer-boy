@@ -486,6 +486,81 @@ Passthrough flows must:
 
 ---
 
+## 10b. Reasoning / thinking-block preservation across providers
+
+**The bug, in one sentence.** Anthropic's native Messages API signs
+every `thinking` / `redacted_thinking` block it returns; when you
+replay that assistant turn back to the API, the thinking blocks on
+the *latest* assistant message must come back **byte-for-byte
+identical**, or the request 400s:
+
+```
+messages.N.content.M: `thinking` or `redacted_thinking` blocks in the
+latest assistant message cannot be modified. These block must remain
+as they were in the original response.
+```
+
+This is a signature-integrity mechanism (thinking can't be forged,
+edited, or reordered and replayed), not a competitive lockout — every
+harness that drives the native Anthropic API hits it identically. The
+high `content.M` index is the tell: it fires on turns with thinking
+*interleaved with several tool-use blocks*, which is exactly the shape
+a multi-tool planning turn produces.
+
+**The two failure modes** (both bind only the *most recent* assistant
+turn; older turns may be freely stripped):
+
+1. **Modifying** a thinking block on the latest turn — re-encoding,
+   trimming, reordering the block sequence.
+2. **Modifying a sibling block** in the same turn when thinking +
+   `tool_use` are combined — the safe reading is *don't touch the
+   latest assistant turn at all* while thinking is live. When thinking
+   and tool calls coexist, the thinking block must also be *present*
+   (not stripped) on the turn you attach the `tool_result` to.
+
+**Why cockpit is immune today — and where it stops being immune.**
+v0 ships only the OpenAI-compatible Chat Completions variant
+(`Model::OpenAi`, `src/engine/model.rs`); the Anthropic native variant
+is still a stub. Chat Completions does not sign or require replay of
+reasoning blocks, and `Model::complete` runs `strip_reasoning` over
+the **entire** history before every request
+(`src/engine/model.rs` — `history.iter().map(strip_reasoning)`), so no
+thinking block is ever replayed. That blanket strip is safe for Chat
+Completions but is **the wrong default the moment the native Anthropic
+variant is wired**: stripping the latest turn's thinking when that
+turn also carries a `tool_use` is itself a 400. So the rule below is a
+precondition for building the Anthropic variant, not a live bug.
+
+**Rules for the native Anthropic path (when built):**
+
+- **Never strip reasoning from the latest assistant turn.** Make
+  `strip_reasoning` position-aware: scrub thinking from turns `< N-1`
+  for token economy ([[pruning_policy]]), preserve the most recent
+  assistant turn's content vector verbatim — signature included.
+- **Replay thinking blocks exactly as received**, including the
+  opaque signature; store the raw content blocks, don't reconstruct
+  them from the captured `ReasoningDelta` text (that text is a
+  display projection and has no signature).
+- **`rewrite_assistant_tool_call` is the in-house tripwire.** The
+  §13c edit-cascade canonical rewrite (`src/engine/agent.rs`) mutates
+  the *most recent* assistant message's tool-call args in place. On
+  Chat Completions that's fine. On native Anthropic, mutating any
+  block of a thinking-bearing latest turn risks the failure mode (2)
+  400. Before enabling native Anthropic, either (a) suppress the
+  in-history rewrite when the turn carries a thinking block (keep the
+  canonical form only in the audit row's `wire_input`, which GOALS §14
+  already separates from what the model sees), or (b) confirm against
+  a live Anthropic endpoint that sibling-`tool_use` edits don't
+  invalidate the thinking signature. GOALS §14 already commits to
+  *never rewriting reasoning prose* — extend that invariant to "never
+  mutate any block of a signed latest assistant turn."
+- **Pruning interacts with this** ([[pruning_policy]]): a prune that
+  drops the latest turn's thinking to save tokens trades a few hundred
+  tokens for a hard 400. The position-aware strip above is the same
+  predicate — older turns only.
+
+---
+
 ## 11. What we explicitly will not do
 
 A list to point at when feature requests come in:

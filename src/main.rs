@@ -25,6 +25,7 @@ mod git;
 mod harness;
 mod intel;
 mod locks;
+mod packages;
 mod providers;
 mod redact;
 mod session;
@@ -78,6 +79,8 @@ async fn main() -> Result<()> {
         Some(Command::Mcp) => commands::mcp::run().await,
         Some(Command::Connect(args)) => commands::connect::run(args).await,
         Some(Command::Pr(args)) => commands::pr::run(args).await,
+        Some(Command::Packages(sub)) => commands::packages::run(sub).await,
+        Some(Command::Kcl(sub)) => commands::kcl::run(sub).await,
         Some(Command::Init(args)) => commands::init::run(args).await,
         Some(Command::Completion { shell }) => {
             use clap::CommandFactory;

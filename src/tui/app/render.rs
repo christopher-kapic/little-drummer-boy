@@ -201,7 +201,8 @@ impl App {
         for entry in &self.history {
             total = total.saturating_add(match entry {
                 HistoryEntry::Plain { .. } => 1,
-                HistoryEntry::ToolLine { .. } => 2, // line + trailing gap
+                HistoryEntry::CompactBoundary { .. } => 2, // rule + trailing gap
+                HistoryEntry::ToolLine { .. } => 2,        // line + trailing gap
                 HistoryEntry::LocalCommand { output, .. } => {
                     // label row + output rows + trailing gap.
                     (output.lines().count() as u16).saturating_add(2)
@@ -259,6 +260,16 @@ impl App {
             self.dialog.render(frame, rects.body);
         } else if let Some(picker) = self.model_picker.as_ref() {
             picker.render(frame, rects.body);
+        } else if self.stats_pane.is_some() {
+            // Take the pane out to satisfy the borrow checker (render is
+            // `&mut self` and the pane's render is `&mut self`), then put
+            // it back. The pane has no side effects beyond updating its
+            // own scroll-clamp state.
+            let mut pane = self.stats_pane.take();
+            if let Some(p) = pane.as_mut() {
+                p.render(frame, rects.body);
+            }
+            self.stats_pane = pane;
         } else {
             // Carve the body for an embedded pane (GOALS §1i) when one
             // is open: fullscreen fills the body, splits divide it. The
@@ -426,6 +437,7 @@ impl App {
                 self.markdown_opts,
                 self.diff_style,
                 self.use_emojis,
+                &self.elided_event_ids,
             );
             let chip_abs = chip_row.map(|cr| all.len() + cr);
             let is_box = matches!(entry, HistoryEntry::ToolBox { .. });
@@ -449,7 +461,8 @@ impl App {
             let gap = match entry {
                 HistoryEntry::User { .. }
                 | HistoryEntry::ToolBox { .. }
-                | HistoryEntry::ToolLine { .. } => true,
+                | HistoryEntry::ToolLine { .. }
+                | HistoryEntry::CompactBoundary { .. } => true,
                 HistoryEntry::Agent { .. } => !idx
                     .checked_sub(1)
                     .map(|i| matches!(self.history[i], HistoryEntry::Agent { .. }))
@@ -725,11 +738,15 @@ impl App {
         )
     }
 
-    /// Build the chrome's context indicator. Format:
-    /// - With known max:   `12% context (max 192k), 0% prunable`
-    /// - Without:          `1.2k tokens, 0% prunable`
-    /// `prunable` is a placeholder zero until the pruning estimator
-    /// (plan §10) lands.
+    /// Build the chrome's context indicator. Format (GOALS §1a):
+    /// - With known max:   `ctx 12% → 8% prunable` (current fraction →
+    ///   projected fraction after `/prune`)
+    /// - Without:          `1.2k tokens, 320 prunable`
+    ///
+    /// The `prunable` figure is the daemon-authoritative
+    /// `prunable_tokens` (from the same `dedup_plan` `/prune` executes),
+    /// so the projection the user sees equals what `/prune` then removes
+    /// (GOALS §10 stable-contract property).
     pub(super) fn context_indicator_text(&self) -> String {
         // Fresh chat (nothing sent, no provider usage yet): replace the
         // useless `0% prunable` placeholder with the instruction-file
@@ -744,17 +761,31 @@ impl App {
             return label;
         }
         let tokens = self.context_tokens();
-        let prunable = 0u32; // placeholder
+        let prunable = self.prunable_tokens;
         match self.launch.active_model_max_context {
             Some(max) if max > 0 => {
                 let pct = ((tokens as u64 * 100) / max as u64).min(999) as u32;
-                let k = max / 1000;
-                format!("{pct}% context (max {k}k), {prunable}% prunable")
+                // Projected fraction after a full prune: subtract the
+                // prunable tokens from the live count, same denominator.
+                let after = (tokens as u64).saturating_sub(prunable);
+                let after_pct = ((after * 100) / max as u64).min(999) as u32;
+                if prunable == 0 {
+                    format!("ctx {pct}%")
+                } else {
+                    format!("ctx {pct}% → {after_pct}% prunable")
+                }
             }
-            _ => format!(
-                "{} tokens, {prunable}% prunable",
-                format_token_count(tokens)
-            ),
+            _ => {
+                if prunable == 0 {
+                    format!("{} tokens", format_token_count(tokens))
+                } else {
+                    format!(
+                        "{} tokens, {} prunable",
+                        format_token_count(tokens),
+                        format_token_count(prunable.min(u32::MAX as u64) as u32)
+                    )
+                }
+            }
         }
     }
 
@@ -833,6 +864,9 @@ impl App {
                 // (GOALS §1k); `/git`'s agent-bound cost is accounted
                 // via `pending_git_blocks`, not here.
                 HistoryEntry::LocalCommand { .. } => 0,
+                // A TUI-only session-boundary divider; never sent to the
+                // agent (the seed-tools' real cost lands as actual turns).
+                HistoryEntry::CompactBoundary { .. } => 0,
             };
         }
         tokens.min(u32::MAX as usize) as u32
@@ -858,6 +892,10 @@ impl App {
                     text, reasoning, ..
                 } => text.len() + reasoning.len(),
                 HistoryEntry::LocalCommand { .. } => 0,
+                HistoryEntry::CompactBoundary {
+                    predecessor_short_id,
+                    ..
+                } => predecessor_short_id.len(),
             };
             sig = sig.wrapping_mul(31).wrapping_add(len as u64);
         }
@@ -1025,7 +1063,18 @@ impl App {
 
     pub(super) fn render_status(&self, frame: &mut ratatui::Frame, area: Rect) {
         let right = chrome::status_line_spans(&self.launch);
-        let left = chrome::left_status_spans(&self.launch);
+        let mut left = chrome::left_status_spans(&self.launch);
+        // Transient async-jobs strip (GOALS §22): only when ≥1 job is
+        // active, appended to the bottom-left so the fixed chrome
+        // (model/agent) is undisturbed.
+        if !self.active_jobs.is_empty() {
+            let jobs: Vec<(String, String, u64)> = self
+                .active_jobs
+                .values()
+                .map(|j| (j.kind.clone(), j.label.clone(), j.iteration))
+                .collect();
+            left.extend(chrome::jobs_strip_spans(&jobs));
+        }
         let right_width: u16 = right
             .iter()
             .map(|s| s.width() as u16)
@@ -1237,6 +1286,7 @@ pub(super) fn extract_selection_plaintext(
 fn entry_rendered_rows(entry: &HistoryEntry) -> u16 {
     match entry {
         HistoryEntry::Plain { .. } => 1,
+        HistoryEntry::CompactBoundary { .. } => 1,
         HistoryEntry::ToolLine { .. } => 1,
         HistoryEntry::LocalCommand { output, .. } => {
             (output.lines().count() as u16).saturating_add(1)

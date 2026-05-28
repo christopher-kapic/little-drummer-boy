@@ -97,9 +97,58 @@ pub struct ProviderEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<AuthKind>,
 
+    /// Prompt-cache behavior for this provider. Drives the cache-cold
+    /// predicate that gates auto-prune (GOALS §10 / `plan.md` T6.f). A
+    /// per-model `cache` overrides this. Defaults to `none` because we
+    /// do **not** autodetect — explicit config only.
+    #[serde(default)]
+    pub cache: CacheConfig,
+
     /// Cached model list. Populated by `/fetch-models` (or the wizard).
     #[serde(default)]
     pub models: Vec<ModelEntry>,
+}
+
+/// Prompt-cache configuration. Set per-provider on [`ProviderEntry`] and
+/// optionally overridden per-model on [`ModelEntry`]. Used only by the
+/// cache-cold predicate (GOALS §10) that decides whether auto-prune may
+/// fire for free. We **never** autodetect mode — absence means `none`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CacheConfig {
+    #[serde(default)]
+    pub mode: CacheMode,
+    /// Seconds a cached prefix survives between sends. After this much
+    /// idle time the provider has dropped the cache, so pruning is free.
+    /// Default 300 (5 min). Only meaningful when `mode != none`.
+    #[serde(default = "default_cache_ttl_secs")]
+    pub ttl_secs: u64,
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self {
+            mode: CacheMode::default(),
+            ttl_secs: default_cache_ttl_secs(),
+        }
+    }
+}
+
+fn default_cache_ttl_secs() -> u64 {
+    300
+}
+
+/// How a provider caches the prompt prefix. `None` (the default) means
+/// no caching — pruning never costs a cache bust there.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum CacheMode {
+    /// No prompt cache (local Ollama / llama.cpp / raw vLLM / most
+    /// OpenRouter routes). Pruning is always free.
+    #[default]
+    None,
+    /// Provider caches a (possibly implicit) prefix subject to a TTL
+    /// (Anthropic ephemeral, OpenAI automatic prefix caching, Gemini).
+    Ephemeral,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -140,6 +189,11 @@ pub struct ModelEntry {
     /// the top of the list.
     #[serde(default, skip_serializing_if = "is_false")]
     pub favorite: bool,
+    /// Per-model prompt-cache override. When set, takes precedence over
+    /// the provider-level [`ProviderEntry::cache`] for the cache-cold
+    /// predicate (GOALS §10).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache: Option<CacheConfig>,
     /// Free-form metadata the `/models` endpoint returned but we don't
     /// model explicitly. Preserved verbatim so re-saving doesn't drop
     /// fields the user (or provider) cares about.
@@ -182,6 +236,24 @@ impl ProviderEntry {
     /// Display label: the user-set `name`, falling back to the id key.
     pub fn label<'a>(&'a self, id: &'a str) -> &'a str {
         self.name.as_deref().unwrap_or(id)
+    }
+}
+
+impl ProvidersConfig {
+    /// Resolve the effective prompt-cache config for `(provider, model)`:
+    /// the model-level override if present, else the provider-level
+    /// config, else the default (`none`). Used by the cache-cold
+    /// predicate (GOALS §10).
+    pub fn resolve_cache(&self, provider: &str, model: &str) -> CacheConfig {
+        let Some(entry) = self.providers.get(provider) else {
+            return CacheConfig::default();
+        };
+        entry
+            .models
+            .iter()
+            .find(|m| m.id == model)
+            .and_then(|m| m.cache.clone())
+            .unwrap_or_else(|| entry.cache.clone())
     }
 }
 
@@ -312,12 +384,14 @@ mod tests {
                 favorite: Some(true),
                 credential_ref: None,
                 auth: Some(AuthKind::ApiKey),
+                cache: CacheConfig::default(),
                 models: vec![ModelEntry {
                     id: "claude-opus-4-7".into(),
                     name: Some("Claude Opus 4.7".into()),
                     thinking_modes: vec![ThinkingMode::Off, ThinkingMode::High],
                     context_length: None,
                     favorite: false,
+                    cache: None,
                     inputs: Some(Inputs {
                         images: Some(true),
                         video: None,
@@ -381,5 +455,49 @@ mod tests {
         let mut entry = ProviderEntry::default();
         entry.name = Some("Pretty".into());
         assert_eq!(entry.label("ignored"), "Pretty");
+    }
+
+    #[test]
+    fn cache_defaults_to_none() {
+        let entry = ProviderEntry::default();
+        assert_eq!(entry.cache.mode, CacheMode::None);
+        assert_eq!(entry.cache.ttl_secs, 300);
+    }
+
+    #[test]
+    fn resolve_cache_prefers_model_override() {
+        let mut cfg = ProvidersConfig::default();
+        let mut entry = ProviderEntry {
+            url: "https://x".into(),
+            cache: CacheConfig {
+                mode: CacheMode::Ephemeral,
+                ttl_secs: 600,
+            },
+            ..ProviderEntry::default()
+        };
+        entry.models.push(ModelEntry {
+            id: "fast".into(),
+            name: None,
+            thinking_modes: vec![],
+            context_length: None,
+            favorite: false,
+            cache: Some(CacheConfig {
+                mode: CacheMode::None,
+                ttl_secs: 300,
+            }),
+            inputs: None,
+            extra: Default::default(),
+        });
+        cfg.providers.insert("p".into(), entry);
+
+        // Model with an override wins.
+        let m = cfg.resolve_cache("p", "fast");
+        assert_eq!(m.mode, CacheMode::None);
+        // Model without an override inherits the provider config.
+        let p = cfg.resolve_cache("p", "other");
+        assert_eq!(p.mode, CacheMode::Ephemeral);
+        assert_eq!(p.ttl_secs, 600);
+        // Unknown provider → default (none).
+        assert_eq!(cfg.resolve_cache("nope", "x").mode, CacheMode::None);
     }
 }

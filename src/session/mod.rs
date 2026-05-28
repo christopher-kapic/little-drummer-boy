@@ -72,6 +72,15 @@ pub struct Session {
     /// call. The TUI prefers this over the local tiktoken estimate
     /// when it's `Some(_)`.
     last_usage: Mutex<Option<crate::tokens::TokenUsage>>,
+    /// Wall-clock instant of the most recent inference send. Stamped by
+    /// [`Self::record_usage`]. The cache-cold predicate (GOALS §10) reads
+    /// it to decide whether the provider's prompt-cache TTL has elapsed.
+    /// In-memory only — a resumed session re-warms naturally.
+    last_send_at: Mutex<Option<std::time::Instant>>,
+    /// User messages pinned via `/pin` (GOALS §10 / `plan.md` T6.e):
+    /// must-survive content injected verbatim into the `/compact`
+    /// handoff, never summarized. In pin order.
+    pinned_messages: Mutex<Vec<String>>,
     /// In-memory tokenizer-calibration accumulator. Samples inference
     /// calls until a window closes, then fits + persists the best
     /// `(strategy, scale)` for the active `(provider, model)`. Never
@@ -141,6 +150,8 @@ impl Session {
             last_time_prelude: Mutex::new(None),
             user_content_tokens: AtomicUsize::new(0),
             last_usage: Mutex::new(None),
+            last_send_at: Mutex::new(None),
+            pinned_messages: Mutex::new(Vec::new()),
             calibrator: Mutex::new(crate::tokens::Calibrator::new()),
         })
     }
@@ -328,6 +339,37 @@ impl Session {
     /// finishes — callers fall back to a local tiktoken estimate.
     pub fn last_usage(&self) -> Option<crate::tokens::TokenUsage> {
         *self.last_usage.lock().unwrap()
+    }
+
+    /// Stamp "an inference send just happened now." Drives the cache-TTL
+    /// arm of the cache-cold predicate (GOALS §10). Called once per
+    /// `model.complete` round-trip.
+    pub fn note_send(&self) {
+        *self.last_send_at.lock().unwrap() = Some(std::time::Instant::now());
+    }
+
+    /// Seconds since the last inference send, or `None` if no send has
+    /// happened yet this (in-memory) session. `None` means "treat the
+    /// cache as cold" — there is no warm prefix to lose.
+    pub fn seconds_since_last_send(&self) -> Option<u64> {
+        self.last_send_at
+            .lock()
+            .unwrap()
+            .map(|t| t.elapsed().as_secs())
+    }
+
+    /// Pin a user message as must-survive (`/pin`). Injected verbatim
+    /// into the next `/compact` handoff. No-ops on blank input.
+    pub fn pin_message(&self, text: &str) {
+        let t = text.trim();
+        if !t.is_empty() {
+            self.pinned_messages.lock().unwrap().push(t.to_string());
+        }
+    }
+
+    /// Snapshot of pinned messages, in pin order.
+    pub fn pinned_messages(&self) -> Vec<String> {
+        self.pinned_messages.lock().unwrap().clone()
     }
 
     /// Feed one inference round into the tokenizer-calibration window.

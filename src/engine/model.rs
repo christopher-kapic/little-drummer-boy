@@ -332,6 +332,12 @@ fn build_agent<C: CompletionClient>(
 /// Remove `AssistantContent::Reasoning` items from a message's
 /// content vector. Used to scrub past thinking blocks from the
 /// history before each outbound request.
+///
+/// Safe for the Chat Completions variant (reasoning is never replayed
+/// there). NOT safe as-is for a native Anthropic variant: stripping the
+/// *latest* assistant turn's thinking — or any turn that pairs thinking
+/// with `tool_use` — 400s the Messages API. Make this position-aware
+/// before wiring native Anthropic. See `miscellaneous.md` §10b.
 fn strip_reasoning(msg: &Message) -> Message {
     match msg {
         Message::Assistant { id, content } => {

@@ -18,10 +18,15 @@
 
 pub mod bash;
 pub mod custom;
+pub mod docs;
 pub mod editunlock;
+pub mod glob;
+pub mod grep;
 pub mod intel;
+pub mod jobs;
 pub mod read;
 pub mod readlock;
+pub mod sandbox;
 pub mod task;
 pub mod unlock;
 pub mod writeunlock;

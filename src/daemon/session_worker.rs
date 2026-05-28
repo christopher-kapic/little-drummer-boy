@@ -81,6 +81,21 @@ pub enum SessionWork {
     SetAgent {
         name: String,
     },
+    /// Cancel a live async job (loop / timer / background, GOALS §22) by
+    /// id, on behalf of the **human** ("stop checking the deploy" /
+    /// `/jobs cancel <id>`). Routed to the driver's single async-job
+    /// authority.
+    CancelJob {
+        job_id: String,
+    },
+    /// Run `/prune` (snapshot dedup) on the foreground agent now.
+    Prune,
+    /// Run `/compact` (fresh-thread handoff) on the foreground agent.
+    Compact,
+    /// Pin a user message verbatim for the next `/compact` (`/pin`).
+    Pin {
+        text: String,
+    },
     Shutdown,
 }
 
@@ -137,6 +152,8 @@ async fn run_worker(
     let root = Arc::new(builtin::orchestrator_build(&spawn_args));
 
     let (driver_input_tx, driver_input_rx) = mpsc::channel::<String>(WORK_QUEUE_CAPACITY);
+    let (driver_control_tx, driver_control_rx) =
+        mpsc::channel::<crate::engine::driver::DriverControl>(WORK_QUEUE_CAPACITY);
     let (engine_event_tx, mut engine_event_rx) = mpsc::channel::<TurnEvent>(WORK_QUEUE_CAPACITY);
 
     // Forward engine events → broadcast channel as proto::Event.
@@ -151,22 +168,42 @@ async fn run_worker(
         }
     });
 
+    // Build the driver, then capture its async-job command sender (GOALS
+    // §22) so a human-initiated `/jobs cancel` reaches the single
+    // authority before moving the driver into its task.
+    let max_concurrent_jobs = max_concurrent_jobs_for(&project_root);
+    let mut driver = Driver::with_max_jobs(
+        session.clone(),
+        locks.clone(),
+        redact.clone(),
+        project_root.clone(),
+        root,
+        max_concurrent_jobs,
+    );
+    let job_cmd_tx = driver.job_command_sender();
+
+    // Seed-tool re-execution (`/compact` handoff, T6.e): if this session
+    // was created by `/compact`, its derived seed-tool plan was persisted
+    // keyed by this session id. Drain it and dispatch the calls (read-only
+    // / idempotent only) into the fresh agent's initial context *before*
+    // the first inference — re-executed, never replayed from a stale
+    // transcript. Done synchronously before the driver loop starts so it
+    // can never race the first user message. Best-effort.
+    if let Ok(seeds) = session.db.take_seed_tools(session_id)
+        && !seeds.is_empty()
+    {
+        driver.run_seed_tools(&seeds, &engine_event_tx).await;
+    }
+
     // Spawn the driver loop.
-    let driver_handle = {
-        let session = session.clone();
-        let locks = locks.clone();
-        let redact = redact.clone();
-        let project_root = project_root.clone();
-        tokio::spawn(async move {
-            let mut driver = Driver::new(session, locks, redact, project_root, root);
-            if let Err(e) = driver
-                .run_main_loop(driver_input_rx, &engine_event_tx)
-                .await
-            {
-                tracing::error!(error = ?e, "driver loop terminated with error");
-            }
-        })
-    };
+    let driver_handle = tokio::spawn(async move {
+        if let Err(e) = driver
+            .run_main_loop(driver_input_rx, driver_control_rx, &engine_event_tx)
+            .await
+        {
+            tracing::error!(error = ?e, "driver loop terminated with error");
+        }
+    });
 
     // Main work loop.
     while let Some(work) = work_rx.recv().await {
@@ -216,6 +253,42 @@ async fn run_worker(
             SessionWork::SetAgent { name } => {
                 if let Err(e) = session.set_active_agent(&name) {
                     tracing::warn!(error = %e, "set_active_agent failed");
+                }
+            }
+            SessionWork::CancelJob { job_id } => {
+                if job_cmd_tx
+                    .send(crate::engine::jobs::JobCommand::Cancel { job_id })
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!(session_id = %session_id, "job command channel closed");
+                }
+            }
+            SessionWork::Prune => {
+                if driver_control_tx
+                    .send(crate::engine::driver::DriverControl::Prune)
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!(session_id = %session_id, "driver control channel closed");
+                }
+            }
+            SessionWork::Compact => {
+                if driver_control_tx
+                    .send(crate::engine::driver::DriverControl::Compact)
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!(session_id = %session_id, "driver control channel closed");
+                }
+            }
+            SessionWork::Pin { text } => {
+                if driver_control_tx
+                    .send(crate::engine::driver::DriverControl::Pin { text })
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!(session_id = %session_id, "driver control channel closed");
                 }
             }
             SessionWork::Shutdown => {
@@ -341,6 +414,72 @@ fn turn_event_to_proto(event: TurnEvent, session_id: Uuid) -> Vec<proto::Event> 
             }]
         }
         TurnEvent::AgentIdle => vec![proto::Event::AgentIdle { session_id }],
+        TurnEvent::JobStarted {
+            job_id,
+            label,
+            kind,
+        } => vec![proto::Event::JobStarted {
+            session_id,
+            job_id,
+            label,
+            kind,
+        }],
+        TurnEvent::JobProgress { job_id } => {
+            vec![proto::Event::JobProgress { session_id, job_id }]
+        }
+        TurnEvent::JobNote { job_id, text } => {
+            vec![proto::Event::JobNote {
+                session_id,
+                job_id,
+                text,
+            }]
+        }
+        TurnEvent::JobCompleted {
+            job_id,
+            label,
+            kind,
+            failed,
+        } => vec![proto::Event::JobCompleted {
+            session_id,
+            job_id,
+            label,
+            kind,
+            failed,
+        }],
+        TurnEvent::ContextProjection {
+            prunable_tokens,
+            cache_cold,
+        } => {
+            vec![proto::Event::ContextProjection {
+                session_id,
+                prunable_tokens,
+                cache_cold,
+            }]
+        }
+        TurnEvent::Pruned {
+            auto,
+            bodies,
+            tokens_saved,
+            elided,
+        } => vec![proto::Event::Pruned {
+            session_id,
+            auto,
+            bodies,
+            tokens_saved,
+            elided,
+        }],
+        TurnEvent::CompactReady {
+            new_session_id,
+            handoff,
+            seed_tool_count,
+            seed_tool_tokens,
+        } => vec![proto::Event::CompactReady {
+            session_id,
+            new_session_id,
+            handoff,
+            seed_tool_count,
+            seed_tool_tokens,
+        }],
     }
 }
 
@@ -349,4 +488,17 @@ fn turn_event_to_proto(event: TurnEvent, session_id: Uuid) -> Vec<proto::Event> 
 /// constants and event-translation helpers stay in one module.
 pub(crate) fn initial_active_agent() -> &'static str {
     "orchestrator-build"
+}
+
+/// Resolve the per-session async-jobs concurrency cap (GOALS §22) from the
+/// layered `extended-config.json` rooted at `project_root`, falling back
+/// to the default when none is configured.
+fn max_concurrent_jobs_for(project_root: &std::path::Path) -> usize {
+    use crate::config::dirs::discover_config_dirs;
+    use crate::config::extended::ExtendedConfigDoc;
+    discover_config_dirs(project_root)
+        .into_iter()
+        .find_map(|d| ExtendedConfigDoc::load(&d.path.join("extended-config.json")).ok())
+        .map(|d| d.config().jobs.max_concurrent)
+        .unwrap_or(crate::engine::jobs::DEFAULT_MAX_CONCURRENT_JOBS)
 }

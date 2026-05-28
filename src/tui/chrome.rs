@@ -71,6 +71,38 @@ pub fn left_status_spans(info: &LaunchInfo) -> Vec<Span<'static>> {
     spans
 }
 
+/// Transient async-jobs strip (GOALS §22). Rendered **only** when ≥1 job
+/// is active — additive to the fixed chrome, never a permanent slot. Each
+/// job gets a glyph by kind: `⟳` loop, `⏲` timer, `⤓` background. The
+/// caller passes `(job_id, kind, label, iteration)` tuples; this returns
+/// the spans to append to the bottom-left status line, prefixed with a
+/// separator. Returns an empty vec when there are no jobs.
+pub fn jobs_strip_spans(jobs: &[(String, String, u64)]) -> Vec<Span<'static>> {
+    if jobs.is_empty() {
+        return Vec::new();
+    }
+    let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+    let active = Style::default().fg(Color::Cyan);
+    let mut spans: Vec<Span<'static>> = vec![Span::styled("  ".to_string(), muted)];
+    for (i, (kind, label, iteration)) in jobs.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(" · ".to_string(), muted));
+        }
+        let glyph = match kind.as_str() {
+            "timer" => "⏲",
+            "background" => "⤓",
+            _ => "⟳",
+        };
+        let detail = if kind == "background" {
+            label.clone()
+        } else {
+            format!("{label} {iteration}")
+        };
+        spans.push(Span::styled(format!("{glyph} {detail}"), active));
+    }
+    spans
+}
+
 pub fn repo_counts(repo: &RepoStatus) -> String {
     let mut parts = Vec::new();
     if repo.staged > 0 {

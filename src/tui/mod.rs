@@ -29,5 +29,6 @@ pub mod model_picker;
 pub mod pty;
 pub mod settings;
 pub mod slash;
+pub mod stats_pane;
 pub mod textfield;
 pub mod theme;

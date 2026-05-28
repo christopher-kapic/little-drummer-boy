@@ -243,52 +243,61 @@ pub struct ConnectedDaemon {
 /// Find the daemon socket, optionally spawn the daemon, return a
 /// connected client. Honors [`LifecycleMode`].
 pub async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemon> {
-    use crate::daemon::{DaemonPaths, DaemonStatus, probe, spawn_detached};
+    use crate::daemon::{
+        DaemonPaths, DaemonStatus, probe, spawn_detached, spawn_detached_ephemeral,
+    };
 
-    let paths = DaemonPaths::resolve()?;
+    let canonical = DaemonPaths::resolve_canonical()?;
 
     match mode {
         LifecycleMode::AttachOrAutoPromote | LifecycleMode::AttachOrEphemeral => {
-            if matches!(probe(&paths).await, DaemonStatus::Running) {
-                let client = DaemonClient::connect(&paths.socket).await?;
+            if matches!(probe(&canonical).await, DaemonStatus::Running) {
+                let client = DaemonClient::connect(&canonical.socket).await?;
                 return Ok(ConnectedDaemon {
                     client,
                     owns_daemon: false,
-                    socket: paths.socket,
+                    socket: canonical.socket,
                 });
             }
         }
         LifecycleMode::AlwaysEphemeral => {
-            // No probe. We always spawn fresh. Don't tread on an
-            // existing daemon; use a unique socket path so the two
-            // daemons don't fight over the file.
-            // (For v1 we *do* share the socket — the ephemeral daemon
-            // gets the canonical path. Multi-daemon-on-one-box is a
-            // follow-up. A pre-existing daemon at the canonical path
-            // means we can't go ephemeral here.)
-            if matches!(probe(&paths).await, DaemonStatus::Running) {
-                anyhow::bail!(
-                    "cannot start ephemeral daemon: another daemon is already running at {}",
-                    paths.socket.display()
-                );
-            }
+            // Always spawn fresh on a unique per-pid ephemeral path
+            // (Layer B). It never touches the canonical socket, so it
+            // coexists with a persistent daemon — no "already running"
+            // bail needed.
         }
     }
 
-    // No daemon — auto-promote.
-    let pid = spawn_detached()?;
-    tracing::info!(pid = pid, "daemon spawned (auto-promote)");
-    // Wait for the socket + a successful handshake.
-    let client = wait_for_daemon(&paths.socket).await?;
-
-    let owns_daemon = matches!(
+    // No reachable daemon to attach to — spawn one.
+    //
+    // `AttachOrAutoPromote` (the TUI) promotes a *persistent* daemon at
+    // the canonical path. The two ephemeral modes spawn a per-pid
+    // ephemeral daemon (Layer B): unique socket/pid the canonical
+    // `daemon stop`/`status` never sees, with the self-reaping watchdog
+    // armed (Layer C) so an uncatchable foreground death can't orphan it.
+    let ephemeral = matches!(
         mode,
         LifecycleMode::AttachOrEphemeral | LifecycleMode::AlwaysEphemeral
     );
 
+    let (paths, pid) = if ephemeral {
+        // Derive the ephemeral path set from *our* pid so it's unique
+        // per run, then hand it to the spawned daemon to bind.
+        let paths = DaemonPaths::resolve_ephemeral(std::process::id())?;
+        let pid = spawn_detached_ephemeral(&paths)?;
+        (paths, pid)
+    } else {
+        let pid = spawn_detached()?;
+        (canonical, pid)
+    };
+    tracing::info!(pid = pid, ephemeral = ephemeral, "daemon spawned");
+
+    // Wait for the socket + a successful handshake.
+    let client = wait_for_daemon(&paths.socket).await?;
+
     Ok(ConnectedDaemon {
         client,
-        owns_daemon,
+        owns_daemon: ephemeral,
         socket: paths.socket,
     })
 }
@@ -316,14 +325,5 @@ async fn wait_for_daemon(socket: &Path) -> Result<DaemonClient> {
         }
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(Duration::from_millis(250));
-    }
-}
-
-impl ConnectedDaemon {
-    /// Tell the daemon to shut down. Used by callers that hold
-    /// `owns_daemon = true` (cockpit run --ephemeral).
-    pub async fn shutdown(&self) -> Result<()> {
-        let _ = self.client.request(Request::StopDaemon).await?;
-        Ok(())
     }
 }

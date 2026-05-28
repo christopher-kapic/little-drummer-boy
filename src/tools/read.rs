@@ -28,7 +28,7 @@ impl Tool for ReadTool {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "path":       { "type": "string", "description": "Path to read" },
+                "path":       { "type": "string", "x-cockpit-kind": "path", "description": "Path to read" },
                 "offset":     { "type": "integer", "description": "1-indexed start line (default 1)" },
                 "limit":      { "type": "integer", "description": "Max lines (default 2000)" },
                 "start_line": { "type": "integer", "description": "1-indexed inclusive range start" },

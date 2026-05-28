@@ -305,42 +305,45 @@ already shows `ctx 65% → 42% prunable` continuously
 prune rule is a stable contract — the live "% prunable" figure must
 mean the same thing every time, or users won't trust it.
 
-**Behavior layers, ordered from safest to riskiest:**
+**Shipped scope (current pass): snapshot-tool dedup only.** `/prune`
+collapses all-but-the-most-recent **result body** for snapshot-class
+tool calls of *exact identity* (same canonical path + identical args)
+for `read` and the read-only intel tools (`outline`, `symbol_find`,
+`word`, `deps`, `circular`, `tree`, `search`). The superseded body is
+replaced with `Part::Elided { original_event_id, reason }`, keeping the
+call shape so reasoning blocks that reference an earlier read still
+parse and no `tool_use` is ever orphaned from its `tool_result`
+(Anthropic API constraint). Elision is **wire-format only** (GOALS
+§14): the on-disk transcript (`tool_calls` rows) and the TUI scrollback
+stay full-fidelity; only the LLM-bound `Vec<Message>` history shrinks.
+The single dedup rule lives in `engine::prune::dedup_plan`; both the
+live "% prunable" projection and the actual `/prune` execution call it,
+so the displayed figure always equals what `/prune` removes.
 
-1. **Snapshot-tool dedup (always-on candidate).** Collapse all but
-   the most recent result body for `read`, the read-only intel tools,
-   and the short whitelisted set of read-only bash commands (`git status`,
-   `git log`, `ls`, `pwd`, `cat` of immutable paths). Replace older
-   bodies with `Part::Elided { original_event_id, reason: "snapshot
-   superseded" }`. The call shape stays so reasoning blocks that
-   reference earlier reads still parse.
-2. **Bash result truncation (always-on, independent of `/prune`).**
-   Any single bash result body over a configurable cap (default 2KB)
-   gets head + tail with `[truncated N lines]` in the middle. The
-   call is preserved; only bulk shrinks. Head + tail because errors
-   typically surface at the tail; head-only loses the failure
-   signal. Same shape `read` already uses for large files.
-3. **Opt-in bash snapshot allowlist.** In `config.json`:
-   `prune.bash_snapshot_commands: ["git status", "git log", …]`.
-   Matches the *exact* command string (no clever parsing). Default
-   empty — the user explicitly takes responsibility for declaring
-   "these commands are safe to dedupe across repeats."
-4. **Manual prune in the TUI.** A `/prune` invocation with no args
-   opens a picker over the largest bash and tool-result bodies in
-   the current transcript; user selects which to drop (or
-   truncate); full bodies remain recoverable from the on-disk
-   transcript even after pruning.
+Interaction is **one-shot + confirm**: bare `/prune` collapses
+everything currently prunable, gated behind a confirm that shows the
+before→after context % and the cache warning (below).
+
+**Deliberately deferred (not started, not stubbed):**
+
+- **Bash result truncation** (always-on head+tail over a cap).
+- **Opt-in bash snapshot allowlist** (`prune.bash_snapshot_commands`).
+- **Pruning of `bash` / `edit` / `write` results** (the classification
+  problem — is `mv` a snapshot? is `npm install`? — is genuinely hard
+  and silently dropping load-bearing output is unacceptable).
+- **Interactive prune picker.**
+
+The dedup machinery (`engine::prune`) is shaped so these are clean
+future additions, not retrofits; none ship now.
 
 **What `/prune` does NOT do:**
 
-- Never auto-prune arbitrary `bash` results — the classification
-  problem (is `mv` a snapshot? is `npm install`?) is genuinely hard
-  and the failure mode (silently dropping load-bearing output) is
-  unacceptable. The opt-in allowlist or manual TUI prune are the
-  escape hatches.
 - Never delete a tool_use without its matching tool_result (Anthropic
   API constraint) — `Part::Elided` rewrites the result body, never
   the call shape.
+- Never elide the most-recent (surviving) body of an identity group;
+  if that body has already been elided, the older bodies are left full
+  rather than emit a marker that points at nothing.
 
 **Cache interaction.** `/prune` invalidates the provider cache from
 the earliest edited turn forward. The bytes a user saves have to
@@ -684,18 +687,17 @@ src/
   guidance/               AGENTS.md / CLAUDE.md / .cursorrules walk-up
                           + hierarchical AGENTS.md (per-dir, walked at
                           read-time, not session-start — see §3a notes)
-  packages/               named-package registry (§3i) — local-path or
-                          git-URL codebases mounted under the
-                          `docs_dir` (`~/packages/<host>/<org>/<repo>`,
-                          per GOALS §4d-bis). Replaces the old kcl
-                          shell-out. The `docs` bundled subagent
-                          (§4.6.d) operates over this directory.
-    registry.rs           packages.toml load/save + SQLite index
-    clone.rs              git clone + pull management
-    branch.rs             checkout-pinned + restore discipline
-    research.rs           research tool — fires a `docs` subagent
-                          scoped to the requested package
-    kcl_import.rs         auto-import from ~/.config/kcl/config.json
+  packages/               package registry side-effects (§3i) — git-URL
+                          or local-path codebases under
+                          `packages_directory` (default
+                          `~/src/cockpit-packages/`, per GOALS §4d-bis).
+                          Replaces the old kcl shell-out. The `docs`
+                          answerer (§4.6.d) operates over a resolved
+                          package dir. Pure CRUD lives in db/packages.rs.
+    mod.rs                clone-dir resolution, percent-encode, ecosystem
+                          slug, shallow git clone, import_from_kcl
+    resolve.rs            registry-metadata repo resolution
+                          (crates.io/npm/PyPI; never a guessed URL)
 
   session/                THE conversation engine
     mod.rs                Session<S> with state-machine S
@@ -1393,10 +1395,11 @@ Locations:
 - `~/.local/share/cockpit/notes/` — memory backend store (sqlite or other).
 - `~/.local/share/cockpit/snapshot/<project-id>/` — opencode-style isolated
   git repo for working-tree snapshots.
-- `<docs_dir>/<host>/<org>/<repo>/` — package registry worktrees
-  (§3i; default `<docs_dir>` is `~/packages`). Git-cloned packages
-  live here; local-path packages are referenced in place. Same
-  tree the `docs` subagent walks (GOALS §4d-bis).
+- `<packages_directory>/<percent-encoded-id>/` — package registry
+  clones (§3i; default `packages_directory` is `~/src/cockpit-packages`).
+  Git-cloned packages live here; local-path packages are referenced in
+  place. The `packages` table indexing them is global, in cockpit.db
+  (GOALS §4d-bis).
 - `~/.local/state/cockpit/logs/cockpit-YYYY-MM-DD.log` — rotated logs.
 - `~/.local/state/cockpit/spillover/<session>/` — tool-output spillover.
 
@@ -1405,69 +1408,43 @@ and `%LOCALAPPDATA%\cockpit`, mirroring opencode.
 
 ### 3i. Package registry (`packages/`)
 
-A user-managed catalog of *external* codebases the cockpit agent can
-read for research questions. Conceptually equivalent to kcl's
-package list, absorbed into cockpit per T7 (§5b). Used by the
-`research` tool (§3c), which fires a `docs` subagent (§4.6.d)
-scoped to the requested package.
+A user-global catalog of *external* codebases the `docs` answerer
+(Docs.2, §4.6.d) reads for dependency-usage questions. Conceptually
+equivalent to kcl's package list, absorbed into cockpit per T7 (§5b).
 
-**Schema** (`~/.config/cockpit/packages.toml` plus an SQLite index):
-
-```toml
-[[packages]]
-name = "clap"
-git = "https://github.com/clap-rs/clap.git"
-branch = "master"                              # pinned; optional
-description = "Rust CLI argument parser"
-
-[[packages]]
-name = "myapp"
-path = "/home/user/projects/myapp"             # local path; no clone
-# no branch lock; use whatever the user has checked out
-
-[[packages]]
-name = "hono-next"
-git = "https://github.com/honojs/hono.git"
-branch = "next"
-```
-
-`name` is the user-facing handle. Either `git` or `path` must be set
-(mutually exclusive). `branch` is optional; when set, cockpit checks
-out the pinned branch before answering and restores the original
-branch when done.
+**Schema** — a `packages` table in the global cockpit DB (migration
+`0006_packages.sql`; NOT a separate TOML file, and NOT project-scoped):
+`identifier` (UNIQUE), `display_name`, `source_type` (`git`|`local`),
+`source_url`, `source_branch`, `path` (absolute on-disk source),
+`shallow`, timestamps. Column shape mirrors kcl's so `cockpit kcl
+import` is a straight copy. `identifier` is ecosystem-prefixed for
+autonomous adds (`cargo:tokio`, `npm:@tanstack/query`, `pip:requests`);
+kcl-imported identifiers are preserved verbatim.
 
 **Commands.**
 
 ```
-cockpit packages add <name> --path <p>            # local registration
-cockpit packages add <name> --git <url> [--branch <b>]
 cockpit packages list
-cockpit packages show <name>
-cockpit packages remove <name>
-cockpit packages pull <name>                      # update git clone
-cockpit packages import-from-kcl                  # absorb existing kcl config
+cockpit packages add <id> --path <dir>            # local registration, no clone
+cockpit packages add <id> --git <url> [--branch <b>] [--shallow]
+cockpit kcl import                                # one-way import from local kcl
 ```
 
-**Clone management.** Git-URL packages clone under the `docs_dir`
-(`agents.docs_dir`, default `~/packages`) at
-`<docs_dir>/<host>/<org>/<repo>/` — the same path the `docs`
-subagent walks (GOALS §4d-bis). `cockpit packages pull` updates
-them. Lock file (`.cockpit-packages.lock`) records the clone
-state; concurrent `cockpit ask` calls share the worktree but
-serialize on branch-switch.
+**Clone management.** Git-URL packages clone (shallow by default) under
+`packages_directory` (default `~/src/cockpit-packages/`) at
+`<dir>/<percent-encoded-identifier>/`. Deduped by `source_url`: a
+monorepo cloned once is reused for every name that maps to it.
+Autonomous adds (Docs.1's `add-package`) resolve the repo URL only from
+official registry metadata (crates.io/npm/PyPI — never a guessed URL;
+§4d-bis). v1 does **not** auto-pull on every query (cost); `source_url`
+/`branch` are recorded so a future `cockpit packages update` could.
 
-**`cockpit ask <package> "..."`** is a top-level convenience that's
-sugar for `cockpit run --agent docs --package <package> "..."` —
-preserves the kcl muscle memory for users moving over.
-
-**Auto-import.** On first run, cockpit checks for `~/.config/kcl/config.json`
-and offers to import the existing package list (one-time prompt).
-Same one-shot migration pattern as `cockpit config import-from-opencode`.
-
-**Branch override per call.** `cockpit ask --branch <other> hono "..."`
-or `research(package: "hono", branch: "other", question: "...")`
-checks out the override, answers, restores the previously pinned
-branch when done.
+**Import from kcl.** `cockpit kcl import` reads a local kcl install's
+`~/.local/share/kcl/kcl.db` (honoring `$XDG_DATA_HOME`) and inserts
+every package cockpit lacks (dedupe by identifier, and by source_url
+for Git), referencing kcl's on-disk clone paths as-is — no re-clone.
+Idempotent; prints a count. One-way only; never writes to kcl. Absent
+kcl DB → clean message, not a crash.
 
 ---
 
@@ -2163,7 +2140,7 @@ cockpit ships a small, generic-named default cast in
 | `orchestrator-plan`   | primary  | `slow` (thinking)| project | Ralph-style planner. Owns the conversation when the focus is *deciding what to do*. Sees the full feature dependency graph(s) (§4.1), can create new graph plans, can append to existing ones. Produces / mutates plan structures; does not write code directly. `/plan` slash command swaps to this one. |
 | `explore`             | subagent | `default`        | project | Read-only investigator over the *current* project. Tools: `read`, `bash` (raw `rg`/`fd`), and the read-only codebase-intelligence tools (GOALS §21). Designed as a search engine — returns `file:line` citations, not prose summaries. |
 | `coder`               | subagent | `slow`           | project | The only agent that holds locks and writes/edits. Receives a scoped task from an orchestrator, makes the changes, returns a structured report. |
-| `docs`                | subagent | `default`        | docs-dir (configurable) | Read-only investigator over the **docs directory** — a configurable location where dependency source code is cloned. Same tool surface as `explore` (`read` / `bash` / intel tools; GOALS §21), same citation-style output; just rooted at the docs dir rather than the project cwd. |
+| `docs`                | subagent | `default`        | pipeline (caller cwd → package dir) | Fixed two-stage noninteractive pipeline that answers "how do I use this dependency?" from its real source. Docs.1 (resolver, caller cwd) confirms/shallow-clones the dependency into cockpit's package registry; Docs.2 (answerer, package dir) reads it with `read` + sandboxed `grep`/`glob` (no bash/network/write) and returns `file:line` citations. To the caller it's one leaf invocation. See GOALS §3a / §4d-bis. |
 
 Names are generic, not personality-themed. The cast is **deliberately
 minimal at v1** — five agents that compose into "plan ↔ build →
@@ -2186,16 +2163,19 @@ session DB and the lock manager, so a graph plan authored under
 `orchestrator-plan` is immediately consumable when the user
 switches to `orchestrator-build`.
 
-**The docs directory.** Configurable via `agents.docs_dir` in
-`config.json` (default `~/packages`). Convention:
-`<docs_dir>/<repohost>/<org>/<repo>` — e.g. `~/packages/github.com/tokio-rs/tokio`.
-Population is the user's responsibility (manual `git clone`,
-or a future `cockpit docs add <repo>` helper) — cockpit itself
-doesn't manage the clones. The `docs` agent's cwd is the docs
-directory; it searches (`bash` `rg`/`fd`, the intel tools) and `read`s normally, and its citations
-are relative to the docs directory so the orchestrator can
-`read <docs_dir>/<repohost>/<org>/<repo>/<file>` to pull
-specific snippets.
+**The package registry (replaces the old docs directory).** cockpit
+owns a user-global `packages` registry (a table in the global cockpit
+DB; GOALS §4d-bis) of dependency source clones. Git clones land in
+`packages_directory` (default `~/src/cockpit-packages/`) under a
+percent-encoded identifier. Unlike the earlier "manual docs directory"
+model, cockpit *does* manage the clones now: Docs.1 shallow-clones a
+dependency on demand from registry-declared repo metadata
+(crates.io/npm/PyPI — never a guessed URL), and the user can seed the
+registry with `cockpit packages add` / `cockpit kcl import`. The `docs`
+unit is a fixed two-stage pipeline (`engine::docs_pipeline`): Docs.1
+runs in the caller's cwd to resolve/clone; Docs.2 runs in the resolved
+package directory and answers from the source. Citations from Docs.2
+are relative to the package root.
 
 **Why this cast composes well.** The two orchestrators
 (`orchestrator-build`, `orchestrator-plan`) are the only primary
@@ -2214,18 +2194,22 @@ between them as designed.
 
 #### The `explore` and `docs` agents: search engines, not synthesizers
 
-**T7-load-bearing.** Both agents share the same operating model
-(only the cwd differs — project for `explore`, docs directory for
-`docs`). This is what makes cheap-model investigation over both
-the current project and dependency sources work. Premium models
-can vacuum up a whole subtree and synthesize prose; cheap models
-can't and shouldn't try. Instead, both agents' job is to **locate
-relevant code and return citations**, not to write prose summaries.
+**T7-load-bearing.** Both are citation-first investigators that
+**locate relevant code and return `file:line` citations**, not prose
+summaries — this is what makes cheap-model investigation work.
+`explore` runs over the *current project*; the `docs` *answerer*
+(Docs.2) runs over a *cloned dependency*. They differ in tool surface,
+not just cwd: `explore` searches with `bash` (raw `rg`/`fd`) + the
+intel tools, while Docs.2 is denied `bash`/network/write and instead
+gets the sandboxed `grep`/`glob` + `read`, hard-confined to the package
+root (it runs inside untrusted third-party code). Premium models can
+vacuum up a whole subtree and synthesize prose; cheap models can't and
+shouldn't try.
 
-Tool surface: `read`, `bash` (raw `rg`/`fd`), and the read-only
-codebase-intelligence tools (GOALS §21). No `write`, no `edit`, no
-further delegation. Cwd is fixed — project root for `explore`,
-`agents.docs_dir` for `docs`.
+Tool surface: `explore` — `read`, `bash` (raw `rg`/`fd`), and the
+read-only codebase-intelligence tools (GOALS §21). Docs.2 — `read` +
+the sandboxed `grep`/`glob` only. No `write`, no `edit`, no further
+delegation for either.
 
 Output schema — structured markdown with file:line citations and
 one-sentence annotations:
@@ -2247,9 +2231,9 @@ one-sentence annotations:
   re-binds them.
 ```
 
-For `docs`, citation paths are relative to the docs dir
-(e.g. `hono/src/router/match.ts:42-78`), so the orchestrator
-can dispatch the right follow-up `read` call without ambiguity.
+For Docs.2, citation paths are relative to the package root
+(e.g. `src/router/match.ts:42-78` within the cloned dependency).
+The answer is surfaced to the caller as the single `docs` tool result.
 
 The orchestrator reads the citations, then uses its own `read`
 tool (or dispatches `coder`) to pull the specific lines it cares
@@ -2447,20 +2431,41 @@ include hashline edits or the injection guard).
 
 What cockpit absorbs from kctx (re-implementation, not vendoring):
 
-- **Named package registry** — local-path or git-URL packages, with
-  optional branch pinning per package. The on-disk schema (§3i) is
-  shaped to match kcl's so import is mechanical.
-- **Branch checkout-and-restore discipline** — when a package
-  declares a pinned branch (or a call passes `--branch override`),
-  cockpit checks out the pinned branch, runs the research, and
-  restores the previously-checked-out branch on completion.
-- **Git clone management** — git-URL packages clone to
-  `<docs_dir>/<host>/<org>/<repo>/` on first use; `cockpit
-  packages pull` updates them.
-- **`cockpit ask <package> "..."` shortcut** — preserves kcl muscle
-  memory.
-- **Auto-import** of kcl's existing `~/.config/kcl/config.json` on
-  first run (or via `cockpit packages import-from-kcl`).
+- **Named package registry** — local-path or git-URL packages. The
+  on-disk schema (`packages` table, migration 0006) is shaped to match
+  kcl's so import is mechanical. **User-global, not project-scoped.**
+- **Git clone management** — git-URL packages clone (shallow,
+  `--depth 1`) to `<packages_directory>/<percent-encoded-id>/` on first
+  use; `source_url`/`branch` recorded so a future `cockpit packages
+  update` could pull (not built in v1 — no auto-pull per cost).
+- **One-way import** — `cockpit kcl import` copies kcl's `packages`
+  rows cockpit lacks (dedupe by identifier + source_url for Git),
+  referencing kcl's on-disk clone paths as-is, idempotent; never
+  writes back to kcl. Absent kcl DB → clean message.
+- **Manual surface** — `cockpit packages list` / `cockpit packages add
+  <id> [--git <url>] [--path <dir>] [--branch] [--shallow]`.
+
+**Implementation tasks (this feature; all landed):**
+
+- **T-docs.A — package registry.** Migration `0006_packages.sql`
+  (global `packages` table); `db/packages.rs` typed CRUD
+  (lookup-by-identifier, lookup-by-source_url, upsert, insert-if-absent);
+  `packages/` for clone-dir resolution, percent-encoding,
+  ecosystem-prefixed slugs, shallow Git clone, `import_from_kcl`;
+  `commands/{packages,kcl}.rs` CLI.
+- **T-docs.B — sandboxed `grep`/`glob`.** `tools/sandbox.rs`
+  path-confinement (canonicalize + prefix check; refuses `..` and
+  symlink escape, with tests); `tools/grep.rs` (ripgrep libraries,
+  budgeted `file:line`); `tools/glob.rs` (`globset` + gitignore walk,
+  budgeted). Both `docs`-answerer-only, never shell to `rg`/`fd`.
+- **T-docs.C — two-stage pipeline.** `engine/docs_pipeline.rs`
+  (parses `{package, question}`, runs Docs.1 in caller cwd seeing only
+  `package`, then Docs.2 in the resolved package dir with `question`);
+  cwd-parameterized noninteractive spawn via `SpawnArgs.cwd` override;
+  `docs-resolver`/`docs-answerer` factories + prompts in `engine/builtin/`;
+  `docs` registered in `is_noninteractive()` and added to the
+  `orchestrator-build` and `coder` `task` allowlists. Auto-clone
+  resolves repo URLs only from registry metadata (`packages/resolve.rs`).
 
 What's *better* in cockpit's implementation than the shell-out path:
 

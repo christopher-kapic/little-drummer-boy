@@ -8,6 +8,7 @@
 //! that needs structured data; a flat `Vec<String>` would force string
 //! parsing tricks at render time.
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use chrono::{DateTime, Local};
@@ -16,6 +17,7 @@ use ratatui::text::{Line, Span};
 
 use crate::config::extended::ThinkingDisplay;
 use crate::tui::markdown;
+use crate::tui::theme::MUTED_COLOR_INDEX;
 
 /// Markdown render preferences, threaded from `App` to each
 /// per-entry renderer. Cheap to copy, so we pass by value.
@@ -105,6 +107,22 @@ pub enum HistoryEntry {
         output: String,
         /// True when the command exited non-zero — tints the label red.
         failed: bool,
+    },
+    /// Boundary marker at the top of a `/compact`-created session
+    /// (`prune-and-compact.md`). `/compact` forks to a fresh thread and
+    /// preserves the old session whole, so this is the divider-equivalent
+    /// for compaction — a muted rule at the session boundary, not an
+    /// inline summary. The predecessor's content lives in the preserved
+    /// session (viewable via `cockpit session show/resume`), so nothing is
+    /// inlined or dimmed here.
+    CompactBoundary {
+        /// Predecessor session's 6-char display id.
+        predecessor_short_id: String,
+        /// Seed-tools re-run in the fresh session (from `CompactReady`).
+        seed_tool_count: usize,
+        /// Approx wire tokens the seed-tools + brief cost on the first
+        /// turn. Shown only when it reads cleanly (non-zero).
+        seed_tool_tokens: u64,
     },
 }
 
@@ -268,6 +286,12 @@ pub struct Rendered {
 /// - [`ThinkingDisplay::Condensed`] (default) — chip, expands on `Ctrl+J`
 /// - [`ThinkingDisplay::Hidden`] — drop the chip and reasoning entirely
 /// - [`ThinkingDisplay::Verbose`] — force expanded regardless of the stored flag
+///
+/// `elided` is the live set of wire-side elided `original_event_id`s
+/// (`call_id`s). A boxed tool call whose `call_id` is in the set has its
+/// result body dimmed in the expanded view to signal it's out of the
+/// model's context — full text stays visible (GOALS §14). A render-time
+/// lookup against live prune state, not a persisted flag.
 pub fn render_entry(
     entry: &HistoryEntry,
     width: u16,
@@ -275,6 +299,7 @@ pub fn render_entry(
     md: MarkdownOpts,
     diff_style: crate::config::extended::DiffStyle,
     emojis: bool,
+    elided: &HashSet<String>,
 ) -> Rendered {
     match entry {
         HistoryEntry::User { text, timestamp } => {
@@ -311,7 +336,15 @@ pub fn render_entry(
             view_offset,
             follow,
             expanded,
-        } => render_toolbox(calls, *view_offset, *follow, *expanded, width, emojis),
+        } => render_toolbox(
+            calls,
+            *view_offset,
+            *follow,
+            *expanded,
+            width,
+            emojis,
+            elided,
+        ),
         HistoryEntry::ToolLine {
             tool,
             summary,
@@ -353,6 +386,24 @@ pub fn render_entry(
                     Span::styled(raw.to_string(), Style::default().fg(TOOL_OUTPUT_FG)),
                 ]));
             }
+            let continuations = vec![false; lines.len()];
+            Rendered {
+                lines,
+                chip_row: None,
+                continuations,
+            }
+        }
+        HistoryEntry::CompactBoundary {
+            predecessor_short_id,
+            seed_tool_count,
+            seed_tool_tokens,
+        } => {
+            let lines = render_compact_boundary(
+                predecessor_short_id,
+                *seed_tool_count,
+                *seed_tool_tokens,
+                width,
+            );
             let continuations = vec![false; lines.len()];
             Rendered {
                 lines,
@@ -907,14 +958,29 @@ fn render_toolbox(
     expanded: bool,
     width: u16,
     emojis: bool,
+    elided: &HashSet<String>,
 ) -> Rendered {
     let mut content: Vec<Vec<Span<'static>>> = Vec::new();
 
     if expanded {
         for call in calls {
+            // A call whose wire-side body is currently elided renders its
+            // expanded output dimmed (muted) to signal it's out of the
+            // model's context. The full text is still shown + selectable;
+            // only the color changes (GOALS §14). Render-time lookup —
+            // the kept most-recent body and any engine "keep full content"
+            // fallback aren't in the set, so they render normally.
+            let is_elided = elided.contains(&call.call_id);
             let input_lines: Vec<&str> = call.full_input.split('\n').collect();
             let first = input_lines.first().copied().unwrap_or("");
-            content.push(tool_call_spans(&call.tool, first, call.state, emojis));
+            let mut first_spans = tool_call_spans(&call.tool, first, call.state, emojis);
+            if is_elided {
+                first_spans.push(Span::styled(
+                    "  (pruned — superseded by a newer read)".to_string(),
+                    Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
+                ));
+            }
+            content.push(first_spans);
             for cont in input_lines.iter().skip(1) {
                 content.push(vec![Span::styled(
                     (*cont).to_string(),
@@ -922,11 +988,13 @@ fn render_toolbox(
                 )]);
             }
             if tool_shows_output(&call.tool) && !call.output.is_empty() {
+                let out_style = if is_elided {
+                    Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX))
+                } else {
+                    Style::default().fg(TOOL_OUTPUT_FG)
+                };
                 for out_line in call.output.split('\n') {
-                    content.push(vec![Span::styled(
-                        format!("    {out_line}"),
-                        Style::default().fg(TOOL_OUTPUT_FG),
-                    )]);
+                    content.push(vec![Span::styled(format!("    {out_line}"), out_style)]);
                 }
             }
         }
@@ -934,12 +1002,22 @@ fn render_toolbox(
         let top = toolbox_top(calls.len(), view_offset, follow);
         for call in calls.iter().skip(top).take(TOOLBOX_VISIBLE) {
             let budget = tool_summary_budget(&call.tool, width as usize, 2, emojis);
-            content.push(tool_call_spans(
+            let mut spans = tool_call_spans(
                 &call.tool,
                 &truncate(&call.summary, budget),
                 call.state,
                 emojis,
-            ));
+            );
+            // Collapsed view: the body isn't shown, but a muted `(pruned)`
+            // tag on the summary still signals the call's result is out of
+            // context. Expand the box for the dimmed body itself.
+            if elided.contains(&call.call_id) {
+                spans.push(Span::styled(
+                    "  (pruned)".to_string(),
+                    Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
+                ));
+            }
+            content.push(spans);
         }
     }
 
@@ -966,6 +1044,54 @@ fn render_toolbox(
         chip_row: None,
         continuations,
     }
+}
+
+/// Render a [`HistoryEntry::CompactBoundary`]: a single muted rule at the
+/// top of a `/compact`-created session, framed by horizontal lines so it
+/// reads as a divider. Theme-driven (the [`MUTED_COLOR_INDEX`] grey the
+/// rest of the chrome uses for secondary text); degrades to a bare label
+/// on a terminal too narrow to fit the rules.
+fn render_compact_boundary(
+    predecessor_short_id: &str,
+    seed_tool_count: usize,
+    seed_tool_tokens: u64,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+    // Build the label; include the seed-tool token cost only when it
+    // reads cleanly (non-zero) — otherwise just note the re-run.
+    let mut label = format!("compacted from {predecessor_short_id}");
+    if seed_tool_count > 0 {
+        let cost = if seed_tool_tokens > 0 {
+            format!(" · {seed_tool_tokens} tok")
+        } else {
+            String::new()
+        };
+        let plural = if seed_tool_count == 1 { "" } else { "s" };
+        label.push_str(&format!(
+            " · {seed_tool_count} seed-tool{plural} re-run{cost}"
+        ));
+    } else {
+        label.push_str(" · seed-tools re-run");
+    }
+
+    let area = width as usize;
+    let label_w = label.chars().count();
+    // ` ── <label> ── ` — two rule chars + a space on each side of the
+    // label. Fall back to the bare label when the terminal is too narrow
+    // to fit even a single rule cell on each side.
+    let frame = 2 * (1 + 2); // " ── " on the left + " ── " on the right
+    if area <= label_w + frame {
+        return vec![Line::from(vec![Span::styled(label, muted)])];
+    }
+    let total_rule = area - label_w - 2; // minus the two flanking spaces
+    let left = total_rule / 2;
+    let right = total_rule - left;
+    vec![Line::from(vec![
+        Span::styled("─".repeat(left), muted),
+        Span::styled(format!(" {label} "), muted),
+        Span::styled("─".repeat(right), muted),
+    ])]
 }
 
 /// Build a one-line span vec with an HH:MM timestamp right-aligned at
@@ -1525,6 +1651,12 @@ mod tests {
         }
     }
 
+    /// No wire-side elisions — the default for tests that don't exercise
+    /// the prune-dimming path.
+    fn no_elided() -> HashSet<String> {
+        HashSet::new()
+    }
+
     fn line_text(line: &Line<'static>) -> String {
         line.spans.iter().map(|s| s.content.as_ref()).collect()
     }
@@ -1560,7 +1692,7 @@ mod tests {
         let calls: Vec<ToolCall> = (0..9)
             .map(|i| mk_call("bash", &format!("cmd{i}"), ToolCallState::Success))
             .collect();
-        let r = render_toolbox(&calls, 0, true, false, 80, false);
+        let r = render_toolbox(&calls, 0, true, false, 80, false, &no_elided());
         assert_eq!(r.lines.len(), TOOLBOX_VISIBLE);
         // Rounded caps top and bottom; in between the newest calls show.
         assert!(line_text(&r.lines[0]).starts_with('╭'));
@@ -1572,7 +1704,7 @@ mod tests {
     #[test]
     fn toolbox_processing_call_is_yellow() {
         let calls = vec![mk_call("bash", "build", ToolCallState::Processing)];
-        let r = render_toolbox(&calls, 0, true, false, 80, false);
+        let r = render_toolbox(&calls, 0, true, false, 80, false, &no_elided());
         assert!(
             r.lines[0]
                 .spans
@@ -1587,7 +1719,7 @@ mod tests {
         bash.output = "file_a\nfile_b".into();
         let mut read = mk_call("read", "f.txt", ToolCallState::Success);
         read.output = "SHOULD_NOT_SHOW".into(); // input-only — never displayed
-        let r = render_toolbox(&[bash, read], 0, true, true, 80, false);
+        let r = render_toolbox(&[bash, read], 0, true, true, 80, false, &no_elided());
         let joined = r.lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
         assert!(joined.contains("file_a") && joined.contains("file_b"));
         assert!(!joined.contains("SHOULD_NOT_SHOW"));
@@ -1597,10 +1729,136 @@ mod tests {
     fn toolbox_honors_emoji_setting() {
         let calls = vec![mk_call("read", "f.txt", ToolCallState::Success)];
         assert!(
-            !line_text(&render_toolbox(&calls, 0, true, false, 80, false).lines[0]).contains('📖')
+            !line_text(&render_toolbox(&calls, 0, true, false, 80, false, &no_elided()).lines[0])
+                .contains('📖')
         );
         assert!(
-            line_text(&render_toolbox(&calls, 0, true, false, 80, true).lines[0]).contains('📖')
+            line_text(&render_toolbox(&calls, 0, true, false, 80, true, &no_elided()).lines[0])
+                .contains('📖')
         );
+    }
+
+    // ── prune dimming ──────────────────────────────────────────────────
+
+    const MUTED: Color = Color::Indexed(MUTED_COLOR_INDEX);
+
+    /// True when any span on `line` carries the theme muted foreground.
+    fn any_muted(line: &Line<'static>) -> bool {
+        line.spans.iter().any(|s| s.style.fg == Some(MUTED))
+    }
+
+    /// A boxed snapshot tool whose `call_id` is in the elided set renders
+    /// its expanded body dimmed (muted) with a `(pruned …)` tag, while the
+    /// kept (non-elided) call of the same kind renders normally. Drives the
+    /// renderer with a SYNTHETIC elided set.
+    #[test]
+    fn elided_body_is_dimmed_kept_body_is_not() {
+        // Two `search` calls (output-bearing snapshot tool): the older is
+        // elided, the newer kept.
+        let mut older = mk_call("search", "TODO", ToolCallState::Success);
+        older.call_id = "c1".into();
+        older.output = "OLDER RESULTS BODY".into();
+        let mut newer = mk_call("search", "TODO", ToolCallState::Success);
+        newer.call_id = "c2".into();
+        newer.output = "NEWER RESULTS BODY".into();
+
+        let elided: HashSet<String> = ["c1".to_string()].into_iter().collect();
+        let r = render_toolbox(
+            &[older, newer],
+            0,
+            true,
+            /* expanded */ true,
+            80,
+            false,
+            &elided,
+        );
+
+        // Locate the body rows (indented output) for each call.
+        let older_body = r
+            .lines
+            .iter()
+            .find(|l| line_text(l).contains("OLDER RESULTS BODY"))
+            .expect("older body present (full-fidelity, still visible)");
+        let newer_body = r
+            .lines
+            .iter()
+            .find(|l| line_text(l).contains("NEWER RESULTS BODY"))
+            .expect("newer body present");
+
+        // Elided body is muted; kept body is not.
+        assert!(any_muted(older_body), "elided body must be dimmed");
+        assert!(
+            !any_muted(newer_body),
+            "kept most-recent body must NOT be dimmed"
+        );
+        // The optional `(pruned …)` tag is emitted on the elided call's
+        // summary line, in the muted style.
+        let joined: String = r.lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(joined.contains("(pruned"), "elided call gets a pruned tag");
+    }
+
+    /// Empty elided set → zero visual change: no body is muted and no tag.
+    #[test]
+    fn no_elisions_means_no_dimming() {
+        let mut call = mk_call("search", "TODO", ToolCallState::Success);
+        call.call_id = "c1".into();
+        call.output = "RESULTS".into();
+        let r = render_toolbox(&[call], 0, true, true, 80, false, &no_elided());
+        let joined: String = r.lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(!joined.contains("(pruned"));
+        assert!(
+            r.lines.iter().all(|l| !any_muted(l)),
+            "no elisions → nothing muted"
+        );
+    }
+
+    // ── compaction boundary ────────────────────────────────────────────
+
+    /// A `/compact`-created session renders a muted boundary marker citing
+    /// the predecessor short-id + seed-tool cost. Drives the renderer with
+    /// a SYNTHETIC compacted-from predecessor.
+    #[test]
+    fn compact_boundary_marker_is_produced_and_muted() {
+        let lines = render_compact_boundary("ab12cd", 3, 1500, 80);
+        assert_eq!(lines.len(), 1);
+        let text = line_text(&lines[0]);
+        assert!(text.contains("compacted from ab12cd"));
+        assert!(text.contains("3 seed-tool"));
+        assert!(text.contains("1500 tok"));
+        // The whole marker is in the theme muted style.
+        assert!(any_muted(&lines[0]), "boundary marker must be muted");
+        // Framed as a rule.
+        assert!(text.contains('─'));
+    }
+
+    /// Narrow terminal → degrades to the bare label, no panic, still muted.
+    #[test]
+    fn compact_boundary_degrades_on_narrow_terminal() {
+        let lines = render_compact_boundary("ab12cd", 0, 0, 4);
+        assert_eq!(lines.len(), 1);
+        assert!(line_text(&lines[0]).contains("compacted from ab12cd"));
+        assert!(any_muted(&lines[0]));
+    }
+
+    /// The full `render_entry` dispatch produces the marker for a
+    /// `CompactBoundary` entry (the path the chat pane actually drives).
+    #[test]
+    fn render_entry_dispatches_compact_boundary() {
+        let entry = HistoryEntry::CompactBoundary {
+            predecessor_short_id: "deadbe".into(),
+            seed_tool_count: 1,
+            seed_tool_tokens: 0,
+        };
+        let r = render_entry(
+            &entry,
+            80,
+            ThinkingDisplay::Condensed,
+            MarkdownOpts::default(),
+            crate::config::extended::DiffStyle::default(),
+            false,
+            &no_elided(),
+        );
+        let text = line_text(&r.lines[0]);
+        assert!(text.contains("compacted from deadbe"));
     }
 }

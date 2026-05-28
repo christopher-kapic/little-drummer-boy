@@ -25,6 +25,9 @@ use crate::tools::custom::CustomBashTool;
 const ORCHESTRATOR_BUILD_PROMPT: &str = include_str!("orchestrator_build.md");
 const CODER_PROMPT: &str = include_str!("coder.md");
 const EXPLORE_PROMPT: &str = include_str!("explore.md");
+/// Docs pipeline stage prompts (GOALS §3a, prompt `docs-agent.md`).
+const DOCS_RESOLVER_PROMPT: &str = include_str!("docs_resolver.md");
+const DOCS_ANSWERER_PROMPT: &str = include_str!("docs_answerer.md");
 
 /// Per-spawn knobs threaded from the driver.
 #[derive(Clone)]
@@ -161,6 +164,15 @@ pub fn load(name: &str, args: &SpawnArgs) -> Result<Agent> {
         "orchestrator-build" => Ok(orchestrator_build(args)),
         "coder" => Ok(coder(args)),
         "explore" => Ok(explore(args)),
+        // `docs` is a fixed two-stage pipeline, not a single agent — the
+        // driver routes it to [`crate::engine::docs_pipeline`] before any
+        // `load()`. Its internal stages are built by the pipeline via
+        // [`docs_resolver`] / [`docs_answerer`], which need per-run state
+        // (`DocsResolution`, the target package, the question) that a name
+        // alone can't supply. Reaching here means the routing diverged.
+        "docs" | "docs-resolver" | "docs-answerer" => bail!(
+            "`{name}` is a pipeline stage routed by the driver; load() should be unreachable for it"
+        ),
         other => bail!("unknown built-in agent `{other}`"),
     }
 }
@@ -168,9 +180,11 @@ pub fn load(name: &str, args: &SpawnArgs) -> Result<Agent> {
 /// True if `name` denotes a built-in agent that runs *noninteractively*
 /// — the orchestrator dispatches it like a tool call (synchronously)
 /// rather than handing the primary conversation off. The driver uses
-/// this to route `task(agent=…, …)` correctly.
+/// this to route `task(agent=…, …)` correctly. `docs` is noninteractive:
+/// the caller sees one leaf invocation even though it's a two-stage
+/// pipeline internally (GOALS §3a leaf-termination).
 pub fn is_noninteractive(name: &str) -> bool {
-    matches!(name, "explore")
+    matches!(name, "explore" | "docs")
 }
 
 #[cfg(test)]
@@ -264,8 +278,13 @@ pub fn orchestrator_build(args: &SpawnArgs) -> Agent {
             .with(Arc::new(crate::tools::bash::BashTool::new()))
             .with(Arc::new(crate::tools::intel::TreeTool))
             .with(Arc::new(crate::tools::intel::HotTool))
+            // The `jobs` meta-tool (GOALS §22) — fixed minimal schema, so
+            // the tools array stays byte-stable as branches are enabled.
+            // Structural: intercepted by the engine and routed to the
+            // driver-owned async-job authority.
+            .with(Arc::new(crate::tools::jobs::JobsTool))
             .with(Arc::new(crate::tools::task::TaskTool::with_subagents(&[
-                "coder", "explore",
+                "coder", "explore", "docs",
             ]))),
         &args.cwd,
     );
@@ -276,7 +295,6 @@ pub fn orchestrator_build(args: &SpawnArgs) -> Agent {
         tools,
         model: args.model.clone(),
         params: args.params.clone(),
-        array_fields: Vec::new(),
     }
 }
 
@@ -296,7 +314,13 @@ pub fn coder(args: &SpawnArgs) -> Agent {
         .with(Arc::new(crate::tools::intel::DepsTool))
         .with(Arc::new(crate::tools::intel::CircularTool))
         .with(Arc::new(crate::tools::intel::WordTool))
-        .with(Arc::new(crate::tools::intel::SearchTool));
+        .with(Arc::new(crate::tools::intel::SearchTool))
+        // `coder` delegates dependency-usage questions to the `docs`
+        // pipeline (GOALS §3a: coder → docs). Noninteractive; the docs
+        // unit returns one leaf report.
+        .with(Arc::new(crate::tools::task::TaskTool::with_subagents(&[
+            "docs",
+        ])));
 
     Agent {
         name: "coder".to_string(),
@@ -304,7 +328,6 @@ pub fn coder(args: &SpawnArgs) -> Agent {
         tools,
         model: args.model.clone(),
         params: args.params.clone(),
-        array_fields: Vec::new(),
     }
 }
 
@@ -336,6 +359,60 @@ pub fn explore(args: &SpawnArgs) -> Agent {
         tools,
         model: args.model.clone(),
         params: args.params.clone(),
-        array_fields: Vec::new(),
+    }
+}
+
+/// Docs.1 — the resolver stage of the `docs` pipeline. Runs in the
+/// caller's cwd (same trust level as `explore`/`coder`), gated to the
+/// registry tools plus `bash`/`webfetch`/`websearch` for registry
+/// lookups. Receives **only** the package name (the question never
+/// enters its context — token economy, GOALS §10). `resolution` is the
+/// shared slot the pipeline reads to learn which package dir to launch
+/// Docs.2 in; `target` is the package the caller asked about.
+pub fn docs_resolver(
+    args: &SpawnArgs,
+    resolution: std::sync::Arc<crate::tools::docs::DocsResolution>,
+    target: String,
+) -> Agent {
+    let tools = with_custom_tools(
+        ToolBox::new()
+            .with(Arc::new(crate::tools::docs::ListPackagesTool::new(
+                resolution.clone(),
+                target,
+            )))
+            .with(Arc::new(crate::tools::docs::AddPackageTool::new(
+                resolution,
+            )))
+            .with(Arc::new(crate::tools::bash::BashTool::new())),
+        &args.cwd,
+    );
+
+    Agent {
+        name: "docs-resolver".to_string(),
+        system: compose_system_prompt(DOCS_RESOLVER_PROMPT, &args.session_short_id, &args.cwd),
+        tools,
+        model: args.model.clone(),
+        params: args.params.clone(),
+    }
+}
+
+/// Docs.2 — the answerer stage of the `docs` pipeline. Runs in the
+/// resolved package directory (`args.cwd` is the package root). Tools:
+/// `read` + the sandboxed `grep`/`glob` only — **no bash, no network, no
+/// write** (prompt `docs-agent.md` decision 2/3). The sandbox confines
+/// every path to `args.cwd`, which is why bash can be denied: Docs.2 runs
+/// inside untrusted third-party source.
+pub fn docs_answerer(args: &SpawnArgs) -> Agent {
+    let tools = ToolBox::new()
+        .with(Arc::new(crate::tools::read::ReadTool))
+        .with(Arc::new(crate::tools::grep::GrepTool))
+        .with(Arc::new(crate::tools::glob::GlobTool));
+
+    Agent {
+        name: "docs-answerer".to_string(),
+        system: compose_system_prompt(DOCS_ANSWERER_PROMPT, &args.session_short_id, &args.cwd),
+        tools,
+        model: args.model.clone(),
+        params: args.params.clone(),
     }
 }

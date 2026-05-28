@@ -43,6 +43,11 @@ pub struct AgentRunner {
     /// Name of whoever's currently on top of the agent stack. The
     /// chrome reads this for the active-agent slot (GOALS §1a).
     pub active_agent: Arc<Mutex<String>>,
+    /// This session's 6-char display id (GOALS §17b). The TUI captures
+    /// it as the predecessor short-id when this session spawns a
+    /// `/compact` handoff, so the fresh session can draw a "compacted
+    /// from <short-id>" boundary marker.
+    pub short_id: String,
     /// This session's project id — the scope for `tag` usage records.
     pub project_id: String,
     /// Frequency counts fetched at attach; the TUI seeds its in-memory
@@ -57,6 +62,18 @@ pub struct AgentRunner {
 /// render the message in its fallback "input captured" stub without
 /// having to format an anyhow chain.
 pub fn try_spawn(cwd: &Path) -> Result<AgentRunner, String> {
+    try_spawn_inner(cwd, None)
+}
+
+/// Re-attach to an existing session by id (the `/compact` commit path,
+/// T6.e). Same as [`try_spawn`] but resumes `session_id` instead of
+/// creating a fresh one, so the TUI switches its event stream + input
+/// channel onto the new compaction-handoff session.
+pub fn attach_to_session(cwd: &Path, session_id: uuid::Uuid) -> Result<AgentRunner, String> {
+    try_spawn_inner(cwd, Some(session_id))
+}
+
+fn try_spawn_inner(cwd: &Path, session_id: Option<uuid::Uuid>) -> Result<AgentRunner, String> {
     let runtime = tokio::runtime::Handle::try_current()
         .map_err(|_| "no tokio runtime — cockpit must be invoked from main".to_string())?;
 
@@ -84,18 +101,19 @@ pub fn try_spawn(cwd: &Path) -> Result<AgentRunner, String> {
             let attached = daemon
                 .client
                 .request_ok(Request::Attach {
-                    session_id: None,
+                    session_id,
                     project_root: Some(project_root),
                 })
                 .await
                 .map_err(|e| format!("attach: {e}"))?;
-            let (session_id, active_agent_name, project_id) = match attached {
+            let (session_id, short_id, active_agent_name, project_id) = match attached {
                 Response::Attached {
                     session_id,
+                    short_id,
                     active_agent,
                     project_id,
                     ..
-                } => (session_id, active_agent, project_id),
+                } => (session_id, short_id, active_agent, project_id),
                 other => return Err(format!("unexpected attach response: {other:?}")),
             };
             // Fetch the autocomplete frequency maps for this session's
@@ -122,13 +140,14 @@ pub fn try_spawn(cwd: &Path) -> Result<AgentRunner, String> {
             Ok::<_, String>((
                 daemon.client,
                 session_id,
+                short_id,
                 active_agent_name,
                 project_id,
                 usage,
             ))
         })
     })?;
-    let (client, session_id, initial_active_agent, project_id, usage) = attached;
+    let (client, session_id, short_id, initial_active_agent, project_id, usage) = attached;
 
     let (input_tx, mut input_rx) = mpsc::channel::<String>(32);
     let (record_tx, mut record_rx) = mpsc::channel::<Request>(32);
@@ -185,6 +204,7 @@ pub fn try_spawn(cwd: &Path) -> Result<AgentRunner, String> {
         record_tx,
         events,
         active_agent,
+        short_id,
         project_id,
         usage,
     })
@@ -257,7 +277,14 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         | InterruptRaised { session_id, .. }
         | InterruptResolved { session_id, .. }
         | AgentIdle { session_id, .. }
-        | SessionEnded { session_id, .. } => *session_id,
+        | SessionEnded { session_id, .. }
+        | JobStarted { session_id, .. }
+        | JobProgress { session_id, .. }
+        | JobNote { session_id, .. }
+        | JobCompleted { session_id, .. }
+        | ContextProjection { session_id, .. }
+        | Pruned { session_id, .. }
+        | CompactReady { session_id, .. } => *session_id,
     })
 }
 
@@ -334,6 +361,62 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
             },
         },
         AgentIdle { .. } => TurnEvent::AgentIdle,
+        JobStarted {
+            job_id,
+            label,
+            kind,
+            ..
+        } => TurnEvent::JobStarted {
+            job_id,
+            label,
+            kind,
+        },
+        JobProgress { job_id, .. } => TurnEvent::JobProgress { job_id },
+        JobNote { job_id, text, .. } => TurnEvent::JobNote { job_id, text },
+        JobCompleted {
+            job_id,
+            label,
+            kind,
+            failed,
+            ..
+        } => TurnEvent::JobCompleted {
+            job_id,
+            label,
+            kind,
+            failed,
+        },
+        ContextProjection {
+            prunable_tokens,
+            cache_cold,
+            ..
+        } => TurnEvent::ContextProjection {
+            prunable_tokens,
+            cache_cold,
+        },
+        Pruned {
+            auto,
+            bodies,
+            tokens_saved,
+            elided,
+            ..
+        } => TurnEvent::Pruned {
+            auto,
+            bodies,
+            tokens_saved,
+            elided,
+        },
+        CompactReady {
+            new_session_id,
+            handoff,
+            seed_tool_count,
+            seed_tool_tokens,
+            ..
+        } => TurnEvent::CompactReady {
+            new_session_id,
+            handoff,
+            seed_tool_count,
+            seed_tool_tokens,
+        },
         // Interrupts and SessionEnded don't have TurnEvent analogues
         // yet — the TUI's needs-attention surface lands with the
         // approval router.

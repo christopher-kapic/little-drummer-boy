@@ -49,7 +49,7 @@ impl Tool for EditunlockTool {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "path":        { "type": "string", "description": "Path to edit" },
+                "path":        { "type": "string", "x-cockpit-kind": "path", "description": "Path to edit" },
                 "old_string":  { "type": "string", "description": "Text to find" },
                 "new_string":  { "type": "string", "description": "Text to replace with" },
                 "replace_all": { "type": "boolean", "description": "Replace every match (default false)" }

@@ -189,6 +189,7 @@ mod tests {
             DaemonPaths {
                 pid_file: PathBuf::from("/tmp/cockpit.test.pid"),
                 socket: PathBuf::from("/tmp/cockpit.test.sock"),
+                ephemeral: false,
             },
         )
     }
