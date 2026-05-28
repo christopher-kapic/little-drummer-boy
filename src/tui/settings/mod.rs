@@ -1255,14 +1255,14 @@ mod tests {
 
     #[test]
     fn enter_on_instructions_row_in_ui_opens_instructions_page() {
-        // UI page row 8 (instructions file) + Enter should land on the
-        // Instructions page. Rows 0-3 are vim/thinking/markdown,
-        // 4-5 are mouse/rich-text-copy (T8.c/T8.g), 6-7 are
-        // name/packages, 8 is instructions.
+        // UI page row 9 (instructions file) + Enter should land on the
+        // Instructions page. Rows 0-3 are vim/thinking/markdown, 4-5 are
+        // mouse/rich-text-copy (T8.c/T8.g), 6 is emojis, 7-8 are
+        // name/packages, 9 is instructions.
         let tmp = TempDir::new().unwrap();
         let mut d = fresh_dialog(&tmp);
         enter_ui_from_root(&mut d);
-        for _ in 0..8 {
+        for _ in 0..9 {
             d.handle_key(press(KeyCode::Char('j')));
         }
         d.handle_key(press(KeyCode::Enter));
@@ -1358,10 +1358,10 @@ mod tests {
     fn fresh_instructions_dialog(tmp: &TempDir) -> SettingsDialog {
         let mut d = fresh_dialog(tmp);
         enter_ui_from_root(&mut d);
-        // Move cursor to the instructions row (idx 8 since T8 added
-        // `mouse` and `rich-text copy` rows at positions 4 and 5)
-        // and Enter to nav.
-        for _ in 0..8 {
+        // Move cursor to the instructions row (idx 9: T8 added `mouse`
+        // and `rich-text copy` at 4/5, and the `emojis` row sits at 6,
+        // pushing instructions to the last position) and Enter to nav.
+        for _ in 0..9 {
             d.handle_key(press(KeyCode::Char('j')));
         }
         d.handle_key(press(KeyCode::Enter));

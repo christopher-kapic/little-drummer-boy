@@ -38,11 +38,11 @@ impl Tool for WriteunlockTool {
         let path_arg = args
             .get("path")
             .and_then(Value::as_str)
-            .ok_or_else(|| anyhow::anyhow!("`path` is required"))?;
+            .ok_or_else(|| crate::engine::tool::invalid_input("`path` is required"))?;
         let content = args
             .get("content")
             .and_then(Value::as_str)
-            .ok_or_else(|| anyhow::anyhow!("`content` is required"))?;
+            .ok_or_else(|| crate::engine::tool::invalid_input("`content` is required"))?;
         let path = resolve(path_arg, &ctx.cwd);
 
         // For *new* files (no existing file on disk) we still require a

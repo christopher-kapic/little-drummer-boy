@@ -65,56 +65,59 @@ pub fn render_diff(
     new: &str,
     style: DiffStyle,
     width: u16,
+    emojis: bool,
 ) -> Vec<Line<'static>> {
     let diff = TextDiff::from_lines(old, new);
     let (added, removed) = count_changes(&diff);
 
     match style {
-        DiffStyle::Hidden => vec![summary_line(tool, path, added, removed)],
+        DiffStyle::Hidden => vec![header_line(tool, path, added, removed, emojis)],
         DiffStyle::Inline => {
-            let mut out = vec![header_line(tool, path, added, removed)];
+            let mut out = vec![header_line(tool, path, added, removed, emojis)];
             out.extend(render_inline(&diff));
             out
         }
         DiffStyle::SideBySide if width >= SIDE_BY_SIDE_MIN_WIDTH => {
-            let mut out = vec![header_line(tool, path, added, removed)];
+            let mut out = vec![header_line(tool, path, added, removed, emojis)];
             out.extend(render_side_by_side(&diff, width));
             out
         }
         DiffStyle::SideBySide => {
             // Degrade to inline at narrow widths. Two-column layout
             // with anything less than ~30 cells per side is unreadable.
-            let mut out = vec![header_line(tool, path, added, removed)];
+            let mut out = vec![header_line(tool, path, added, removed, emojis)];
             out.extend(render_inline(&diff));
             out
         }
     }
 }
 
-fn header_line(tool: &str, path: &str, added: usize, removed: usize) -> Line<'static> {
-    Line::from(vec![
-        Span::raw(LEFT_INDENT.to_string()),
-        Span::styled("✓ ", Style::default().fg(COL_HEADER)),
-        Span::styled(format!("{tool}: "), Style::default().fg(COL_HEADER)),
-        Span::raw(path.to_string()),
-        Span::raw(" "),
-        Span::styled(
-            format!("(+{added} −{removed})"),
-            Style::default().fg(COL_SEP),
-        ),
-    ])
-}
-
-fn summary_line(tool: &str, path: &str, added: usize, removed: usize) -> Line<'static> {
-    Line::from(vec![
-        Span::raw(LEFT_INDENT.to_string()),
-        Span::styled("✓ ", Style::default().fg(COL_HEADER)),
-        Span::raw(format!("{tool}: {path} ")),
-        Span::styled(
-            format!("(+{added} −{removed})"),
-            Style::default().fg(COL_SEP),
-        ),
-    ])
+/// Diff header: `[glyph] label: path (+N −M)`. The glyph + label come
+/// from the shared tool-line helper so diffs match the tool-box styling
+/// and honor the emoji setting.
+fn header_line(
+    tool: &str,
+    path: &str,
+    added: usize,
+    removed: usize,
+    emojis: bool,
+) -> Line<'static> {
+    let (glyph, label) = crate::tui::history::tool_glyph_label(tool, emojis);
+    let mut spans = vec![Span::raw(LEFT_INDENT.to_string())];
+    if !glyph.is_empty() {
+        spans.push(Span::raw(glyph));
+    }
+    spans.push(Span::styled(
+        format!("{label}: "),
+        Style::default().fg(COL_HEADER),
+    ));
+    spans.push(Span::raw(path.to_string()));
+    spans.push(Span::raw(" "));
+    spans.push(Span::styled(
+        format!("(+{added} −{removed})"),
+        Style::default().fg(COL_SEP),
+    ));
+    Line::from(spans)
 }
 
 fn count_changes<'a>(diff: &TextDiff<'a, 'a, str>) -> (usize, usize) {
@@ -308,6 +311,7 @@ mod tests {
             "a\nB\nc\n",
             DiffStyle::Hidden,
             120,
+            false,
         );
         assert_eq!(lines.len(), 1);
         let s = &lines_to_strings(&lines)[0];
@@ -324,6 +328,7 @@ mod tests {
             "alpha\nBETA\ngamma\n",
             DiffStyle::Inline,
             120,
+            false,
         );
         let rendered = lines_to_strings(&lines);
         assert!(rendered[0].contains("(+1 −1)"));
@@ -342,6 +347,7 @@ mod tests {
             "a\nB\n",
             DiffStyle::SideBySide,
             40,
+            false,
         );
         // Narrow mode should look like the inline render (uses `- ` /
         // `+ ` prefixes rather than the side-by-side `│` separator).
@@ -360,6 +366,7 @@ mod tests {
             "alpha\nBETA\n",
             DiffStyle::SideBySide,
             120,
+            false,
         );
         let rendered = lines_to_strings(&wide).join("\n");
         // Header doesn't carry the column separator; body rows do.

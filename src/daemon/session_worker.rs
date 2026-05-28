@@ -305,12 +305,14 @@ fn turn_event_to_proto(event: TurnEvent, session_id: Uuid) -> Vec<proto::Event> 
             call_id,
             tool,
             error,
+            kind,
         } => vec![proto::Event::ToolError {
             session_id,
             agent,
             call_id,
             tool,
             error,
+            kind,
         }],
         TurnEvent::SubagentSpawned {
             parent,

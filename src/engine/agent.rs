@@ -88,12 +88,15 @@ pub enum TurnEvent {
         truncated: bool,
     },
     /// A tool errored. The model will see this string as the tool
-    /// result; the TUI renders it red.
+    /// result; the TUI renders it red. `kind` tells the TUI whether the
+    /// model built the call badly (bold red) or the tool failed for
+    /// another reason (red).
     ToolError {
         agent: String,
         call_id: String,
         tool: String,
         error: String,
+        kind: crate::engine::tool::ToolFailKind,
     },
     /// `task` invoked a subagent; primary handoff (GOALS §3b) starts.
     /// Driver handles the actual stack push.
@@ -322,11 +325,11 @@ pub async fn turn(
         }
         let recovery = tool_recovery.unwrap_or(recovery);
 
-        let (raw_output, hard_fail) = match &result {
-            Ok(ToolOutput { content, .. }) => (content.clone(), false),
+        let (raw_output, hard_fail, fail_kind) = match &result {
+            Ok(ToolOutput { content, .. }) => (content.clone(), false, None),
             Err(e) => {
                 let msg = format!("Error: {e}");
-                (msg, true)
+                (msg, true, Some(crate::engine::tool::classify_failure(e)))
             }
         };
 
@@ -344,6 +347,7 @@ pub async fn turn(
                     call_id: tc.id.clone(),
                     tool: tc.function.name.clone(),
                     error: output_str.clone(),
+                    kind: fail_kind.unwrap_or(crate::engine::tool::ToolFailKind::Execution),
                 })
                 .await;
         } else {

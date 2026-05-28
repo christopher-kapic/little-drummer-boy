@@ -40,7 +40,7 @@ impl Tool for ReadlockTool {
         let path_arg = args
             .get("path")
             .and_then(Value::as_str)
-            .ok_or_else(|| anyhow::anyhow!("`path` is required"))?;
+            .ok_or_else(|| crate::engine::tool::invalid_input("`path` is required"))?;
         let path = resolve(path_arg, &ctx.cwd);
         ctx.locks.acquire(&path, &ctx.agent_id, ctx.session.id)?;
         read_impl(args, ctx, true)

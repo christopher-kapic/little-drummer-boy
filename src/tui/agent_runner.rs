@@ -200,12 +200,14 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
             call_id,
             tool,
             error,
+            kind,
             ..
         } => TurnEvent::ToolError {
             agent,
             call_id,
             tool,
             error,
+            kind,
         },
         SubagentSpawned {
             parent,

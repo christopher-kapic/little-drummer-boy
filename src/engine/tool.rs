@@ -15,9 +15,59 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::engine::message::ToolDefinition;
+
+/// Why a tool call failed. Surfaced to the TUI so it can tell a bad
+/// *call* (the model's fault) from a bad *outcome* (the tool's fault).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolFailKind {
+    /// The model constructed the call badly — a missing / wrong-type
+    /// required argument, or a value the tool can't satisfy (e.g. an
+    /// `old_string` that isn't in the file) — and the §12 repair layer
+    /// couldn't fix it. The model is at fault.
+    Invocation,
+    /// The tool ran but failed for an environmental reason: an I/O
+    /// error, a non-zero command exit surfaced as an error, a lock
+    /// conflict, etc.
+    Execution,
+}
+
+/// Marker error a tool returns when the *arguments* were the problem
+/// (see [`ToolFailKind::Invocation`]). The dispatcher downcasts to this
+/// to classify the failure; build it with [`invalid_input`].
+#[derive(Debug)]
+pub struct InvalidToolInput(pub String);
+
+impl std::fmt::Display for InvalidToolInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for InvalidToolInput {}
+
+/// Build an [`InvalidToolInput`] error. Tools use this for missing /
+/// wrong-type required args and for argument values that can't be
+/// satisfied — anything that's the model's fault rather than the
+/// environment's.
+pub fn invalid_input(msg: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(InvalidToolInput(msg.into()))
+}
+
+/// Classify a dispatch error: an [`InvalidToolInput`] anywhere in the
+/// chain means the model built the call badly; everything else is an
+/// execution failure.
+pub fn classify_failure(err: &anyhow::Error) -> ToolFailKind {
+    if err.downcast_ref::<InvalidToolInput>().is_some() {
+        ToolFailKind::Invocation
+    } else {
+        ToolFailKind::Execution
+    }
+}
 
 /// A locked-down tool whose argument type is always `serde_json::Value`.
 ///

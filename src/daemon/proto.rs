@@ -343,12 +343,15 @@ pub enum Event {
     },
 
     /// Tool errored. The model sees this string as the tool result.
+    /// `kind` distinguishes a bad call (the model's fault) from a bad
+    /// outcome (the tool's fault) for the TUI's color treatment.
     ToolError {
         session_id: Uuid,
         agent: String,
         call_id: String,
         tool: String,
         error: String,
+        kind: crate::engine::tool::ToolFailKind,
     },
 
     /// `task` invoked an interactive subagent; primary handoff begins.

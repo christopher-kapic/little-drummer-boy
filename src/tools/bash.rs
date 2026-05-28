@@ -117,7 +117,7 @@ impl Tool for BashTool {
         let command = args
             .get("command")
             .and_then(Value::as_str)
-            .ok_or_else(|| anyhow::anyhow!("`command` is required"))?;
+            .ok_or_else(|| crate::engine::tool::invalid_input("`command` is required"))?;
         let cwd = args
             .get("cwd")
             .and_then(Value::as_str)

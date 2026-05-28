@@ -67,9 +67,9 @@ pub(super) struct GrabState {
 }
 
 /// Rows on the UI page (vim mode, thinking, render-agent-markdown,
-/// render-user-markdown, mouse, rich-text-copy, name, packages dir,
-/// instructions file).
-pub(super) const UI_ROWS: usize = 9;
+/// render-user-markdown, mouse, rich-text-copy, emojis, name, packages
+/// dir, instructions file).
+pub(super) const UI_ROWS: usize = 10;
 
 pub(super) fn bool_label(on: bool, on_label: &str, off_label: &str) -> String {
     if on {
@@ -220,10 +220,14 @@ impl SettingsDialog {
                     p.status = save_status(self.save_extended());
                 }
                 6 => {
+                    self.extended.tui.use_emojis = !self.extended.tui.use_emojis;
+                    p.status = save_status(self.save_extended());
+                }
+                7 => {
                     p.buf = TextField::new(self.extended.name.clone().unwrap_or_default());
                     p.editing = Some(UiField::Name);
                 }
-                7 => {
+                8 => {
                     let cur = self
                         .extended
                         .packages_directory
@@ -233,7 +237,7 @@ impl SettingsDialog {
                     p.buf = TextField::new(cur);
                     p.editing = Some(UiField::PackagesDir);
                 }
-                8 => {
+                9 => {
                     return Nav::Replace(Page::Instructions(InstructionsPage {
                         cursor: 0,
                         grabbed: None,
@@ -258,7 +262,7 @@ impl SettingsDialog {
         )));
         lines.push(Line::default());
 
-        let rows: [(&str, String); 9] = [
+        let rows: [(&str, String); 10] = [
             (
                 "vim mode",
                 vim_label(self.extended.tui.vim_mode).to_string(),
@@ -297,6 +301,14 @@ impl SettingsDialog {
                     self.extended.tui.rich_text_copy,
                     "on (default — Ctrl+Shift+Y copies last agent message as rich text)",
                     "off (Ctrl+Shift+Y disabled)",
+                ),
+            ),
+            (
+                "emojis",
+                bool_label(
+                    self.extended.tui.use_emojis,
+                    "enabled (emoji glyphs in tool calls + splash)",
+                    "disabled (default — text-only; safe for terminals without emoji)",
                 ),
             ),
             (
@@ -436,7 +448,7 @@ impl SettingsDialog {
             KeyCode::Esc | KeyCode::Char('q') => return Nav::Close,
             KeyCode::Left | KeyCode::Backspace | KeyCode::Char('h') => {
                 return Nav::Replace(Page::Ui(UiPage {
-                    cursor: 8,
+                    cursor: 9,
                     editing: None,
                     buf: TextField::default(),
                     status: None,

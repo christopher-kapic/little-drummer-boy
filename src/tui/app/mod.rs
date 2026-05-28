@@ -38,7 +38,9 @@ use crate::git::{self, RepoStatus};
 use crate::tui::agent_runner::{self, AgentRunner};
 use crate::tui::composer::{Composer, VimMode, input_prefix_width};
 use crate::tui::geometry::PaneGeometry;
-use crate::tui::history::{HistoryEntry, MarkdownOpts, PendingMsg, route_text_delta};
+use crate::tui::history::{
+    HistoryEntry, MarkdownOpts, PendingMsg, ToolCall, ToolCallState, route_text_delta,
+};
 use crate::tui::settings::{self, Dialog};
 use crate::welcome::{self, LaunchInfo};
 
@@ -160,6 +162,9 @@ pub struct App {
     /// side-by-side → inline is per-render, computed from the
     /// rendered pane width.
     pub(super) diff_style: DiffStyle,
+    /// `tui.use_emojis`. Threaded into the history renderers so tool-call
+    /// boxes (and other glyphs) pick emoji vs. text-only labels.
+    pub(super) use_emojis: bool,
     /// Cached args from `ToolStart` for edit tools that need them at
     /// `ToolEnd` time (to build the `Diff` history entry). Keyed by
     /// `call_id`; entries are popped at `ToolEnd`. Anything left
@@ -262,6 +267,11 @@ pub struct App {
     /// lives there — or `None` for non-clickable rows. Refreshed every
     /// render.
     pub(super) clickable_rows: Vec<Option<usize>>,
+    /// Click/wheel hit map: for each *visible* chat row, the index
+    /// (within `self.history`) of the `ToolBox` rendered there, or
+    /// `None`. A wheel over a collapsed box scrolls the box; a click on
+    /// any box row toggles its expansion. Refreshed every render.
+    pub(super) box_rows: Vec<Option<usize>>,
     /// Last cursor-shape we asked the terminal to use. Tracked so we
     /// only re-issue the escape when the desired shape changes (most
     /// terminals tolerate redundant `SetCursorStyle` writes but a few
@@ -440,6 +450,7 @@ impl App {
         let mouse_capture = tui_cfg.mouse_capture;
         let exit_tail_lines = tui_cfg.exit_tail_lines;
         let rich_text_copy = tui_cfg.rich_text_copy;
+        let use_emojis = tui_cfg.use_emojis;
         let mut app = Self {
             launch,
             composer,
@@ -447,6 +458,7 @@ impl App {
             thinking_setting,
             markdown_opts,
             diff_style,
+            use_emojis,
             pending_edit_args: HashMap::new(),
             queue: Vec::new(),
             prompt_history: Vec::new(),
@@ -471,6 +483,7 @@ impl App {
             chat_text_grid: Vec::new(),
             chat_cont_rows: Vec::new(),
             clickable_rows: Vec::new(),
+            box_rows: Vec::new(),
             last_cursor_shape: None,
             at_selected: 0,
             at_scroll: 0,
@@ -799,6 +812,7 @@ impl App {
         self.queue.clear();
         self.pending = None;
         self.clickable_rows.clear();
+        self.box_rows.clear();
         self.chat_area = None;
         self.chat_text_grid.clear();
         self.chat_cont_rows.clear();
@@ -976,19 +990,59 @@ impl App {
                 ..
             } => {
                 self.finalize_pending();
+                // Edit tools render as a diff, which breaks the box. We
+                // wait for ToolEnd to push the `Diff` entry once we have
+                // the result.
                 if is_edit_tool(&tool) {
                     if let Some(captured) = extract_edit_args(&args) {
                         self.pending_edit_args.insert(call_id, captured);
-                        // Diff replaces both the placeholder and the
-                        // result line — wait for ToolEnd to push the
-                        // entry.
                         return;
                     }
                 }
-                let short = agent_runner::short_args(&args);
-                self.history.push(HistoryEntry::Plain {
-                    line: format!("  → {tool}({short})"),
-                });
+                let (summary, full_input) = tool_invocation(&tool, &args);
+                // Write tools are conceptually diffs too — render them as
+                // a standalone line that breaks the box (no diff body
+                // until the engine surfaces pre-write content).
+                if is_write_tool(&tool) {
+                    self.history.push(HistoryEntry::ToolLine {
+                        call_id,
+                        tool,
+                        summary,
+                        state: ToolCallState::Processing,
+                    });
+                    return;
+                }
+                let call = ToolCall {
+                    call_id,
+                    tool,
+                    summary,
+                    full_input,
+                    output: String::new(),
+                    state: ToolCallState::Processing,
+                };
+                // Append to the open box (a run of consecutive boxable
+                // calls), or start a new one. Anything non-boxable
+                // pushed since the last box (agent text, a diff, a write,
+                // a subagent) means `last` isn't a ToolBox, so the run
+                // restarts here.
+                if let Some(HistoryEntry::ToolBox {
+                    calls,
+                    view_offset,
+                    follow,
+                    ..
+                }) = self.history.last_mut()
+                {
+                    calls.push(call);
+                    *view_offset =
+                        crate::tui::history::toolbox_top(calls.len(), *view_offset, *follow);
+                } else {
+                    self.history.push(HistoryEntry::ToolBox {
+                        calls: vec![call],
+                        view_offset: 0,
+                        follow: true,
+                        expanded: false,
+                    });
+                }
             }
             TurnEvent::ToolEnd {
                 tool,
@@ -1006,26 +1060,36 @@ impl App {
                     });
                     return;
                 }
-                let snippet = agent_runner::first_line(&output, 200);
-                let mark = if truncated { " (truncated)" } else { "" };
-                self.history.push(HistoryEntry::Plain {
-                    line: format!("  ✓ {tool}: {snippet}{mark}"),
-                });
+                self.update_tool_state(&call_id, ToolCallState::Success, Some((output, truncated)));
             }
             TurnEvent::ToolError {
                 tool,
                 error,
                 call_id,
+                kind,
                 ..
             } => {
-                self.finalize_pending();
-                // Drop any cached args from a paired ToolStart that
-                // never produced a ToolEnd — the diff would be
-                // misleading on a hard failure.
+                // Drop any cached args from a paired ToolStart that never
+                // produced a ToolEnd — the diff would be misleading on a
+                // hard failure.
                 self.pending_edit_args.remove(&call_id);
-                self.history.push(HistoryEntry::Plain {
-                    line: format!("  ✗ {tool}: {error}"),
-                });
+                // Bold red when the model built the call badly; plain red
+                // when the tool failed for another reason.
+                let state = match kind {
+                    crate::engine::tool::ToolFailKind::Invocation => ToolCallState::BadCall,
+                    crate::engine::tool::ToolFailKind::Execution => ToolCallState::Failed,
+                };
+                if !self.update_tool_state(&call_id, state, Some((error.clone(), false))) {
+                    // No pending call to update (e.g. an edit/write tool
+                    // whose entry we never created) — leave a standalone
+                    // failed line so the error is still visible.
+                    self.history.push(HistoryEntry::ToolLine {
+                        call_id,
+                        tool,
+                        summary: agent_runner::first_line(&error, 200),
+                        state,
+                    });
+                }
             }
             TurnEvent::SubagentSpawned {
                 parent,
@@ -1053,6 +1117,50 @@ impl App {
     /// Computes `think_duration` from the gap between `started_at` and
     /// the first text delta — that's the *reasoning* time, not the
     /// total turn time.
+    /// Find the most-recent tool call with `call_id` — in a `ToolBox` or
+    /// a standalone `ToolLine` — and update its state. For output-bearing
+    /// box tools the output is stored as the expandable detail; input-
+    /// only tools (read/readlock/unlock) drop it so a big file read
+    /// doesn't sit in history. Returns whether a call was found.
+    pub(super) fn update_tool_state(
+        &mut self,
+        call_id: &str,
+        state: ToolCallState,
+        output: Option<(String, bool)>,
+    ) -> bool {
+        for entry in self.history.iter_mut().rev() {
+            match entry {
+                HistoryEntry::ToolBox { calls, .. } => {
+                    if let Some(call) = calls.iter_mut().rev().find(|c| c.call_id == call_id) {
+                        call.state = state;
+                        if let Some((out, truncated)) = output.as_ref()
+                            && crate::tui::history::tool_shows_output(&call.tool)
+                        {
+                            call.output = if *truncated {
+                                format!("{out}\n… (output truncated)")
+                            } else {
+                                out.clone()
+                            };
+                        }
+                        return true;
+                    }
+                }
+                HistoryEntry::ToolLine {
+                    call_id: cid,
+                    state: st,
+                    ..
+                } => {
+                    if cid == call_id {
+                        *st = state;
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
     pub(super) fn finalize_pending(&mut self) {
         let Some(mut p) = self.pending.take() else {
             return;
@@ -1355,16 +1463,29 @@ impl App {
         // each row.
         match mouse.kind {
             MouseEventKind::ScrollUp => {
-                if self.mouse_in_chat_area(&mouse) {
+                if let Some(area) = self.chat_area
+                    && self.mouse_in_chat_area(&mouse)
+                {
                     self.selection = None;
-                    self.scroll_chat_up(3);
+                    // A collapsed tool box under the cursor captures the
+                    // wheel until it hits its top; then the transcript
+                    // scrolls.
+                    let rel = (mouse.row - area.y) as usize;
+                    if !self.scroll_box_at_row(rel, true) {
+                        self.scroll_chat_up(3);
+                    }
                 }
                 return;
             }
             MouseEventKind::ScrollDown => {
-                if self.mouse_in_chat_area(&mouse) {
+                if let Some(area) = self.chat_area
+                    && self.mouse_in_chat_area(&mouse)
+                {
                     self.selection = None;
-                    self.scroll_chat_down(3);
+                    let rel = (mouse.row - area.y) as usize;
+                    if !self.scroll_box_at_row(rel, false) {
+                        self.scroll_chat_down(3);
+                    }
                 }
                 return;
             }
@@ -1441,6 +1562,14 @@ impl App {
             }
             return;
         }
+        // Click anywhere on a tool box toggles its expansion (per-block):
+        // expanded shows every call in full (and disables the internal
+        // scroll); collapsed returns to the windowed view.
+        if self.box_rows.get(rel).copied().flatten().is_some() {
+            self.selection = None;
+            self.toggle_box_at_row(rel);
+            return;
+        }
         // Non-chip chat row + left-down: start a fresh drag-select.
         // Anchor = focus = click point; mouse-drag will extend the
         // focus from here.
@@ -1492,6 +1621,80 @@ impl App {
     /// logical lines. Saturates at 0 (pinned to bottom = live).
     pub(super) fn scroll_chat_down(&mut self, n: usize) {
         self.chat_scroll_offset = self.chat_scroll_offset.saturating_sub(n);
+    }
+
+    /// If a *collapsed* `ToolBox` sits under chat-relative row `rel`,
+    /// advance its internal viewport by one call in `up`'s direction.
+    /// Returns `true` if it consumed the wheel (the box moved); `false`
+    /// to let the transcript scroll instead — so the box captures the
+    /// wheel only between its top and its newest call. Scrolling up
+    /// drops `follow`; scrolling back to the end restores it.
+    pub(super) fn scroll_box_at_row(&mut self, rel: usize, up: bool) -> bool {
+        let Some(Some(idx)) = self.box_rows.get(rel).copied() else {
+            return false;
+        };
+        let Some(HistoryEntry::ToolBox {
+            calls,
+            view_offset,
+            follow,
+            expanded,
+        }) = self.history.get_mut(idx)
+        else {
+            return false;
+        };
+        if *expanded {
+            return false;
+        }
+        let n = calls.len();
+        if n <= crate::tui::history::TOOLBOX_VISIBLE {
+            return false;
+        }
+        let max_offset = n - crate::tui::history::TOOLBOX_VISIBLE;
+        let cur = if *follow {
+            max_offset
+        } else {
+            (*view_offset).min(max_offset)
+        };
+        if up {
+            if cur == 0 {
+                return false;
+            }
+            *follow = false;
+            *view_offset = cur - 1;
+            true
+        } else {
+            if *follow {
+                return false;
+            }
+            let next = cur + 1;
+            if next >= max_offset {
+                *view_offset = max_offset;
+                *follow = true;
+            } else {
+                *view_offset = next;
+            }
+            true
+        }
+    }
+
+    /// Toggle the expansion of the `ToolBox` under chat-relative row
+    /// `rel`. Collapsing resumes `follow` so the newest calls show.
+    /// Returns whether a box was toggled.
+    pub(super) fn toggle_box_at_row(&mut self, rel: usize) -> bool {
+        let Some(Some(idx)) = self.box_rows.get(rel).copied() else {
+            return false;
+        };
+        if let Some(HistoryEntry::ToolBox {
+            expanded, follow, ..
+        }) = self.history.get_mut(idx)
+        {
+            *expanded = !*expanded;
+            if !*expanded {
+                *follow = true;
+            }
+            return true;
+        }
+        false
     }
 
     /// Translate an absolute mouse position into a `(line, col)` in
@@ -1663,6 +1866,7 @@ impl App {
         self.diff_style = tui_cfg.diff_style;
         self.exit_tail_lines = tui_cfg.exit_tail_lines;
         self.rich_text_copy = tui_cfg.rich_text_copy;
+        self.use_emojis = tui_cfg.use_emojis;
         // Note: mouse_capture is *not* synced here. The live terminal
         // state is reconciled via the dialog's pending-flag drain
         // (see sync_mouse_capture_from_dialog) so we don't reapply
@@ -1785,6 +1989,44 @@ impl App {
 /// Pull `(path, old, new)` out of an edit tool's args. Returns
 /// `None` when any field is missing; the caller falls back to the
 /// generic Plain rendering in that case.
+/// True for write tools rendered as a standalone line (they'd be diffs,
+/// but the engine doesn't surface pre-write content yet — see
+/// [`crate::tui::diff`]).
+fn is_write_tool(tool: &str) -> bool {
+    matches!(tool, "write" | "writeunlock")
+}
+
+/// `(collapsed_summary, full_input)` for a tool call. The summary is a
+/// single line (path, first line of a command, URL); `full_input` is the
+/// complete invocation text shown when a box is expanded.
+fn tool_invocation(tool: &str, args: &serde_json::Value) -> (String, String) {
+    let field = |k: &str| args.get(k).and_then(|v| v.as_str()).map(str::to_string);
+    match tool {
+        "bash" => {
+            let cmd = field("command").unwrap_or_default();
+            let first = cmd.lines().next().unwrap_or("").to_string();
+            let summary = if cmd.contains('\n') {
+                format!("{first} …")
+            } else {
+                first
+            };
+            (summary, cmd)
+        }
+        "read" | "readlock" | "unlock" | "write" | "writeunlock" | "edit" | "editunlock" => {
+            let p = field("path").unwrap_or_else(|| agent_runner::short_args(args));
+            (p.clone(), p)
+        }
+        "webfetch" => {
+            let u = field("url").unwrap_or_else(|| agent_runner::short_args(args));
+            (u.clone(), u)
+        }
+        _ => {
+            let s = agent_runner::short_args(args);
+            (s.clone(), s)
+        }
+    }
+}
+
 fn extract_edit_args(args: &serde_json::Value) -> Option<PendingEditArgs> {
     let path = args.get("path")?.as_str()?.to_string();
     let old = args.get("old_string")?.as_str()?.to_string();
@@ -1808,6 +2050,17 @@ fn new_pending(name: String) -> PendingMsg {
 fn entry_to_plain_lines(entry: &HistoryEntry) -> Vec<String> {
     match entry {
         HistoryEntry::Plain { line } => vec![line.clone()],
+        HistoryEntry::ToolLine { tool, summary, .. } => {
+            let (_, label) = crate::tui::history::tool_glyph_label(tool, false);
+            vec![format!("  {label}: {summary}")]
+        }
+        HistoryEntry::ToolBox { calls, .. } => calls
+            .iter()
+            .map(|c| {
+                let (_, label) = crate::tui::history::tool_glyph_label(&c.tool, false);
+                format!("  {label}: {}", c.summary)
+            })
+            .collect(),
         HistoryEntry::Diff {
             tool,
             path,

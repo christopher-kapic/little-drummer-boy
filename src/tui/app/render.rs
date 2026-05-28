@@ -130,6 +130,10 @@ impl App {
         for entry in &self.history {
             total = total.saturating_add(match entry {
                 HistoryEntry::Plain { .. } => 1,
+                HistoryEntry::ToolLine { .. } => 2, // line + trailing gap
+                HistoryEntry::ToolBox {
+                    calls, expanded, ..
+                } => toolbox_row_estimate(calls, *expanded).saturating_add(1),
                 HistoryEntry::Diff { old, new, .. } => diff_row_estimate(old, new),
                 HistoryEntry::User { text, .. } => {
                     let body = text.matches('\n').count() as u16 + 1;
@@ -300,6 +304,10 @@ impl App {
         // the chip row toggles on click — body rows stay open for
         // drag-select.
         let mut targets: Vec<Option<usize>> = Vec::new();
+        // `box_targets[i]` carries the history index of the `ToolBox`
+        // that owns row `i` of `all`, else `None`. Drives wheel capture
+        // (scroll the box, not the transcript) and click-to-expand.
+        let mut box_targets: Vec<Option<usize>> = Vec::new();
         // `conts[i]` is `true` when row `i` of `all` is a soft-wrap
         // continuation of the prior logical line.
         let mut conts: Vec<bool> = Vec::new();
@@ -314,14 +322,17 @@ impl App {
                 self.thinking_setting,
                 self.markdown_opts,
                 self.diff_style,
+                self.use_emojis,
             );
             let chip_abs = chip_row.map(|cr| all.len() + cr);
+            let is_box = matches!(entry, HistoryEntry::ToolBox { .. });
             for i in 0..lines.len() {
                 targets.push(if Some(all.len() + i) == chip_abs {
                     Some(idx)
                 } else {
                     None
                 });
+                box_targets.push(if is_box { Some(idx) } else { None });
             }
             // Each entry's renderer returns one bool per emitted line;
             // pad if there's any mismatch (defensive — shouldn't
@@ -330,23 +341,23 @@ impl App {
             entry_conts.resize(lines.len(), false);
             conts.extend(entry_conts);
             all.extend(lines);
-            // Insert a one-line gap after agent entries to separate from
-            // the next user message or pending turn. Skip consecutive
-            // agents so multi-turn blocks read as a single block.
-            if matches!(entry, HistoryEntry::User { .. }) {
-                all.push(Line::default());
-                targets.push(None);
-                conts.push(false);
-            } else if matches!(entry, HistoryEntry::Agent { .. }) {
-                let prev_is_agent = idx
+            // One-line gap after a block so it separates from what
+            // follows. Consecutive agents share a block (no gap between).
+            let gap = match entry {
+                HistoryEntry::User { .. }
+                | HistoryEntry::ToolBox { .. }
+                | HistoryEntry::ToolLine { .. } => true,
+                HistoryEntry::Agent { .. } => !idx
                     .checked_sub(1)
                     .map(|i| matches!(self.history[i], HistoryEntry::Agent { .. }))
-                    .unwrap_or(false);
-                if !prev_is_agent {
-                    all.push(Line::default());
-                    targets.push(None);
-                    conts.push(false);
-                }
+                    .unwrap_or(false),
+                _ => false,
+            };
+            if gap {
+                all.push(Line::default());
+                targets.push(None);
+                box_targets.push(None);
+                conts.push(false);
             }
         }
         if let Some(pending) = &self.pending {
@@ -354,6 +365,7 @@ impl App {
             let pending_lines = render_pending(pending, dots, area.width);
             for _ in 0..pending_lines.len() {
                 targets.push(None);
+                box_targets.push(None);
                 conts.push(false);
             }
             all.extend(pending_lines);
@@ -374,27 +386,32 @@ impl App {
         // Bottom-align the visible window over `all`, then walk back by
         // `chat_scroll_offset` logical lines so the user can scroll up
         // into history with the wheel (T8.f wheel-scroll path).
-        let (visible, visible_targets, visible_conts): (
+        let (visible, visible_targets, visible_box, visible_conts): (
             Vec<Line<'static>>,
+            Vec<Option<usize>>,
             Vec<Option<usize>>,
             Vec<bool>,
         ) = if all.len() < area_h {
             let pad = area_h - all.len();
             let mut v: Vec<Line<'static>> = (0..pad).map(|_| Line::default()).collect();
             let mut t: Vec<Option<usize>> = (0..pad).map(|_| None).collect();
+            let mut b: Vec<Option<usize>> = (0..pad).map(|_| None).collect();
             let mut c: Vec<bool> = (0..pad).map(|_| false).collect();
             v.extend(all);
             t.extend(targets);
+            b.extend(box_targets);
             c.extend(conts);
-            (v, t, c)
+            (v, t, b, c)
         } else {
             let drop = all.len() - area_h - self.chat_scroll_offset;
             let v: Vec<Line<'static>> = all.into_iter().skip(drop).take(area_h).collect();
             let t: Vec<Option<usize>> = targets.into_iter().skip(drop).take(area_h).collect();
+            let b: Vec<Option<usize>> = box_targets.into_iter().skip(drop).take(area_h).collect();
             let c: Vec<bool> = conts.into_iter().skip(drop).take(area_h).collect();
-            (v, t, c)
+            (v, t, b, c)
         };
         self.clickable_rows = visible_targets;
+        self.box_rows = visible_box;
         self.chat_cont_rows = visible_conts;
 
         frame.render_widget(Paragraph::new(visible).wrap(Wrap { trim: false }), area);
@@ -585,6 +602,11 @@ impl App {
             tokens += match entry {
                 HistoryEntry::User { text, .. } => crate::tokens::count(text),
                 HistoryEntry::Plain { line } => crate::tokens::count(line),
+                HistoryEntry::ToolLine { summary, .. } => crate::tokens::count(summary),
+                HistoryEntry::ToolBox { calls, .. } => calls
+                    .iter()
+                    .map(|c| crate::tokens::count(&c.summary) + crate::tokens::count(&c.output))
+                    .sum(),
                 HistoryEntry::Diff { old, new, .. } => {
                     crate::tokens::count(old) + crate::tokens::count(new)
                 }
@@ -924,6 +946,10 @@ pub(super) fn extract_selection_plaintext(
 fn entry_rendered_rows(entry: &HistoryEntry) -> u16 {
     match entry {
         HistoryEntry::Plain { .. } => 1,
+        HistoryEntry::ToolLine { .. } => 1,
+        HistoryEntry::ToolBox {
+            calls, expanded, ..
+        } => toolbox_row_estimate(calls, *expanded),
         HistoryEntry::Diff { old, new, .. } => diff_row_estimate(old, new),
         HistoryEntry::User { text, .. } => (text.matches('\n').count() as u16 + 1) + 2,
         HistoryEntry::Agent {
@@ -1081,4 +1107,22 @@ pub(super) fn diff_row_estimate(old: &str, new: &str) -> u16 {
     let old_lines = old.matches('\n').count() as u16 + 1;
     let new_lines = new.matches('\n').count() as u16 + 1;
     old_lines.saturating_add(new_lines).saturating_add(1) // +1 for header
+}
+
+/// Approximate rendered row count for a `ToolBox`. Collapsed caps at
+/// [`crate::tui::history::TOOLBOX_VISIBLE`]; expanded sums each call's
+/// input + (non-empty) output lines. Mirrors `render_toolbox`.
+pub(super) fn toolbox_row_estimate(calls: &[crate::tui::history::ToolCall], expanded: bool) -> u16 {
+    use crate::tui::history::TOOLBOX_VISIBLE;
+    if !expanded {
+        return (calls.len().min(TOOLBOX_VISIBLE).max(1)) as u16;
+    }
+    let mut rows: u16 = 0;
+    for c in calls {
+        rows = rows.saturating_add(c.full_input.matches('\n').count() as u16 + 1);
+        if !c.output.is_empty() {
+            rows = rows.saturating_add(c.output.matches('\n').count() as u16 + 1);
+        }
+    }
+    rows.max(1)
 }

@@ -233,6 +233,12 @@ pub struct TuiConfig {
     /// the dump entirely; `-1` dumps the whole session.
     #[serde(default = "default_exit_tail_lines")]
     pub exit_tail_lines: i32,
+    /// Use emoji glyphs in the chat (tool-call boxes, the rooster
+    /// splash, …). Default off — many terminals can't render emoji and
+    /// show tofu boxes instead, so cockpit ships text-only and lets the
+    /// user opt in.
+    #[serde(default)]
+    pub use_emojis: bool,
 }
 
 fn default_exit_tail_lines() -> i32 {
@@ -386,6 +392,7 @@ impl Default for TuiConfig {
             mouse_capture: true,
             rich_text_copy: true,
             exit_tail_lines: default_exit_tail_lines(),
+            use_emojis: false,
         }
     }
 }

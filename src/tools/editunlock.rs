@@ -62,15 +62,15 @@ impl Tool for EditunlockTool {
         let path_arg = args
             .get("path")
             .and_then(Value::as_str)
-            .ok_or_else(|| anyhow::anyhow!("`path` is required"))?;
+            .ok_or_else(|| crate::engine::tool::invalid_input("`path` is required"))?;
         let old_string = args
             .get("old_string")
             .and_then(Value::as_str)
-            .ok_or_else(|| anyhow::anyhow!("`old_string` is required"))?;
+            .ok_or_else(|| crate::engine::tool::invalid_input("`old_string` is required"))?;
         let new_string = args
             .get("new_string")
             .and_then(Value::as_str)
-            .ok_or_else(|| anyhow::anyhow!("`new_string` is required"))?;
+            .ok_or_else(|| crate::engine::tool::invalid_input("`new_string` is required"))?;
         let replace_all = args
             .get("replace_all")
             .and_then(Value::as_bool)
@@ -90,10 +90,10 @@ impl Tool for EditunlockTool {
             None => {
                 // Total miss — write nothing, return a near-miss diagnostic.
                 let near = nearest_miss(&original, old_string);
-                bail!(
+                return Err(crate::engine::tool::invalid_input(format!(
                     "no match for `old_string` in `{}`. Closest near-miss:\n```\n{near}\n```",
                     path.display()
-                );
+                )));
             }
         };
 
@@ -163,9 +163,9 @@ fn find_match(file: &str, target: &str, replace_all: bool) -> Result<Option<Matc
     if file.contains(target) {
         let count = file.matches(target).count();
         if !replace_all && count > 1 {
-            bail!(
-                "Found multiple matches for `old_string`; pass more surrounding context or set replace_all: true"
-            );
+            return Err(crate::engine::tool::invalid_input(
+                "Found multiple matches for `old_string`; pass more surrounding context or set replace_all: true",
+            ));
         }
         return Ok(Some(Match {
             canonical: target.to_string(),
@@ -275,9 +275,9 @@ fn match_via_normalizer(
         if norm == norm_target {
             hits.push(cand_for_compare);
             if hits.len() > 1 && !replace_all {
-                bail!(
-                    "Found multiple matches for `old_string` at normalized stage; pass more surrounding context or set replace_all: true"
-                );
+                return Err(crate::engine::tool::invalid_input(
+                    "Found multiple matches for `old_string` at normalized stage; pass more surrounding context or set replace_all: true",
+                ));
             }
         }
     }

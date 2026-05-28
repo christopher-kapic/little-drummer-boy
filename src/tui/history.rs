@@ -63,7 +63,78 @@ pub enum HistoryEntry {
         old: String,
         new: String,
     },
+    /// A run of consecutive boxable tool calls (read, readlock, unlock,
+    /// bash, webfetch, …) rendered inside a light-grey rounded sidebar.
+    /// Diff tools (edit/editunlock), write tools, and subagent calls
+    /// break the run, so a box never holds them. The collapsed view
+    /// shows at most [`TOOLBOX_VISIBLE`] calls with an internal scroll;
+    /// a click expands it to show every call in full.
+    ToolBox {
+        calls: Vec<ToolCall>,
+        /// Topmost visible call in collapsed mode. Ignored while
+        /// `follow` or `expanded`.
+        view_offset: usize,
+        /// Collapsed viewport auto-pins to the newest call as calls
+        /// stream in. Cleared when the user scrolls up; restored when
+        /// they scroll back to the end.
+        follow: bool,
+        /// Click-expanded: render every call in full (input + output for
+        /// output-bearing tools) and disable the internal scroll.
+        expanded: bool,
+    },
+    /// A standalone tool call rendered as one styled line outside any
+    /// box. Used for `write` / `writeunlock`: conceptually diffs that
+    /// break the box, but the engine doesn't surface pre-write file
+    /// content yet (see [`crate::tui::diff`]), so they render as a
+    /// one-liner until that lands.
+    ToolLine {
+        call_id: String,
+        tool: String,
+        summary: String,
+        state: ToolCallState,
+    },
 }
+
+/// Lifecycle state of one tool call. Drives the line color: yellow
+/// while the model waits, white on success, red when the tool failed,
+/// bold red when the model built the call badly (unrecoverable).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolCallState {
+    /// The model is waiting on the tool — yellow.
+    Processing,
+    /// Completed successfully — white.
+    Success,
+    /// The tool ran but failed for an environmental reason — red.
+    Failed,
+    /// The model constructed the call badly; unrecoverable — bold red.
+    BadCall,
+}
+
+/// One tool call inside a [`HistoryEntry::ToolBox`].
+#[derive(Debug, Clone)]
+pub struct ToolCall {
+    pub call_id: String,
+    pub tool: String,
+    /// One-line collapsed summary: a path, the first line of a bash
+    /// command, a URL, … Truncated to the pane width at render time.
+    pub summary: String,
+    /// Full invocation text for the expanded view (e.g. a multi-line
+    /// bash command). Equal to `summary` for single-line calls.
+    pub full_input: String,
+    /// Full tool output, shown only when the box is expanded *and* the
+    /// tool is output-bearing. Empty for input-only tools.
+    pub output: String,
+    pub state: ToolCallState,
+}
+
+/// Max tool-call rows a collapsed [`HistoryEntry::ToolBox`] shows
+/// before it scrolls internally.
+pub const TOOLBOX_VISIBLE: usize = 6;
+
+/// Light grey for the tool-box sidebar (xterm 256-color).
+const SIDEBAR_FG: Color = Color::Indexed(244);
+/// Dim grey for expanded tool output lines.
+const TOOL_OUTPUT_FG: Color = Color::Indexed(245);
 
 /// In-flight assistant turn. Lives in `App.pending` from
 /// `ThinkingStarted` to `AssistantText`; once finalized it gets pushed
@@ -190,6 +261,7 @@ pub fn render_entry(
     thinking: ThinkingDisplay,
     md: MarkdownOpts,
     diff_style: crate::config::extended::DiffStyle,
+    emojis: bool,
 ) -> Rendered {
     match entry {
         HistoryEntry::User { text, timestamp } => {
@@ -212,12 +284,41 @@ pub fn render_entry(
             old,
             new,
         } => {
-            let lines = crate::tui::diff::render_diff(tool, path, old, new, diff_style, width);
+            let lines =
+                crate::tui::diff::render_diff(tool, path, old, new, diff_style, width, emojis);
             let continuations = vec![false; lines.len()];
             Rendered {
                 lines,
                 chip_row: None,
                 continuations,
+            }
+        }
+        HistoryEntry::ToolBox {
+            calls,
+            view_offset,
+            follow,
+            expanded,
+        } => render_toolbox(calls, *view_offset, *follow, *expanded, width, emojis),
+        HistoryEntry::ToolLine {
+            tool,
+            summary,
+            state,
+            ..
+        } => {
+            // Standalone styled one-liner, indented to align with box
+            // content (the box's sidebar+space is 2 cells wide).
+            let avail = tool_summary_budget(tool, width as usize, 2, emojis);
+            let mut spans = vec![Span::raw("  ".to_string())];
+            spans.extend(tool_call_spans(
+                tool,
+                &truncate(summary, avail),
+                *state,
+                emojis,
+            ));
+            Rendered {
+                lines: vec![Line::from(spans)],
+                chip_row: None,
+                continuations: vec![false],
             }
         }
         HistoryEntry::Agent {
@@ -650,6 +751,195 @@ fn render_agent(
         lines: out,
         chip_row,
         continuations: conts,
+    }
+}
+
+/// `(glyph, label)` for a tool's rendered line. `glyph` is an emoji
+/// with a trailing space when `emojis` is on, empty otherwise; `label`
+/// is the verb shown bold before the `:`. With emojis on, the lock /
+/// unlock emoji conveys the lock state so the lock variants collapse to
+/// the base verb (`readlock` → `read`); with emojis off the full tool
+/// name is kept so the lock state stays legible.
+pub fn tool_glyph_label(tool: &str, emojis: bool) -> (String, String) {
+    let (glyph, label): (&str, &str) = match tool {
+        "bash" => ("⚙️", "bash"),
+        "read" => ("📖", "read"),
+        "readlock" => ("🔒", if emojis { "read" } else { "readlock" }),
+        "unlock" => ("🔓", "unlock"),
+        "write" => ("🖋️", "write"),
+        "writeunlock" => ("🔓", if emojis { "write" } else { "writeunlock" }),
+        "edit" => ("🖋️", "edit"),
+        "editunlock" => ("🔓", if emojis { "edit" } else { "editunlock" }),
+        other => ("", other),
+    };
+    let glyph = if emojis && !glyph.is_empty() {
+        format!("{glyph} ")
+    } else {
+        String::new()
+    };
+    (glyph, label.to_string())
+}
+
+fn tool_state_style(state: ToolCallState) -> Style {
+    match state {
+        ToolCallState::Processing => Style::default().fg(Color::Yellow),
+        ToolCallState::Success => Style::default().fg(Color::White),
+        ToolCallState::Failed => Style::default().fg(Color::Red),
+        ToolCallState::BadCall => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+    }
+}
+
+/// Tools whose output is worth showing when a box is expanded. Input-
+/// only tools (read/readlock/unlock) never show output — the user can
+/// open the file themselves. Public so the event handler can avoid
+/// storing large outputs it will never display.
+pub fn tool_shows_output(tool: &str) -> bool {
+    !matches!(tool, "read" | "readlock" | "unlock")
+}
+
+/// Spans for one tool-call line: `[glyph] label: summary`, the label
+/// bold and the whole line tinted by `state`.
+fn tool_call_spans(
+    tool: &str,
+    text: &str,
+    state: ToolCallState,
+    emojis: bool,
+) -> Vec<Span<'static>> {
+    let (glyph, label) = tool_glyph_label(tool, emojis);
+    let style = tool_state_style(state);
+    let mut spans = Vec::new();
+    if !glyph.is_empty() {
+        spans.push(Span::raw(glyph));
+    }
+    spans.push(Span::styled(
+        format!("{label}:"),
+        style.add_modifier(Modifier::BOLD),
+    ));
+    if !text.is_empty() {
+        spans.push(Span::raw(" ".to_string()));
+        spans.push(Span::styled(text.to_string(), style));
+    }
+    spans
+}
+
+/// Chars available for a collapsed summary after the left `indent`, the
+/// glyph, the bold `label`, and the `": "` separator.
+fn tool_summary_budget(tool: &str, width: usize, indent: usize, emojis: bool) -> usize {
+    let (glyph, label) = tool_glyph_label(tool, emojis);
+    let prefix = indent + glyph.chars().count() + label.chars().count() + 2;
+    width.saturating_sub(prefix).max(8)
+}
+
+/// Truncate `s` to `max` columns with a trailing `…` when it overflows.
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
+/// Topmost visible call index for a collapsed [`HistoryEntry::ToolBox`].
+/// `follow` pins to the last [`TOOLBOX_VISIBLE`] calls; otherwise the
+/// stored `view_offset` (clamped) wins. Public so the scroll handler
+/// can compute the same window.
+pub fn toolbox_top(len: usize, view_offset: usize, follow: bool) -> usize {
+    if len <= TOOLBOX_VISIBLE {
+        return 0;
+    }
+    let max_offset = len - TOOLBOX_VISIBLE;
+    if follow {
+        max_offset
+    } else {
+        view_offset.min(max_offset)
+    }
+}
+
+/// Left sidebar glyph for row `i` of an `n`-row box: rounded caps top
+/// and bottom, a plain rule in between, a single rule for a 1-row box.
+fn sidebar_glyph(i: usize, n: usize) -> char {
+    if n <= 1 {
+        '│'
+    } else if i == 0 {
+        '╭'
+    } else if i + 1 == n {
+        '╰'
+    } else {
+        '│'
+    }
+}
+
+/// Render a [`HistoryEntry::ToolBox`]: a light-grey rounded sidebar with
+/// the tool-call lines inside it. Collapsed shows up to
+/// [`TOOLBOX_VISIBLE`] calls (windowed by scroll/follow); expanded shows
+/// every call in full, including input + output for output-bearing
+/// tools.
+fn render_toolbox(
+    calls: &[ToolCall],
+    view_offset: usize,
+    follow: bool,
+    expanded: bool,
+    width: u16,
+    emojis: bool,
+) -> Rendered {
+    let mut content: Vec<Vec<Span<'static>>> = Vec::new();
+
+    if expanded {
+        for call in calls {
+            let input_lines: Vec<&str> = call.full_input.split('\n').collect();
+            let first = input_lines.first().copied().unwrap_or("");
+            content.push(tool_call_spans(&call.tool, first, call.state, emojis));
+            for cont in input_lines.iter().skip(1) {
+                content.push(vec![Span::styled(
+                    (*cont).to_string(),
+                    tool_state_style(call.state),
+                )]);
+            }
+            if tool_shows_output(&call.tool) && !call.output.is_empty() {
+                for out_line in call.output.split('\n') {
+                    content.push(vec![Span::styled(
+                        format!("    {out_line}"),
+                        Style::default().fg(TOOL_OUTPUT_FG),
+                    )]);
+                }
+            }
+        }
+    } else {
+        let top = toolbox_top(calls.len(), view_offset, follow);
+        for call in calls.iter().skip(top).take(TOOLBOX_VISIBLE) {
+            let budget = tool_summary_budget(&call.tool, width as usize, 2, emojis);
+            content.push(tool_call_spans(
+                &call.tool,
+                &truncate(&call.summary, budget),
+                call.state,
+                emojis,
+            ));
+        }
+    }
+
+    if content.is_empty() {
+        content.push(Vec::new());
+    }
+
+    let n = content.len();
+    let mut out: Vec<Line<'static>> = Vec::with_capacity(n);
+    for (i, mut spans) in content.into_iter().enumerate() {
+        let mut row = vec![
+            Span::styled(
+                sidebar_glyph(i, n).to_string(),
+                Style::default().fg(SIDEBAR_FG),
+            ),
+            Span::raw(" ".to_string()),
+        ];
+        row.append(&mut spans);
+        out.push(Line::from(row));
+    }
+    let continuations = vec![false; out.len()];
+    Rendered {
+        lines: out,
+        chip_row: None,
+        continuations,
     }
 }
 
@@ -1155,5 +1445,97 @@ mod tests {
         let tail = tail.expect("has tail");
         assert!(head.iter().any(|s| s.style == bold));
         assert!(tail.iter().any(|s| s.style == bold));
+    }
+
+    // ── tool box ──────────────────────────────────────────────────────
+
+    fn mk_call(tool: &str, summary: &str, state: ToolCallState) -> ToolCall {
+        ToolCall {
+            call_id: "id".into(),
+            tool: tool.into(),
+            summary: summary.into(),
+            full_input: summary.into(),
+            output: String::new(),
+            state,
+        }
+    }
+
+    fn line_text(line: &Line<'static>) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn glyph_label_collapses_lock_variants_only_with_emoji() {
+        // Emoji on: the lock/unlock emoji carries the lock state, so the
+        // label collapses to the base verb.
+        assert_eq!(tool_glyph_label("readlock", true).1, "read");
+        assert_eq!(tool_glyph_label("writeunlock", true).1, "write");
+        // Emoji off: keep the full tool name so the lock state is legible.
+        assert_eq!(tool_glyph_label("readlock", false).1, "readlock");
+        assert_eq!(tool_glyph_label("writeunlock", false).1, "writeunlock");
+        // A glyph only appears when emojis are enabled.
+        assert!(tool_glyph_label("bash", false).0.is_empty());
+        assert!(!tool_glyph_label("bash", true).0.is_empty());
+    }
+
+    #[test]
+    fn toolbox_top_follows_and_clamps() {
+        // <= visible: always pinned to the start.
+        assert_eq!(toolbox_top(3, 0, true), 0);
+        assert_eq!(toolbox_top(3, 5, false), 0);
+        // Following pins to the last window.
+        assert_eq!(toolbox_top(10, 0, true), 10 - TOOLBOX_VISIBLE);
+        // Not following: the stored offset wins, clamped to the max.
+        assert_eq!(toolbox_top(10, 2, false), 2);
+        assert_eq!(toolbox_top(10, 99, false), 10 - TOOLBOX_VISIBLE);
+    }
+
+    #[test]
+    fn toolbox_collapsed_caps_at_visible_with_rounded_caps() {
+        let calls: Vec<ToolCall> = (0..9)
+            .map(|i| mk_call("bash", &format!("cmd{i}"), ToolCallState::Success))
+            .collect();
+        let r = render_toolbox(&calls, 0, true, false, 80, false);
+        assert_eq!(r.lines.len(), TOOLBOX_VISIBLE);
+        // Rounded caps top and bottom; in between the newest calls show.
+        assert!(line_text(&r.lines[0]).starts_with('╭'));
+        assert!(line_text(&r.lines[TOOLBOX_VISIBLE - 1]).starts_with('╰'));
+        assert!(line_text(&r.lines[0]).contains("cmd3")); // 9 - 6
+        assert!(line_text(&r.lines[TOOLBOX_VISIBLE - 1]).contains("cmd8"));
+    }
+
+    #[test]
+    fn toolbox_processing_call_is_yellow() {
+        let calls = vec![mk_call("bash", "build", ToolCallState::Processing)];
+        let r = render_toolbox(&calls, 0, true, false, 80, false);
+        assert!(
+            r.lines[0]
+                .spans
+                .iter()
+                .any(|s| s.style.fg == Some(Color::Yellow))
+        );
+    }
+
+    #[test]
+    fn toolbox_expanded_shows_output_only_for_output_bearing_tools() {
+        let mut bash = mk_call("bash", "ls", ToolCallState::Success);
+        bash.output = "file_a\nfile_b".into();
+        let mut read = mk_call("read", "f.txt", ToolCallState::Success);
+        read.output = "SHOULD_NOT_SHOW".into(); // input-only — never displayed
+        let r = render_toolbox(&[bash, read], 0, true, true, 80, false);
+        let joined = r.lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(joined.contains("file_a") && joined.contains("file_b"));
+        assert!(!joined.contains("SHOULD_NOT_SHOW"));
+    }
+
+    #[test]
+    fn toolbox_honors_emoji_setting() {
+        let calls = vec![mk_call("read", "f.txt", ToolCallState::Success)];
+        assert!(
+            !line_text(&render_toolbox(&calls, 0, true, false, 80, false).lines[0]).contains('📖')
+        );
+        assert!(
+            line_text(&render_toolbox(&calls, 0, true, false, 80, true).lines[0]).contains('📖')
+        );
     }
 }
