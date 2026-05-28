@@ -28,6 +28,7 @@ pub mod question;
 pub mod read;
 pub mod readlock;
 pub mod sandbox;
+pub mod shell_sandbox;
 pub mod skill;
 pub mod task;
 pub mod unlock;

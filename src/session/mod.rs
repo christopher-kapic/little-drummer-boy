@@ -41,6 +41,21 @@ pub struct Session {
     pub project_root: PathBuf,
     pub started_at: DateTime<Utc>,
     pub db: Db,
+    /// Private per-session tmp dir under the system temp location
+    /// (sandboxing part 2). Read+write inside the sandboxed shell and
+    /// counted as "inside the boundary" for native-tool path checks, so
+    /// sessions can't read each other's tmp. Created lazily on first
+    /// [`Self::tmp_dir`] access; removed on [`Self::end`] and on drop.
+    /// `Mutex<Option<…>>` so creation is one-shot and `end()` can take it.
+    tmp_dir: Mutex<Option<PathBuf>>,
+    /// Whether filesystem sandboxing is active for this session
+    /// (sandboxing part 2). Resolved at spawn time by the precedence
+    /// daemon-`--no-sandbox` → client-`--no-sandbox` → ON
+    /// ([`Self::set_sandbox_enabled`]); flipped at runtime by the
+    /// `/sandbox` slash command. Read per tool call via
+    /// [`Self::sandbox_enabled`]; effective immediately. Default `true`
+    /// (sandboxing on) until the spawn path resolves the precedence.
+    sandbox_enabled: std::sync::atomic::AtomicBool,
     /// 6-char human-display id, unique within `project_id`
     /// (GOALS §17b). Populated at create-time; backfilled lazily for
     /// pre-§17 rows on [`Session::resume`].
@@ -153,7 +168,55 @@ impl Session {
             last_send_at: Mutex::new(None),
             pinned_messages: Mutex::new(Vec::new()),
             calibrator: Mutex::new(crate::tokens::Calibrator::new()),
+            tmp_dir: Mutex::new(None),
+            sandbox_enabled: std::sync::atomic::AtomicBool::new(true),
         })
+    }
+
+    /// Whether filesystem sandboxing is active for this session right now
+    /// (sandboxing part 2). Read per tool call.
+    pub fn sandbox_enabled(&self) -> bool {
+        self.sandbox_enabled.load(Ordering::Relaxed)
+    }
+
+    /// Set the session's sandbox-enabled flag. Used by the spawn path to
+    /// apply the daemon → client → ON precedence, and by the `/sandbox`
+    /// slash command to flip it at runtime. Returns the new state.
+    pub fn set_sandbox_enabled(&self, enabled: bool) -> bool {
+        self.sandbox_enabled.store(enabled, Ordering::Relaxed);
+        enabled
+    }
+
+    /// Toggle the sandbox-enabled flag (`/sandbox` with no argument).
+    /// Returns the new state.
+    pub fn toggle_sandbox_enabled(&self) -> bool {
+        let new = !self.sandbox_enabled();
+        self.set_sandbox_enabled(new)
+    }
+
+    /// The session's private tmp dir (sandboxing part 2), creating it on
+    /// first access under `<system temp>/cockpit-session-<id>`. Sandboxed
+    /// shells get read+write here, and native-tool path checks treat it
+    /// as inside the boundary. Returns `None` only if the directory can't
+    /// be created (a degraded but non-fatal state: native checks then
+    /// fall back to cwd-only, and the shell sandbox simply omits the tmp
+    /// allow entry).
+    pub fn tmp_dir(&self) -> Option<PathBuf> {
+        let mut slot = self.tmp_dir.lock().unwrap();
+        if let Some(dir) = slot.as_ref() {
+            return Some(dir.clone());
+        }
+        let dir = std::env::temp_dir().join(format!("cockpit-session-{}", self.id));
+        match std::fs::create_dir_all(&dir) {
+            Ok(()) => {
+                *slot = Some(dir.clone());
+                Some(dir)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, dir = %dir.display(), "creating session tmp dir failed");
+                None
+            }
+        }
     }
 
     /// Manually set the session's title. Locks out the auto-titling
@@ -270,9 +333,24 @@ impl Session {
     }
 
     /// End the session — sets `ended_at` in the DB. Doesn't drop the
-    /// row; history stays queryable via `cockpit session list`.
+    /// row; history stays queryable via `cockpit session list`. Also
+    /// removes the per-session tmp dir (sandboxing part 2): a session's
+    /// scratch space doesn't outlive it.
     pub fn end(&self) -> Result<()> {
+        self.remove_tmp_dir();
         self.db.end_session(self.id).context("ending session")
+    }
+
+    /// Remove the per-session tmp dir if one was created. Idempotent.
+    /// Best-effort: a removal failure is logged, never propagated — it
+    /// must not block session teardown.
+    fn remove_tmp_dir(&self) {
+        if let Some(dir) = self.tmp_dir.lock().unwrap().take()
+            && let Err(e) = std::fs::remove_dir_all(&dir)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(error = %e, dir = %dir.display(), "removing session tmp dir failed");
+        }
     }
 
     /// Append one tool-call audit row to the §15b table.
@@ -511,6 +589,16 @@ impl Session {
             }
             *cal = crate::tokens::Calibrator::new();
         }
+    }
+}
+
+impl Drop for Session {
+    /// Backstop tmp cleanup (sandboxing part 2): if a session is dropped
+    /// without an explicit [`Self::end`] (e.g. an `Arc` ref-count hits
+    /// zero on a teardown path that didn't end it), still remove the
+    /// scratch dir so it doesn't linger across daemon restarts.
+    fn drop(&mut self) {
+        self.remove_tmp_dir();
     }
 }
 

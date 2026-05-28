@@ -171,14 +171,28 @@ impl StatsPane {
                 self.requery();
             }
             KeyCode::Up | KeyCode::Char('k') => {
-                self.cursor = self.cursor.saturating_sub(1);
-                self.scroll = self.scroll.saturating_sub(1);
+                let n = self.recovery_rows();
+                let prev = self.cursor;
+                self.cursor = crate::tui::nav::wrap_prev(self.cursor, n);
+                if self.cursor > prev {
+                    // Wrapped first → last: jump the body to the bottom so
+                    // the now-selected last row is visible.
+                    self.scroll = self.last_content_rows.saturating_sub(self.last_body_height);
+                } else {
+                    self.scroll = self.scroll.saturating_sub(1);
+                }
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                let max = self.recovery_rows().saturating_sub(1);
-                self.cursor = (self.cursor + 1).min(max);
-                let max_scroll = self.last_content_rows.saturating_sub(self.last_body_height);
-                self.scroll = (self.scroll + 1).min(max_scroll);
+                let n = self.recovery_rows();
+                let prev = self.cursor;
+                self.cursor = crate::tui::nav::wrap_next(self.cursor, n);
+                if self.cursor < prev {
+                    // Wrapped last → first: jump the body to the top.
+                    self.scroll = 0;
+                } else {
+                    let max_scroll = self.last_content_rows.saturating_sub(self.last_body_height);
+                    self.scroll = (self.scroll + 1).min(max_scroll);
+                }
             }
             KeyCode::PageUp => {
                 self.scroll = self.scroll.saturating_sub(self.last_body_height.max(1));
@@ -832,7 +846,7 @@ mod tests {
     }
 
     #[test]
-    fn cursor_moves_and_clamps() {
+    fn cursor_moves_and_wraps() {
         let mut rollup = empty_rollup();
         rollup.recovery.by_model = vec![
             RecoveryRow {
@@ -858,12 +872,12 @@ mod tests {
         assert_eq!(pane.cursor, 0);
         pane.handle_key(press(KeyCode::Down));
         assert_eq!(pane.cursor, 1);
-        // Clamp at the last row.
+        // Wrap last → first.
         pane.handle_key(press(KeyCode::Down));
-        assert_eq!(pane.cursor, 1);
-        pane.handle_key(press(KeyCode::Up));
         assert_eq!(pane.cursor, 0);
-        // Clamp at the top.
+        // Wrap first → last.
+        pane.handle_key(press(KeyCode::Up));
+        assert_eq!(pane.cursor, 1);
         pane.handle_key(press(KeyCode::Up));
         assert_eq!(pane.cursor, 0);
     }

@@ -195,10 +195,10 @@ impl SettingsDialog {
                 });
             }
             KeyCode::Up | KeyCode::Char('k') => {
-                p.cursor = p.cursor.saturating_sub(1);
+                p.cursor = crate::tui::nav::wrap_prev(p.cursor, rows);
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                p.cursor = (p.cursor + 1).min(rows - 1);
+                p.cursor = crate::tui::nav::wrap_next(p.cursor, rows);
             }
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => match p.cursor {
                 0 => {
@@ -464,8 +464,9 @@ impl SettingsDialog {
         }
 
         let rows = self.extended.agent_guidance_files.len();
-        // Max cursor = rows (the `[+ add]` synthetic row at the bottom).
-        let max_cursor = rows;
+        // Navigable count = file rows + 1 synthetic `[+ add]` row at the
+        // bottom (cursor `rows`).
+        let nav_len = rows + 1;
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => return Nav::Close,
             KeyCode::Left | KeyCode::Backspace | KeyCode::Char('h') => {
@@ -478,10 +479,10 @@ impl SettingsDialog {
                 }));
             }
             KeyCode::Up | KeyCode::Char('k') => {
-                p.cursor = p.cursor.saturating_sub(1);
+                p.cursor = crate::tui::nav::wrap_prev(p.cursor, nav_len);
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                p.cursor = (p.cursor + 1).min(max_cursor);
+                p.cursor = crate::tui::nav::wrap_next(p.cursor, nav_len);
             }
             KeyCode::Char('a') => {
                 self.start_instructions_grab_on_new(p);

@@ -70,11 +70,12 @@ impl DaemonPromptDialog {
                 true
             }
             KeyCode::Up | KeyCode::Char('k') => {
-                self.cursor = self.cursor.saturating_sub(1);
+                // 3 rows: start+connect / continue-without / exit.
+                self.cursor = crate::tui::nav::wrap_prev(self.cursor, 3);
                 false
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                self.cursor = (self.cursor + 1).min(2);
+                self.cursor = crate::tui::nav::wrap_next(self.cursor, 3);
                 false
             }
             KeyCode::Enter => {
@@ -215,6 +216,19 @@ mod tests {
             d.take_choice().is_none(),
             "navigation must not set a choice"
         );
+    }
+
+    /// The 3-row list wraps at both ends like every other selectable
+    /// list: Up on the first row lands on the last, Down on the last
+    /// lands on the first.
+    #[test]
+    fn nav_wraps_at_both_ends() {
+        let mut d = fresh();
+        assert_eq!(d.cursor, 0);
+        d.handle_key(press(KeyCode::Up));
+        assert_eq!(d.cursor, 2, "Up from first wraps to last");
+        d.handle_key(press(KeyCode::Down));
+        assert_eq!(d.cursor, 0, "Down from last wraps to first");
     }
 
     #[test]

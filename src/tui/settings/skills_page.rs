@@ -84,8 +84,10 @@ impl SettingsDialog {
         }
 
         let dir_count = self.extended.skills.scan_dirs.len();
-        // Rows: 0 = toggle, 1..=dir_count = entries, dir_count+1 = add.
+        // Rows: 0 = toggle, 1..=dir_count = entries, dir_count+1 = add
+        // (the last navigable index); `nav_len` is the row count.
         let max_cursor = dir_count + 1;
+        let nav_len = max_cursor + 1;
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => return Nav::Close,
             KeyCode::Left | KeyCode::Backspace | KeyCode::Char('h') => {
@@ -94,10 +96,10 @@ impl SettingsDialog {
                 });
             }
             KeyCode::Up | KeyCode::Char('k') => {
-                p.cursor = p.cursor.saturating_sub(1);
+                p.cursor = crate::tui::nav::wrap_prev(p.cursor, nav_len);
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                p.cursor = (p.cursor + 1).min(max_cursor);
+                p.cursor = crate::tui::nav::wrap_next(p.cursor, nav_len);
             }
             KeyCode::Char('a') => {
                 self.start_skills_grab_on_new(p);

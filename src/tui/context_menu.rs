@@ -89,21 +89,19 @@ impl ContextMenu {
         items
     }
 
+    /// Move the keyboard focus by `delta` (±1), wrapping at both ends —
+    /// Up on the first item lands on the last, Down on the last lands on
+    /// the first. Consistent with every other selectable list in the TUI.
     pub fn move_cursor(&mut self, delta: i32) {
-        let len = self.items.len() as i32;
+        let len = self.items.len();
         if len == 0 {
             return;
         }
-        let mut idx = self.cursor as i32 + delta;
-        // Clamp rather than wrap. The menu is short enough that
-        // wrap is more confusing than helpful.
-        if idx < 0 {
-            idx = 0;
-        }
-        if idx >= len {
-            idx = len - 1;
-        }
-        self.cursor = idx as usize;
+        self.cursor = match delta.cmp(&0) {
+            std::cmp::Ordering::Less => crate::tui::nav::wrap_prev(self.cursor, len),
+            std::cmp::Ordering::Greater => crate::tui::nav::wrap_next(self.cursor, len),
+            std::cmp::Ordering::Equal => self.cursor,
+        };
     }
 
     pub fn focused_action(&self) -> Option<ContextMenuAction> {
@@ -191,4 +189,51 @@ pub fn render_context_menu(frame: &mut Frame, full_area: Rect, menu: &ContextMen
         ]));
     }
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn menu(items: Vec<ContextMenuAction>) -> ContextMenu {
+        ContextMenu {
+            preferred_origin: (0, 0),
+            clicked_chat_row: 0,
+            cursor: 0,
+            items,
+        }
+    }
+
+    #[test]
+    fn move_cursor_wraps_at_both_ends() {
+        let mut m = menu(vec![
+            ContextMenuAction::CopyAsRichText,
+            ContextMenuAction::CopyAsMarkdown,
+            ContextMenuAction::CopyAsPlainText,
+        ]);
+        // Up from the first item wraps to the last.
+        m.move_cursor(-1);
+        assert_eq!(m.cursor, 2);
+        // Down from the last item wraps to the first.
+        m.move_cursor(1);
+        assert_eq!(m.cursor, 0);
+    }
+
+    #[test]
+    fn move_cursor_single_item_stays_put() {
+        let mut m = menu(vec![ContextMenuAction::CopyAsMarkdown]);
+        m.move_cursor(1);
+        assert_eq!(m.cursor, 0);
+        m.move_cursor(-1);
+        assert_eq!(m.cursor, 0);
+    }
+
+    #[test]
+    fn move_cursor_empty_is_noop() {
+        let mut m = menu(Vec::new());
+        m.move_cursor(1);
+        assert_eq!(m.cursor, 0);
+        m.move_cursor(-1);
+        assert_eq!(m.cursor, 0);
+    }
 }

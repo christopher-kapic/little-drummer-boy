@@ -365,12 +365,26 @@ impl SessionsPane {
             return;
         }
         let level = self.current_mut();
-        let next = (level.cursor as isize + delta).clamp(0, len as isize - 1) as usize;
-        level.cursor = next;
+        let prev = level.cursor;
+        // Wrap at both ends, consistent with every other selectable list.
+        level.cursor = if delta < 0 {
+            crate::tui::nav::wrap_prev(prev, len)
+        } else {
+            crate::tui::nav::wrap_next(prev, len)
+        };
         // Keep the cursor inside the visible window (rough: each card is
         // ~4 rows). The render pass does the precise clamp.
         if delta < 0 {
-            level.scroll = level.scroll.saturating_sub(1);
+            if level.cursor > prev {
+                // Wrapped first → last: scroll toward the bottom; render
+                // clamps to the precise floor.
+                level.scroll = level.scroll.saturating_add(len);
+            } else {
+                level.scroll = level.scroll.saturating_sub(1);
+            }
+        } else if level.cursor < prev {
+            // Wrapped last → first: jump back to the top.
+            level.scroll = 0;
         } else {
             level.scroll += 1;
         }
@@ -1131,6 +1145,38 @@ mod tests {
     }
 
     /// Build a pane with a fixed root level and no daemon interaction.
+    #[test]
+    fn cursor_wraps_at_both_ends() {
+        let cards = vec![
+            (summary(Uuid::new_v4(), 300), Tier::Unread),
+            (summary(Uuid::new_v4(), 200), Tier::Unread),
+            (summary(Uuid::new_v4(), 100), Tier::Unread),
+        ];
+        let mut pane = test_pane(cards);
+        assert_eq!(pane.current().cursor, 0);
+        // Up from the first card wraps to the last.
+        pane.handle_key(press(KeyCode::Up));
+        assert_eq!(pane.current().cursor, 2);
+        // Down from the last card wraps to the first.
+        pane.handle_key(press(KeyCode::Down));
+        assert_eq!(pane.current().cursor, 0);
+        // `j`/`k` navigate the same (non-typing list).
+        pane.handle_key(press(KeyCode::Char('k')));
+        assert_eq!(pane.current().cursor, 2);
+        pane.handle_key(press(KeyCode::Char('j')));
+        assert_eq!(pane.current().cursor, 0);
+    }
+
+    #[test]
+    fn cursor_single_card_stays_put() {
+        let cards = vec![(summary(Uuid::new_v4(), 100), Tier::Unread)];
+        let mut pane = test_pane(cards);
+        pane.handle_key(press(KeyCode::Down));
+        assert_eq!(pane.current().cursor, 0);
+        pane.handle_key(press(KeyCode::Up));
+        assert_eq!(pane.current().cursor, 0);
+    }
+
     fn test_pane(cards: Vec<(SessionSummary, Tier)>) -> SessionsPane {
         SessionsPane {
             project_id: Some("pid".into()),

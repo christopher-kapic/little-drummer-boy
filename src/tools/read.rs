@@ -39,6 +39,12 @@ impl Tool for ReadTool {
     }
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
+        // Native-tool boundary check (sandboxing part 2): a path outside
+        // cwd + session tmp escalates via the approval prompt (naming the
+        // exact path) before any read happens.
+        if let Some(p) = args.get("path").and_then(Value::as_str) {
+            crate::tools::sandbox::check_native_access(ctx, &resolve(p, &ctx.cwd)).await?;
+        }
         read_impl(args, ctx, false)
     }
 }

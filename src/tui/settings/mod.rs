@@ -559,10 +559,10 @@ impl SettingsDialog {
                 return true;
             }
             KeyCode::Up | KeyCode::Char('k') => {
-                cursor = cursor.saturating_sub(1);
+                cursor = crate::tui::nav::wrap_prev(cursor, children.len());
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                cursor = (cursor + 1).min(children.len().saturating_sub(1));
+                cursor = crate::tui::nav::wrap_next(cursor, children.len());
             }
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
                 let chosen = children.get(cursor).map(|n| n.title).unwrap_or("");
@@ -838,15 +838,11 @@ fn list_key_action(key: KeyEvent, cursor: &mut usize, len: usize) -> ListAction 
     match key.code {
         KeyCode::Esc => ListAction::Close,
         KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => {
-            if *cursor > 0 {
-                *cursor -= 1;
-            }
+            *cursor = crate::tui::nav::wrap_prev(*cursor, len);
             ListAction::Stay
         }
         KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
-            if *cursor + 1 < len {
-                *cursor += 1;
-            }
+            *cursor = crate::tui::nav::wrap_next(*cursor, len);
             ListAction::Stay
         }
         KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') if *cursor < len => {
@@ -1023,6 +1019,38 @@ mod tests {
         assert!(valid_url("http://localhost:1234"));
         assert!(!valid_url("foo.example"));
         assert!(!valid_url(""));
+    }
+
+    #[test]
+    fn list_key_action_wraps_at_both_ends() {
+        use crossterm::event::{KeyEventKind, KeyEventState, KeyModifiers};
+        fn k(code: KeyCode) -> KeyEvent {
+            KeyEvent {
+                code,
+                modifiers: KeyModifiers::empty(),
+                kind: KeyEventKind::Press,
+                state: KeyEventState::empty(),
+            }
+        }
+        let mut cursor = 0usize;
+        let len = 3usize;
+        // Up from the first row wraps to the last.
+        list_key_action(k(KeyCode::Up), &mut cursor, len);
+        assert_eq!(cursor, 2);
+        // Down from the last row wraps to the first.
+        list_key_action(k(KeyCode::Down), &mut cursor, len);
+        assert_eq!(cursor, 0);
+        // `j`/`k` navigate identically on this non-typing list.
+        list_key_action(k(KeyCode::Char('k')), &mut cursor, len);
+        assert_eq!(cursor, 2);
+        list_key_action(k(KeyCode::Char('j')), &mut cursor, len);
+        assert_eq!(cursor, 0);
+        // A single-item list stays put.
+        let mut one = 0usize;
+        list_key_action(k(KeyCode::Up), &mut one, 1);
+        assert_eq!(one, 0);
+        list_key_action(k(KeyCode::Down), &mut one, 1);
+        assert_eq!(one, 0);
     }
 
     #[test]

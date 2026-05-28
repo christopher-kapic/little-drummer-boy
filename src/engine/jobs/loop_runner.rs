@@ -190,6 +190,13 @@ async fn run_iteration(
             ctx.cwd.clone(),
             interrupts.clone(),
             cancel.clone(),
+            // A loop fork is a leaf with no human on the other end, so it
+            // can't raise an answerable approval prompt either (same
+            // reason it gets a detached interrupt hub). No approver →
+            // native tools skip the boundary prompt (never deny) and the
+            // sandboxed shell can't escalate. The fork still runs
+            // confined when sandboxing is on.
+            None,
             turn_tx,
         )
         .await?;

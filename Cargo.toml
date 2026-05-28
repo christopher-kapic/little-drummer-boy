@@ -119,6 +119,18 @@ grep-matcher = "0.1"
 # because `bash.rs` executes commands via `sh -c`.
 brush-parser = "0.4"
 
+# Filesystem sandboxing engine for the `bash` tool (sandboxing part 2,
+# GOALS run-lifecycle). Linux/macOS/WSL only — `Sandbox::...prepare()`
+# yields a `tokio::process::Command` we own (so cockpit keeps its
+# process-group kill + timeout + ctrl-c cancel), confining reads to cwd +
+# the per-session tmp dir while allowing PATH execution. Windows has no
+# backend: the shell runs unconfined with a one-time per-session notice.
+# Native cockpit tools are confined in-process (all platforms), not by
+# zerobox. Linux re-entry requires `arg0::dispatch_linux_sandbox_helper`
+# early in `main` + a PATH-prepend helper guard kept alive for the
+# process lifetime.
+zerobox = "0.3"
+
 # Secret scanning / redaction
 aho-corasick = "1"
 dotenvy = "0.15"

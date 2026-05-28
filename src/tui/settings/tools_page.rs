@@ -147,10 +147,10 @@ impl SettingsDialog {
                 });
             }
             KeyCode::Up | KeyCode::Char('k') => {
-                p.cursor = p.cursor.saturating_sub(1);
+                p.cursor = crate::tui::nav::wrap_prev(p.cursor, total_rows);
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                p.cursor = (p.cursor + 1).min(total_rows.saturating_sub(1));
+                p.cursor = crate::tui::nav::wrap_next(p.cursor, total_rows);
             }
             KeyCode::Char('t') => {
                 let tool_idx = p.cursor / rows_per_tool;

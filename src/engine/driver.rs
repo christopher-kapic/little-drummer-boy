@@ -168,6 +168,14 @@ pub struct Driver {
     /// `turn()` (to abort the in-flight inference) and `ToolCtx` (to kill a
     /// long-running `bash` subprocess) within the run.
     cancel_current: Arc<std::sync::Mutex<Option<tokio_util::sync::CancellationToken>>>,
+    /// Command/path approval driver (sandboxing part 2). Threaded into
+    /// every [`ToolCtx`] so `bash`'s run-fail-escalate and the native
+    /// tools' out-of-boundary path checks can prompt + remember. `None`
+    /// until the session worker installs it via
+    /// [`Self::set_approver`] before the loop starts (same shape as the
+    /// interrupt hub); seed-tool re-execution before that runs with no
+    /// approver (skips the prompt, never denies).
+    approver: Option<Arc<crate::approval::Approver>>,
 }
 
 /// Inbound channel capacity for job events / commands. Generous; job
@@ -239,6 +247,7 @@ impl Driver {
             interrupts: Arc::new(crate::engine::interrupt::InterruptHub::detached()),
             skills_no_utility_model_logged: false,
             cancel_current: Arc::new(std::sync::Mutex::new(None)),
+            approver: None,
         }
     }
 
@@ -250,6 +259,16 @@ impl Driver {
     /// construction.
     pub fn set_interrupt_hub(&mut self, hub: Arc<crate::engine::interrupt::InterruptHub>) {
         self.interrupts = hub;
+    }
+
+    /// Install the command/path approval driver (sandboxing part 2)
+    /// before the main loop starts. The session worker builds it with the
+    /// session's grant store + the client-wired interrupt hub, so the
+    /// approval prompt fans out to the attached client exactly like a
+    /// `question`. Must be set after [`Self::set_interrupt_hub`] (the
+    /// approver captures the same hub).
+    pub fn set_approver(&mut self, approver: Arc<crate::approval::Approver>) {
+        self.approver = Some(approver);
     }
 
     /// Wrap `user_text` with the `[time: ...]` prelude when the
@@ -781,6 +800,10 @@ impl Driver {
             // has no run-scoped cancel slot, so a fresh never-cancelled
             // token suffices.
             cancel: tokio_util::sync::CancellationToken::new(),
+            // Seeds are read-only/idempotent and run before the approver
+            // is consulted in earnest; a missing approver skips the
+            // boundary prompt (never denies).
+            approver: self.approver.clone(),
         };
         let mut blocks: Vec<String> = Vec::new();
         for seed in seeds {
@@ -1089,6 +1112,7 @@ impl Driver {
                     self.cwd.clone(),
                     self.interrupts.clone(),
                     cancel.clone(),
+                    self.approver.clone(),
                     tx,
                 )
                 .await
@@ -1276,6 +1300,7 @@ impl Driver {
                             self.cwd.clone(),
                             self.interrupts.clone(),
                             cancel.clone(),
+                            self.approver.clone(),
                         )
                         .await
                         {
@@ -1466,6 +1491,7 @@ pub(crate) async fn run_noninteractive(
     cwd: std::path::PathBuf,
     interrupts: Arc<crate::engine::interrupt::InterruptHub>,
     cancel: tokio_util::sync::CancellationToken,
+    approver: Option<Arc<crate::approval::Approver>>,
 ) -> Result<String> {
     use crate::engine::agent::turn;
 
@@ -1488,6 +1514,7 @@ pub(crate) async fn run_noninteractive(
             cwd.clone(),
             interrupts.clone(),
             cancel.clone(),
+            approver.clone(),
             &sink_tx,
         )
         .await?;

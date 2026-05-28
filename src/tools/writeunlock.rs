@@ -45,6 +45,10 @@ impl Tool for WriteunlockTool {
             .ok_or_else(|| crate::engine::tool::invalid_input("`content` is required"))?;
         let path = resolve(path_arg, &ctx.cwd);
 
+        // Native-tool boundary check (sandboxing part 2): an out-of-cwd
+        // write target escalates (naming the path) before we touch disk.
+        crate::tools::sandbox::check_native_access(ctx, &path).await?;
+
         // For *new* files (no existing file on disk) we still require a
         // prior call to `read` / `readlock` — the "read first" rule
         // would force unnecessary friction. Resolve by checking for

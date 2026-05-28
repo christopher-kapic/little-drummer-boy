@@ -151,6 +151,14 @@ impl Tool for OutlineTool {
             .get("path")
             .and_then(Value::as_str)
             .ok_or_else(|| invalid_input("`path` is required"))?;
+        // Native-tool boundary check (sandboxing part 2): the regex
+        // fallback below reads the file off disk, so an out-of-cwd path
+        // must escalate first.
+        crate::tools::sandbox::check_native_access(
+            ctx,
+            &crate::tools::common::resolve(path_arg, &ctx.cwd),
+        )
+        .await?;
         let rel = rel_path(path_arg, ctx);
         let index = index_of(ctx);
         index.ensure_fresh().await?;
@@ -734,6 +742,10 @@ impl Tool for SearchTool {
             Some(p) => crate::tools::common::resolve(p, &ctx.cwd),
             None => root.clone(),
         };
+        // Native-tool boundary check (sandboxing part 2): a `path` filter
+        // pointing outside cwd + session tmp must escalate before the
+        // search reads any file contents there.
+        crate::tools::sandbox::check_native_access(ctx, &search_dir).await?;
         let have_rg = which::which("rg").is_ok();
         let raw = run_search(have_rg, pattern, &search_dir, ignore_case, context, glob).await?;
 

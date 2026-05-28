@@ -473,6 +473,15 @@ pub struct App {
     /// suppressed until the active `@partial` token is dropped (e.g.
     /// whitespace appears after `@` or the `@` is deleted).
     pub(super) at_dismissed: bool,
+    /// Highlighted index in the slash-command popup. Reset to 0 (the
+    /// frequency-ranked top match) whenever the slash query changes;
+    /// moved by Up/Down while the popup is open. While the popup shows,
+    /// Up/Down drive this cursor instead of composer history recall.
+    pub(super) slash_selected: usize,
+    /// Top visible index of the slash popup's scroll window, maintained
+    /// with the same 1-row scrolloff as the `@`-popup (see
+    /// [`super::windowed_scroll`]). Reset alongside `slash_selected`.
+    pub(super) slash_scroll: usize,
     /// `/new` was invoked; the event loop services it on the next tick
     /// (needs the terminal handle for `insert_before` so the existing
     /// history spills to scrollback before the welcome header is
@@ -774,6 +783,8 @@ impl App {
             accepted_tags: Vec::new(),
             queued_tag_calls: Vec::new(),
             at_dismissed: false,
+            slash_selected: 0,
+            slash_scroll: 0,
             pending_new_session: false,
             last_usage: None,
             estimate_at_last_usage: 0,
@@ -2916,6 +2927,9 @@ impl App {
         // commands (`/git`, `/editor`) can read their arguments.
         let raw = self.composer.text().to_string();
         self.composer.clear();
+        // The slash line is gone; reset the menu cursor so the next `/`
+        // session opens on the top match.
+        self.reset_slash_window();
         // Tally the pick for frequency-ranked autocomplete (global).
         self.record_usage(
             crate::daemon::proto::UsageKind::Slash,

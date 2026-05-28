@@ -168,10 +168,11 @@ impl ModelPickerDialog {
 
     fn handle_pick_key(&mut self, key: KeyEvent) -> bool {
         let visible = self.filtered_indices();
-        let max = visible.len().saturating_sub(1);
+        // Arrow keys navigate (with wrap); `j`/`k` stay literal text for
+        // the filter, since this step is typing-driven.
         match key.code {
             KeyCode::Up => {
-                self.cursor = self.cursor.saturating_sub(1);
+                self.cursor = crate::tui::nav::wrap_prev(self.cursor, visible.len());
                 self.scroll = crate::tui::app::windowed_scroll(
                     self.cursor,
                     self.scroll,
@@ -180,7 +181,7 @@ impl ModelPickerDialog {
                 );
             }
             KeyCode::Down => {
-                self.cursor = (self.cursor + 1).min(max);
+                self.cursor = crate::tui::nav::wrap_next(self.cursor, visible.len());
                 self.scroll = crate::tui::app::windowed_scroll(
                     self.cursor,
                     self.scroll,
@@ -231,10 +232,10 @@ impl ModelPickerDialog {
         };
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => {
-                *cursor = cursor.saturating_sub(1);
+                *cursor = crate::tui::nav::wrap_prev(*cursor, modes.len());
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                *cursor = (*cursor + 1).min(modes.len().saturating_sub(1));
+                *cursor = crate::tui::nav::wrap_next(*cursor, modes.len());
             }
             KeyCode::Left | KeyCode::Char('h') | KeyCode::Backspace => {
                 self.step = Step::Pick;
@@ -531,5 +532,68 @@ mod tests {
     fn esc_signals_close() {
         let mut d = empty_dialog();
         assert!(d.handle_key(press(KeyCode::Esc)));
+    }
+
+    fn entry(model: &str) -> Entry {
+        Entry {
+            provider_id: "p".into(),
+            model_id: model.into(),
+            display_name: None,
+            is_favorite: false,
+            thinking_modes: Vec::new(),
+        }
+    }
+
+    fn dialog_with(entries: Vec<Entry>) -> ModelPickerDialog {
+        ModelPickerDialog {
+            config_path: PathBuf::from("/tmp/cockpit.test"),
+            cfg: ProvidersConfig::default(),
+            entries,
+            filter: TextField::default(),
+            cursor: 0,
+            scroll: 0,
+            step: Step::Pick,
+            error: None,
+            done: false,
+        }
+    }
+
+    /// The pick step (arrow-only nav; `j`/`k` are filter text) wraps at
+    /// both ends like every other selectable list.
+    #[test]
+    fn pick_step_arrows_wrap() {
+        let mut d = dialog_with(vec![entry("a"), entry("b"), entry("c")]);
+        assert_eq!(d.cursor, 0);
+        // Up from the first item wraps to the last.
+        d.handle_key(press(KeyCode::Up));
+        assert_eq!(d.cursor, 2);
+        // Down from the last item wraps to the first.
+        d.handle_key(press(KeyCode::Down));
+        assert_eq!(d.cursor, 0);
+    }
+
+    /// The think step is a non-typing list: `j`/`k` (and arrows) navigate
+    /// and wrap.
+    #[test]
+    fn think_step_jk_wraps() {
+        let mut d = dialog_with(vec![entry("a")]);
+        d.step = Step::ChooseThinking {
+            provider_id: "p".into(),
+            model_id: "a".into(),
+            modes: vec![ThinkingMode::Off, ThinkingMode::Low, ThinkingMode::High],
+            cursor: 0,
+        };
+        // `k` (Up) from the first wraps to the last.
+        d.handle_key(press(KeyCode::Char('k')));
+        match &d.step {
+            Step::ChooseThinking { cursor, .. } => assert_eq!(*cursor, 2),
+            _ => panic!("left the think step"),
+        }
+        // `j` (Down) from the last wraps to the first.
+        d.handle_key(press(KeyCode::Char('j')));
+        match &d.step {
+            Step::ChooseThinking { cursor, .. } => assert_eq!(*cursor, 0),
+            _ => panic!("left the think step"),
+        }
     }
 }

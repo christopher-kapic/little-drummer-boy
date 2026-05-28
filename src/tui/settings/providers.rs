@@ -304,11 +304,11 @@ impl HeaderEditor {
         match key.code {
             // `Tab`/`Shift+Tab` move like `↓`/`↑` while browsing rows.
             KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => {
-                self.cursor = self.cursor.saturating_sub(1);
+                self.cursor = crate::tui::nav::wrap_prev(self.cursor, self.max_cursor() + 1);
                 HeaderResult::Stay
             }
             KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
-                self.cursor = (self.cursor + 1).min(self.max_cursor());
+                self.cursor = crate::tui::nav::wrap_next(self.cursor, self.max_cursor() + 1);
                 HeaderResult::Stay
             }
             KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') | KeyCode::Backspace => {
@@ -573,7 +573,6 @@ impl SettingsDialog {
                 delete_pending,
             } => {
                 let ids: Vec<String> = self.config.providers.keys().cloned().collect();
-                let max_cursor = ids.len().saturating_sub(1);
                 let pressed_d = matches!(key.code, KeyCode::Char('d'));
                 match key.code {
                     KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') | KeyCode::Backspace => {
@@ -583,10 +582,10 @@ impl SettingsDialog {
                     }
                     KeyCode::Char('q') => return Nav::Close,
                     KeyCode::Up | KeyCode::Char('k') => {
-                        *cursor = cursor.saturating_sub(1);
+                        *cursor = crate::tui::nav::wrap_prev(*cursor, ids.len());
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
-                        *cursor = (*cursor + 1).min(max_cursor);
+                        *cursor = crate::tui::nav::wrap_next(*cursor, ids.len());
                     }
                     KeyCode::Char('a') => {
                         return Nav::Replace(Page::Providers(ProvidersPage::Add(AddState::new())));
@@ -695,10 +694,10 @@ impl SettingsDialog {
         match &mut s.step {
             AddStep::PickTemplate { cursor } => match key.code {
                 KeyCode::Up | KeyCode::Char('k') => {
-                    *cursor = cursor.saturating_sub(1);
+                    *cursor = crate::tui::nav::wrap_prev(*cursor, templates::TEMPLATES.len());
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
-                    *cursor = (*cursor + 1).min(templates::TEMPLATES.len() - 1);
+                    *cursor = crate::tui::nav::wrap_next(*cursor, templates::TEMPLATES.len());
                 }
                 KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
                     let t = &templates::TEMPLATES[*cursor];
@@ -945,10 +944,10 @@ impl SettingsDialog {
                 }));
             }
             KeyCode::Up | KeyCode::Char('k') => {
-                s.cursor = s.cursor.saturating_sub(1);
+                s.cursor = crate::tui::nav::wrap_prev(s.cursor, EDIT_MENU_LEN);
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                s.cursor = (s.cursor + 1).min(EDIT_MENU_LEN - 1);
+                s.cursor = crate::tui::nav::wrap_next(s.cursor, EDIT_MENU_LEN);
             }
             KeyCode::Char('s') => {
                 self.config
@@ -1121,10 +1120,11 @@ impl SettingsDialog {
                 }));
             }
             KeyCode::Up | KeyCode::Char('k') => {
-                s.cursor = s.cursor.saturating_sub(1);
+                // 3 rows: confirm / cancel / "don't ask again".
+                s.cursor = crate::tui::nav::wrap_prev(s.cursor, 3);
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                s.cursor = (s.cursor + 1).min(2);
+                s.cursor = crate::tui::nav::wrap_next(s.cursor, 3);
             }
             KeyCode::Char(' ') => {
                 if s.cursor == 2 {

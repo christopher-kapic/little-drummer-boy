@@ -265,6 +265,7 @@ pub async fn turn(
     cwd: std::path::PathBuf,
     interrupts: Arc<crate::engine::interrupt::InterruptHub>,
     cancel: tokio_util::sync::CancellationToken,
+    approver: Option<Arc<crate::approval::Approver>>,
     tx: &mpsc::Sender<TurnEvent>,
 ) -> Result<TurnOutcome> {
     let tools = agent.tools.definitions();
@@ -406,6 +407,7 @@ pub async fn turn(
         redact: redact.clone(),
         interrupts,
         cancel,
+        approver,
     };
 
     for tc in &calls {

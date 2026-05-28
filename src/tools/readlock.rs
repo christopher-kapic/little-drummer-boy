@@ -42,6 +42,9 @@ impl Tool for ReadlockTool {
             .and_then(Value::as_str)
             .ok_or_else(|| crate::engine::tool::invalid_input("`path` is required"))?;
         let path = resolve(path_arg, &ctx.cwd);
+        // Native-tool boundary check (sandboxing part 2) before taking
+        // the lock — a denied path never acquires.
+        crate::tools::sandbox::check_native_access(ctx, &path).await?;
         ctx.locks.acquire(&path, &ctx.agent_id, ctx.session.id)?;
         read_impl(args, ctx, true)
     }

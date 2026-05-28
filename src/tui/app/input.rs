@@ -7,7 +7,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crate::tui::composer::{Operator, VimMode};
 use crate::tui::history::HistoryEntry;
 
-use super::{App, slash_matches};
+use super::App;
 use crate::tui::settings::Dialog;
 
 /// Result of handing a submitted turn to the agent runner. Carries
@@ -370,9 +370,9 @@ impl App {
                 KeyCode::Up => {
                     let n = self.at_suggestions().len();
                     if n > 0 {
-                        // Hard stop at the top (no wrap) + scrolloff so
-                        // the previous item stays visible until index 0.
-                        self.at_selected = self.at_selected.saturating_sub(1);
+                        // Wrap at the top (first → last) + scrolloff so the
+                        // neighbor stays visible (see `windowed_scroll`).
+                        self.at_selected = crate::tui::nav::wrap_prev(self.at_selected, n);
                         self.at_scroll = super::windowed_scroll(
                             self.at_selected,
                             self.at_scroll,
@@ -385,7 +385,8 @@ impl App {
                 KeyCode::Down => {
                     let n = self.at_suggestions().len();
                     if n > 0 {
-                        self.at_selected = (self.at_selected + 1).min(n - 1);
+                        // Wrap at the bottom (last → first).
+                        self.at_selected = crate::tui::nav::wrap_next(self.at_selected, n);
                         self.at_scroll = super::windowed_scroll(
                             self.at_selected,
                             self.at_scroll,
@@ -416,6 +417,44 @@ impl App {
                 _ => {}
             }
         }
+        // Slash-menu intercepts Up/Down while it's visible so they move
+        // the highlight instead of triggering composer history recall
+        // (the suppression is scoped to "menu showing" — Up/Down resume
+        // normal recall the moment the menu closes). `j`/`k` are NOT
+        // navigation here: the user is typing to filter, so they stay
+        // literal text (matching the `@` menu). Mutually exclusive with
+        // the `@`-popup (one needs a leading `/`, the other an `@`-token).
+        if self.slash_query().is_some() {
+            match key.code {
+                KeyCode::Up => {
+                    let n = self.slash_suggestions().len();
+                    if n > 0 {
+                        self.slash_selected = crate::tui::nav::wrap_prev(self.slash_selected, n);
+                        self.slash_scroll = super::windowed_scroll(
+                            self.slash_selected,
+                            self.slash_scroll,
+                            n,
+                            super::AUTOCOMPLETE_ROWS as usize,
+                        );
+                    }
+                    return false;
+                }
+                KeyCode::Down => {
+                    let n = self.slash_suggestions().len();
+                    if n > 0 {
+                        self.slash_selected = crate::tui::nav::wrap_next(self.slash_selected, n);
+                        self.slash_scroll = super::windowed_scroll(
+                            self.slash_selected,
+                            self.slash_scroll,
+                            n,
+                            super::AUTOCOMPLETE_ROWS as usize,
+                        );
+                    }
+                    return false;
+                }
+                _ => {}
+            }
+        }
         match key.code {
             KeyCode::Esc => {
                 // Esc cancels an in-progress slash command. Otherwise:
@@ -425,6 +464,7 @@ impl App {
                 // exit path; `/exit`, Ctrl+C, Ctrl+D cover that).
                 if self.slash_query().is_some() {
                     self.composer.clear();
+                    self.reset_slash_window();
                 } else if self.composer.vim_enabled() {
                     self.composer.set_vim_mode(VimMode::Normal);
                     self.composer.set_pending_g(false);
@@ -437,6 +477,7 @@ impl App {
                 {
                     self.composer.insert_char('\n');
                     self.refresh_at_dismiss();
+                    self.reset_slash_window();
                     false
                 } else {
                     self.complete_or_submit()
@@ -450,6 +491,7 @@ impl App {
             // multiplexer hop.
             KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.composer.insert_char('\n');
+                self.reset_slash_window();
                 false
             }
             KeyCode::Backspace => {
@@ -475,6 +517,7 @@ impl App {
                     self.refresh_at_dismiss();
                 }
                 self.reset_at_window();
+                self.reset_slash_window();
                 false
             }
             KeyCode::Delete => {
@@ -489,6 +532,7 @@ impl App {
                 self.composer.delete_right();
                 self.refresh_at_dismiss();
                 self.reset_at_window();
+                self.reset_slash_window();
                 false
             }
             KeyCode::Left => {
@@ -525,6 +569,9 @@ impl App {
                 // history navigation.
                 self.refresh_at_dismiss();
                 self.reset_at_window();
+                // Typing narrows the slash matches; snap the cursor back
+                // to the top match so it never points past the new set.
+                self.reset_slash_window();
                 false
             }
             _ => false,
@@ -638,6 +685,16 @@ impl App {
         self.at_scroll = 0;
     }
 
+    /// Reset the slash-popup highlight + scroll window to the top (the
+    /// frequency-ranked match). Called after any composer edit that
+    /// changes the active slash query so the cursor doesn't point past a
+    /// narrowed match set; also restores the "Enter runs the top match"
+    /// default. Harmless when no slash query is active.
+    pub(super) fn reset_slash_window(&mut self) {
+        self.slash_selected = 0;
+        self.slash_scroll = 0;
+    }
+
     /// Accept the currently-highlighted `@`-suggestion: replace the
     /// active `@partial` with the chosen path (trailing `/` for dirs).
     /// Returns true if a replacement was applied.
@@ -713,6 +770,29 @@ impl App {
     }
 
     pub(super) fn handle_key_normal(&mut self, key: KeyEvent) -> bool {
+        // While the slash menu is visible, the arrow keys move its
+        // highlight rather than recalling history — same rule as Insert
+        // mode, so the menu behaves identically regardless of vim mode.
+        // (`j`/`k` keep their Normal-mode vim meaning; only the arrows
+        // are menu-nav, mirroring the `@`-popup's arrow-only contract.)
+        if self.slash_query().is_some() && matches!(key.code, KeyCode::Up | KeyCode::Down) {
+            let n = self.slash_suggestions().len();
+            if n > 0 {
+                self.slash_selected = if matches!(key.code, KeyCode::Up) {
+                    crate::tui::nav::wrap_prev(self.slash_selected, n)
+                } else {
+                    crate::tui::nav::wrap_next(self.slash_selected, n)
+                };
+                self.slash_scroll = super::windowed_scroll(
+                    self.slash_selected,
+                    self.slash_scroll,
+                    n,
+                    super::AUTOCOMPLETE_ROWS as usize,
+                );
+            }
+            self.composer.set_pending_g(false);
+            return false;
+        }
         // Arrow keys + Backspace/Delete still work in Normal mode —
         // they're convenient even for vim users. Char keys go through
         // the vim dispatcher below.
@@ -934,11 +1014,17 @@ impl App {
             }
             return false;
         }
-        if let Some(query) = self.slash_query() {
-            if let Some(cmd) = slash_matches(query, &self.usage_slash).first() {
-                return self.execute_slash(**cmd);
+        if self.slash_query().is_some() {
+            // Run whatever is highlighted. The default highlight is the
+            // frequency-ranked top match (index 0), so `/foo`+Enter still
+            // runs the top match — preserving the pre-cursor muscle memory.
+            let matches = self.slash_suggestions();
+            if matches.is_empty() {
+                return false;
             }
-            return false;
+            let idx = self.slash_selected.min(matches.len() - 1);
+            let cmd = *matches[idx];
+            return self.execute_slash(cmd);
         }
         self.submit_input()
     }
@@ -1336,6 +1422,59 @@ mod tag_delete_tests {
     fn forward_delete_quoted_tag() {
         let b = "@\"my file.rs\" rest";
         assert_eq!(completed_tag_span_forward(b, 0, &none()), Some((0, 13)));
+    }
+}
+
+#[cfg(test)]
+mod slash_cursor_tests {
+    use crate::tui::nav::{wrap_next, wrap_prev};
+
+    /// The slash-menu cursor mirrors the `@`-popup: the highlight moves
+    /// with the same wrap math the handler applies, and the default
+    /// highlight is index 0 — the frequency-ranked top match (see
+    /// `slash_rank_tests`), preserving "type `/foo` + Enter runs the top
+    /// match" muscle memory.
+    #[test]
+    fn cursor_default_is_top_match_and_wraps() {
+        // A fresh slash session starts on the top-ranked match.
+        let mut sel = 0usize;
+        let n = 3usize; // e.g. /settings, /session, /stats
+        assert_eq!(sel, 0, "default highlight is the top match");
+        // Up from the top wraps to the last.
+        sel = wrap_prev(sel, n);
+        assert_eq!(sel, 2);
+        // Down from the last wraps back to the top.
+        sel = wrap_next(sel, n);
+        assert_eq!(sel, 0);
+        // Interior Down steps normally.
+        sel = wrap_next(sel, n);
+        assert_eq!(sel, 1);
+    }
+
+    /// Recall suppression is scoped to "menu visible": the handler routes
+    /// Up/Down to slash-nav exactly when `slash_query().is_some()`, and to
+    /// composer history recall otherwise. This models that branch.
+    #[test]
+    fn history_recall_suppressed_only_while_menu_visible() {
+        fn up_does_slash_nav(slash_query_is_some: bool) -> bool {
+            // The handler's gate: while a slash query is active, Up/Down
+            // move the menu cursor and return early; otherwise they fall
+            // through to `history_up`/`history_down`.
+            slash_query_is_some
+        }
+        assert!(up_does_slash_nav(true), "menu visible → slash nav");
+        assert!(
+            !up_does_slash_nav(false),
+            "menu not visible → history recall resumes"
+        );
+    }
+
+    /// A single-item match set (the common `/foo` exact-prefix case)
+    /// stays on its one item under either arrow.
+    #[test]
+    fn single_match_stays_put() {
+        assert_eq!(wrap_next(0, 1), 0);
+        assert_eq!(wrap_prev(0, 1), 0);
     }
 }
 

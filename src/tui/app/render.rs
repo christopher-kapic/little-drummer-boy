@@ -20,7 +20,7 @@ use crate::tui::theme::MUTED_COLOR_INDEX;
 
 use super::{
     AUTOCOMPLETE_ROWS, App, INPUT_BORDER, MAX_INPUT_CONTENT, MIN_INPUT_CONTENT, PaneSide,
-    Selection, Toast, ToastKind, WORKING_MESSAGES, slash_matches,
+    Selection, SlashCommand, Toast, ToastKind, WORKING_MESSAGES, slash_matches,
 };
 
 /// Startup grace before the working indicator first appears — prevents
@@ -49,6 +49,21 @@ impl App {
         let rest = self.composer.text().strip_prefix('/')?;
         let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
         Some(&rest[..end])
+    }
+
+    /// The frequency-ranked slash matches for the current query, or an
+    /// empty list when no slash query is active. Capped to the popup's
+    /// visible budget so the cursor index can never point past what the
+    /// menu shows. The first entry is the auto-selected top match.
+    pub(super) fn slash_suggestions(&self) -> Vec<&'static SlashCommand> {
+        match self.slash_query() {
+            Some(query) => {
+                let mut matches = slash_matches(query, &self.usage_slash);
+                matches.truncate(AUTOCOMPLETE_ROWS as usize);
+                matches
+            }
+            None => Vec::new(),
+        }
     }
 
     /// True when the `@`-popup should be drawn: the composer reports an
@@ -937,11 +952,10 @@ impl App {
             }
             return;
         }
-        let query = self.slash_query().unwrap_or("");
-        let mut matches = slash_matches(query, &self.usage_slash);
-        // Cap to the autocomplete-rows budget; pad blanks below so the
-        // popup keeps a stable 6-row footprint regardless of match count.
-        matches.truncate(AUTOCOMPLETE_ROWS as usize);
+        // `slash_suggestions` already caps to the autocomplete-rows
+        // budget; blanks are padded below so the popup keeps a stable
+        // 6-row footprint regardless of match count.
+        let matches = self.slash_suggestions();
         let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
 
         let mut lines: Vec<Line<'static>> = if matches.is_empty() {
@@ -950,15 +964,22 @@ impl App {
                 Span::styled("no matching command", Style::default().fg(Color::Red)),
             ])]
         } else {
+            let window = AUTOCOMPLETE_ROWS as usize;
+            // Clamp defensively: the match set can shrink between a
+            // keypress and this render (the user typed another char).
+            let selected = self.slash_selected.min(matches.len().saturating_sub(1));
+            let offset = super::windowed_scroll(selected, self.slash_scroll, matches.len(), window);
             let name_w = matches.iter().map(|c| c.name.len()).max().unwrap_or(0);
             matches
                 .iter()
                 .enumerate()
+                .skip(offset)
+                .take(window)
                 .map(|(i, cmd)| {
-                    let is_best = i == 0;
-                    let marker = if is_best { "▸ " } else { "  " };
+                    let is_sel = i == selected;
+                    let marker = if is_sel { "▸ " } else { "  " };
                     let name_padded = format!("/{:<width$}", cmd.name, width = name_w);
-                    let name_style = if is_best {
+                    let name_style = if is_sel {
                         Style::default().fg(Color::Yellow)
                     } else {
                         Style::default().fg(Color::White)

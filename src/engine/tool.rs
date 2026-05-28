@@ -187,6 +187,15 @@ pub struct ToolCtx {
     /// of holding the turn open. Fresh per turn; cancelling it never
     /// affects a later turn.
     pub cancel: tokio_util::sync::CancellationToken,
+    /// Command/path approval driver (sandboxing part 2). The `bash` tool
+    /// consults it for the run-fail-escalate flow (broadened re-run on a
+    /// non-zero sandboxed exit), and the native file/intel tools consult
+    /// it via [`crate::tools::sandbox::check_native_access`] to escalate
+    /// an out-of-boundary path access. `None` on paths with no client
+    /// fan-out (seed-tool re-execution, tool tests): a missing approver
+    /// skips the prompt — it never silently denies. Shared `Arc` so one
+    /// approver instance backs the whole delegation tree.
+    pub approver: Option<Arc<crate::approval::Approver>>,
 }
 
 /// Project the `Tool` trait into a `ToolDefinition` rig understands.
