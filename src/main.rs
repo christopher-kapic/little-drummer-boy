@@ -23,6 +23,7 @@ mod engine;
 mod envref;
 mod git;
 mod harness;
+mod intel;
 mod locks;
 mod providers;
 mod redact;

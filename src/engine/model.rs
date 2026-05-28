@@ -248,20 +248,29 @@ impl Model {
 /// base-URL override) work for inference, not just `/models` fetches.
 fn build_openai_model(provider_id: &str, entry: &ProviderEntry, model_id: &str) -> Result<Model> {
     let resolved = models_fetch::resolve_provider_request(provider_id, entry)?;
-    let auth = resolved
+    // A missing Authorization header means the provider is keyless — a
+    // fully-local OpenAI-compatible endpoint (e.g. LM Studio at
+    // `http://localhost:1234/v1`). That is not an error: the resolver
+    // already errors for an Authorization ref whose env var is unset
+    // (`models_fetch::resolve_provider_request`), so here absence means
+    // "send no auth". Build the client with an empty api key — rig's
+    // OpenAI-compat `CompletionsClient` has no dedicated no-key
+    // constructor; an empty string is the documented no-auth form (the
+    // local endpoint ignores the empty bearer). A remote endpoint that
+    // truly needs a key but got none will surface its own 401.
+    let token = resolved
         .headers
         .iter()
         .find(|h| h.name.eq_ignore_ascii_case("authorization"))
-        .with_context(|| {
-            format!("provider `{provider_id}` produced no Authorization header after resolution")
-        })?;
-    let token = auth
-        .value
-        .strip_prefix("Bearer ")
-        .or_else(|| auth.value.strip_prefix("bearer "))
-        .unwrap_or(&auth.value)
-        .trim()
-        .to_string();
+        .map(|auth| {
+            auth.value
+                .strip_prefix("Bearer ")
+                .or_else(|| auth.value.strip_prefix("bearer "))
+                .unwrap_or(&auth.value)
+                .trim()
+                .to_string()
+        })
+        .unwrap_or_default();
 
     // rig appends `/chat/completions` to the base URL (see
     // `OpenAICompletionsExt`'s build_uri). The user's templates put the
@@ -426,5 +435,29 @@ impl rig::tool::Tool for StaticTool {
 
     async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {
         Err(StaticToolError)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::providers::ProviderEntry;
+
+    #[test]
+    fn build_openai_model_succeeds_for_keyless_provider() {
+        // Mirror the keyless resolver test
+        // (`providers::models_fetch::non_copilot_provider_without_auth_resolves_unauthenticated`):
+        // a fully-local OpenAI-compatible endpoint (LM Studio) has no
+        // Authorization header. `build_openai_model` must treat absence
+        // as "no API key" and build the client unauthenticated rather
+        // than erroring with "no Authorization header after resolution".
+        let entry = ProviderEntry {
+            url: "http://localhost:1234/v1".into(),
+            headers: vec![],
+            ..ProviderEntry::default()
+        };
+        let model = build_openai_model("lmstudio", &entry, "local-model")
+            .expect("keyless provider must build");
+        assert_eq!(model.model_id(), "local-model");
     }
 }

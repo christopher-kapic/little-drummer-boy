@@ -262,6 +262,8 @@ pub fn orchestrator_build(args: &SpawnArgs) -> Agent {
         ToolBox::new()
             .with(Arc::new(crate::tools::read::ReadTool))
             .with(Arc::new(crate::tools::bash::BashTool::new()))
+            .with(Arc::new(crate::tools::intel::TreeTool))
+            .with(Arc::new(crate::tools::intel::HotTool))
             .with(Arc::new(crate::tools::task::TaskTool::with_subagents(&[
                 "coder", "explore",
             ]))),
@@ -288,7 +290,13 @@ pub fn coder(args: &SpawnArgs) -> Agent {
         .with(Arc::new(crate::tools::writeunlock::WriteunlockTool))
         .with(Arc::new(crate::tools::unlock::UnlockTool))
         .with(Arc::new(crate::tools::editunlock::EditunlockTool))
-        .with(Arc::new(crate::tools::bash::BashTool::new()));
+        .with(Arc::new(crate::tools::bash::BashTool::new()))
+        .with(Arc::new(crate::tools::intel::OutlineTool))
+        .with(Arc::new(crate::tools::intel::SymbolFindTool))
+        .with(Arc::new(crate::tools::intel::DepsTool))
+        .with(Arc::new(crate::tools::intel::CircularTool))
+        .with(Arc::new(crate::tools::intel::WordTool))
+        .with(Arc::new(crate::tools::intel::SearchTool));
 
     Agent {
         name: "coder".to_string(),
@@ -310,7 +318,15 @@ pub fn explore(args: &SpawnArgs) -> Agent {
     let tools = with_custom_tools(
         ToolBox::new()
             .with(Arc::new(crate::tools::read::ReadTool))
-            .with(Arc::new(crate::tools::bash::BashTool::new())),
+            .with(Arc::new(crate::tools::bash::BashTool::new()))
+            .with(Arc::new(crate::tools::intel::TreeTool))
+            .with(Arc::new(crate::tools::intel::OutlineTool))
+            .with(Arc::new(crate::tools::intel::SymbolFindTool))
+            .with(Arc::new(crate::tools::intel::WordTool))
+            .with(Arc::new(crate::tools::intel::DepsTool))
+            .with(Arc::new(crate::tools::intel::HotTool))
+            .with(Arc::new(crate::tools::intel::CircularTool))
+            .with(Arc::new(crate::tools::intel::SearchTool)),
         &args.cwd,
     );
 

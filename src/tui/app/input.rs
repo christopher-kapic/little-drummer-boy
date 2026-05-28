@@ -10,6 +10,39 @@ use crate::tui::history::HistoryEntry;
 use super::{App, slash_matches};
 use crate::tui::settings::Dialog;
 
+/// Result of handing a submitted turn to the agent runner. Carries
+/// whether the working span this submit may have started was orphaned —
+/// i.e. no worker received the turn, so no `AgentIdle` will ever arrive
+/// to lower `busy`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DispatchOutcome {
+    /// The wire was accepted by a running worker; `AgentIdle` will end
+    /// the span normally.
+    Sent,
+    /// The input queue was full; the turn was rejected.
+    QueueFull,
+    /// The driver task has exited; the channel is closed.
+    DriverClosed,
+    /// Runner construction failed (`Some(Err(_))`) — e.g. the model
+    /// won't resolve, so no worker was ever spawned.
+    RunnerFailed,
+    /// No runner present (`None`) — nothing was started, nothing to undo.
+    NoRunner,
+}
+
+impl DispatchOutcome {
+    /// True when the turn never reached a worker, so a working span
+    /// opened for this submit would otherwise hang forever.
+    fn span_orphaned(self) -> bool {
+        matches!(
+            self,
+            DispatchOutcome::QueueFull
+                | DispatchOutcome::DriverClosed
+                | DispatchOutcome::RunnerFailed
+        )
+    }
+}
+
 impl App {
     pub(super) fn handle_key(&mut self, key: KeyEvent) -> bool {
         // Embedded pane (GOALS §1i): while a pane is open, `Ctrl+X`
@@ -890,11 +923,16 @@ impl App {
         // the latter drops to `None` between tool rounds, so a message
         // typed during tool execution would otherwise be mistaken for a
         // fresh turn.
-        if self.busy {
+        // True only on the fresh-submit path: this submit owns the
+        // rising edge of the working span and must undo it if the turn
+        // can't be handed off. The busy/queue path didn't start a span,
+        // so it must never tear one down.
+        let owns_working_span = if self.busy {
             self.queue.push(submitted.clone());
             // Defer the tool-call entries so they render right after the
             // folded user message (on the next `ThinkingStarted`).
             self.queued_tag_calls.extend(expanded.expansions);
+            false
         } else {
             // Fresh human message: start a new working span (resets the
             // cumulative clock and re-rolls the working line) and render
@@ -910,30 +948,42 @@ impl App {
             self.prompt_history.push(submitted.clone());
             self.prompt_history_cursor = 0;
             self.staged_draft = None;
-        }
+            true
+        };
 
         self.ensure_agent_runner();
-        match self.agent_runner.as_ref() {
+        let outcome = match self.agent_runner.as_ref() {
             Some(Ok(runner)) => match runner.input_tx.try_send(wire) {
-                Ok(()) => {}
+                Ok(()) => DispatchOutcome::Sent,
                 Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                     self.history.push(HistoryEntry::Plain {
                         line: "engine: input queue full — wait for the current turn to finish"
                             .to_string(),
                     });
+                    DispatchOutcome::QueueFull
                 }
                 Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                     self.history.push(HistoryEntry::Plain {
                         line: "engine: driver task has exited".to_string(),
                     });
+                    DispatchOutcome::DriverClosed
                 }
             },
             Some(Err(e)) => {
                 self.history.push(HistoryEntry::Plain {
                     line: format!("engine: {e}"),
                 });
+                DispatchOutcome::RunnerFailed
             }
-            None => {}
+            None => DispatchOutcome::NoRunner,
+        };
+        // A turn the worker never received will never emit `AgentIdle`
+        // (the sole `busy` falling edge), so the rising edge this submit
+        // created would otherwise be stuck on forever. Undo it — but only
+        // for the fresh-submit path that owns the edge; the queue path
+        // started no span and must leave any in-flight turn alone.
+        if owns_working_span && outcome.span_orphaned() {
+            self.end_working_span();
         }
         self.composer.clear();
         self.at_dismissed = false;
@@ -1212,5 +1262,57 @@ mod tag_delete_tests {
     fn forward_delete_quoted_tag() {
         let b = "@\"my file.rs\" rest";
         assert_eq!(completed_tag_span_forward(b, 0, &none()), Some((0, 13)));
+    }
+}
+
+#[cfg(test)]
+mod dispatch_span_tests {
+    use super::DispatchOutcome;
+
+    /// Reproduce `submit_input`'s working-span teardown rule without a
+    /// live daemon. The bug was that a failed-start submit left `busy`
+    /// stuck `true` forever, since `AgentIdle` (the sole falling edge)
+    /// never arrives when no worker was spawned. This models the exact
+    /// production gate (`owns_working_span && outcome.span_orphaned()`)
+    /// against the `begin`/`end_working_span` semantics (`busy` true on
+    /// rising edge, false on falling edge).
+    fn busy_after_fresh_submit(outcome: DispatchOutcome) -> bool {
+        // Fresh-submit path always owns the rising edge it just opened.
+        let owns_working_span = true;
+        let mut busy = true; // begin_working_span() set this.
+        if owns_working_span && outcome.span_orphaned() {
+            busy = false; // end_working_span() lowers it.
+        }
+        busy
+    }
+
+    #[test]
+    fn runner_failed_clears_busy() {
+        // The reported stuck-span case: runner is `Some(Err(_))`.
+        assert!(!busy_after_fresh_submit(DispatchOutcome::RunnerFailed));
+    }
+
+    #[test]
+    fn queue_full_and_driver_closed_clear_busy() {
+        assert!(!busy_after_fresh_submit(DispatchOutcome::QueueFull));
+        assert!(!busy_after_fresh_submit(DispatchOutcome::DriverClosed));
+    }
+
+    #[test]
+    fn successful_send_keeps_busy_until_agent_idle() {
+        // A normal turn stays "working"; only `AgentIdle` ends it.
+        assert!(busy_after_fresh_submit(DispatchOutcome::Sent));
+    }
+
+    #[test]
+    fn queue_path_never_tears_down_a_span() {
+        // The busy/queue path started no span this submit, so even an
+        // orphaning outcome must leave any in-flight turn's span alone.
+        let owns_working_span = false;
+        let mut busy = true; // a legitimately in-flight turn.
+        if owns_working_span && DispatchOutcome::RunnerFailed.span_orphaned() {
+            busy = false;
+        }
+        assert!(busy);
     }
 }

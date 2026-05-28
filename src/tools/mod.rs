@@ -19,6 +19,7 @@
 pub mod bash;
 pub mod custom;
 pub mod editunlock;
+pub mod intel;
 pub mod read;
 pub mod readlock;
 pub mod task;

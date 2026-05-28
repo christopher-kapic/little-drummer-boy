@@ -212,7 +212,12 @@ after a few cycles.
   central indexing helper); **no file watcher**. **No `grep`/`glob`
   tool** — raw search is `bash` + `rg`/`fd`, `search` is the budgeted
   path. Role-scoped per-agent assignment. Graduated to GOALS §21, plan
-  M2; build spec `prompts/codebase-intelligence-tools.md`.
+  M2; build spec `prompts/codebase-intelligence-tools.md`. **LANDED
+  2026-05-28**: Phase 1 implemented in `src/intel/` (index + tree-sitter
+  extraction + import resolver + budgeted writer) and `src/tools/intel.rs`
+  (8 tools), with `read` extended for line-ranges; wired to `explore`,
+  `coder`, and `orchestrator-build`. Migration 0005 backs the index.
+  (`impact` + trigram search index remain Phase 2.)
 
 - **D14. Async jobs (loop/timer/background) + mid-conversation tool
   growth.** → **DECIDED 2026-05-28**: One `jobs` **meta-tool** with a

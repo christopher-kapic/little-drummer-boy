@@ -144,8 +144,9 @@ exact tokens. Complements `search` (which handles patterns and substrings).
 
 **Implementation:** During outline indexing, tokenize each file into
 identifier-boundary tokens and write `(token → [(file, line)])` rows into
-SQLite. The index is maintained incrementally by the file watcher. Total storage
-for a 100k-line Rust project is roughly 2–5 MB in SQLite.
+SQLite. The index is refreshed **on-demand** by the central indexing helper
+(no file watcher — see §2), the same chokepoint that keeps `outline`
+fresh. Total storage for a 100k-line Rust project is roughly 2–5 MB in SQLite.
 
 **Source inspiration:** `codedb word`/`codedb_word`.
 
@@ -201,9 +202,9 @@ with modification timestamps and change counts since the last session.
 can see what changed recently without parsing git log. Also valuable for
 "what files am I likely to need?" heuristics when continuing a previous task.
 
-**Implementation:** The file watcher (GOALS.md §1e gitignore integration) already
-tracks mtime. `hot` is a SQL query on the watcher's file state table, sorted by
-mtime desc. Zero new dependencies.
+**Implementation:** `hot` is pure-FS — a gitignore-aware walk (the `ignore`
+crate, GOALS.md §1e) that stats each tracked file and sorts by mtime desc.
+No index dependency and no file watcher (see §2). Zero new dependencies.
 
 **Source inspiration:** `codedb hot`/`codedb_hot`.
 

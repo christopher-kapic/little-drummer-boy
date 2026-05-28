@@ -644,14 +644,21 @@ fn require_attached(state: &ClientState) -> std::result::Result<&AttachedSession
 fn internal<E: std::fmt::Display>(err: E) -> ErrorPayload {
     ErrorPayload {
         code: ErrorCode::Internal,
-        message: err.to_string(),
+        // `{:#}` walks the full anyhow context chain (e.g. `resolving
+        // model: provider ...: ...`) rather than printing only the
+        // outermost context, so daemon-surfaced errors are legible
+        // instead of an opaque `internal: resolving model`.
+        message: format!("{err:#}"),
     }
 }
 
 fn not_implemented(what: &str) -> ErrorPayload {
     ErrorPayload {
         code: ErrorCode::Internal,
-        message: format!("{what} not yet implemented in v1"),
+        // `{:#}` for consistency with `internal()`; `what` is a plain
+        // slug here, so the alternate form is identical, but keeping the
+        // same form means a future error-typed arg would print its chain.
+        message: format!("{what:#} not yet implemented in v1"),
     }
 }
 

@@ -120,6 +120,23 @@ unicode-width = "0.2"
 # pane (tui.diff_style). Provides line+intraline diff primitives.
 similar = "3"
 
+# Codebase-intelligence outline index (GOALS §21). `tree-sitter` core
+# parses; the grammar crates supply per-language `LANGUAGE` consts. The
+# grammar versions span 0.23–0.25 but are mutually compatible: modern
+# grammars depend on the tiny `tree-sitter-language` shim (the
+# `LanguageFn` ABI), not on `tree-sitter` core directly, so there's a
+# single core in the tree. `rayon` drives the parallel parse; the serial
+# SQLite write goes through the bundled `rusqlite` connection.
+tree-sitter = "0.26"
+tree-sitter-rust = "0.24"
+tree-sitter-typescript = "0.23"
+tree-sitter-javascript = "0.25"
+tree-sitter-python = "0.25"
+tree-sitter-go = "0.25"
+tree-sitter-c = "0.24"
+tree-sitter-cpp = "0.23"
+rayon = "1"
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 

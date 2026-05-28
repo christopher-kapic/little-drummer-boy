@@ -173,6 +173,28 @@ pub fn write_and_release(ctx: &ToolCtx, path: &Path, bytes: &[u8]) -> Result<()>
     Ok(())
 }
 
+/// Build a minimal in-memory [`ToolCtx`] for tool tests: a fresh
+/// in-memory DB, a session rooted at `root`, an empty redaction table,
+/// and a lock manager. Shared by the file-tool and intel-tool test
+/// modules so each doesn't re-spell the wiring.
+#[cfg(test)]
+pub(crate) fn test_ctx(root: &Path) -> ToolCtx {
+    use std::sync::Arc;
+
+    let db = crate::db::Db::open_in_memory().unwrap();
+    let session = crate::session::Session::create(db.clone(), root.to_path_buf(), "coder").unwrap();
+    let locks = Arc::new(crate::locks::LockManager::from_db(db).unwrap());
+    let cfg = crate::config::extended::RedactConfig::default();
+    let redact = Arc::new(crate::redact::RedactionTable::build(&cfg, root).unwrap());
+    ToolCtx {
+        agent_id: "coder".to_string(),
+        locks,
+        session: Arc::new(session),
+        cwd: root.to_path_buf(),
+        redact,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

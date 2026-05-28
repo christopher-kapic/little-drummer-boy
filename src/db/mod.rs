@@ -172,6 +172,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0002_sessions_fork.sql"),
     include_str!("migrations/0003_usage_events.sql"),
     include_str!("migrations/0004_tokenizer_calibration.sql"),
+    include_str!("migrations/0005_intel_index.sql"),
 ];
 
 fn migrate(conn: &Connection) -> Result<()> {
