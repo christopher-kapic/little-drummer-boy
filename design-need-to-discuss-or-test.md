@@ -136,6 +136,13 @@ drifts.
 **Recommendation pending decision:** factor. The drift cost across
 three duplicated code paths exceeds the abstraction cost.
 
+**Note (2026-05-28):** the `jobs` meta-tool (D14, GOALS §22) is a
+*separate* cache-safe growth pattern (fixed-schema meta-tool + hint
+messages), and the codebase-intelligence tools (D13, §21) deliberately
+use distinct precise schemas — neither plugs into `LazyToolCatalog`.
+This primitive stays scoped to the three lazy-discovery consumers
+(skills, MCP tools, MCP resources).
+
 ---
 
 ## RESOLVED
@@ -194,3 +201,38 @@ after a few cycles.
   `engine::is_at_safe_compaction_boundary()`. Predicate:
   `tool_call_in_flight.is_none() && active_subagents.is_empty()
   && !pending_user_interaction`. Land with plan T6.e implementation.
+
+- **D13. Codebase-intelligence tools — surface, exposure, index
+  invalidation.** → **DECIDED 2026-05-28**: Ship the Phase-1 set from
+  `codebase-intelligence.md` (`tree`, `outline`, `symbol_find`, `word`,
+  `deps`, `hot`, `circular`, `search` + `read` line-range) as
+  **distinct precise-schema tools** (not a meta-tool), backed by a
+  tree-sitter outline index in the cockpit SQLite DB (project-scoped,
+  six tables). **On-demand invalidation** (mtime+size+hash via one
+  central indexing helper); **no file watcher**. **No `grep`/`glob`
+  tool** — raw search is `bash` + `rg`/`fd`, `search` is the budgeted
+  path. Role-scoped per-agent assignment. Graduated to GOALS §21, plan
+  M2; build spec `prompts/codebase-intelligence-tools.md`.
+
+- **D14. Async jobs (loop/timer/background) + mid-conversation tool
+  growth.** → **DECIDED 2026-05-28**: One `jobs` **meta-tool** with a
+  fixed minimal schema (`action`+`args`); branches enabled mid-session
+  by appending a hint message + accepting the action at dispatch — the
+  cache-safe way to grow a tool surface (mutating the `tools` array
+  busts the prompt cache). `timer` = `loop.start(limit=1)`.
+  Ephemeral-fork loops with `note` as the only fork→main channel;
+  **single async-job authority** (forks can't spawn jobs — they
+  request, main decides). `background` shell-only in v1. Graduated to
+  GOALS §22, plan M3; build spec `prompts/async-jobs-subsystem.md`.
+  Related: D11 (the meta-tool is a *different* pattern from the
+  lazy-discovery catalog).
+
+- **D15. Compact-after-delegation.** → **DECIDED 2026-05-28**: On
+  delegation, prepare a smaller main context so a cache-cold resume is
+  cheap. **Lazy** shrink at TTL-minus-margin for cache providers,
+  **eager** at delegation start for no-cache providers; on return, full
+  context if cache hot, shrunk if cold. Shrink strategy is a setting:
+  **`prune` (default)** or `compact`, reusing the existing cache-cold
+  predicate (plan T6.f). Per-provider/model thresholds deferred (hook
+  in the per-model config layer, cf. D8). Graduated to GOALS §23; build
+  spec `prompts/compact-after-delegation.md`.

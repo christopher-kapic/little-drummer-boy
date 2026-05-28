@@ -243,8 +243,8 @@ Behavior:
   inlined content is **line-numbered** with the same 2000-line /
   ~8 KB caps, the same truncation marker, and the same redaction
   as the model-invoked `read`. (If the model wants a directory
-  listing *its* way, it runs `bash ls` or `glob` — those are the
-  model-facing tools; the `@`-tag inliner is not.)
+  listing *its* way, it runs `bash ls` — that's the model-facing
+  route; the `@`-tag inliner is not.)
 - **Each expansion shows in the chat as a harness-automatic
   tool-call entry.** When a tagged message is sent, every `@`-tag
   renders a one-line tool-call entry in the transcript
@@ -714,9 +714,9 @@ else is a user-authored agent.
 |-----------------------|----------|-----|---------|
 | `orchestrator-build`  | primary  | project root | The traditional coding-harness experience. Owns the user's conversation when the focus is *making the change*. Tools: `read` (shallow inspection of files the user references; not for searching), `task` (delegation), `skill`. May invoke `explore` interactively (one at a time) or in the background (multiple in parallel). May invoke `coder` interactively (one at a time). Does not directly `write`/`edit` and does not hold file locks. |
 | `orchestrator-plan`   | primary  | project root | Ralph-style planner. Owns the user's conversation when the focus is *deciding what to do*. Tools: `read` (shallow inspection), `task`, `skill`, plus plan-graph tools (create / append / update / delete / trigger). Sees in-progress and not-yet-implemented plans (completed plans are hidden by default; see "plan visibility" below). Triggering hands the plan off to the ralph executor (see §3b "Background agents") — `orchestrator-plan` does **not** hold the user's conversation while the plan runs; the user keeps talking to `orchestrator-plan` about other plans. Delegates to `explore` (interactive one-at-a-time, or background multi-parallel). Does not write code. |
-| `explore`             | subagent | project root | Read-only investigator over the **current project**. Tools restricted to `read`/`glob`/`grep`. Cannot invoke subagents. Returns `file:line` citations, not prose summaries. |
-| `coder`               | subagent | project root | The only agent that holds file locks and writes/edits. Tools: `read`/`readlock`/`write`/`writeunlock`/`unlock`/`edit`/`glob`/`grep`/`bash`/`task`. The `task` permission is scoped to `docs` only (noninteractive, may run multiple in parallel). Receives a scoped task from its caller, makes the changes, returns a structured report. Mode is set by caller: interactive when invoked by `orchestrator-build`, noninteractive when invoked by the ralph executor (see §3b). |
-| `docs`                | subagent | `agents.docs_dir` (configurable; see §4) | Read-only investigator over the **docs directory** — a user-configured location with dependency source code cloned into subdirectories. Same `read`/`glob`/`grep` surface as `explore`, same citation-style output. Cannot invoke subagents. |
+| `explore`             | subagent | project root | Read-only investigator over the **current project**. Tools: `read`, `bash` (raw `rg`/`fd`), and the read-only codebase-intelligence tools (§21). Cannot invoke subagents. Returns `file:line` citations, not prose summaries. |
+| `coder`               | subagent | project root | The only agent that holds file locks and writes/edits. Tools: `read`/`readlock`/`write`/`writeunlock`/`unlock`/`edit`/`bash`/`task` plus the codebase-intelligence tools (§21). The `task` permission is scoped to `docs` only (noninteractive, may run multiple in parallel). Receives a scoped task from its caller, makes the changes, returns a structured report. Mode is set by caller: interactive when invoked by `orchestrator-build`, noninteractive when invoked by the ralph executor (see §3b). |
+| `docs`                | subagent | `agents.docs_dir` (configurable; see §4) | Read-only investigator over the **docs directory** — a user-configured location with dependency source code cloned into subdirectories. Same `read` / `bash` / intel-tool surface as `explore` (§21), same citation-style output. Cannot invoke subagents. |
 
 **Why two orchestrators.** "Plan" and "build" are different
 cognitive modes, not different priorities of the same mode. A
@@ -757,8 +757,9 @@ orchestrators, includes a one-line nudge: *"For multi-file
 investigation, codebase searches, or anything you'd describe
 as 'figuring out where X lives,' spawn an `explore` subagent
 instead — it returns `file:line` citations under a token cap."*
-Orchestrators do **not** get `glob` or `grep` directly — those
-are the routes that earn the explore round-trip.
+Orchestrators do **not** get `bash` or the codebase-intelligence
+search tools directly — those are the routes that earn the explore
+round-trip.
 
 **Plan visibility on `orchestrator-plan`.** To keep the context
 manageable on long-lived projects, `orchestrator-plan` sees only
@@ -1442,8 +1443,9 @@ that touches every subsystem.
   is never lost to head-only truncation.
 - **Two complementary context-reduction commands.** `/prune` is
   deterministic, mechanical, and reviewable — it collapses superseded
-  snapshot tool results (older `read`/`ls`/`grep`/`git status` calls
-  that a newer call has obsoleted) into one-line markers, with no LLM
+  snapshot results (older `read` calls and read-only `bash` snapshots
+  like `ls` / `rg` / `git status` that a newer call has obsoleted) into
+  one-line markers, with no LLM
   in the loop. `/compact` is the heavyweight option: it asks the model
   to draft a handoff prompt summarizing the work so far, then starts a
   fresh thread seeded with that prompt (the old thread is preserved on
@@ -1476,20 +1478,27 @@ that touches every subsystem.
   list of `seed_tools: [{name, args}, ...]` that are dispatched
   **before** the new conversation starts; the results land in the new
   agent's initial context as if it had just run them. Restricted to
-  **read-only, idempotent** tools (`read`, `glob`, `grep`, `ls`,
-  `git status`). No `bash`, no `write`, no `edit`. Re-execute, never
+  **read-only, idempotent** tools (`read` and the read-only
+  codebase-intelligence tools — `tree`, `outline`, `symbol_find`,
+  `word`, `deps`, `hot`, `circular`, `search`; §21). No `bash`, no
+  `write`, no `edit`. Re-execute, never
   replay cached output — the seed exists to save the new agent a
   round-trip, not to hand off stale snapshots. The TUI surfaces
   seed-tool token cost on the receiving agent's first turn so an
   over-eager parent is debuggable.
 - **Built-in tool surface is small.** v1 ships `read, readlock, write,
-  writeunlock, edit, bash, glob, grep, task, skill, webfetch,
-  mcp_invoke`. The lock-aware tool set (`readlock` / `write` /
-  `writeunlock`) is required for the multi-agent file-locking model
-  (see `plan.md` §4.1); plain `read` is the unlocked snapshot variant
-  for exploration that doesn't intend to modify. No `websearch`
-  (provider-side search exists; if a user wants `cockpit`-side, they
-  pipe `curl` through `bash`). No tool we couldn't justify removing.
+  writeunlock, edit, bash, task, skill, webfetch, mcp_invoke`, the
+  codebase-intelligence tools (`tree, outline, symbol_find, word, deps,
+  hot, circular, search`; §21), and the `jobs` meta-tool (§22). The
+  lock-aware tool set (`readlock` / `write` / `writeunlock`) is
+  required for the multi-agent file-locking model (see `plan.md`
+  §4.1); plain `read` is the unlocked snapshot variant for exploration
+  that doesn't intend to modify. **No `grep`/`glob` tool** — raw search
+  is `bash` + `rg`/`fd`; the budgeted/structured path is the `search`
+  intel tool, which post-processes into token-capped results (a raw
+  `bash rg` dump has no budget awareness). No `websearch` (provider-
+  side search exists; if a user wants `cockpit`-side, they pipe `curl`
+  through `bash`). No tool we couldn't justify removing.
 - **MCP via lazy discovery** (§18 — reversed from the prior "no MCP"
   policy). The original §10 objection to MCP was token cost: a typical
   MCP server's per-tool schemas inject thousands of tokens into every
@@ -2236,7 +2245,7 @@ short hash so renames and symlink shifts don't fragment history.
 
 For every `tool_calls` row with a non-`NULL` `path`, attribute the
 call to a language by file extension. Bucket non-file tools
-(`bash`, `grep`, `task`, ...) as `shell` and report them in a
+(`bash`, `task`, `webfetch`, ...) as `shell` and report them in a
 separate "non-file activity" row beneath the language bar.
 
 **v1: static extension table.** A baked-in map of ~40 extensions
@@ -2306,7 +2315,7 @@ table.
 │    ███░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  Markdown      8.3%    35 calls │
 │    ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  Other        10.4%    43 calls │
 │                                                                     │
-│  Non-file activity: 412 bash / 76 grep / 22 task                    │
+│  Non-file activity: 412 bash / 76 search / 22 task                  │
 │                                                                     │
 └─ q quit  s switch scope  r switch range  e expand row  ─────────────┘
 ```
@@ -2335,7 +2344,7 @@ Bands:
 
 | Severity | Meaning |
 |----------|---------|
-| **0.0** | Clean call. Schema-valid input, no repair needed. Tools without recovery semantics (`bash`, `grep`, plain `read`) sit here unless they hard-fail. |
+| **0.0** | Clean call. Schema-valid input, no repair needed. Tools without recovery semantics (`bash`, `tree`, plain `read`) sit here unless they hard-fail. |
 | **0.1–0.3** | Trivial mismatch. Whitespace trim, single-field shape fix, or escape normalization. Fully semantics-preserving recovery; the model was *almost* right. |
 | **0.4–0.6** | Moderate mismatch. Multiple normalizations needed, or a structural rearrangement of the args (`wrap_single_arg`, `parse_stringified_array`, `escape_normalized`). |
 | **0.7–0.9** | Major mismatch. The harness recovered (e.g. anchor-based or context-aware cascade matched), but the model emitted something substantially different from the file's bytes. A 0.9 is a near-miss-of-the-near-miss; only the last cascade stage saved it. |
@@ -2368,7 +2377,7 @@ added to §12's catalog or §13b's cascade get a one-line addition
 to the rubric and a band assignment based on which family of
 mistake they cover.
 
-For tools that don't participate in recovery (`bash`, `grep`,
+For tools that don't participate in recovery (`bash`,
 plain `read`, `task`, `skill`, ...), severity is binary: 0.0 or
 1.0. The middle of the scale is empty, which is fine — they're
 still useful to roll up (average severity per project, per model,
@@ -3016,6 +3025,136 @@ This distinction must be surfaced in the Add-Provider wizard and in
    may stop working without notice."*
 3. Implementation lives under `src/auth/<vendor>.rs`; never share an
    OAuth client id across `auth/` modules.
+
+---
+
+## 21. Codebase-intelligence tools
+
+A first-class set of read-only navigation tools backed by a
+tree-sitter outline index, so agents orient and navigate at minimal
+token cost instead of reading whole files or shelling to `rg`. Full
+design in `codebase-intelligence.md`; build spec in
+`prompts/codebase-intelligence-tools.md`. `kcl` ships the same tools
+as `kcl explore …` subcommands — study it (`kcl ask kcl …`) before
+implementing.
+
+**Phase-1 surface (all CK-approved):** `tree` (annotated dir tree),
+`outline` (per-file symbols), `symbol_find` (definition sites),
+`word` (exact-identifier inverted index), `deps` (file import graph,
+forward + reverse), `hot` (recently modified), `circular` (import
+cycles), `search` (budget-capped structured content search), plus a
+line-range extension to the existing `read`. `impact` (symbol blast
+radius) and a trigram search index are Phase 2.
+
+**Decisions.**
+
+- **Distinct tools, precise schemas** — not a meta-tool. The set is
+  known per-agent at session start, so fixed precise schemas give the
+  weak target models and the repair layer (§12) a clear contract.
+- **On-demand invalidation, no file watcher.** Each call re-stats
+  tracked files (mtime+size, hash tiebreaker) and re-indexes
+  stale/removed ones through one central indexing helper before
+  answering. A watcher's silent-staleness failure mode loses to the
+  top priority (correctness for weak models); it may later be added
+  only as a dirty-marking accelerator over the on-demand path.
+- **Index in the cockpit SQLite DB**, project-scoped so multi-project
+  is an additive change. Six tables (`files`, `symbols`, `imports`,
+  `identifiers`, `deps`, `callsites`).
+- **Budgeted output** via `tokens.rs` (`search` default 4 000-token
+  cap), dropping whole writes atomically to keep a valid prefix (§10).
+- **No `grep`/`glob` tool.** Raw search is `bash` + `rg`/`fd`;
+  `search` is the budgeted/structured path.
+
+**Per-agent assignment (starting default; revisit later).** `explore`:
+all. `coder`: `read`(line-range), `outline`, `symbol_find`, `deps`,
+`circular`, `word`, `search` (+ its write tools; `impact` joins in
+Phase 2). `orchestrator-plan`: `tree`, `deps`, `circular`, `hot`.
+`orchestrator-build`: `tree`, `hot`. `docs`: `tree`, `outline`,
+`symbol_find`, `read`(line-range).
+
+---
+
+## 22. Async jobs — loop / timer / background
+
+Agents can schedule recurring self-prompts (`loop`), one-shot delayed
+prompts (`timer`), and background shell jobs (`background`) that run
+without blocking the human. Build spec in
+`prompts/async-jobs-subsystem.md`. The three share one daemon-resident
+async subsystem; they differ only in trigger (interval / once /
+process-exit) and body (re-prompt / shell).
+
+**One `jobs` meta-tool, not three tools.** The surface grows
+mid-conversation (`background.tail`/`cancel` are meaningless until a
+background exists). A meta-tool with a **fixed minimal schema**
+(`action` + `args`) keeps the tools array byte-stable so capability
+growth never busts the prompt cache; a branch is enabled by appending
+a hint message + accepting the action at dispatch (both cache-safe),
+with per-action args validated through the repair layer (§12). This is
+the canonical mid-conversation-growth pattern (see CLAUDE.md design
+rules); distinct precise-schema tools are still used where the set is
+fixed at start (e.g. §21).
+
+**Branches.** `loop.start(interval, prompt, backoff=false,
+limit=10|∞, keep_in_context=true, independent=false)`; `loop.cancel`
+(enabled while a loop is live; available in main, and a fork may
+cancel its own loop); `background.start(cmd)` → returns a handle
+immediately; `background.tail` / `background.cancel` (enabled after a
+background exists).
+
+**`timer` = `loop.start` with `limit=1`** — no separate tool; the UI
+renders a `limit=1` loop as a timer.
+
+**Ephemeral-fork loops (`keep_in_context=false`).** Each iteration
+runs in a fork branched from the main context at registration.
+`independent` chooses fresh-fork-per-iteration vs accumulate-in-fork
+(default). Nothing crosses to main during the loop except `note(text)`
+— the only fork→main channel, shown live in the UI but injected into
+main context only at termination; the terminal iteration's full result
+is promoted to main.
+
+**Single async-job authority (anti-runaway).** Main owns all jobs —
+same shape as single-writer `coder` (§3a). A fork's
+`loop.start`/`background.start` do not execute; they emit a request
+routed back to main, which decides whether to run it. Prevents
+recursive/runaway loops.
+
+**Surfacing.** Completions, timer fires, and background exits inject
+as a late-arriving turn at the next turn boundary (daemon NDJSON
+proto, §8); output is budget-capped (§10). A transient jobs strip
+(shown only when ≥1 job is active — additive to the fixed chrome §1a),
+inline completion events, a `/jobs` list-and-cancel command, and
+`needs_attention` flagging on end/failure.
+
+---
+
+## 23. Compact-after-delegation
+
+When the main agent delegates to a sub-agent, the wait can outlast the
+provider's prompt-cache TTL, so the main context's cache goes cold.
+This hides the cost by preparing a smaller main context to resume from
+when the cache is lost. Build spec in
+`prompts/compact-after-delegation.md`.
+
+- **Cache-capable provider — lazy.** Don't shrink at delegation start;
+  only if the sub-agent is still running at TTL-minus-margin, shrink
+  in parallel. Fast delegations waste nothing.
+- **No-cache provider — eager.** Shrink at delegation start (no cache
+  to protect; latency hides under the delegation).
+- **On return:** cache hot → resume on the full context (no quality
+  loss); cache cold → resume on the shrunk context (smaller cold read).
+- **Shrink strategy is a setting:** `prune` (default — matches the
+  existing "auto-prune when expected cache-hit = 0" policy, §10 /
+  `plan.md` T6.f; lower quality loss) or `compact` (the §T6.e
+  fresh-thread handoff; heavier, more savings).
+- **Cache-cold check reuses the existing auto-prune predicate** (§10)
+  — no second cache-state heuristic.
+- Runs daemon-side (the daemon owns session/inference state). The same
+  logic applies to background delegations (§22).
+
+**Future (hook now, UI later).** Per-provider/model context-usage
+thresholds for autocache/autoprune live in the per-model config layer
+(§4; the three-knob cap per `design-need-to-discuss-or-test.md` D8),
+so adding the threshold UI later is additive.
 
 ---
 

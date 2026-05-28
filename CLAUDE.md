@@ -18,6 +18,9 @@ for any of them.
    Before adding or changing a feature, check whether the relevant
    question is open here — if so, resolve it first (in conversation
    with the user) and graduate the entry to GOALS/plan.
+6. `codebase-intelligence.md` — design of the codebase-intelligence
+   tools (GOALS §21). Detailed build specs for in-flight features live
+   in `prompts/`.
 
 If a feature isn't in one of those docs, it isn't in scope yet. Update
 the docs first; then code.
@@ -121,12 +124,17 @@ out new deps in PR descriptions.
   the dispatcher runs schema validation, walks the catalog at the
   paths the validator disagreed at, and re-validates. Preprocessing
   is a silent-corruption hazard.
-- **Built-in v1 tool surface is fixed:** `read, readlock, write,
-  writeunlock, edit, bash, glob, grep, task, skill, webfetch,
-  mcp_invoke`. Anything outside that list needs a design discussion
-  before it's added (GOALS §10). `mcp_invoke` dispatches to MCP
-  servers via lazy discovery (catalog of name + one-line description;
-  schema loaded on first call) — see GOALS §18.
+- **Built-in v1 tool surface:** `read` (paginated + line-range),
+  `readlock, write, writeunlock, edit, bash, task, skill, webfetch,
+  mcp_invoke`, the codebase-intelligence tools (`tree, outline,
+  symbol_find, word, deps, hot, circular, search` — GOALS §21), and
+  the `jobs` meta-tool (`loop`/`timer`/`background` — GOALS §22).
+  There is **no** `grep`/`glob` tool: raw search is `bash` + `rg`/`fd`;
+  budgeted/structured search is the `search` intel tool. Anything
+  outside this set needs a design discussion before it's added (GOALS
+  §10). `mcp_invoke` dispatches to MCP servers via lazy discovery
+  (catalog of name + one-line description; schema loaded on first
+  call) — see GOALS §18.
 - **Wire vs user transcript split** (GOALS §14). One tool-call row
   carries `wire_input` + `original_input` + `recovery`. The model
   sees the canonical form; the user sees the original with a recovery
@@ -142,6 +150,26 @@ out new deps in PR descriptions.
   `mcp_invoke(server, tool, args)` call. Token economy (§10) holds
   because no MCP server's per-tool schema is ever injected into the
   system prompt. `cockpit mcp {add,list,test}` manages servers.
+- **Mid-conversation capability growth uses a meta-tool, never tool
+  injection.** Changing the `tools` array mid-session reserializes the
+  cached prefix and busts the prompt cache. When a tool's surface must
+  grow as a conversation proceeds (e.g. `jobs`, GOALS §22), expose one
+  meta-tool with a fixed minimal schema (`action` + `args`) and enable
+  branches by appending a hint message + accepting the action at
+  dispatch — both cache-safe. Per-action args are validated through the
+  repair layer (§12). Use distinct precise-schema tools where the set
+  is fixed at start (e.g. the intel tools).
+- **Single async-job authority.** All loops/timers/background jobs are
+  owned by the main thread (GOALS §22) — same shape as single-writer
+  `coder` and the single in-daemon lock authority. Ephemeral loop forks
+  cannot spawn async work; their `loop.start`/`background.start` calls
+  become requests routed back to main, which decides whether to run
+  them. Prevents runaway/recursive loops.
+- **Codebase-intelligence index is on-demand, not watcher-driven**
+  (GOALS §21). Each intel-tool call re-stats tracked files (mtime+size,
+  hash tiebreaker) and re-indexes stale/removed ones before answering —
+  a watcher's silent-staleness failure mode loses to priority #1. One
+  central indexing helper; no per-tool duplication.
 - **Vim mode is default-on** in the composer.
 - **Cross-platform:** Linux, macOS, Windows. CI runs the matrix.
 - **Token economy is non-negotiable** (GOALS §10). Tool descriptions

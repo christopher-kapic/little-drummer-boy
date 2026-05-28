@@ -308,8 +308,8 @@ mean the same thing every time, or users won't trust it.
 **Behavior layers, ordered from safest to riskiest:**
 
 1. **Snapshot-tool dedup (always-on candidate).** Collapse all but
-   the most recent result body for `read`, `glob`, `grep`, and the
-   short whitelisted set of read-only bash commands (`git status`,
+   the most recent result body for `read`, the read-only intel tools,
+   and the short whitelisted set of read-only bash commands (`git status`,
    `git log`, `ls`, `pwd`, `cat` of immutable paths). Replace older
    bodies with `Part::Elided { original_event_id, reason: "snapshot
    superseded" }`. The call shape stays so reasoning blocks that
@@ -371,8 +371,8 @@ implements a **handoff to a fresh thread**:
    todos, pinned-message contents verbatim.
 3. **Compute the seed-tools list.** The runtime walks the prior
    session's read history and the current lock table to derive a
-   list of read-only tool calls (`read`, `glob`, `grep`, `ls`,
-   `git status`) whose results the model was actively using just
+   list of read-only tool calls (`read`, `ls`, `git status`, and the
+   read-only intel tools) whose results the model was actively using just
    before compaction. These calls are dispatched at the start of the
    new thread and their results land as if the new agent had just
    run them — the new agent doesn't pay a fresh round-trip to
@@ -641,7 +641,7 @@ is the IPC. To go remote, we add a transport, not a rewrite.
 │                 │  │                  │         │                     │
 │  read/write/    │  │  rig-core +      │         │  trait MemoryBackend│
 │  edit/bash/     │  │  transform       │  ◀─ ┐   │  - local-sqlite (v1)│
-│  glob/grep/     │  │  layer (model-   │     │   │  - git-private-     │
+│  search/hot     │  │  layer (model-   │     │   │  - git-private-     │
 │  task/skill/    │  │  specific muts,  │     │   │    branch (theory)  │
 │  webfetch       │  │  cache-boundary  │     │   │  - hindsight-style  │
 │                 │  │  preservation)   │     │   │    external (theory)│
@@ -717,7 +717,7 @@ src/
 
   tools/                  the built-in tool surface
     mod.rs                ToolRegistry, defer_loading support
-    read.rs, write.rs, edit.rs, bash.rs, glob.rs, grep.rs,
+    read.rs, write.rs, edit.rs, bash.rs,
     task.rs               subagent w/ TaskPacket contract
     skill.rs              lazy skill load
     webfetch.rs
@@ -727,6 +727,11 @@ src/
     file_lock.rs          readlock/writeunlock/unlock — exclusive
                           per-file lock manager (GOALS §3a, §4.1)
     truncate.rs           output spillover (cf. opencode.md §16)
+    intel.rs              codebase-intelligence tools — tree, outline,
+                          symbol_find, word, deps, hot, circular,
+                          search; over the outline index (GOALS §21)
+    jobs.rs               `jobs` meta-tool — loop/timer/background +
+                          note; routes to the async subsystem (§22)
 
   graph/                  graph-plan executor (T2 / §4.1)
     mod.rs                plan model, scheduler
@@ -736,6 +741,15 @@ src/
     hooks.rs              lifecycle hooks (pre/post step, pre/post test)
     retries.rs            per-step retry budget, context-injection on retry
     tests.rs              deterministic test command runner
+
+  intel_index/            tree-sitter outline index (GOALS §21):
+                          parser + central index_target helper
+                          (parallel parse → serial write), SQLite
+                          schema, on-demand mtime/size/hash invalidation
+  jobs/                   async subsystem (GOALS §22): scheduler for
+                          loop/timer/background, ephemeral loop forks,
+                          note buffer, fork→main job requests
+                          (daemon-resident)
 
   harness/                external-harness invocation
     mod.rs                trait Harness, invoke_noninteractive
@@ -1019,7 +1033,9 @@ This is the right level of abstraction; ship it from v1.
 ### 3c. Tools (`tools/`)
 
 GOALS §10's v1 tool surface: `read, readlock, write, writeunlock,
-edit, bash, glob, grep, task, skill, webfetch`. The lock-aware
+edit, bash, task, skill, webfetch, mcp_invoke`, the codebase-
+intelligence tools (GOALS §21), and the `jobs` meta-tool (GOALS
+§22). The lock-aware
 verbs are the single-exclusive-lock model (§4.1 / GOALS §3a):
 `read` is the unlocked snapshot for exploration; `readlock` takes
 the exclusive lock (intent to modify); `write`/`edit` require it;
@@ -1116,9 +1132,9 @@ Default thresholds 100 / 1000 lines, configurable. Summarizer failure
 falls back to raw + stderr banner so the model sees the cost-shift.
 The summary itself is budget-bounded
 ([`features/claw.md` §17](./features/claw.md): max chars / lines /
-line-chars). Especially valuable for `grep` / `glob` / `find` output
-where the model usually wants the *shape* of the result, not all
-50,000 matches.
+line-chars). Especially valuable for `bash` search output
+(`rg`/`fd`/`find`) and the `search` intel tool, where the model
+usually wants the *shape* of the result, not all 50,000 matches.
 
 The summary is produced by whatever the user has mapped to the
 `smol` category (§4.6) — for cheap-orchestrator sessions this is
@@ -1225,8 +1241,8 @@ that the user is likely to want to steer mid-flight.
 include an optional `seed_tools: [{name, args}, ...]` list. Each
 entry is dispatched **before** the subagent's first inference call;
 results land in the subagent's initial context as if it had just run
-them. Restricted to read-only, idempotent tools (`read`, `glob`,
-`grep`, `ls`, `git status`); `bash`/`write`/`edit` are rejected at
+them. Restricted to read-only, idempotent tools (`read` and the
+read-only intel tools — GOALS §21); `bash`/`write`/`edit` are rejected at
 schema validation. Tools are **re-executed**, not replayed from the
 parent's transcript, so the subagent never inherits stale snapshots.
 Purpose: a parent that already knows the subagent will need
@@ -2145,9 +2161,9 @@ cockpit ships a small, generic-named default cast in
 |-----------------------|----------|------------------|-----|---------|
 | `orchestrator-build`  | primary  | `default`        | project | Traditional coding-harness experience. Owns the conversation when the focus is *making the change*. Delegates to `explore` / `docs` / `coder`. No direct `write`/`edit`; no file locks. `/build` slash command swaps to this one. |
 | `orchestrator-plan`   | primary  | `slow` (thinking)| project | Ralph-style planner. Owns the conversation when the focus is *deciding what to do*. Sees the full feature dependency graph(s) (§4.1), can create new graph plans, can append to existing ones. Produces / mutates plan structures; does not write code directly. `/plan` slash command swaps to this one. |
-| `explore`             | subagent | `default`        | project | Read-only investigator over the *current* project. Tools restricted to `read`/`glob`/`grep`. Designed as a search engine — returns `file:line` citations, not prose summaries. |
+| `explore`             | subagent | `default`        | project | Read-only investigator over the *current* project. Tools: `read`, `bash` (raw `rg`/`fd`), and the read-only codebase-intelligence tools (GOALS §21). Designed as a search engine — returns `file:line` citations, not prose summaries. |
 | `coder`               | subagent | `slow`           | project | The only agent that holds locks and writes/edits. Receives a scoped task from an orchestrator, makes the changes, returns a structured report. |
-| `docs`                | subagent | `default`        | docs-dir (configurable) | Read-only investigator over the **docs directory** — a configurable location where dependency source code is cloned. Same tool surface as `explore` (`read`/`glob`/`grep`), same citation-style output; just rooted at the docs dir rather than the project cwd. |
+| `docs`                | subagent | `default`        | docs-dir (configurable) | Read-only investigator over the **docs directory** — a configurable location where dependency source code is cloned. Same tool surface as `explore` (`read` / `bash` / intel tools; GOALS §21), same citation-style output; just rooted at the docs dir rather than the project cwd. |
 
 Names are generic, not personality-themed. The cast is **deliberately
 minimal at v1** — five agents that compose into "plan ↔ build →
@@ -2176,7 +2192,7 @@ switches to `orchestrator-build`.
 Population is the user's responsibility (manual `git clone`,
 or a future `cockpit docs add <repo>` helper) — cockpit itself
 doesn't manage the clones. The `docs` agent's cwd is the docs
-directory; it `glob`/`grep`/`read`s normally, and its citations
+directory; it searches (`bash` `rg`/`fd`, the intel tools) and `read`s normally, and its citations
 are relative to the docs directory so the orchestrator can
 `read <docs_dir>/<repohost>/<org>/<repo>/<file>` to pull
 specific snippets.
@@ -2206,9 +2222,10 @@ can vacuum up a whole subtree and synthesize prose; cheap models
 can't and shouldn't try. Instead, both agents' job is to **locate
 relevant code and return citations**, not to write prose summaries.
 
-Tool surface: `read`, `glob`, `grep` only. No `write`, no `edit`,
-no `bash`, no further delegation. Cwd is fixed — project root for
-`explore`, `agents.docs_dir` for `docs`.
+Tool surface: `read`, `bash` (raw `rg`/`fd`), and the read-only
+codebase-intelligence tools (GOALS §21). No `write`, no `edit`, no
+further delegation. Cwd is fixed — project root for `explore`,
+`agents.docs_dir` for `docs`.
 
 Output schema — structured markdown with file:line citations and
 one-sentence annotations:
@@ -2241,8 +2258,9 @@ inside its own fresh context; the orchestrator only ever sees the
 curated index.
 
 **Why this pattern works for cheap models.** Cheap models are
-reasonable at retrieval-and-ranking (`grep`, `glob`, then "which
-of these matches is most relevant?") and bad at multi-page
+reasonable at retrieval-and-ranking (`bash rg`, the `search` /
+`symbol_find` intel tools, then "which of these matches is most
+relevant?") and bad at multi-page
 synthesis. The two investigators exploit the strength and sidestep
 the weakness. The orchestrator does the synthesis using focused,
 model-curated reads — much cheaper context, much higher signal.
@@ -3141,7 +3159,7 @@ step's dependencies cheap.
   chrome.
 - Tool surface: `read` (with hashline tagging), `write`/`edit`
   (with hashline anchors + `write-existing-file-guard`), `bash`
-  (with `bash-file-read-guard` + env-scrub), `glob`, `grep`,
+  (with `bash-file-read-guard` + env-scrub),
   `task` (category XOR agent), `skill`, `webfetch` + spillover
   (with the 3-tier raw/summary/spillover decision tree from
   Sparkshell).
@@ -3189,6 +3207,12 @@ step's dependencies cheap.
 - Skill discovery (lazy, defer-loaded).
 - Compaction (opencode algorithm).
 - `cockpit pr` convenience wrapper.
+- **Codebase-intelligence tools (GOALS §21)** — tree-sitter outline
+  index (central `index_target` helper, on-demand invalidation, SQLite
+  schema) + the Phase-1 tool set (`tree`/`outline`/`symbol_find`/
+  `word`/`deps`/`hot`/`circular`/`search` + `read` line-range). Study
+  `kcl explore` first. Full spec:
+  `prompts/codebase-intelligence-tools.md`.
 
 **M3 — Novel primitives.**
 - Injection guard (§4.3).
@@ -3210,9 +3234,19 @@ step's dependencies cheap.
   policy under `caching`; eager under `context`. Smart defaults from
   provider metadata. Awareness-hint injection ("N earlier reads
   elided") for pruned bodies.
+- **Async jobs subsystem (GOALS §22)** — the `jobs` meta-tool
+  (cache-safe branch growth via hints), `loop`/`timer`/`background`,
+  ephemeral-fork loops + `note`, single async-job authority
+  (fork→main job requests), jobs strip + `/jobs`. Full spec:
+  `prompts/async-jobs-subsystem.md`.
+- **Compact-after-delegation (GOALS §23)** — lazy shrink at
+  TTL-minus-margin (eager for no-cache providers), full-vs-shrunk
+  resume on return, `prune`/`compact` setting (default `prune`)
+  reusing the T6.f cache-cold predicate. Full spec:
+  `prompts/compact-after-delegation.md`.
 
 **M4 — Polish & v1 release.**
-- Filesystem scan cache shared across grep/glob/find.
+- Filesystem scan cache shared across `bash` search and the codebase-intelligence index.
 - Universal config discovery (Cursor / Windsurf / Cline rules pickup).
 - Cargo dist release pipeline (Linux/macOS/Windows).
 - Mock-LLM parity harness for CI

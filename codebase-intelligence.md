@@ -16,6 +16,14 @@ graph) — and classifies them against cockpit's design constraints.
   without going through `redact::scrub()`.
 - No MCP protocol support (`cockpit mcp` prints a pointer and exits).
 
+**Decisions locked in this design pass (2026-05-28):** ship as
+**distinct tools with precise schemas** (not a meta-tool); the index
+uses **on-demand invalidation** (no file watcher — see §2); there is
+**no `grep`/`glob` tool** (raw search is `bash` + `rg`/`fd`, `search`
+is the budgeted path); each agent gets a **role-scoped subset** (GOALS
+§21 per-agent assignment). Build spec:
+`prompts/codebase-intelligence-tools.md`.
+
 ---
 
 ## Part 1 — Add These
@@ -62,7 +70,12 @@ tool never hard-errors on unknown file types.
 
 The outline index is persisted in the cockpit SQLite DB (one row per file, keyed
 by path + mtime hash) so repeated calls are O(1) cache hits. The cache is
-invalidated by the file watcher.
+invalidated **on-demand**: each call re-stats tracked files (mtime+size, hash as
+tiebreaker) and re-indexes the stale/removed ones before answering, all through
+one central indexing helper. **No file watcher** — a watcher's silent-staleness
+failure mode is unacceptable for the OS-model correctness target; it may later be
+added only as a dirty-marking accelerator over the on-demand path. **DECIDED
+2026-05-28.**
 
 **Source inspiration:** `codedb outline`/`codedb_outline`, `codebase_symbols`
 (SocratiCode).
@@ -430,7 +443,7 @@ Ship in order:
 | Index storage | `rusqlite` (already bundled) | Zero new dep; recursive CTEs handle graph traversal; FTS5 available for BM25 search later |
 | Gitignore filtering | `ignore` crate (already in scope) | Correct handling of nested ignore files, negation patterns, `core.excludesfile`; don't roll our own |
 | Full-text search | `rg` subprocess → `grep-regex` crate | Start simple; trigram index layer added later |
-| File watching | `notify` crate or polling | Notify for inotify/FSEvents/kqueue; polling fallback for remote FS |
+| Index invalidation | On-demand (mtime+size+hash) | No watcher in v1 — freshness verified at query time; a watcher may later be added only as a dirty-marking accelerator |
 | Semantic search (deferred) | `sqlite-vec` + local embedding | Keeps zero-external-process constraint if/when the extension matures |
 
 ---
