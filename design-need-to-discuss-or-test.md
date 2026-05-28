@@ -145,6 +145,61 @@ This primitive stays scoped to the three lazy-discovery consumers
 
 ---
 
+## D17. Direct-write orchestrator-build (relax single-writer for small tasks)
+
+**Context.** Today only `coder` writes / holds file locks — single
+writer per delegation tree (GOALS §3a, CLAUDE.md). For a *small* task,
+having `orchestrator-build` spawn `coder` at all is arguably overkill:
+the round-trip costs tokens and latency for a one-line edit.
+
+**The proposal (deferred, not adopted).** Give `orchestrator-build`
+direct `readlock` / `edit` / `write` (and a new `append` tool, D18 below)
+for small tasks, making it a *second writer*. The tool descriptions
+surfaced to `orchestrator-build` would steer it: edit directly when the
+task is small, delegate to `coder` when it's big.
+
+**Decision so far (2026-05-28).** Keep the single-writer invariant for
+now — option **(i)**: `orchestrator-build` stays delegation-only; we make
+the `coder` hop *cheap* for small tasks instead (fast-path spawn, minimal
+ceremony) rather than adding a second writer. **Revisit (ii) later.**
+
+**Hard prerequisite for revisiting.** Direct-write is *contingent on
+dynamic (per-agent) tool descriptions* — without the ability to vary a
+tool's description by the agent it's surfaced to, we can't steer
+`orchestrator-build` to "edit small / delegate big," so direct-write
+would have no guard rail. Per-agent descriptions (the GOALS §3a `read`
+nudge is the first instance) must land first.
+
+**Decisions needed when we revisit.**
+- Does a second writer require lock-manager changes, or does the existing
+  single-in-daemon authority already serialize two writers in one tree
+  safely? (Audit `locks/` before adopting.)
+- What's the size threshold / heuristic that routes "edit here" vs
+  "delegate to `coder`", and is it the model's call (via tool-description
+  steering) or a runtime classifier?
+
+**Unblocks.** Lower-latency, lower-token small edits in the build flow.
+
+---
+
+## D18. `append` tool (write-by-append, no prior read)
+
+**Context.** Surfaced alongside D17. A tool that appends to the end of a
+file *without reading it first* — useful for decision logs / scratch
+notes the agent writes but never needs to read back. Token win: the old
+contents never enter context.
+
+**Open.**
+- It mutates a file, so it's a *write-capable* tool → subject to the same
+  single-writer policy as D17. v1 home is therefore `coder` only (not
+  `orchestrator-build`) until D17(ii) is revisited.
+- Locking: append must acquire/append/release atomically so concurrent
+  appends from parallel `coder`s (ralph) don't interleave. Confirm the
+  lock manager grants a short exclusive append-lock.
+- Does it create the file if absent, or error? (Lean: create.)
+
+---
+
 ## RESOLVED
 
 Decisions that have been made and graduated to `GOALS.md` / `plan.md`.

@@ -308,16 +308,21 @@ impl Session {
     /// Record provider-reported token usage for a round-trip: persist
     /// it to `inference_calls` for `/stats` and store the latest value
     /// on the session so the TUI can show it in the context indicator.
-    /// No-op when the active provider/model isn't set on the session
-    /// (background calls during startup).
-    pub fn record_usage(&self, usage: crate::tokens::TokenUsage) -> Result<()> {
+    /// No-op (for the DB write) when the active provider/model isn't set
+    /// on the session (background calls during startup).
+    ///
+    /// `call_id` is the round-trip's id — the SAME value used to key the
+    /// captured request body in `inference_requests`
+    /// ([`Self::record_inference_request`]) so the metadata row and the
+    /// full payload join on `call_id` (session-log-export Part A).
+    pub fn record_usage(&self, call_id: Uuid, usage: crate::tokens::TokenUsage) -> Result<()> {
         *self.last_usage.lock().unwrap() = Some(usage);
 
         let (Some(provider), Some(model)) = (self.active_provider(), self.active_model()) else {
             return Ok(());
         };
         let row = crate::db::inference_calls::InferenceCallRow {
-            call_id: Uuid::new_v4(),
+            call_id,
             session_id: self.id,
             project_id: self.project_id.clone(),
             project_root: self.project_root.to_string_lossy().into_owned(),
@@ -332,6 +337,99 @@ impl Session {
         self.db
             .insert_inference_call(&row)
             .context("inserting inference_call")
+    }
+
+    /// Persist the full assembled (post-redaction) outbound request body
+    /// for one inference call, keyed by `call_id` (session-log-export
+    /// Part A). Always-on — every call, every session. The payload is the
+    /// exact as-sent form; no second redaction pass is applied.
+    pub fn record_inference_request(&self, call_id: Uuid, payload: &Value) -> Result<()> {
+        self.db
+            .insert_inference_request(&call_id.to_string(), self.id, payload)
+            .context("inserting inference_request")
+    }
+
+    /// Append one event to the session timeline (session-log-export Part
+    /// B). Always-on, engine/daemon-owned. Returns the assigned monotonic
+    /// `seq`. Best-effort callers may ignore the result.
+    pub fn record_event(
+        &self,
+        kind: crate::db::session_log::SessionEventKind,
+        agent: Option<&str>,
+        call_id: Option<&str>,
+        data: &Value,
+    ) -> Result<i64> {
+        self.db
+            .insert_session_event(self.id, kind, agent, call_id, data)
+            .context("inserting session_event")
+    }
+
+    /// Record a `context_pruned` timeline event (session-log-export Part
+    /// C). Fired by the real `/prune` path (manual + cache-cold auto): a
+    /// wire-only snapshot dedup that elided superseded tool-result bodies.
+    /// Carries messages-before/after, wire tokens-before/after, the elided
+    /// `original_event_id`s, the reason, and the trigger (auto vs manual).
+    ///
+    /// Because auto-prune fires right before an inference call, this event
+    /// lands immediately before the next `inference_request` event in
+    /// `seq` order — the two adjacent request payloads then *show* the
+    /// elision directly, which is the before/after-prune audit the export
+    /// is for. `agent` is the foreground agent the prune targeted.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_context_pruned(
+        &self,
+        agent: &str,
+        auto: bool,
+        messages_before: usize,
+        messages_after: usize,
+        tokens_before: u64,
+        tokens_after: u64,
+        elided: &[String],
+        reason: &str,
+    ) -> Result<i64> {
+        self.record_event(
+            crate::db::session_log::SessionEventKind::ContextPruned,
+            Some(agent),
+            None,
+            &serde_json::json!({
+                "kind": "prune",
+                "trigger": if auto { "auto" } else { "manual" },
+                "messages_before": messages_before,
+                "messages_after": messages_after,
+                "tokens_before": tokens_before,
+                "tokens_after": tokens_after,
+                "elided": elided,
+                "reason": reason,
+            }),
+        )
+    }
+
+    /// Record a `session_compacted` timeline boundary (session-log-export
+    /// Part C). `/compact` is a fresh-thread handoff, not an in-session
+    /// edit: it starts a brand-new successor session and preserves this
+    /// one. Modeled as a session boundary (predecessor → successor short
+    /// ids) the export follows like the fork tree, so both sessions land
+    /// in one unified `events.json`. Not a `context_pruned` event.
+    pub fn record_session_compacted(
+        &self,
+        agent: &str,
+        successor_session_id: Uuid,
+        successor_short_id: &str,
+        seed_tool_count: usize,
+    ) -> Result<i64> {
+        self.record_event(
+            crate::db::session_log::SessionEventKind::SessionCompacted,
+            Some(agent),
+            None,
+            &serde_json::json!({
+                "kind": "compaction",
+                "predecessor_session_id": self.id.to_string(),
+                "predecessor_short_id": self.short_id,
+                "successor_session_id": successor_session_id.to_string(),
+                "successor_short_id": successor_short_id,
+                "seed_tool_count": seed_tool_count,
+            }),
+        )
     }
 
     /// Most recent provider-reported usage, if we've made any calls

@@ -79,6 +79,62 @@ pub struct ExtendedConfig {
     /// Async-jobs subsystem knobs (GOALS §22).
     #[serde(default)]
     pub jobs: JobsConfig,
+
+    /// Answering-dialog knobs (GOALS §3b) — shared by the `question`
+    /// tool today and tool-approval prompts later.
+    #[serde(default)]
+    pub dialog: DialogConfig,
+
+    /// Skills subsystem knobs (GOALS §5): scan directories and the
+    /// auto-`!`-command toggle.
+    #[serde(default)]
+    pub skills: SkillsConfig,
+}
+
+/// Skills subsystem config (GOALS §5).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SkillsConfig {
+    /// Directories scanned for `<name>/SKILL.md`. Each entry supports `~`
+    /// home expansion, `$VAR` references, and relative paths resolved
+    /// against cwd. When empty, the defaults apply: `~/.agents/skills`
+    /// plus the project-local `./.agents/skills` (cwd up to the git
+    /// worktree root).
+    #[serde(default)]
+    pub scan_dirs: Vec<String>,
+
+    /// Auto-`!`-command toggle. `true` = Claude mode (inline
+    /// `` !`command` `` directives in a skill body run, their stdout
+    /// replaces the directive — scrubbed before entering context).
+    /// `false` (default) = Codex mode (directives injected verbatim; the
+    /// command never runs). Default disabled: auto-running shell is a
+    /// footgun; correctness/safety over convenience.
+    #[serde(default)]
+    pub auto_bang_commands: bool,
+}
+
+/// Answering-dialog config (GOALS §3b). Governs the reusable selectable-
+/// pages dialog that the `question` tool — and, later, tool-approval
+/// prompts — present over the composer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DialogConfig {
+    /// Anti-misfire lockout: how long (milliseconds) the dialog ignores
+    /// input after it appears, so a user who was mid-typing in the
+    /// composer can't accidentally answer. The border renders grey
+    /// during the lockout and white once it elapses. Default 1500 ms.
+    #[serde(default = "default_dialog_lockout_ms")]
+    pub lockout_ms: u64,
+}
+
+impl Default for DialogConfig {
+    fn default() -> Self {
+        Self {
+            lockout_ms: default_dialog_lockout_ms(),
+        }
+    }
+}
+
+fn default_dialog_lockout_ms() -> u64 {
+    1500
 }
 
 /// Async-jobs subsystem config (GOALS §22).
@@ -400,6 +456,8 @@ impl Default for ExtendedConfig {
             prompt_injection_guard: PromptInjectionGuardConfig::default(),
             system_prompt: SystemPromptConfig::default(),
             jobs: JobsConfig::default(),
+            dialog: DialogConfig::default(),
+            skills: SkillsConfig::default(),
         }
     }
 }
@@ -574,5 +632,38 @@ mod tests {
         );
         assert_eq!(cfg2.system_prompt.time_injection_interval_minutes, 10);
         assert!(!cfg2.tui.banner.enabled);
+    }
+
+    #[test]
+    fn skills_config_default_is_codex_mode_and_no_dirs() {
+        let cfg = ExtendedConfig::default();
+        assert!(cfg.skills.scan_dirs.is_empty());
+        assert!(
+            !cfg.skills.auto_bang_commands,
+            "auto-`!` must default to disabled (Codex mode)"
+        );
+    }
+
+    #[test]
+    fn skills_config_round_trips_through_extended_doc() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("extended-config.json");
+        std::fs::write(&path, "{}").unwrap();
+        let mut doc = ExtendedConfigDoc::load(&path).unwrap();
+        let mut cfg = doc.config();
+        cfg.skills.scan_dirs = vec!["~/.agents/skills".into(), "$PWD/.agents/skills".into()];
+        cfg.skills.auto_bang_commands = true;
+        doc.write(&cfg).unwrap();
+
+        let doc2 = ExtendedConfigDoc::load(&path).unwrap();
+        let cfg2 = doc2.config();
+        assert_eq!(
+            cfg2.skills.scan_dirs,
+            vec![
+                "~/.agents/skills".to_string(),
+                "$PWD/.agents/skills".to_string()
+            ]
+        );
+        assert!(cfg2.skills.auto_bang_commands);
     }
 }

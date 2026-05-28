@@ -171,6 +171,14 @@ async fn run_iteration(
     turn_tx: &mpsc::Sender<TurnEvent>,
 ) -> anyhow::Result<String> {
     let mut next_prompt = Message::user(ctx.redact.scrub(prompt));
+    // A loop fork is a leaf with no human on the other end — it can't
+    // raise an answerable interrupt (single async-job authority, GOALS
+    // §22). A detached hub satisfies the shared `turn` signature. Same for
+    // cancellation: a fork isn't tied to the foreground run's ctrl+c slot
+    // (it's cancelled via `jobs(loop.cancel)`), so a fresh never-cancelled
+    // token keeps the signature uniform.
+    let interrupts = Arc::new(crate::engine::interrupt::InterruptHub::detached());
+    let cancel = tokio_util::sync::CancellationToken::new();
     for _ in 0..MAX_ITERATION_TURNS {
         let outcome = turn(
             agent,
@@ -180,6 +188,8 @@ async fn run_iteration(
             ctx.locks.clone(),
             ctx.redact.clone(),
             ctx.cwd.clone(),
+            interrupts.clone(),
+            cancel.clone(),
             turn_tx,
         )
         .await?;

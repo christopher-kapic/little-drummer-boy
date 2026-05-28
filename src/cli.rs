@@ -268,7 +268,18 @@ pub enum SessionCommand {
 
 #[derive(Debug, clap::Args)]
 pub struct ExportArgs {
+    /// Session to export: a 6-char `short_id` or a full UUID. Recurses
+    /// the fork tree (target + all descendant forks).
     pub session_id: Option<String>,
+
+    /// Output `.zip` path. Defaults to `./cockpit-session-<short_id>.zip`.
+    /// Refuses to overwrite an existing file unless `--force`.
+    #[arg(short, long, value_name = "PATH")]
+    pub output: Option<PathBuf>,
+
+    /// Overwrite the output path if it already exists.
+    #[arg(long)]
+    pub force: bool,
 }
 
 #[derive(Debug, clap::Args)]

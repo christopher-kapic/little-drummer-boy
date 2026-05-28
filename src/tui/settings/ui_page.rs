@@ -1,10 +1,14 @@
 //! `/settings → UI` and the `Instructions File` sub-page reached from it.
 //!
 //! UI page: vim mode, thinking display, markdown rendering toggles,
-//! mouse capture, rich-text copy, name, packages dir. The
+//! mouse capture, rich-text copy, name, packages dir, utility model. The
 //! "instructions file" row at the bottom drills into the
 //! [`InstructionsPage`] grab/reorder editor for
 //! `extended.agent_guidance_files`.
+//!
+//! The `utility model` row edits `extended.utility_model`
+//! (`"provider:model-id"`), the cheap model used for background work
+//! (auto-titling §17d, skills auto-selection §5).
 
 use std::path::PathBuf;
 
@@ -38,6 +42,7 @@ pub(crate) struct UiPage {
 pub(super) enum UiField {
     Name,
     PackagesDir,
+    UtilityModel,
 }
 
 /// `/settings → UI → Instructions File` state. Edits the
@@ -68,8 +73,8 @@ pub(super) struct GrabState {
 
 /// Rows on the UI page (vim mode, thinking, render-agent-markdown,
 /// render-user-markdown, mouse, rich-text-copy, emojis, name, packages
-/// dir, instructions file).
-pub(super) const UI_ROWS: usize = 10;
+/// dir, utility model, instructions file).
+pub(super) const UI_ROWS: usize = 11;
 
 pub(super) fn bool_label(on: bool, on_label: &str, off_label: &str) -> String {
     if on {
@@ -159,6 +164,10 @@ impl SettingsDialog {
                                 Some(PathBuf::from(new))
                             };
                         }
+                        UiField::UtilityModel => {
+                            self.extended.utility_model =
+                                if new.is_empty() { None } else { Some(new) };
+                        }
                     }
                     p.editing = None;
                     p.status = match self.save_extended() {
@@ -238,6 +247,10 @@ impl SettingsDialog {
                     p.editing = Some(UiField::PackagesDir);
                 }
                 9 => {
+                    p.buf = TextField::new(self.extended.utility_model.clone().unwrap_or_default());
+                    p.editing = Some(UiField::UtilityModel);
+                }
+                10 => {
                     return Nav::Replace(Page::Instructions(InstructionsPage {
                         cursor: 0,
                         grabbed: None,
@@ -262,7 +275,7 @@ impl SettingsDialog {
         )));
         lines.push(Line::default());
 
-        let rows: [(&str, String); 10] = [
+        let rows: [(&str, String); 11] = [
             (
                 "vim mode",
                 vim_label(self.extended.tui.vim_mode).to_string(),
@@ -328,6 +341,14 @@ impl SettingsDialog {
                     .unwrap_or_else(|| "(unset)".to_string()),
             ),
             (
+                "utility model",
+                self.extended
+                    .utility_model
+                    .clone()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "(unset — provider:model-id)".to_string()),
+            ),
+            (
                 "instructions file",
                 if self.extended.agent_guidance_files.is_empty() {
                     "(none)".to_string()
@@ -362,6 +383,7 @@ impl SettingsDialog {
             let prompt = match field {
                 UiField::Name => "name: ",
                 UiField::PackagesDir => "packages dir: ",
+                UiField::UtilityModel => "utility model (provider:model-id): ",
             };
             lines.push(Line::default());
             lines.push(Line::from(vec![
@@ -448,7 +470,7 @@ impl SettingsDialog {
             KeyCode::Esc | KeyCode::Char('q') => return Nav::Close,
             KeyCode::Left | KeyCode::Backspace | KeyCode::Char('h') => {
                 return Nav::Replace(Page::Ui(UiPage {
-                    cursor: 9,
+                    cursor: 10,
                     editing: None,
                     buf: TextField::default(),
                     status: None,

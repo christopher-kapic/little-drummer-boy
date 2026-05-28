@@ -1,0 +1,440 @@
+//! `/settings → Skills` page (GOALS §5).
+//!
+//! Edits `extended.skills`:
+//!   - the **auto-`!`-command** toggle (`auto_bang_commands`) — Claude
+//!     mode (run inline `` !`command` `` directives) vs Codex mode
+//!     (inject verbatim; default).
+//!   - the **scan-directory list** (`scan_dirs`) — add / edit / remove
+//!     entries with the same grab/reorder editor the Instructions page
+//!     uses. Each entry supports `~`, `$VAR`, and relative paths.
+//!
+//! Layout: row 0 is the toggle; rows 1..=N are the scan-dir entries; the
+//! last row is the synthetic `[+ add directory]`. Toggling and list
+//! edits both persist via `save_extended()`.
+
+use crossterm::event::{KeyCode, KeyEvent};
+use ratatui::Frame;
+use ratatui::layout::Rect;
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Paragraph, Wrap};
+
+use crate::tui::textfield::TextField;
+use crate::tui::theme::MUTED_COLOR_INDEX;
+
+use super::{Nav, Page, SettingsDialog, save_status};
+
+/// `/settings → Skills` state. The grab editor mirrors the Instructions
+/// page: while a scan-dir row is grabbed, typing edits it and Enter
+/// commits / Esc reverts.
+pub(super) struct SkillsPage {
+    pub(super) cursor: usize,
+    pub(super) grabbed: Option<GrabState>,
+    pub(super) status: Option<String>,
+}
+
+pub(super) struct GrabState {
+    pub(super) buf: TextField,
+    /// Original value; `Some` for existing rows (Esc restores it), `None`
+    /// for a freshly-added row (Esc deletes it).
+    pub(super) original: Option<String>,
+}
+
+impl SettingsDialog {
+    pub(super) fn handle_skills_key(&mut self, key: KeyEvent) -> bool {
+        let placeholder = Page::Skills(SkillsPage {
+            cursor: 0,
+            grabbed: None,
+            status: None,
+        });
+        let mut page = std::mem::replace(&mut self.page, placeholder);
+        let nav = if let Page::Skills(p) = &mut page {
+            self.handle_skills_page_key(key, p)
+        } else {
+            Nav::Stay
+        };
+        match nav {
+            Nav::Stay => {
+                self.page = page;
+                false
+            }
+            Nav::Replace(new) => {
+                self.page = new;
+                false
+            }
+            Nav::Close => true,
+        }
+    }
+
+    /// The toggle occupies cursor 0; scan-dir rows occupy 1..=len; the
+    /// `[+ add]` synthetic row is at `len + 1`.
+    fn handle_skills_page_key(&mut self, key: KeyEvent, p: &mut SkillsPage) -> Nav {
+        // ── Grab mode: editing a scan-dir entry's text ──────────────
+        if p.grabbed.is_some() {
+            match key.code {
+                KeyCode::Enter => self.commit_skills_grab(p),
+                KeyCode::Esc => self.cancel_skills_grab(p),
+                _ => {
+                    if let Some(g) = p.grabbed.as_mut() {
+                        g.buf.handle_key(key);
+                    }
+                }
+            }
+            return Nav::Stay;
+        }
+
+        let dir_count = self.extended.skills.scan_dirs.len();
+        // Rows: 0 = toggle, 1..=dir_count = entries, dir_count+1 = add.
+        let max_cursor = dir_count + 1;
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => return Nav::Close,
+            KeyCode::Left | KeyCode::Backspace | KeyCode::Char('h') => {
+                return Nav::Replace(Page::Root {
+                    cursor: self.last_root_cursor,
+                });
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                p.cursor = p.cursor.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                p.cursor = (p.cursor + 1).min(max_cursor);
+            }
+            KeyCode::Char('a') => {
+                self.start_skills_grab_on_new(p);
+            }
+            KeyCode::Char('d') | KeyCode::Delete => {
+                if let Some(idx) = dir_index(p.cursor, dir_count) {
+                    self.extended.skills.scan_dirs.remove(idx);
+                    // Keep the cursor on a valid row.
+                    let new_count = self.extended.skills.scan_dirs.len();
+                    p.cursor = p.cursor.min(new_count + 1);
+                    p.status = save_status(self.save_extended());
+                }
+            }
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                if p.cursor == 0 {
+                    // Toggle auto-`!`.
+                    self.extended.skills.auto_bang_commands =
+                        !self.extended.skills.auto_bang_commands;
+                    p.status = save_status(self.save_extended());
+                } else if let Some(idx) = dir_index(p.cursor, dir_count) {
+                    let cur = self.extended.skills.scan_dirs[idx].clone();
+                    p.grabbed = Some(GrabState {
+                        buf: TextField::new(cur.clone()),
+                        original: Some(cur),
+                    });
+                    p.status = None;
+                } else if p.cursor == max_cursor {
+                    self.start_skills_grab_on_new(p);
+                }
+            }
+            _ => {}
+        }
+        Nav::Stay
+    }
+
+    /// Append an empty scan-dir row, move the cursor to it, and grab it.
+    fn start_skills_grab_on_new(&mut self, p: &mut SkillsPage) {
+        self.extended.skills.scan_dirs.push(String::new());
+        let idx = self.extended.skills.scan_dirs.len() - 1;
+        p.cursor = idx + 1; // +1 for the leading toggle row
+        p.grabbed = Some(GrabState {
+            buf: TextField::default(),
+            original: None,
+        });
+        p.status = None;
+    }
+
+    /// Drop the grabbed row, writing its buffer back. An empty trimmed
+    /// value deletes the row instead.
+    fn commit_skills_grab(&mut self, p: &mut SkillsPage) {
+        let Some(g) = p.grabbed.take() else { return };
+        let dir_count = self.extended.skills.scan_dirs.len();
+        let Some(idx) = dir_index(p.cursor, dir_count) else {
+            p.status = None;
+            return;
+        };
+        let trimmed = g.buf.text().trim().to_string();
+        if trimmed.is_empty() {
+            self.extended.skills.scan_dirs.remove(idx);
+        } else if let Some(slot) = self.extended.skills.scan_dirs.get_mut(idx) {
+            *slot = trimmed;
+        }
+        let new_count = self.extended.skills.scan_dirs.len();
+        p.cursor = p.cursor.min(new_count + 1);
+        p.status = save_status(self.save_extended());
+    }
+
+    /// Drop the grabbed row without saving: restore an existing row's
+    /// original value, or remove a freshly-added row.
+    fn cancel_skills_grab(&mut self, p: &mut SkillsPage) {
+        let Some(g) = p.grabbed.take() else { return };
+        let dir_count = self.extended.skills.scan_dirs.len();
+        let idx = dir_index(p.cursor, dir_count);
+        match g.original {
+            Some(name) => {
+                if let Some(i) = idx
+                    && let Some(slot) = self.extended.skills.scan_dirs.get_mut(i)
+                {
+                    *slot = name;
+                }
+            }
+            None => {
+                if let Some(i) = idx {
+                    self.extended.skills.scan_dirs.remove(i);
+                }
+            }
+        }
+        let new_count = self.extended.skills.scan_dirs.len();
+        p.cursor = p.cursor.min(new_count + 1);
+        p.status = None;
+    }
+
+    pub(super) fn render_skills_page(&self, frame: &mut Frame, area: Rect, p: &SkillsPage) {
+        let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+        let yellow = Style::default().fg(Color::Yellow);
+        let cyan = Style::default().fg(Color::Cyan);
+        let mut lines: Vec<Line<'static>> = vec![
+            Line::from(Span::styled(
+                "Skills".to_string(),
+                Style::default().add_modifier(Modifier::BOLD),
+            )),
+            Line::default(),
+            Line::from(Span::styled(
+                "Scan dirs hold `<name>/SKILL.md` skills. Entries support \
+                 `~`, `$VAR`, and relative paths. Empty list = defaults \
+                 (~/.agents/skills + ./.agents/skills)."
+                    .to_string(),
+                muted,
+            )),
+            Line::default(),
+        ];
+
+        // Row 0: auto-`!` toggle.
+        let toggle_on_cursor = p.cursor == 0;
+        let toggle_marker = if toggle_on_cursor { "▸ " } else { "  " };
+        let toggle_label_style = if toggle_on_cursor {
+            yellow.add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        let toggle_value = if self.extended.skills.auto_bang_commands {
+            "Claude mode (run inline !`command`; output scrubbed)"
+        } else {
+            "Codex mode (default — inject !`command` verbatim; never runs)"
+        };
+        lines.push(Line::from(vec![
+            Span::raw(toggle_marker),
+            Span::styled("auto-! commands  ", toggle_label_style),
+            Span::styled(toggle_value.to_string(), muted),
+        ]));
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled(
+            "scan directories".to_string(),
+            muted,
+        )));
+
+        for (i, dir) in self.extended.skills.scan_dirs.iter().enumerate() {
+            let row_cursor = i + 1; // +1 for the toggle row
+            let is_grabbed = p.grabbed.is_some() && row_cursor == p.cursor;
+            let on_cursor = row_cursor == p.cursor;
+            let marker = if is_grabbed {
+                "✥ "
+            } else if on_cursor {
+                "▸ "
+            } else {
+                "  "
+            };
+            let display = if is_grabbed {
+                p.grabbed.as_ref().unwrap().buf.text().to_string()
+            } else {
+                dir.clone()
+            };
+            let style = if is_grabbed {
+                cyan.add_modifier(Modifier::BOLD)
+            } else if on_cursor {
+                yellow.add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            let mut spans = vec![Span::raw(marker), Span::styled(display, style)];
+            if is_grabbed {
+                spans.push(Span::styled("▎".to_string(), cyan));
+                if p.grabbed.as_ref().unwrap().buf.text().is_empty() {
+                    spans.push(Span::styled("  (type directory)".to_string(), muted));
+                }
+            }
+            lines.push(Line::from(spans));
+        }
+
+        // `[+ add directory]` row — hidden while a row is grabbed.
+        if p.grabbed.is_none() {
+            let add_idx = self.extended.skills.scan_dirs.len() + 1;
+            let add_selected = p.cursor == add_idx;
+            let marker = if add_selected { "▸ " } else { "  " };
+            let style = if add_selected {
+                yellow.add_modifier(Modifier::BOLD)
+            } else {
+                muted
+            };
+            lines.push(Line::from(vec![
+                Span::raw(marker),
+                Span::styled("[+ add directory]".to_string(), style),
+            ]));
+        }
+
+        if let Some(status) = &p.status {
+            lines.push(Line::default());
+            lines.push(Line::from(Span::styled(status.clone(), yellow)));
+        }
+
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+    }
+}
+
+/// Map a page cursor to a `scan_dirs` index. Cursor 0 is the toggle; the
+/// `[+ add]` synthetic row is past the end. Returns `None` for both.
+fn dir_index(cursor: usize, dir_count: usize) -> Option<usize> {
+    if cursor == 0 {
+        return None;
+    }
+    let idx = cursor - 1;
+    if idx < dir_count { Some(idx) } else { None }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::extended::ExtendedConfigDoc;
+    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+    use tempfile::TempDir;
+
+    fn press(code: KeyCode) -> KeyEvent {
+        KeyEvent {
+            code,
+            modifiers: KeyModifiers::empty(),
+            kind: KeyEventKind::Press,
+            state: KeyEventState::empty(),
+        }
+    }
+
+    fn fresh_skills_dialog(tmp: &TempDir) -> SettingsDialog {
+        let path = tmp.path().join("config.json");
+        std::fs::write(&path, "{}").unwrap();
+        let mut d = SettingsDialog::open(path);
+        d.page = Page::Skills(SkillsPage {
+            cursor: 0,
+            grabbed: None,
+            status: None,
+        });
+        d
+    }
+
+    #[test]
+    fn toggling_auto_bang_persists() {
+        let tmp = TempDir::new().unwrap();
+        let mut d = fresh_skills_dialog(&tmp);
+        assert!(
+            !d.extended.skills.auto_bang_commands,
+            "default is Codex mode"
+        );
+        // Cursor is at 0 (toggle). Enter flips it.
+        d.handle_key(press(KeyCode::Enter));
+        assert!(d.extended.skills.auto_bang_commands);
+        let reloaded = ExtendedConfigDoc::load(&d.extended_path).unwrap().config();
+        assert!(
+            reloaded.skills.auto_bang_commands,
+            "toggle must persist to disk"
+        );
+    }
+
+    #[test]
+    fn add_edit_and_remove_scan_dir() {
+        let tmp = TempDir::new().unwrap();
+        let mut d = fresh_skills_dialog(&tmp);
+        // Move to the `[+ add directory]` row (cursor = dir_count + 1 = 1
+        // when empty) and grab a new row.
+        d.handle_key(press(KeyCode::Char('a')));
+        match &d.page {
+            Page::Skills(p) => assert!(p.grabbed.is_some(), "expected a grabbed new row"),
+            other => panic!("expected Skills page, got {other:?}"),
+        }
+        for ch in "~/skills".chars() {
+            d.handle_key(KeyEvent {
+                code: KeyCode::Char(ch),
+                modifiers: KeyModifiers::empty(),
+                kind: KeyEventKind::Press,
+                state: KeyEventState::empty(),
+            });
+        }
+        d.handle_key(press(KeyCode::Enter)); // commit
+        assert_eq!(d.extended.skills.scan_dirs, vec!["~/skills".to_string()]);
+        let reloaded = ExtendedConfigDoc::load(&d.extended_path).unwrap().config();
+        assert_eq!(reloaded.skills.scan_dirs, vec!["~/skills".to_string()]);
+
+        // Delete it: cursor is on the entry (row 1).
+        d.page = Page::Skills(SkillsPage {
+            cursor: 1,
+            grabbed: None,
+            status: None,
+        });
+        d.handle_key(press(KeyCode::Char('d')));
+        assert!(d.extended.skills.scan_dirs.is_empty());
+        let reloaded2 = ExtendedConfigDoc::load(&d.extended_path).unwrap().config();
+        assert!(reloaded2.skills.scan_dirs.is_empty());
+    }
+
+    #[test]
+    fn esc_on_fresh_row_removes_it() {
+        let tmp = TempDir::new().unwrap();
+        let mut d = fresh_skills_dialog(&tmp);
+        d.handle_key(press(KeyCode::Char('a')));
+        d.handle_key(press(KeyCode::Esc));
+        match &d.page {
+            Page::Skills(p) => assert!(p.grabbed.is_none()),
+            other => panic!("expected Skills page, got {other:?}"),
+        }
+        assert!(
+            d.extended.skills.scan_dirs.is_empty(),
+            "esc on a freshly-added row deletes it"
+        );
+    }
+
+    #[test]
+    fn esc_after_editing_existing_restores_value() {
+        let tmp = TempDir::new().unwrap();
+        let mut d = fresh_skills_dialog(&tmp);
+        d.extended.skills.scan_dirs = vec!["orig".into()];
+        d.page = Page::Skills(SkillsPage {
+            cursor: 1,
+            grabbed: None,
+            status: None,
+        });
+        d.handle_key(press(KeyCode::Enter)); // grab existing
+        for ch in "XYZ".chars() {
+            d.handle_key(KeyEvent {
+                code: KeyCode::Char(ch),
+                modifiers: KeyModifiers::empty(),
+                kind: KeyEventKind::Press,
+                state: KeyEventState::empty(),
+            });
+        }
+        d.handle_key(press(KeyCode::Esc));
+        assert_eq!(
+            d.extended.skills.scan_dirs,
+            vec!["orig".to_string()],
+            "esc restores the original value"
+        );
+    }
+
+    #[test]
+    fn dir_index_maps_correctly() {
+        // Cursor 0 = toggle, no dir.
+        assert_eq!(dir_index(0, 2), None);
+        // Cursor 1 = first dir.
+        assert_eq!(dir_index(1, 2), Some(0));
+        assert_eq!(dir_index(2, 2), Some(1));
+        // Cursor 3 = `[+ add]` synthetic row.
+        assert_eq!(dir_index(3, 2), None);
+    }
+}

@@ -64,6 +64,14 @@ rig = { version = "0.37", package = "rig-core", features = ["image"] }
 # Storage
 rusqlite = { version = "0.40", features = ["bundled"] }
 
+# Session-log export archive writer (`cockpit export <session>` → .zip,
+# session-log-export Part D). `default-features = false` + only `deflate`
+# drops the aes/bzip2/zstd/xz/time extras we don't use — we write a small
+# set of JSON files from in-memory bytes via `ZipWriter` + `start_file` +
+# `write_all` + `finish` (API verified against zip 8.6 docs + a compile
+# probe; kcl lacks the `zip` package).
+zip = { version = "8.6", default-features = false, features = ["deflate"] }
+
 # Codec helpers for the NDJSON daemon wire protocol (GOALS §8c).
 # `Framed<UnixStream, LinesCodec>` lifts a byte stream into a
 # `Sink<String> + Stream<Item = String>` we can layer serde on top of.
@@ -100,6 +108,16 @@ notify = "8"
 grep-searcher = "0.1"
 grep-regex = "0.1"
 grep-matcher = "0.1"
+
+# Shell-command classification for the command-approval subsystem
+# (sandboxing part 1). A real bash-grammar AST (from the brush shell) —
+# distinguishes pipelines / `&&`-`||` lists / sequences / subshells /
+# simple commands and is quoting-correct, so `echo "a && b"` is one
+# simple command, not a chain. Tokenize-only crates (`shlex`,
+# `shell-words`) can't answer compound-vs-simple; `conch-parser` is
+# unmaintained; `yash-syntax` is GPL-incompatible. We parse in `sh_mode`
+# because `bash.rs` executes commands via `sh -c`.
+brush-parser = "0.4"
 
 # Secret scanning / redaction
 aho-corasick = "1"

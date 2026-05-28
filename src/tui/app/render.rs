@@ -256,6 +256,10 @@ impl App {
 
         if let Some(prompt) = self.daemon_prompt.as_ref() {
             prompt.render(frame, rects.body);
+        } else if let Some(dialog) = self.question_dialog.as_ref() {
+            // Answering dialog (GOALS §3b) replaces the composer; render
+            // it over the body like the other modals so it owns input.
+            dialog.render(frame, rects.body);
         } else if self.dialog.is_active() {
             self.dialog.render(frame, rects.body);
         } else if let Some(picker) = self.model_picker.as_ref() {
@@ -270,6 +274,15 @@ impl App {
                 p.render(frame, rects.body);
             }
             self.stats_pane = pane;
+        } else if self.sessions_pane.is_some() {
+            // Same take/render/restore as `stats_pane` (both renders are
+            // `&mut self`). Renders into `rects.body` so the fixed chrome
+            // (cwd + git branch + context + active agent) stays visible.
+            let mut pane = self.sessions_pane.take();
+            if let Some(p) = pane.as_mut() {
+                p.render(frame, rects.body);
+            }
+            self.sessions_pane = pane;
         } else {
             // Carve the body for an embedded pane (GOALS §1i) when one
             // is open: fullscreen fills the body, splits divide it. The

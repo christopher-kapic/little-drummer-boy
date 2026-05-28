@@ -26,6 +26,7 @@ pub mod builtin;
 pub mod compact;
 pub mod docs_pipeline;
 pub mod driver;
+pub mod interrupt;
 pub mod jobs;
 pub mod message;
 pub mod model;

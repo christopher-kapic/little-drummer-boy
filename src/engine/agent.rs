@@ -118,6 +118,15 @@ pub enum TurnEvent {
     /// whole-stack signal, not a per-agent one.
     AgentIdle,
 
+    /// A `question` tool raised an interrupt (GOALS §3b): the agent is
+    /// blocked until the user answers. The TUI opens the answering
+    /// dialog from this; the answer round-trips back to the daemon as
+    /// `ResolveInterrupt`. Carries the batch of questions to render.
+    InterruptRaised {
+        interrupt_id: uuid::Uuid,
+        questions: crate::daemon::proto::InterruptQuestionSet,
+    },
+
     /// An async job (loop / timer / background, GOALS §22) started. UI
     /// only — drives the transient jobs strip. `kind` is `loop` /
     /// `timer` / `background`.
@@ -245,6 +254,7 @@ pub enum TurnOutcome {
 /// becomes part of the next inference call. The model also never sees
 /// the raw form via the user transcript: `tool_call_events.output` is
 /// the scrubbed text.
+#[allow(clippy::too_many_arguments)]
 pub async fn turn(
     agent: &Agent,
     history: &mut Vec<Message>,
@@ -253,6 +263,8 @@ pub async fn turn(
     locks: Arc<crate::locks::LockManager>,
     redact: Arc<RedactionTable>,
     cwd: std::path::PathBuf,
+    interrupts: Arc<crate::engine::interrupt::InterruptHub>,
+    cancel: tokio_util::sync::CancellationToken,
     tx: &mpsc::Sender<TurnEvent>,
 ) -> Result<TurnOutcome> {
     let tools = agent.tools.definitions();
@@ -271,9 +283,15 @@ pub async fn turn(
     // prefix.
     session.note_send();
 
-    let (msg_id, choice, usage) = agent
+    // One id per round-trip, shared by the captured request body
+    // (`inference_requests`), the metadata row (`inference_calls`), and
+    // the `inference_request` timeline event — so the export joins them
+    // (session-log-export Parts A/B).
+    let call_id = Uuid::new_v4();
+
+    let ((msg_id, choice, usage), captured_request) = agent
         .model
-        .complete(
+        .complete_captured(
             &agent.system,
             history,
             prompt.clone(),
@@ -281,9 +299,34 @@ pub async fn turn(
             agent.params.clone(),
             &agent.name,
             tx,
+            &cancel,
         )
         .await
         .with_context(|| format!("completion call for agent `{}`", agent.name))?;
+
+    // Persist the full as-sent (post-redaction) request body (Part A).
+    // Best-effort: auditing must never break a live turn.
+    if let Err(e) = session.record_inference_request(call_id, &captured_request) {
+        tracing::warn!(error = %e, "record_inference_request failed");
+    }
+    // Timeline event for the request (Part B). Token usage is folded in
+    // when the provider reported it; the export resolves the `file` name
+    // deterministically from this event's seq + short_id + call_id.
+    let usage_json = usage.map(|u| {
+        serde_json::json!({
+            "input_tokens": u.input_tokens,
+            "output_tokens": u.output_tokens,
+            "cached_input_tokens": u.cached_input_tokens,
+        })
+    });
+    if let Err(e) = session.record_event(
+        crate::db::session_log::SessionEventKind::InferenceRequest,
+        Some(&agent.name),
+        Some(&call_id.to_string()),
+        &serde_json::json!({ "usage": usage_json }),
+    ) {
+        tracing::warn!(error = %e, "record inference_request event failed");
+    }
 
     // Assistant output text, extracted once: used both for the
     // calibration text basis below and the AssistantText emit further
@@ -291,7 +334,7 @@ pub async fn turn(
     let text = extract_text(&choice);
 
     if let Some(u) = usage {
-        if let Err(e) = session.record_usage(u) {
+        if let Err(e) = session.record_usage(call_id, u) {
             tracing::warn!(error = %e, "session.record_usage failed");
         }
         // Feed the round into tokenizer calibration. The basis is a
@@ -337,6 +380,16 @@ pub async fn turn(
                 text: text.clone(),
             })
             .await;
+        // Timeline event (Part B). Tagged with the same `call_id` as the
+        // request that produced it so the export can group a turn.
+        if let Err(e) = session.record_event(
+            crate::db::session_log::SessionEventKind::AssistantMessage,
+            Some(&agent.name),
+            Some(&call_id.to_string()),
+            &serde_json::json!({ "text": text }),
+        ) {
+            tracing::warn!(error = %e, "record assistant_message event failed");
+        }
     }
 
     let calls: Vec<ToolCall> = collect_tool_calls(&choice);
@@ -351,6 +404,8 @@ pub async fn turn(
         session: session.clone(),
         cwd,
         redact: redact.clone(),
+        interrupts,
+        cancel,
     };
 
     for tc in &calls {
@@ -378,6 +433,24 @@ pub async fn turn(
                 .unwrap_or("coder")
                 .to_string();
             let noninteractive = crate::engine::builtin::is_noninteractive(&child);
+            // Timeline event (Part B): a `task` delegation spawned a
+            // child. Carries the child agent, the triggering task call id,
+            // and the brief. (Interactive subagents share this session's
+            // id with a distinct agent name; user-/loop-forks are separate
+            // sessions the export follows via the fork tree.)
+            if let Err(e) = session.record_event(
+                crate::db::session_log::SessionEventKind::SubagentSpawned,
+                Some(&agent.name),
+                Some(&tc.id),
+                &serde_json::json!({
+                    "child_agent": child,
+                    "task_call_id": tc.id,
+                    "noninteractive": noninteractive,
+                    "prompt": prompt,
+                }),
+            ) {
+                tracing::warn!(error = %e, "record subagent_spawned event failed");
+            }
             if !noninteractive {
                 let _ = tx
                     .send(TurnEvent::SubagentSpawned {
@@ -539,6 +612,14 @@ pub async fn turn(
             })
         );
 
+        let duration_ms = start.elapsed().as_millis() as u64;
+
+        // Surface the recovery split for the timeline event (Part B):
+        // the wire-vs-user inputs + recovery kind/stage make tool-input
+        // corrections auditable in the export.
+        let (recovery_kind, recovery_stage) = recovery.db_fields();
+        let tool_path = args.get("path").and_then(Value::as_str).map(str::to_string);
+
         // Persist the audit row. v0 stores the original AND a wire form
         // that's equal to the original; §13c canonical-form rewrite
         // will diverge them when implemented.
@@ -548,18 +629,41 @@ pub async fn turn(
             agent: agent.name.clone(),
             call_id: tc.id.clone(),
             tool: tc.function.name.clone(),
-            path: args.get("path").and_then(Value::as_str).map(str::to_string),
-            original_input_json: original,
-            wire_input_json: args,
+            path: tool_path,
+            original_input_json: original.clone(),
+            wire_input_json: args.clone(),
             recovery,
             hard_fail,
             output: output_str.clone(),
             truncated,
-            duration_ms: start.elapsed().as_millis() as u64,
+            duration_ms,
         }) {
             // Auditing must not break the live conversation. Log and
             // continue — the model still sees the tool result.
             tracing::warn!(error = %e, tool = %tc.function.name, "persisting tool_call_event failed");
+        }
+
+        // Timeline event (Part B), sourced from / consistent with the
+        // `tool_call_events` audit row above. The `call_id` here is the
+        // model's per-tool-call id (`tc.id`), which is distinct from the
+        // round-trip `call_id` (above) — both correlations matter.
+        if let Err(e) = session.record_event(
+            crate::db::session_log::SessionEventKind::ToolCall,
+            Some(&agent.name),
+            Some(&tc.id),
+            &serde_json::json!({
+                "tool": tc.function.name,
+                "original_input": original,
+                "wire_input": args,
+                "recovery_kind": recovery_kind,
+                "recovery_stage": recovery_stage,
+                "hard_fail": hard_fail,
+                "output": output_str,
+                "truncated": truncated,
+                "duration_ms": duration_ms,
+            }),
+        ) {
+            tracing::warn!(error = %e, tool = %tc.function.name, "record tool_call event failed");
         }
 
         history.push(tool_result_message(tc, output_str));

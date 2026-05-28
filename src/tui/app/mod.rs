@@ -50,6 +50,62 @@ const INPUT_BORDER: u16 = 2;
 const GIT_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const EVENT_TICK: Duration = Duration::from_millis(100);
 
+/// Double-press window for ctrl+c (GOALS §3a). A single ctrl+c interrupts
+/// the running agent (never quits); a second press within this window of
+/// the previous press exits the TUI. Sliding from the last press, so a
+/// steady stream of slow presses interrupts repeatedly and never exits.
+pub(super) const CTRL_C_EXIT_WINDOW: Duration = Duration::from_millis(500);
+
+/// What a ctrl+c press should do, decided purely from the prior-press
+/// time, the agent's busy state, and the configured window. Factored out
+/// of [`App`] so the state machine is unit-testable without a live
+/// terminal or daemon. See [`decide_ctrl_c`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CtrlCAction {
+    /// Second press inside the window — exit the TUI now (regardless of
+    /// agent state). During a run, this is the "interrupt AND exit" case:
+    /// the first press already sent the interrupt.
+    Exit,
+    /// First press (or first after the window lapsed) while the agent is
+    /// running — arm the exit window, show the hint, and interrupt the
+    /// agent.
+    ArmAndInterrupt,
+    /// First press while the agent is idle — arm the exit window and show
+    /// the hint only (nothing to interrupt).
+    ArmOnly,
+}
+
+/// Pure double-press decision (GOALS §3a). `now` is a monotonic clock
+/// reading; `armed_at` is the previous press time while the window is
+/// live (`None` once it has lapsed); `agent_busy` is whether a turn is in
+/// flight. Returns the action plus the new `armed_at` to store: `None`
+/// when exiting (window is moot), `Some(now)` when arming/re-arming.
+///
+/// Rules:
+/// - A press within `window` of `armed_at` → [`CtrlCAction::Exit`].
+/// - Otherwise it's a fresh first press: re-arm at `now`, and interrupt
+///   iff the agent is running.
+pub(super) fn decide_ctrl_c(
+    now: Instant,
+    armed_at: Option<Instant>,
+    window: Duration,
+    agent_busy: bool,
+) -> (CtrlCAction, Option<Instant>) {
+    if let Some(prev) = armed_at
+        && now.duration_since(prev) <= window
+    {
+        // Second press inside the window: exit regardless of agent state.
+        return (CtrlCAction::Exit, None);
+    }
+    // Fresh first press (or the window lapsed): arm and, if busy, interrupt.
+    let action = if agent_busy {
+        CtrlCAction::ArmAndInterrupt
+    } else {
+        CtrlCAction::ArmOnly
+    };
+    (action, Some(now))
+}
+
 /// Max suggestion rows the slash / @ autocomplete popup ever takes.
 /// When fewer matches exist, the popup pads with blank lines so the
 /// composer doesn't visibly shift as the user types and the candidate
@@ -307,9 +363,19 @@ pub struct App {
     /// the part-1 roll-up layer; `None` when closed. Routed input/render
     /// alongside `dialog` / `model_picker`.
     pub(super) stats_pane: Option<crate::tui::stats_pane::StatsPane>,
+    /// `/sessions` + `/resume` browser pane (GOALS §17f). A full-body
+    /// overlay; `None` when closed. Routed input/render alongside
+    /// `stats_pane`. Enter resumes the highlighted session via the
+    /// existing `attach_to_session` path.
+    pub(super) sessions_pane: Option<crate::tui::sessions_pane::SessionsPane>,
     /// "Daemon not running" prompt shown at startup. Once the user picks,
     /// this is taken and the prompt closes.
     pub(super) daemon_prompt: Option<crate::tui::daemon_prompt::DaemonPromptDialog>,
+    /// Answering dialog for a `question`-tool interrupt (GOALS §3b).
+    /// Opened from `TurnEvent::InterruptRaised`, replaces the composer,
+    /// and on submit/cancel sends `ResolveInterrupt` back to the daemon.
+    /// `None` when no question is pending.
+    pub(super) question_dialog: Option<crate::tui::dialog::question::QuestionDialog>,
     /// True after we've successfully connected to (or started) the daemon.
     pub(super) daemon_connected: bool,
     /// Lines emitted by an in-flight `/fetch-models` task. The event
@@ -532,6 +598,13 @@ pub struct App {
     /// from `JobStarted` / `JobNote` / `JobProgress` / `JobCompleted`
     /// events.
     pub(super) active_jobs: std::collections::BTreeMap<String, ActiveJob>,
+    /// Monotonic timestamp of the most recent ctrl+c press, while the
+    /// double-press exit window is armed. A single ctrl+c interrupts a
+    /// running agent (never quits); a second press within
+    /// [`CTRL_C_EXIT_WINDOW`] of the previous one exits the TUI. `None`
+    /// when the window has lapsed (the next press is a fresh first press).
+    /// Uses `Instant` (monotonic) so a wall-clock jump can't mis-trigger.
+    pub(super) ctrl_c_armed_at: Option<Instant>,
 }
 
 /// A live async job tracked by the TUI for the jobs strip / `/jobs`.
@@ -678,7 +751,9 @@ impl App {
             dialog: Dialog::None,
             model_picker: None,
             stats_pane: None,
+            sessions_pane: None,
             daemon_prompt,
+            question_dialog: None,
             daemon_connected,
             fetch_models_progress: Arc::new(Mutex::new(Vec::new())),
             agent_runner: None,
@@ -730,6 +805,7 @@ impl App {
             dragging_divider: false,
             pending_git_blocks: Vec::new(),
             active_jobs: std::collections::BTreeMap::new(),
+            ctrl_c_armed_at: None,
         };
         // First-run convenience: if the daemon prompt doesn't gate
         // startup, open the Add-Provider wizard immediately when no
@@ -901,6 +977,7 @@ impl App {
             self.sync_active_agent();
             self.sync_mouse_capture_from_dialog();
             self.tick_toast();
+            self.tick_ctrl_c_window();
             self.dialog.tick();
             // Auto-close the embedded pane when its child has exited
             // (GOALS §1i — e.g. `:q`).
@@ -954,6 +1031,67 @@ impl App {
             && Instant::now() > toast.expires_at
         {
             self.toast = None;
+        }
+    }
+
+    /// Handle a ctrl+c press (GOALS §3a). Single press interrupts a
+    /// running agent (never quits); a second press within
+    /// [`CTRL_C_EXIT_WINDOW`] of the previous exits. Returns `true` to
+    /// exit the TUI (the event loop breaks). Drives the double-press
+    /// state machine via the pure [`decide_ctrl_c`] unit, sends the
+    /// daemon `CancelTurn` on an interrupt, and shows the transient exit
+    /// hint via the existing toast mechanism.
+    pub(super) fn handle_ctrl_c(&mut self) -> bool {
+        let (action, new_armed) = decide_ctrl_c(
+            Instant::now(),
+            self.ctrl_c_armed_at,
+            CTRL_C_EXIT_WINDOW,
+            self.busy,
+        );
+        self.ctrl_c_armed_at = new_armed;
+        match action {
+            CtrlCAction::Exit => true,
+            CtrlCAction::ArmAndInterrupt => {
+                self.interrupt_agent();
+                self.show_ctrl_c_hint();
+                false
+            }
+            CtrlCAction::ArmOnly => {
+                self.show_ctrl_c_hint();
+                false
+            }
+        }
+    }
+
+    /// Send the daemon a `CancelTurn` for the attached session (GOALS
+    /// §3a). Fire-and-forget over the runner's request channel — same
+    /// path `/jobs cancel` uses. No-op (and harmless) when no runner is
+    /// connected. The daemon aborts the in-flight inference and kills any
+    /// running `bash` subprocess; the resulting `AgentIdle` clears `busy`.
+    pub(super) fn interrupt_agent(&self) {
+        self.send_daemon_request(crate::daemon::proto::Request::CancelTurn);
+    }
+
+    /// Show the transient "press ctrl+c again to exit" hint. Reuses the
+    /// status-line toast; its TTL is the exit window so it disappears
+    /// exactly when a second press would no longer exit.
+    fn show_ctrl_c_hint(&mut self) {
+        self.toast = Some(Toast {
+            text: "Press ctrl+c again to exit".to_string(),
+            kind: ToastKind::Info,
+            expires_at: Instant::now() + CTRL_C_EXIT_WINDOW,
+        });
+    }
+
+    /// Disarm the ctrl+c exit window once it has lapsed. Called once per
+    /// event-loop tick so a lone press auto-resets to a fresh first press
+    /// without needing another event. The hint toast self-expires on the
+    /// same TTL via [`Self::tick_toast`].
+    pub(super) fn tick_ctrl_c_window(&mut self) {
+        if let Some(armed) = self.ctrl_c_armed_at
+            && Instant::now().duration_since(armed) > CTRL_C_EXIT_WINDOW
+        {
+            self.ctrl_c_armed_at = None;
         }
     }
 
@@ -1373,6 +1511,30 @@ impl App {
         }
     }
 
+    /// Send the answering dialog's outcome back to the daemon (GOALS
+    /// §3b). Both submit and cancel become a `ResolveInterrupt` — cancel
+    /// carries `ResolveResponse::Cancel`, which the worker fans out to a
+    /// per-question `Cancel` so the blocked `question` tool unblocks with
+    /// dismissed answers.
+    pub(super) fn resolve_question_dialog(
+        &self,
+        result: crate::tui::dialog::question::QuestionResult,
+    ) {
+        use crate::daemon::proto::{Request, ResolveResponse};
+        use crate::tui::dialog::question::QuestionResult;
+        let (interrupt_id, response) = match result {
+            QuestionResult::Submit {
+                interrupt_id,
+                responses,
+            } => (interrupt_id, ResolveResponse::Batch { responses }),
+            QuestionResult::Cancel { interrupt_id } => (interrupt_id, ResolveResponse::Cancel),
+        };
+        self.send_daemon_request(Request::ResolveInterrupt {
+            interrupt_id,
+            response,
+        });
+    }
+
     /// `/prune` (T6.d): show the before→after context % and the
     /// cache-bust warning, then arm the confirm. The numbers come from the
     /// daemon-authoritative `prunable_tokens` (same `dedup_plan` `/prune`
@@ -1500,6 +1662,44 @@ impl App {
             }
         }
         false
+    }
+
+    /// Resume `session_id` from the `/sessions` browser. Reuses the
+    /// existing session-switch path (`attach_to_session`, the same plumbing
+    /// `/compact` commit uses) — the runner's event stream + input channel
+    /// move onto the resumed session, and the daemon marks it viewed on
+    /// attach (clearing its unread state). Mirrors `commit_compact`'s
+    /// transcript reset; new agent output streams in live.
+    pub(super) fn resume_session(&mut self, session_id: uuid::Uuid) {
+        match agent_runner::attach_to_session(&self.launch.cwd, session_id) {
+            Ok(runner) => {
+                let short_id = runner.short_id.clone();
+                self.project_id = Some(runner.project_id.clone());
+                // Switch the runner: fresh transcript view bound to the
+                // resumed session.
+                self.history.clear();
+                self.queue.clear();
+                self.pending = None;
+                self.prunable_tokens = 0;
+                self.elided_event_ids.clear();
+                self.active_jobs.clear();
+                self.chat_scroll_offset = 0;
+                self.agent_runner = Some(Ok(runner));
+                let label = if short_id.is_empty() {
+                    session_id.to_string()
+                } else {
+                    short_id
+                };
+                self.history.push(HistoryEntry::Plain {
+                    line: format!("/resume: switched to session {label}."),
+                });
+            }
+            Err(e) => {
+                self.history.push(HistoryEntry::Plain {
+                    line: format!("/resume: could not attach to session: {e}"),
+                });
+            }
+        }
     }
 
     /// `/pin <text>`: mark a message as must-survive for the next
@@ -1800,6 +2000,23 @@ impl App {
             TurnEvent::AgentIdle => {
                 self.finalize_pending();
                 self.end_working_span();
+            }
+            TurnEvent::InterruptRaised {
+                interrupt_id,
+                questions,
+            } => {
+                // A `question` tool blocked the agent (GOALS §3b). Open
+                // the answering dialog over the composer. The
+                // anti-misfire lockout uses the configured delay. If a
+                // dialog is somehow already open (re-raise), the newest
+                // one wins — the prior interrupt stays parked in the DB.
+                let lockout =
+                    Duration::from_millis(load_dialog_config(&self.launch.cwd).lockout_ms);
+                self.question_dialog = Some(crate::tui::dialog::question::QuestionDialog::new(
+                    interrupt_id,
+                    questions,
+                    lockout,
+                ));
             }
             TurnEvent::JobStarted {
                 job_id,
@@ -2251,6 +2468,14 @@ impl App {
         // other mouse event is eaten so nothing reaches the chat
         // underneath. Ahead of the embedded-pane / chat handlers.
         if let Some(pane) = self.stats_pane.as_mut() {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => pane.scroll_up(),
+                MouseEventKind::ScrollDown => pane.scroll_down(),
+                _ => {}
+            }
+            return;
+        }
+        if let Some(pane) = self.sessions_pane.as_mut() {
             match mouse.kind {
                 MouseEventKind::ScrollUp => pane.scroll_up(),
                 MouseEventKind::ScrollDown => pane.scroll_down(),
@@ -2781,9 +3006,10 @@ impl App {
                 return false;
             }
             "sessions" | "resume" => {
-                "/sessions: stub — session-picker UI not wired yet. The wire RPCs \
-                 (ListSessions with project_id/parent filters, ForkSession, \
-                 RenameSession, DeleteSession) are live in the daemon."
+                self.sessions_pane = Some(crate::tui::sessions_pane::SessionsPane::open(
+                    &self.launch.cwd,
+                ));
+                return false;
             }
             "fork" => {
                 "/fork: stub — the ForkSession RPC is live in the daemon; the TUI \
@@ -3378,6 +3604,21 @@ fn load_tui_config(cwd: &Path) -> crate::config::extended::TuiConfig {
     crate::config::extended::TuiConfig::default()
 }
 
+/// Resolve the answering-dialog config (GOALS §3b) from the layered
+/// `extended-config.json` — same first-match walk as
+/// [`load_tui_config`]. Used to read the anti-misfire lockout delay.
+fn load_dialog_config(cwd: &Path) -> crate::config::extended::DialogConfig {
+    for dir in discover_config_dirs(cwd) {
+        let path = dir.path.join("extended-config.json");
+        if let Ok(bytes) = std::fs::read(&path)
+            && let Ok(cfg) = serde_json::from_slice::<ExtendedConfig>(&bytes)
+        {
+            return cfg.dialog;
+        }
+    }
+    crate::config::extended::DialogConfig::default()
+}
+
 /// Background task that polls `git status` every `GIT_REFRESH_INTERVAL`
 /// without blocking the event-loop thread. The result lands in `shared`;
 /// the event loop reads it on the next tick.
@@ -3567,5 +3808,102 @@ mod local_cmd_tests {
         assert!(out.contains("hello"));
         let (_o, failed) = exec_capture_shell("exit 3", std::path::Path::new("."));
         assert!(failed);
+    }
+}
+
+#[cfg(test)]
+mod ctrl_c_tests {
+    use super::{CTRL_C_EXIT_WINDOW, CtrlCAction, decide_ctrl_c};
+    use std::time::{Duration, Instant};
+
+    /// Idle + single (first) press: arm the window + show hint only,
+    /// nothing to interrupt. The window is armed at `now`.
+    #[test]
+    fn idle_first_press_arms_only() {
+        let now = Instant::now();
+        let (action, armed) = decide_ctrl_c(now, None, CTRL_C_EXIT_WINDOW, false);
+        assert_eq!(action, CtrlCAction::ArmOnly);
+        assert_eq!(armed, Some(now));
+    }
+
+    /// Busy + single (first) press: arm the window AND interrupt the agent.
+    #[test]
+    fn busy_first_press_arms_and_interrupts() {
+        let now = Instant::now();
+        let (action, armed) = decide_ctrl_c(now, None, CTRL_C_EXIT_WINDOW, true);
+        assert_eq!(action, CtrlCAction::ArmAndInterrupt);
+        assert_eq!(armed, Some(now));
+    }
+
+    /// Second press inside the window exits — regardless of agent state.
+    /// During a run, the first press already interrupted; this second one
+    /// is the "interrupt AND exit" case.
+    #[test]
+    fn second_press_within_window_exits_when_busy() {
+        let first = Instant::now();
+        let second = first + Duration::from_millis(200); // < 500ms
+        let (action, armed) = decide_ctrl_c(second, Some(first), CTRL_C_EXIT_WINDOW, true);
+        assert_eq!(action, CtrlCAction::Exit);
+        assert_eq!(armed, None);
+    }
+
+    /// Second press inside the window exits even when idle (idle + two fast
+    /// presses = exit).
+    #[test]
+    fn second_press_within_window_exits_when_idle() {
+        let first = Instant::now();
+        let second = first + Duration::from_millis(499);
+        let (action, _armed) = decide_ctrl_c(second, Some(first), CTRL_C_EXIT_WINDOW, false);
+        assert_eq!(action, CtrlCAction::Exit);
+    }
+
+    /// Exactly at the window boundary still counts as a second press
+    /// (`<=` window).
+    #[test]
+    fn second_press_at_window_boundary_exits() {
+        let first = Instant::now();
+        let second = first + CTRL_C_EXIT_WINDOW;
+        let (action, _armed) = decide_ctrl_c(second, Some(first), CTRL_C_EXIT_WINDOW, false);
+        assert_eq!(action, CtrlCAction::Exit);
+    }
+
+    /// Two presses spaced further apart than the window NEVER exit: the
+    /// second is treated as a fresh first press (re-armed at `now`).
+    #[test]
+    fn presses_outside_window_never_exit() {
+        let first = Instant::now();
+        let second = first + Duration::from_millis(501); // > 500ms
+        let (action, armed) = decide_ctrl_c(second, Some(first), CTRL_C_EXIT_WINDOW, false);
+        assert_eq!(action, CtrlCAction::ArmOnly);
+        assert_eq!(
+            armed,
+            Some(second),
+            "a lapsed window re-arms at the new press"
+        );
+
+        // A steady stream of slow presses interrupts repeatedly, never
+        // exits: each press is > window after the previous.
+        let third = second + Duration::from_millis(600);
+        let (action, armed) = decide_ctrl_c(third, Some(second), CTRL_C_EXIT_WINDOW, true);
+        assert_eq!(action, CtrlCAction::ArmAndInterrupt);
+        assert_eq!(armed, Some(third));
+    }
+
+    /// The window slides from the *last* press: a press just inside the
+    /// window of the immediately-previous press exits, even if the very
+    /// first press was long ago.
+    #[test]
+    fn window_slides_from_last_press() {
+        let t0 = Instant::now();
+        // First press, armed at t0.
+        let (_a, armed) = decide_ctrl_c(t0, None, CTRL_C_EXIT_WINDOW, false);
+        // A press > window later: fresh first press, re-arm.
+        let t1 = t0 + Duration::from_millis(800);
+        let (a, armed) = decide_ctrl_c(t1, armed, CTRL_C_EXIT_WINDOW, false);
+        assert_eq!(a, CtrlCAction::ArmOnly);
+        // A press < window after t1: exits (slides from t1, not t0).
+        let t2 = t1 + Duration::from_millis(100);
+        let (a, _armed) = decide_ctrl_c(t2, armed, CTRL_C_EXIT_WINDOW, false);
+        assert_eq!(a, CtrlCAction::Exit);
     }
 }

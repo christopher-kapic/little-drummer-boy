@@ -163,4 +163,35 @@ impl SessionRegistry {
     pub fn active_session_ids(&self) -> Vec<Uuid> {
         self.inner.workers.lock().unwrap().keys().copied().collect()
     }
+
+    /// Live `(has_active_jobs, processing)` status for a session, or
+    /// `None` when no worker is live for it (the browser then treats it
+    /// as not-processing / no-jobs). Lock-free read of the worker's
+    /// shared atomics (GOALS §17f).
+    pub fn live_status(&self, session_id: Uuid) -> Option<(bool, bool)> {
+        self.inner
+            .workers
+            .lock()
+            .unwrap()
+            .get(&session_id)
+            .map(|h| h.live_status())
+    }
+
+    /// Interrupt a live session before archive/delete (GOALS §17h): stop
+    /// its worker (which closes the driver — cancelling its async jobs as
+    /// the driver task drops, and ending the current turn cleanly) and
+    /// forget the handle. No-op when no worker is live. Returns `true`
+    /// when a live worker was stopped. Awaits the `Shutdown` send so the
+    /// worker has begun teardown before the caller applies the DB op.
+    pub async fn interrupt_and_stop(&self, session_id: Uuid) -> bool {
+        let handle = self.lookup(session_id);
+        let Some(handle) = handle else {
+            return false;
+        };
+        let _ = handle
+            .send_work(crate::daemon::session_worker::SessionWork::Shutdown)
+            .await;
+        self.forget(session_id);
+        true
+    }
 }

@@ -338,6 +338,29 @@ async fn handle_request(
             parent_session_id,
         } => list_sessions(ctx, project_id, parent_session_id),
 
+        Request::SessionLiveStatus { session_ids } => {
+            let statuses = session_ids
+                .into_iter()
+                .filter_map(|id| {
+                    ctx.registry
+                        .live_status(id)
+                        .map(|(has_active_jobs, processing)| proto::LiveStatus {
+                            session_id: id,
+                            has_active_jobs,
+                            processing,
+                        })
+                })
+                .collect();
+            Ok(Response::SessionLiveStatus { statuses })
+        }
+
+        Request::ArchiveSession {
+            session_id,
+            cascade,
+        } => archive_session(ctx, session_id, cascade).await,
+
+        Request::UnarchiveSession { session_id } => unarchive_session(ctx, session_id),
+
         Request::ForkSession {
             parent_session_id,
             fork_point_turn_id,
@@ -348,7 +371,7 @@ async fn handle_request(
         Request::DeleteSession {
             session_id,
             cascade,
-        } => delete_session(ctx, session_id, cascade),
+        } => delete_session(ctx, session_id, cascade).await,
 
         Request::GetConfig => {
             // The /config TUI payload lands in P3. For now stub it
@@ -561,6 +584,14 @@ fn attach(
     // Replace any prior attachment.
     let event_rx = handle.subscribe();
     let session_id = handle.session_id;
+
+    // Read/unread marker (GOALS §17f): the session just became active for
+    // this client, so everything the agent produced up to now is "seen."
+    // Best-effort — a marker write failure must not block the attach.
+    if let Err(e) = ctx.db.mark_session_viewed(session_id) {
+        tracing::warn!(error = %e, %session_id, "mark_session_viewed failed");
+    }
+
     let project_root = handle.project_root.to_string_lossy().into_owned();
     let active_agent = handle.active_agent_name.clone();
 
@@ -624,6 +655,26 @@ fn list_sessions(
             .count_forks_for(row.session_id)
             .map_err(internal)
             .unwrap_or(0);
+        // Full subtree descendant count for the archive/delete cascade
+        // statement (GOALS §17h) — direct forks plus their descendants.
+        let descendant_count = ctx
+            .db
+            .count_descendants(row.session_id)
+            .map_err(internal)
+            .unwrap_or(0);
+        // Read/unread + pending-question inputs for the browser's tiers
+        // 3-4 (GOALS §17f). Best-effort: a query miss degrades to "no
+        // activity / no open question" rather than failing the list.
+        let latest_activity_at = ctx
+            .db
+            .latest_agent_activity_at(row.session_id)
+            .ok()
+            .flatten();
+        let open_interrupts = ctx
+            .db
+            .list_open_interrupts(row.session_id)
+            .map(|v| v.len() as u32)
+            .unwrap_or(0);
         sessions.push(proto::SessionSummary {
             session_id: row.session_id,
             short_id: row.short_id,
@@ -636,6 +687,11 @@ fn list_sessions(
             title: row.title,
             parent_session_id: row.parent_session_id,
             fork_count,
+            descendant_count,
+            last_viewed_at: row.last_viewed_at,
+            latest_activity_at,
+            open_interrupts,
+            archived_at: row.archived_at,
         });
     }
     Ok(Response::Sessions { sessions })
@@ -690,7 +746,7 @@ fn rename_session(
     Ok(Response::Ack)
 }
 
-fn delete_session(
+async fn delete_session(
     ctx: &DaemonContext,
     session_id: Uuid,
     cascade: bool,
@@ -705,9 +761,76 @@ fn delete_session(
         }
         Err(e) => return Err(internal(e)),
     }
+    // Don't delete out from under a running worker (GOALS §17h): stop any
+    // live workers in the affected subtree first — that cancels their
+    // async jobs and ends the current turn cleanly.
+    interrupt_subtree(ctx, session_id, cascade).await;
     ctx.db
         .delete_session(session_id, cascade)
         .map_err(internal)?;
+    Ok(Response::Ack)
+}
+
+async fn archive_session(
+    ctx: &DaemonContext,
+    session_id: Uuid,
+    cascade: bool,
+) -> std::result::Result<Response, ErrorPayload> {
+    match ctx.db.get_session(session_id) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return Err(ErrorPayload {
+                code: ErrorCode::UnknownSession,
+                message: format!("unknown session {session_id}"),
+            });
+        }
+        Err(e) => return Err(internal(e)),
+    }
+    // Same interrupt-first rule as delete: don't archive a session while
+    // its worker is live.
+    interrupt_subtree(ctx, session_id, cascade).await;
+    ctx.db
+        .archive_session(session_id, cascade)
+        .map_err(internal)?;
+    Ok(Response::Ack)
+}
+
+/// Stop any live worker for `root` (and, when `cascade`, its whole fork
+/// subtree) before an archive/delete. Best-effort over the candidate ids
+/// the daemon currently has active workers for — there is no DB walk
+/// here because only sessions with a live worker need interrupting, and
+/// the registry already knows those.
+async fn interrupt_subtree(ctx: &DaemonContext, root: Uuid, cascade: bool) {
+    if !cascade {
+        ctx.registry.interrupt_and_stop(root).await;
+        return;
+    }
+    // Cascade: interrupt every active session whose row sits in the
+    // subtree rooted at `root`. We intersect the daemon's live worker set
+    // with the DB subtree so we only walk what's actually running.
+    let active = ctx.registry.active_session_ids();
+    for id in active {
+        if ctx.db.is_in_subtree(root, id).unwrap_or(false) {
+            ctx.registry.interrupt_and_stop(id).await;
+        }
+    }
+}
+
+fn unarchive_session(
+    ctx: &DaemonContext,
+    session_id: Uuid,
+) -> std::result::Result<Response, ErrorPayload> {
+    match ctx.db.get_session(session_id) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return Err(ErrorPayload {
+                code: ErrorCode::UnknownSession,
+                message: format!("unknown session {session_id}"),
+            });
+        }
+        Err(e) => return Err(internal(e)),
+    }
+    ctx.db.unarchive_session(session_id).map_err(internal)?;
     Ok(Response::Ack)
 }
 

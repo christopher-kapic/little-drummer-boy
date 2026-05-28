@@ -753,6 +753,42 @@ the cast table and §4d-bis), but to its caller it is a single
 noninteractive leaf — the two stages are an implementation detail of
 the `docs` unit, not additional delegation, so leaf-termination holds.
 
+**Multi-task decomposition on `orchestrator-build` (sequential, fresh
+context per task).** A single user prompt often contains several
+distinct tasks. Rather than carry all of them in one ever-growing
+context, `orchestrator-build` **orders them and the runtime runs one
+fresh `orchestrator-build` episode per task, sequentially** — each task
+starts with clean context for maximum reasoning quality (priority #1,
+the weak-model target). This is **runtime-owned episode sequencing, not
+self-spawn**: `orchestrator-build` does *not* appear in its own
+invocation-tree children, the scheduler owns the task queue, and the
+"one interactive agent at a time / interactive agents don't spawn
+interactive agents" rules (§3b) are preserved unchanged.
+
+- **Single small task** is the common case: no decomposition, no
+  episode machinery — `orchestrator-build` briefs `coder` directly. The
+  `coder` hop is kept *cheap* (fast-path spawn, minimal ceremony) so a
+  one-line change isn't penalized for not being a write-capable
+  orchestrator. (`orchestrator-build` stays delegation-only in v1;
+  direct-write for small tasks is deferred — see
+  `design-need-to-discuss-or-test.md` D17, contingent on per-agent tool
+  descriptions.)
+- **TUI invariant.** Episode sequencing must be indistinguishable from
+  a normal session: the chrome keeps showing `orchestrator-build` across
+  episode boundaries, there is no visible "subagent returned / new agent
+  started" seam, and the next task's episode simply begins the way a
+  fresh turn does today. The user is always "talking to
+  `orchestrator-build`."
+- **Mid-flight task add.** When the user adds a task while an episode is
+  running, the active episode decides *now vs later* and uses
+  `task_request` (§3b; urgency `now` / `after_current`) to either fold
+  it into the current episode or append it to the runtime queue at the
+  right position.
+- **No parallel fan-out from `orchestrator-build`.** Tasks run one at a
+  time. A user who wants tasks executed in parallel uses
+  `orchestrator-plan` + the ralph executor (§3b) — that is the only
+  parallel-execution path; `orchestrator-build` is not made ralph-like.
+
 **Orchestrators may read, but should delegate searches.** Both
 orchestrators get `read` so the user can `@`-tag a file (see §1e)
 or ask "what does foo.rs say on line 42?" without a subagent

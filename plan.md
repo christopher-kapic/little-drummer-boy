@@ -1319,6 +1319,39 @@ is the contract for `mode: "subagent"`: `objective`, `scope`,
 are a design smell. Forks don't need a `TaskPacket` — they inherit
 the parent's context which already carries the necessary state.
 
+### 3d-bis. Multi-task episode sequencing (`orchestrator-build`)
+
+Per GOALS §3a, a multi-task user prompt is run as **one fresh
+`orchestrator-build` episode per task, sequentially** — not as one
+long context, and not as `orchestrator-build` spawning itself. The
+**runtime owns the task queue**; each episode is a fresh primary
+context for one ordered task. This is *not* a new delegation primitive
+— it reuses the existing primary-agent lifecycle, just torn down and
+re-stood-up per queue entry by the scheduler. Implications:
+
+- **Decomposition + ordering** is produced by the first
+  `orchestrator-build` turn (it emits an ordered task list); the
+  runtime enqueues it. A single small task short-circuits the queue
+  entirely (no episode machinery).
+- **TUI seamlessness is a hard requirement.** The chrome's
+  active-agent label stays `orchestrator-build` across episode
+  boundaries; the composer/turn flow looks identical to a normal
+  session. No "subagent returned" seam between episodes. (This is the
+  one constraint the user pinned: episode sequencing must be invisible
+  as a mechanism.)
+- **Mid-flight add** rides `task_request` (§3d / GOALS §3b): urgency
+  `now` folds into the current episode, `after_current` appends to the
+  runtime queue at the right position.
+- **Cheap `coder` hop.** Because `orchestrator-build` stays
+  delegation-only (single-writer invariant, §4.1), small edits still
+  go through `coder`; the spawn path is kept minimal-ceremony so the
+  round-trip cost is low. Direct-write on `orchestrator-build` is
+  deferred — `design-need-to-discuss-or-test.md` D17, gated on
+  per-agent tool descriptions.
+- **Sequential only.** Parallel task execution is *not* offered here;
+  it is `orchestrator-plan` + the ralph executor's job (the routing
+  table in §4.2 reflects this split).
+
 ### 3e. Approval router (`session/approvals.rs`)
 
 Codex's `ApprovalsReviewer { User, AutoApprove, CloudService }`
@@ -1728,7 +1761,8 @@ The two primitives together cover the full design space of
 | "Try fix A and fix B from this turn" | two forks (shared setup, diverge after) |
 | "Ask Opus and Sonnet the same hard question from here" | two forks, different `category` per fork |
 | "Generate 5 candidate optimizations to bench" | 5 forks under an evaluator-gated graph node |
-| "Decompose this big task into independent steps" | graph plan with subagent nodes |
+| "Do these 3 things one after another, hands-on" | `orchestrator-build` multi-task decomposition → sequential episodes (§3d-bis) |
+| "Decompose this big task and run the steps in parallel" | graph plan with subagent nodes (`orchestrator-plan` + ralph) |
 
 ### 4.3 Prompt-injection guard
 

@@ -192,6 +192,8 @@ pub(crate) fn test_ctx(root: &Path) -> ToolCtx {
         session: Arc::new(session),
         cwd: root.to_path_buf(),
         redact,
+        interrupts: Arc::new(crate::engine::interrupt::InterruptHub::detached()),
+        cancel: tokio_util::sync::CancellationToken::new(),
     }
 }
 

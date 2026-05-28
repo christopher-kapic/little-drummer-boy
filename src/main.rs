@@ -9,6 +9,7 @@
 //! See `GOALS.md` for what the binary is for.
 
 mod agents;
+mod approval;
 mod auth;
 mod auto_title;
 mod banner;

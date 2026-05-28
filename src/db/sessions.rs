@@ -44,6 +44,15 @@ pub struct SessionRow {
     /// `true` when the user has manually set [`title`]. Locks out the
     /// utility-model auto-titling pass.
     pub user_renamed: bool,
+    /// Epoch seconds the user last opened/resumed this session in a
+    /// client (migration 0010). `None` = never viewed. The browser
+    /// reads a session as unread when its latest agent-produced event is
+    /// newer than this marker (or it has activity and was never viewed).
+    pub last_viewed_at: Option<i64>,
+    /// Epoch seconds the session was archived (recoverable soft-delete,
+    /// migration 0010). `None` = live. Archived sessions are hidden from
+    /// the browser by default.
+    pub archived_at: Option<i64>,
 }
 
 impl SessionRow {
@@ -71,6 +80,8 @@ impl SessionRow {
             fork_point_turn_id: row.get("fork_point_turn_id")?,
             title: row.get("title")?,
             user_renamed: user_renamed != 0,
+            last_viewed_at: row.get("last_viewed_at")?,
+            archived_at: row.get("archived_at")?,
         })
     }
 }
@@ -161,6 +172,8 @@ impl Db {
             fork_point_turn_id: None,
             title: None,
             user_renamed: false,
+            last_viewed_at: None,
+            archived_at: None,
         })
     }
 
@@ -217,6 +230,8 @@ impl Db {
                 fork_point_turn_id,
                 title: None,
                 user_renamed: false,
+                last_viewed_at: None,
+                archived_at: None,
             })
         })
     }
@@ -244,6 +259,26 @@ impl Db {
                 Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
                 Err(e) => Err(e).context("query get_session_by_short_id"),
             }
+        })
+    }
+
+    /// Look up sessions by `short_id` across **every** project. Used by
+    /// `cockpit export <session>`, which accepts a bare short_id without a
+    /// project context. Returns all matches so the caller can report an
+    /// ambiguous identifier (a short_id is unique only within a project).
+    pub fn find_sessions_by_short_id_global(&self, short_id: &str) -> Result<Vec<SessionRow>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn
+                .prepare("SELECT * FROM sessions WHERE short_id = ?1")
+                .context("preparing find_sessions_by_short_id_global")?;
+            let rows = stmt
+                .query_map([short_id], SessionRow::from_row)
+                .context("querying sessions by short_id")?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.context("decoding session row")?);
+            }
+            Ok(out)
         })
     }
 
@@ -359,24 +394,7 @@ impl Db {
     pub fn delete_session(&self, session_id: Uuid, cascade: bool) -> Result<()> {
         self.with_conn(|conn| {
             if cascade {
-                let mut to_delete = vec![session_id];
-                let mut frontier = vec![session_id];
-                while let Some(parent) = frontier.pop() {
-                    let mut stmt = conn
-                        .prepare("SELECT session_id FROM sessions WHERE parent_session_id = ?1")
-                        .context("preparing fork-walk")?;
-                    let children = stmt
-                        .query_map([parent.to_string()], |row| {
-                            let s: String = row.get(0)?;
-                            parse_uuid(&s)
-                        })
-                        .context("querying fork-walk")?;
-                    for child in children {
-                        let id = child.context("decoding fork child")?;
-                        to_delete.push(id);
-                        frontier.push(id);
-                    }
-                }
+                let to_delete = collect_subtree(conn, session_id)?;
                 for id in to_delete {
                     conn.execute(
                         "DELETE FROM sessions WHERE session_id = ?1",
@@ -392,6 +410,129 @@ impl Db {
                 .context("deleting session")?;
             }
             Ok(())
+        })
+    }
+
+    /// Set the read/unread marker to now (migration 0010). Called when a
+    /// client opens/resumes the session — everything the agent produced
+    /// up to this instant counts as seen; later agent output reads as
+    /// unread.
+    pub fn mark_session_viewed(&self, session_id: Uuid) -> Result<()> {
+        let now = Utc::now().timestamp();
+        self.with_conn(|conn| {
+            conn.execute(
+                "UPDATE sessions SET last_viewed_at = ?1 WHERE session_id = ?2",
+                params![now, session_id.to_string()],
+            )
+            .context("marking session viewed")?;
+            Ok(())
+        })
+    }
+
+    /// Timestamp (epoch seconds) of the most recent agent-produced event
+    /// for a session, or `None` when the session has no agent activity
+    /// yet. The max across `tool_call_events` and `inference_calls` — the
+    /// two tables that record agent output. Drives the unread tier: a
+    /// session is unread when this is newer than `last_viewed_at` (or it
+    /// has activity and was never viewed).
+    pub fn latest_agent_activity_at(&self, session_id: Uuid) -> Result<Option<i64>> {
+        self.with_conn(|conn| {
+            let ts: Option<i64> = conn
+                .query_row(
+                    "SELECT MAX(t) FROM (
+                         SELECT MAX(timestamp) AS t FROM tool_call_events WHERE session_id = ?1
+                         UNION ALL
+                         SELECT MAX(timestamp) AS t FROM inference_calls WHERE session_id = ?1
+                     )",
+                    [session_id.to_string()],
+                    |row| row.get(0),
+                )
+                .context("querying latest_agent_activity_at")?;
+            Ok(ts)
+        })
+    }
+
+    /// Archive a session (recoverable soft-delete, migration 0010). With
+    /// `cascade = true`, archives every descendant fork (depth-unbounded)
+    /// via the same recursive walk `delete_session` uses, so the whole
+    /// fork subtree disappears from the browser together. Idempotent —
+    /// re-archiving an already-archived row just re-stamps `archived_at`.
+    pub fn archive_session(&self, session_id: Uuid, cascade: bool) -> Result<()> {
+        let now = Utc::now().timestamp();
+        self.with_conn(|conn| {
+            let targets = if cascade {
+                collect_subtree(conn, session_id)?
+            } else {
+                vec![session_id]
+            };
+            for id in targets {
+                conn.execute(
+                    "UPDATE sessions SET archived_at = ?1 WHERE session_id = ?2",
+                    params![now, id.to_string()],
+                )
+                .context("archiving session")?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Clear a session's archive flag (recover). Single row only — the
+    /// browser unarchives one session at a time from the archived view.
+    pub fn unarchive_session(&self, session_id: Uuid) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "UPDATE sessions SET archived_at = NULL WHERE session_id = ?1",
+                [session_id.to_string()],
+            )
+            .context("unarchiving session")?;
+            Ok(())
+        })
+    }
+
+    /// Count the descendant forks of a session (depth-unbounded, not
+    /// counting the session itself). Used by the archive/delete confirm
+    /// dialog to state how many sessions the cascade will affect.
+    pub fn count_descendants(&self, session_id: Uuid) -> Result<u32> {
+        self.with_conn(|conn| {
+            let n = collect_subtree(conn, session_id)?.len();
+            // `collect_subtree` includes the root; descendants are the rest.
+            Ok((n.saturating_sub(1)) as u32)
+        })
+    }
+
+    /// `true` when `node` is `root` itself or a (transitive) descendant
+    /// of `root` in the fork tree. Walks `node`'s ancestor chain upward —
+    /// cheap for the shallow trees forks produce, and bounded by a guard
+    /// against cyclic/dangling parents. Used by the daemon to decide
+    /// which live workers to interrupt before a cascading archive/delete.
+    pub fn is_in_subtree(&self, root: Uuid, node: Uuid) -> Result<bool> {
+        if root == node {
+            return Ok(true);
+        }
+        self.with_conn(|conn| {
+            let mut cur = node;
+            // Bound the walk so a corrupted parent cycle can't spin.
+            for _ in 0..10_000 {
+                let parent: Option<String> = match conn.query_row(
+                    "SELECT parent_session_id FROM sessions WHERE session_id = ?1",
+                    [cur.to_string()],
+                    |row| row.get(0),
+                ) {
+                    Ok(p) => p,
+                    Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(false),
+                    Err(e) => return Err(anyhow::Error::from(e)).context("is_in_subtree walk"),
+                };
+                let Some(parent) = parent else {
+                    return Ok(false);
+                };
+                let parent =
+                    parse_uuid(&parent).map_err(|e| anyhow::anyhow!("decoding parent id: {e}"))?;
+                if parent == root {
+                    return Ok(true);
+                }
+                cur = parent;
+            }
+            Ok(false)
         })
     }
 
@@ -483,6 +624,31 @@ impl Db {
             }
         })
     }
+}
+
+/// Collect a session and every descendant fork (depth-unbounded),
+/// root-first. Shared by `delete_session`, `archive_session`, and
+/// `count_descendants` so the subtree walk lives in exactly one place.
+fn collect_subtree(conn: &Connection, root: Uuid) -> Result<Vec<Uuid>> {
+    let mut all = vec![root];
+    let mut frontier = vec![root];
+    while let Some(parent) = frontier.pop() {
+        let mut stmt = conn
+            .prepare("SELECT session_id FROM sessions WHERE parent_session_id = ?1")
+            .context("preparing fork-walk")?;
+        let children = stmt
+            .query_map([parent.to_string()], |row| {
+                let s: String = row.get(0)?;
+                parse_uuid(&s)
+            })
+            .context("querying fork-walk")?;
+        for child in children {
+            let id = child.context("decoding fork child")?;
+            all.push(id);
+            frontier.push(id);
+        }
+    }
+    Ok(all)
 }
 
 fn get_session_inner(conn: &Connection, session_id: Uuid) -> rusqlite::Result<Option<SessionRow>> {
@@ -645,6 +811,104 @@ mod tests {
         // The child is still there — its parent_session_id now points at a
         // dangling id, which the application layer is expected to handle.
         assert!(db.get_session(child.session_id).unwrap().is_some());
+    }
+
+    #[test]
+    fn mark_viewed_sets_marker() {
+        let db = Db::open_in_memory().unwrap();
+        let s = db.create_session("p", "/x", "a").unwrap();
+        assert!(
+            db.get_session(s.session_id)
+                .unwrap()
+                .unwrap()
+                .last_viewed_at
+                .is_none()
+        );
+        db.mark_session_viewed(s.session_id).unwrap();
+        assert!(
+            db.get_session(s.session_id)
+                .unwrap()
+                .unwrap()
+                .last_viewed_at
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn archive_cascades_subtree_and_unarchive_recovers() {
+        let db = Db::open_in_memory().unwrap();
+        let parent = db.create_session("p", "/x", "a").unwrap();
+        let child = db.create_fork(parent.session_id, None).unwrap();
+        let grandchild = db.create_fork(child.session_id, None).unwrap();
+        // Descendant count excludes the root itself.
+        assert_eq!(db.count_descendants(parent.session_id).unwrap(), 2);
+
+        db.archive_session(parent.session_id, true).unwrap();
+        for id in [parent.session_id, child.session_id, grandchild.session_id] {
+            assert!(
+                db.get_session(id).unwrap().unwrap().archived_at.is_some(),
+                "archive should cascade the whole subtree"
+            );
+        }
+
+        // Unarchive recovers a single row (the rest stay archived).
+        db.unarchive_session(parent.session_id).unwrap();
+        assert!(
+            db.get_session(parent.session_id)
+                .unwrap()
+                .unwrap()
+                .archived_at
+                .is_none()
+        );
+        assert!(
+            db.get_session(child.session_id)
+                .unwrap()
+                .unwrap()
+                .archived_at
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn is_in_subtree_walks_ancestors() {
+        let db = Db::open_in_memory().unwrap();
+        let root = db.create_session("p", "/x", "a").unwrap();
+        let child = db.create_fork(root.session_id, None).unwrap();
+        let grandchild = db.create_fork(child.session_id, None).unwrap();
+        let other = db.create_session("p", "/x", "a").unwrap();
+        assert!(db.is_in_subtree(root.session_id, root.session_id).unwrap());
+        assert!(db.is_in_subtree(root.session_id, child.session_id).unwrap());
+        assert!(
+            db.is_in_subtree(root.session_id, grandchild.session_id)
+                .unwrap()
+        );
+        assert!(!db.is_in_subtree(root.session_id, other.session_id).unwrap());
+        assert!(
+            !db.is_in_subtree(child.session_id, root.session_id).unwrap(),
+            "the parent is not in the child's subtree"
+        );
+    }
+
+    #[test]
+    fn archive_no_cascade_leaves_forks_live() {
+        let db = Db::open_in_memory().unwrap();
+        let parent = db.create_session("p", "/x", "a").unwrap();
+        let child = db.create_fork(parent.session_id, None).unwrap();
+        db.archive_session(parent.session_id, false).unwrap();
+        assert!(
+            db.get_session(parent.session_id)
+                .unwrap()
+                .unwrap()
+                .archived_at
+                .is_some()
+        );
+        assert!(
+            db.get_session(child.session_id)
+                .unwrap()
+                .unwrap()
+                .archived_at
+                .is_none()
+        );
     }
 
     #[test]

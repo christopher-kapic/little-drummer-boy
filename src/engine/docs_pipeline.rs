@@ -52,8 +52,15 @@ pub async fn run(
     session: Arc<Session>,
     locks: Arc<crate::locks::LockManager>,
     redact: Arc<RedactionTable>,
+    cancel: tokio_util::sync::CancellationToken,
 ) -> Result<String> {
     let input = parse_input(brief);
+
+    // The docs pipeline's two stages are leaf agents (`docs-resolver` /
+    // `docs-answerer`) — neither carries the `question` tool, so they
+    // never raise a human-answer interrupt. A detached hub satisfies the
+    // shared tool-call signature without wiring a client fan-out.
+    let interrupts = Arc::new(crate::engine::interrupt::InterruptHub::detached());
 
     // ---- Stage 1: resolver, in the caller's cwd, sees only `package`.
     let resolution = DocsResolution::new();
@@ -68,6 +75,8 @@ pub async fn run(
         locks.clone(),
         redact.clone(),
         spawn_args.cwd.clone(),
+        interrupts.clone(),
+        cancel.clone(),
     )
     .await?;
 
@@ -101,6 +110,8 @@ pub async fn run(
         locks,
         redact,
         resolved.path,
+        interrupts,
+        cancel,
     )
     .await?;
     Ok(answer)

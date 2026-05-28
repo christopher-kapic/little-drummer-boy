@@ -174,6 +174,19 @@ pub struct ToolCtx {
     /// want to scrub *before* a long output is even allocated (e.g.
     /// `bash` capping output and only scrubbing what fits).
     pub redact: Arc<crate::redact::RedactionTable>,
+    /// Interrupt wakeup hub (GOALS §3b). Structural tools that block on
+    /// a human answer — today only `question` — raise an interrupt
+    /// through this and await the resolution that arrives, out of band,
+    /// on the daemon worker's `ResolveInterrupt` path. Threaded as an
+    /// `Arc` so the same hub instance is shared with the worker.
+    pub interrupts: Arc<crate::engine::interrupt::InterruptHub>,
+    /// Per-turn cancellation token (user ctrl+c → `CancelTurn`). Long-
+    /// running tools — today `bash` — race their subprocess against
+    /// `cancel.cancelled()` and kill it (process group on Unix) when the
+    /// user aborts the turn, so a runaway test run dies promptly instead
+    /// of holding the turn open. Fresh per turn; cancelling it never
+    /// affects a later turn.
+    pub cancel: tokio_util::sync::CancellationToken,
 }
 
 /// Project the `Tool` trait into a `ToolDefinition` rig understands.

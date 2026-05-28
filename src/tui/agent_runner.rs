@@ -246,6 +246,64 @@ pub async fn fetch_guidance_estimate(
     }
 }
 
+/// Run one blocking daemon request against an already-running daemon and
+/// return the typed response. Connects only — never spawns — so the
+/// `/sessions` browser degrades gracefully (no live data, no DB writes,
+/// no crash) when the daemon isn't up. Mirrors `try_spawn_inner`'s
+/// `block_in_place` pattern so it's callable from the synchronous TUI
+/// key handlers. `Err(String)` for any transport/typed failure.
+pub fn daemon_request_blocking(req: Request) -> Result<Response, String> {
+    use crate::daemon::{DaemonPaths, DaemonStatus, probe};
+    let runtime =
+        tokio::runtime::Handle::try_current().map_err(|_| "no tokio runtime".to_string())?;
+    tokio::task::block_in_place(|| {
+        runtime.block_on(async {
+            let paths = DaemonPaths::resolve().map_err(|e| format!("daemon paths: {e}"))?;
+            if !matches!(probe(&paths).await, DaemonStatus::Running) {
+                return Err("daemon not running".to_string());
+            }
+            let client = crate::daemon::client::DaemonClient::connect(&paths.socket)
+                .await
+                .map_err(|e| format!("daemon connect: {e}"))?;
+            client
+                .request_ok(req)
+                .await
+                .map_err(|e| format!("daemon request: {e}"))
+        })
+    })
+}
+
+/// List sessions for the `/sessions` browser. `project_id = Some(p)` +
+/// `parent = None` → root sessions in `p`; `parent = Some(s)` → direct
+/// forks of `s`; both `None` → every open session (all-projects scope).
+pub fn list_sessions_blocking(
+    project_id: Option<String>,
+    parent_session_id: Option<uuid::Uuid>,
+) -> Result<Vec<proto::SessionSummary>, String> {
+    match daemon_request_blocking(Request::ListSessions {
+        project_id,
+        parent_session_id,
+    })? {
+        Response::Sessions { sessions } => Ok(sessions),
+        other => Err(format!("unexpected list_sessions response: {other:?}")),
+    }
+}
+
+/// Fetch live `(has_active_jobs, processing)` status for the candidate
+/// session ids. Daemon down / no live worker → empty map; callers treat
+/// absent ids as not-processing / no-jobs.
+pub fn session_live_status_blocking(
+    session_ids: Vec<uuid::Uuid>,
+) -> std::collections::HashMap<uuid::Uuid, (bool, bool)> {
+    match daemon_request_blocking(Request::SessionLiveStatus { session_ids }) {
+        Ok(Response::SessionLiveStatus { statuses }) => statuses
+            .into_iter()
+            .map(|s| (s.session_id, (s.has_active_jobs, s.processing)))
+            .collect(),
+        _ => std::collections::HashMap::new(),
+    }
+}
+
 fn update_active_agent(event: &proto::Event, slot: &Arc<Mutex<String>>) {
     match event {
         proto::Event::SubagentSpawned { child, .. } => {
@@ -417,9 +475,19 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
             seed_tool_count,
             seed_tool_tokens,
         },
-        // Interrupts and SessionEnded don't have TurnEvent analogues
-        // yet — the TUI's needs-attention surface lands with the
-        // approval router.
+        // A question-tool interrupt (GOALS §3b) carries a question batch;
+        // surface it so the TUI opens the answering dialog. A bare
+        // `InterruptRaised` with no batch (the `jobs` needs-attention
+        // nudge) has no dialog and stays a no-op here. `InterruptResolved`
+        // / `SessionEnded` have no TurnEvent analogue.
+        InterruptRaised {
+            interrupt_id,
+            questions: Some(questions),
+            ..
+        } => TurnEvent::InterruptRaised {
+            interrupt_id,
+            questions,
+        },
         InterruptRaised { .. } | InterruptResolved { .. } | SessionEnded { .. } => return None,
     })
 }

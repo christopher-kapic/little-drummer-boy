@@ -50,6 +50,46 @@ pub enum DriverControl {
 /// hit this cap, extras stay in the channel for the *next* fold.
 const MAX_FOLD: usize = 16;
 
+/// Handle the session worker keeps to cancel the in-flight user-message
+/// run on a ctrl+c (`SessionWork::Cancel`). Shares the driver's
+/// `cancel_current` slot; cancelling the live token aborts the in-flight
+/// inference and signals any running `bash` subprocess to die. Idempotent
+/// and safe at idle — when no run is in flight the slot is `None` and
+/// [`Self::cancel`] is a no-op.
+#[derive(Clone)]
+pub struct CancelHandle {
+    current: Arc<std::sync::Mutex<Option<tokio_util::sync::CancellationToken>>>,
+}
+
+impl CancelHandle {
+    /// Cancel the in-flight run, if any. Safe to call when idle (no-op),
+    /// when already cancelling (cancelling a cancelled token is a no-op),
+    /// and concurrently from multiple callers.
+    pub fn cancel(&self) {
+        if let Ok(slot) = self.current.lock()
+            && let Some(token) = slot.as_ref()
+        {
+            token.cancel();
+        }
+    }
+}
+
+/// RAII guard that clears the driver's `cancel_current` slot when a
+/// user-message run ends (any exit path). Ensures a finished run's token
+/// can never be cancelled by a late ctrl+c that should instead arm a
+/// fresh first press.
+struct CancelSlotGuard {
+    slot: Arc<std::sync::Mutex<Option<tokio_util::sync::CancellationToken>>>,
+}
+
+impl Drop for CancelSlotGuard {
+    fn drop(&mut self) {
+        if let Ok(mut slot) = self.slot.lock() {
+            *slot = None;
+        }
+    }
+}
+
 /// One agent's slice of state on the driver stack.
 pub struct AgentSession {
     pub agent: Arc<Agent>,
@@ -107,6 +147,27 @@ pub struct Driver {
     /// inference carries the live working set, then cleared. Avoids two
     /// consecutive user messages on the wire.
     pending_seed_context: Option<String>,
+    /// Interrupt wakeup hub (GOALS §3b) threaded into every tool call so
+    /// the `question` tool can block on a human answer. Defaults to a
+    /// [`detached`](crate::engine::interrupt::InterruptHub::detached) hub
+    /// (no client fan-out); the session worker swaps in the client-wired
+    /// one via [`Self::set_interrupt_hub`] before the loop starts, and
+    /// keeps the same `Arc` so its `ResolveInterrupt` handler can wake
+    /// the blocked tool.
+    interrupts: Arc<crate::engine::interrupt::InterruptHub>,
+    /// One-shot guard for the "skills auto-selection skipped: no
+    /// utility_model" notice (GOALS §5). Logged at most once per driver
+    /// so an unconfigured utility model doesn't spam the log every turn.
+    skills_no_utility_model_logged: bool,
+    /// Cancellation handle for the in-flight user-message run (ctrl+c →
+    /// `CancelTurn`, GOALS §3a). `run_user_input` installs a fresh
+    /// [`CancellationToken`] here at the start of each run and clears it on
+    /// exit; the session worker holds a clone of the `Arc` so a
+    /// `SessionWork::Cancel` can read the live token and fire it. `None`
+    /// when idle — cancelling then is a safe no-op. Threaded into every
+    /// `turn()` (to abort the in-flight inference) and `ToolCtx` (to kill a
+    /// long-running `bash` subprocess) within the run.
+    cancel_current: Arc<std::sync::Mutex<Option<tokio_util::sync::CancellationToken>>>,
 }
 
 /// Inbound channel capacity for job events / commands. Generous; job
@@ -175,7 +236,20 @@ impl Driver {
             appended_hints: std::collections::HashSet::new(),
             prune_watermark: std::collections::HashMap::new(),
             pending_seed_context: None,
+            interrupts: Arc::new(crate::engine::interrupt::InterruptHub::detached()),
+            skills_no_utility_model_logged: false,
+            cancel_current: Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    /// Swap in the session worker's client-wired interrupt hub (GOALS
+    /// §3b) before the main loop starts. The worker keeps the same
+    /// `Arc` so its `ResolveInterrupt` handler wakes whatever tool call
+    /// is blocked on the answer. Same shape as [`JobAuthority`]'s
+    /// `set_turn_tx`: the channel-bearing dependency isn't known at
+    /// construction.
+    pub fn set_interrupt_hub(&mut self, hub: Arc<crate::engine::interrupt::InterruptHub>) {
+        self.interrupts = hub;
     }
 
     /// Wrap `user_text` with the `[time: ...]` prelude when the
@@ -189,6 +263,46 @@ impl Driver {
         {
             Some(prelude) => format!("{prelude}\n\n{user_text}"),
             None => user_text,
+        }
+    }
+
+    /// Skills auto-selection seam (GOALS §5). Loads the layered config,
+    /// consults the cheap utility model with the skill catalog + the
+    /// user message, and—if a skill is selected—returns `user_text` with
+    /// the (`!`-processed, scrubbed) skill body prepended so the main
+    /// agent's first inference carries it. Returns `user_text` unchanged
+    /// when no skill is chosen.
+    ///
+    /// Graceful degradation: an unset `utility_model` skips the pass
+    /// (logged at most once) and returns `user_text` untouched — no
+    /// error, no main-model fallback. The cheap model only ever sees the
+    /// `(name, description)` catalog (token economy, GOALS §10).
+    async fn maybe_inject_skill(&mut self, user_text: &str) -> String {
+        let (extended, providers) = crate::auto_title::load_configs_for(&self.cwd);
+
+        if extended.utility_model.is_none() {
+            if !self.skills_no_utility_model_logged {
+                self.skills_no_utility_model_logged = true;
+                tracing::info!("skills auto-selection skipped: no `utility_model` configured");
+            }
+            return user_text.to_string();
+        }
+
+        let selection = crate::skills::auto_select::select(
+            &self.cwd,
+            &extended,
+            &providers,
+            &self.redact,
+            user_text,
+        )
+        .await;
+
+        match selection {
+            crate::skills::auto_select::Selection::Skill { name, body } => {
+                tracing::debug!(skill = %name, "skills auto-selection injected skill body");
+                format!("Skill `{name}` (auto-selected):\n\n{body}\n\n---\n\n{user_text}")
+            }
+            crate::skills::auto_select::Selection::None => user_text.to_string(),
         }
     }
 
@@ -208,6 +322,16 @@ impl Driver {
     /// in [`Self::run_main_loop`].
     pub fn job_command_sender(&self) -> mpsc::Sender<JobCommand> {
         self.jobs.command_sender()
+    }
+
+    /// A handle the session worker keeps so a user ctrl+c
+    /// (`SessionWork::Cancel`) can abort the in-flight user-message run.
+    /// Cheap to clone — it shares the driver's `cancel_current` slot. See
+    /// [`CancelHandle::cancel`].
+    pub fn cancel_handle(&self) -> CancelHandle {
+        CancelHandle {
+            current: self.cancel_current.clone(),
+        }
     }
 
     /// Long-running main loop: pulls user input from `input_rx` and
@@ -333,16 +457,58 @@ impl Driver {
     /// a refreshed `ContextProjection`.
     async fn do_prune(&mut self, auto: bool, tx: &mpsc::Sender<TurnEvent>) {
         let depth = self.stack.len();
+        let agent_name = self.active_agent().to_string();
         let top = self.stack.last_mut().expect("stack never empty");
+        // Snapshot wire-token total + message count before the prune so
+        // the timeline event (Part C) can record the before/after delta.
+        let messages_before = top.history.len();
+        let tokens_before = wire_token_total(&top.history);
+        // This prune's targets (the bodies elided *this* call) — the
+        // `original_event_id`s describing what was removed.
+        let this_prune = prune::dedup_plan(&top.history);
+        let this_elided: Vec<String> = this_prune
+            .targets
+            .iter()
+            .map(|t| t.elision.original_event_id.clone())
+            .collect();
+        let reason = this_prune
+            .targets
+            .first()
+            .map(|t| t.elision.reason.to_string())
+            .unwrap_or_else(|| "snapshot superseded".to_string());
+
         let applied = prune::prune_history(&mut top.history);
         let bodies = applied.targets.len();
         let tokens_saved = applied.tokens_saved() as u64;
+        let messages_after = top.history.len();
+        let tokens_after = wire_token_total(&top.history);
         // The full live elided set (cumulative across prunes), so the TUI
         // dims every currently-elided body — not just this prune's targets.
         let elided = prune::current_elided_ids(&top.history);
         // Update the watermark so auto-prune short-circuits until the
         // foreground history grows again.
         self.prune_watermark.insert(depth, top.history.len());
+
+        // Timeline event (Part C): record the prune so the export can
+        // audit it. Only when something was actually elided — an empty
+        // prune is not a meaningful timeline entry. Ordered immediately
+        // before the next `inference_request` event by construction
+        // (auto-prune fires right before a `turn`).
+        if bodies > 0
+            && let Err(e) = self.session.record_context_pruned(
+                &agent_name,
+                auto,
+                messages_before,
+                messages_after,
+                tokens_before,
+                tokens_after,
+                &this_elided,
+                &reason,
+            )
+        {
+            tracing::warn!(error = %e, "record context_pruned event failed");
+        }
+
         let _ = tx
             .send(TurnEvent::Pruned {
                 auto,
@@ -493,6 +659,19 @@ impl Driver {
             tracing::warn!(error = %e, "compact: persisting seed tools failed");
         }
 
+        // Timeline boundary (Part C): `/compact` started a fresh successor
+        // session. The export follows this link like the fork tree so both
+        // sessions land in one unified `events.json`. Modeled as a session
+        // boundary, NOT a `context_pruned` event.
+        if let Err(e) = self.session.record_session_compacted(
+            self.active_agent(),
+            new_session.id,
+            &new_session.short_id,
+            seeds.len(),
+        ) {
+            tracing::warn!(error = %e, "record session_compacted event failed");
+        }
+
         let _ = tx
             .send(TurnEvent::CompactReady {
                 new_session_id: new_session.id,
@@ -511,10 +690,14 @@ impl Driver {
     async fn draft_brief(&self) -> String {
         let top = self.stack.last().expect("stack never empty");
         let prompt = Message::user(crate::engine::compact::brief_prompt());
+        // Always-on capture (Part A): the `/compact` brief is an inference
+        // call too, so persist its request body + a timeline event keyed by
+        // a fresh round-trip id.
+        let call_id = uuid::Uuid::new_v4();
         match top
             .agent
             .model
-            .complete(
+            .complete_captured(
                 &top.agent.system,
                 &top.history,
                 prompt,
@@ -522,10 +705,33 @@ impl Driver {
                 top.agent.params.clone(),
                 &top.agent.name,
                 &self.silent_event_tx(),
+                // The `/compact` brief is a short utility round-trip, not a
+                // user-message turn; it isn't tied to the run's ctrl+c
+                // cancel slot. A fresh never-cancelled token keeps the
+                // signature uniform.
+                &tokio_util::sync::CancellationToken::new(),
             )
             .await
         {
-            Ok((_, choice, _)) => {
+            Ok(((_, choice, usage), captured)) => {
+                if let Err(e) = self.session.record_inference_request(call_id, &captured) {
+                    tracing::warn!(error = %e, "compact brief: record_inference_request failed");
+                }
+                let usage_json = usage.map(|u| {
+                    serde_json::json!({
+                        "input_tokens": u.input_tokens,
+                        "output_tokens": u.output_tokens,
+                        "cached_input_tokens": u.cached_input_tokens,
+                    })
+                });
+                if let Err(e) = self.session.record_event(
+                    crate::db::session_log::SessionEventKind::InferenceRequest,
+                    Some(&top.agent.name),
+                    Some(&call_id.to_string()),
+                    &serde_json::json!({ "usage": usage_json, "purpose": "compact_brief" }),
+                ) {
+                    tracing::warn!(error = %e, "compact brief: record inference_request event failed");
+                }
                 let text = crate::engine::message::extract_text(&choice);
                 if text.trim().is_empty() {
                     "(model produced no brief; rely on the state appendix below)".to_string()
@@ -570,6 +776,11 @@ impl Driver {
             session: self.session.clone(),
             cwd: self.cwd.clone(),
             redact: self.redact.clone(),
+            interrupts: self.interrupts.clone(),
+            // Seed-tool re-execution runs before the first user turn; it
+            // has no run-scoped cancel slot, so a fresh never-cancelled
+            // token suffices.
+            cancel: tokio_util::sync::CancellationToken::new(),
         };
         let mut blocks: Vec<String> = Vec::new();
         for seed in seeds {
@@ -790,6 +1001,31 @@ impl Driver {
         input_rx: &mut mpsc::Receiver<String>,
         tx: &mpsc::Sender<TurnEvent>,
     ) -> Result<()> {
+        // Install a fresh cancellation token for this run so a user ctrl+c
+        // (`SessionWork::Cancel` → `CancelHandle::cancel`) can abort the
+        // in-flight inference and kill any running `bash` subprocess. The
+        // guard clears the slot on every exit path (normal, cancel, error)
+        // so a stale token can never affect a later run.
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let _cancel_guard = {
+            *self.cancel_current.lock().unwrap() = Some(cancel.clone());
+            CancelSlotGuard {
+                slot: self.cancel_current.clone(),
+            }
+        };
+        // Timeline event (session-log-export Part B): the unit of user /
+        // injected input that drives this run. Tagged with the foreground
+        // agent. Recorded before prelude/seed wrapping so the export shows
+        // the user's actual text.
+        if let Err(e) = self.session.record_event(
+            crate::db::session_log::SessionEventKind::UserMessage,
+            Some(self.active_agent()),
+            None,
+            &serde_json::json!({ "text": user_text }),
+        ) {
+            tracing::warn!(error = %e, "record user_message event failed");
+        }
+
         // Auto-title hook (GOALS §17d). `note_user_content` returns
         // true only when this call's tokens cross the threshold for
         // the first time *and* the session is eligible (no title,
@@ -819,6 +1055,15 @@ impl Driver {
             Some(seed) => format!("{seed}\n\n{user_text}"),
             None => user_text,
         };
+
+        // Skills auto-selection (GOALS §5): consult the cheap utility
+        // model with the skill catalog + this message; if it picks one,
+        // prepend the (`!`-processed, scrubbed) body so the main agent's
+        // first inference carries it. Skipped gracefully (logged once)
+        // when no utility model is configured — never falls back to the
+        // main model.
+        let user_text = self.maybe_inject_skill(&user_text).await;
+
         let mut next_prompt = Message::user(self.with_time_prelude(user_text));
 
         loop {
@@ -832,7 +1077,7 @@ impl Driver {
                 top.agent.clone()
             };
 
-            let outcome = {
+            let turn_result = {
                 let top = self.stack.last_mut().expect("stack never empty");
                 turn(
                     &agent,
@@ -842,9 +1087,27 @@ impl Driver {
                     self.locks.clone(),
                     self.redact.clone(),
                     self.cwd.clone(),
+                    self.interrupts.clone(),
+                    cancel.clone(),
                     tx,
                 )
-                .await?
+                .await
+            };
+            // A user ctrl+c (`CancelTurn`) aborts the in-flight inference
+            // via `cancel`; `turn` surfaces it as an `InferenceCancelled`
+            // sentinel. Unwind cleanly back to idle rather than treating it
+            // as a real error: the agent stack stays consistent (the
+            // assistant turn was never pushed), the worker's main loop
+            // proceeds to emit `AgentIdle`, and the composer becomes usable
+            // again. Any queued messages stay in `input_rx` for the next
+            // run. Real errors still propagate.
+            let outcome = match turn_result {
+                Ok(outcome) => outcome,
+                Err(e) if crate::engine::model::is_cancelled(&e) => {
+                    tracing::info!(agent = %agent.name, "turn cancelled by user");
+                    return Ok(());
+                }
+                Err(e) => return Err(e),
             };
 
             match outcome {
@@ -893,6 +1156,14 @@ impl Driver {
                             }
                         }
                         let report = collect_final_text(&child.history);
+                        if let Err(e) = self.session.record_event(
+                            crate::db::session_log::SessionEventKind::SubagentReport,
+                            Some(&child.agent.name),
+                            child.answering.as_ref().map(|p| p.call_id.as_str()),
+                            &serde_json::json!({ "report": report }),
+                        ) {
+                            tracing::warn!(error = %e, "record subagent_report event failed");
+                        }
                         let _ = tx
                             .send(TurnEvent::SubagentReport {
                                 agent: child.agent.name.clone(),
@@ -987,6 +1258,7 @@ impl Driver {
                             self.session.clone(),
                             self.locks.clone(),
                             self.redact.clone(),
+                            cancel.clone(),
                         )
                         .await
                         {
@@ -1002,6 +1274,8 @@ impl Driver {
                             self.locks.clone(),
                             self.redact.clone(),
                             self.cwd.clone(),
+                            self.interrupts.clone(),
+                            cancel.clone(),
                         )
                         .await
                         {
@@ -1009,6 +1283,21 @@ impl Driver {
                             Err(e) => format!("Error: {e:#}"),
                         }
                     };
+                    // Timeline event (Part B): the noninteractive subagent's
+                    // report. This path emits ToolStart/End directly (not
+                    // through `turn`'s dispatch loop), so the report is
+                    // recorded here rather than as a `tool_call` event.
+                    if let Err(e) = self.session.record_event(
+                        crate::db::session_log::SessionEventKind::SubagentReport,
+                        Some(&child_agent),
+                        Some(&task_call_id),
+                        &serde_json::json!({
+                            "child_agent": child_agent,
+                            "report": report,
+                        }),
+                    ) {
+                        tracing::warn!(error = %e, "record subagent_report event failed");
+                    }
                     let _ = tx
                         .send(TurnEvent::ToolEnd {
                             agent: self.stack.last().unwrap().agent.name.clone(),
@@ -1145,6 +1434,21 @@ fn fold_messages(messages: Vec<String>) -> String {
     messages.join("\n\n")
 }
 
+/// Estimate the wire-side token total of a message history via the
+/// cl100k_base fallback counter over each message's serialized form. Used
+/// only for the `context_pruned` timeline event's before/after figures
+/// (session-log-export Part C) — a faithful proxy, the same basis the
+/// tokenizer-calibration sampler uses, not an exact provider count.
+fn wire_token_total(history: &[Message]) -> u64 {
+    history
+        .iter()
+        .map(|m| match serde_json::to_string(m) {
+            Ok(s) => crate::tokens::count(&s) as u64,
+            Err(_) => 0,
+        })
+        .sum()
+}
+
 /// Run a child agent's loop to completion synchronously. Used for
 /// noninteractive subagents — explore primarily. Drops the child's
 /// per-turn events on the floor (the parent's history already has a
@@ -1152,6 +1456,7 @@ fn fold_messages(messages: Vec<String>) -> String {
 /// back. Limited to `MAX_NONINTERACTIVE_TURNS` to bound runaway loops.
 pub(crate) const MAX_NONINTERACTIVE_TURNS: usize = 12;
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_noninteractive(
     child: Agent,
     brief: String,
@@ -1159,6 +1464,8 @@ pub(crate) async fn run_noninteractive(
     locks: Arc<crate::locks::LockManager>,
     redact: Arc<RedactionTable>,
     cwd: std::path::PathBuf,
+    interrupts: Arc<crate::engine::interrupt::InterruptHub>,
+    cancel: tokio_util::sync::CancellationToken,
 ) -> Result<String> {
     use crate::engine::agent::turn;
 
@@ -1179,6 +1486,8 @@ pub(crate) async fn run_noninteractive(
             locks.clone(),
             redact.clone(),
             cwd.clone(),
+            interrupts.clone(),
+            cancel.clone(),
             &sink_tx,
         )
         .await?;

@@ -169,6 +169,28 @@ pub enum Request {
         parent_session_id: Option<Uuid>,
     },
 
+    /// Per-session live status for the `/sessions` browser's top two
+    /// tiers (GOALS §17f): which of `session_ids` currently have active
+    /// async jobs (loop/timer/background) and which are mid-turn
+    /// (processing). Sourced from the in-daemon per-session `JobAuthority`
+    /// plus worker turn-state — the TUI is a socket client and can't see
+    /// in-memory daemon state otherwise. Sessions with no live worker are
+    /// simply absent from the response (the browser treats them as
+    /// not-processing, no-jobs and falls back to DB tiers).
+    SessionLiveStatus { session_ids: Vec<Uuid> },
+
+    /// Archive a session (recoverable soft-delete, GOALS §17h). With
+    /// `cascade`, archives the whole descendant fork subtree. The browser
+    /// hides archived sessions by default with a toggle to reveal them.
+    ArchiveSession {
+        session_id: Uuid,
+        #[serde(default)]
+        cascade: bool,
+    },
+
+    /// Clear a session's archive flag (recover it from the archived view).
+    UnarchiveSession { session_id: Uuid },
+
     /// Branch a fork off `parent_session_id` at `fork_point_turn_id`
     /// (None = tail). GOALS §17e.
     ForkSession {
@@ -329,6 +351,13 @@ pub enum Response {
         sessions: Vec<SessionSummary>,
     },
 
+    /// Per-session live status. Answer to [`Request::SessionLiveStatus`].
+    /// Only sessions with a live worker appear; everything else is
+    /// implicitly not-processing / no-jobs.
+    SessionLiveStatus {
+        statuses: Vec<LiveStatus>,
+    },
+
     /// New session created by `ForkSession`.
     Forked {
         session_id: Uuid,
@@ -484,8 +513,16 @@ pub enum Event {
         interrupt_id: Uuid,
         agent: String,
         description: String,
+        /// Legacy single-question payload (the `jobs` needs-attention
+        /// nudge raises with neither field set). Kept for wire
+        /// back-compat; new question-tool interrupts use `questions`.
         #[serde(default)]
         question: Option<InterruptQuestion>,
+        /// Multi-question batch (GOALS §3b). Present when an agent's
+        /// `question` tool raised the interrupt; drives the answering
+        /// dialog. Mutually exclusive with `question` in practice.
+        #[serde(default)]
+        questions: Option<InterruptQuestionSet>,
     },
 
     /// An outstanding interrupt was resolved — emitted to every client
@@ -656,6 +693,18 @@ pub enum HistoryEntry {
     },
 }
 
+/// One session's live in-daemon status, from the per-session
+/// `JobAuthority` + worker turn-state. Drives the browser's tiers 1-2
+/// (GOALS §17f). Only emitted for sessions with a live worker.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LiveStatus {
+    pub session_id: Uuid,
+    /// At least one loop/timer/background job is live.
+    pub has_active_jobs: bool,
+    /// A turn is in flight (between `ThinkingStarted` and `AgentIdle`).
+    pub processing: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionSummary {
     pub session_id: Uuid,
@@ -679,6 +728,27 @@ pub struct SessionSummary {
     /// `[N forks]` from this.
     #[serde(default)]
     pub fork_count: u32,
+    /// Total descendant forks (depth-unbounded, excluding this session).
+    /// The archive/delete confirm states this as the cascade count.
+    #[serde(default)]
+    pub descendant_count: u32,
+    /// Epoch seconds the user last opened/resumed this session (GOALS
+    /// §17f). `None` = never viewed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_viewed_at: Option<i64>,
+    /// Epoch seconds of the most recent agent-produced event (max across
+    /// tool calls + inference). `None` = no agent activity yet. The
+    /// browser marks a session unread when this is newer than
+    /// `last_viewed_at`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_activity_at: Option<i64>,
+    /// Count of open (unresolved) interrupts/questions for this session
+    /// (`needs_attention`). Drives the "read, pending question" tier.
+    #[serde(default)]
+    pub open_interrupts: u32,
+    /// Epoch seconds the session was archived (GOALS §17h). `None` = live.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -753,6 +823,19 @@ pub struct InterruptOption {
     pub label: String,
 }
 
+/// A batch of one or more questions raised in a single interrupt. The
+/// `question` tool (GOALS §3b) carries an array of questions in one
+/// call because tool dispatch is sequential and structural tools drop
+/// the rest of the turn — so everything the agent needs has to ride in
+/// one interrupt. Each entry reuses [`InterruptQuestion`], so a
+/// single-question batch is wire-equivalent to the legacy shape (the
+/// answering UI and the resolution path treat `[q]` and a bare `q`
+/// identically).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InterruptQuestionSet {
+    pub questions: Vec<InterruptQuestion>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", content = "data")]
 pub enum ResolveResponse {
@@ -765,9 +848,33 @@ pub enum ResolveResponse {
     Freetext {
         text: String,
     },
+    /// One answer per question in an [`InterruptQuestionSet`], in the
+    /// same order the questions were posed. Each entry is a `Single` /
+    /// `Multi` / `Freetext` — never a nested `Batch` or `Cancel`. The
+    /// `question` tool maps these back to its result array; a
+    /// single-question batch may equally arrive as a bare `Single` /
+    /// `Multi` / `Freetext` (the resolver unwraps both shapes).
+    Batch {
+        responses: Vec<ResolveResponse>,
+    },
     /// User dismissed the interrupt without answering. The agent
     /// receives an empty resolution and decides how to proceed.
     Cancel,
+}
+
+impl ResolveResponse {
+    /// Normalize a resolution into the per-question answer list a
+    /// [`InterruptQuestionSet`] of `n` questions expects. `Batch` is
+    /// returned as-is; a bare single-question answer wraps to a
+    /// one-element list; `Cancel` fans out to `n` `Cancel`s so every
+    /// question reads as dismissed.
+    pub fn into_batch(self, n: usize) -> Vec<ResolveResponse> {
+        match self {
+            ResolveResponse::Batch { responses } => responses,
+            ResolveResponse::Cancel => std::iter::repeat_n(ResolveResponse::Cancel, n).collect(),
+            other => vec![other],
+        }
+    }
 }
 
 // ---- Codec -----------------------------------------------------------------
@@ -911,6 +1018,52 @@ mod tests {
                 }
             }
         ));
+    }
+
+    #[test]
+    fn session_live_status_round_trip() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let env = Envelope::request(
+            Uuid::new_v4(),
+            Request::SessionLiveStatus {
+                session_ids: vec![a, b],
+            },
+        );
+        let s = serde_json::to_string(&env).unwrap();
+        let back: Envelope = serde_json::from_str(&s).unwrap();
+        match back.body {
+            Body::Request {
+                request: Request::SessionLiveStatus { session_ids },
+                ..
+            } => assert_eq!(session_ids, vec![a, b]),
+            other => panic!("expected SessionLiveStatus, got {other:?}"),
+        }
+
+        // Response side.
+        let res = Envelope::response(
+            Uuid::new_v4(),
+            Response::SessionLiveStatus {
+                statuses: vec![LiveStatus {
+                    session_id: a,
+                    has_active_jobs: true,
+                    processing: false,
+                }],
+            },
+        );
+        let s = serde_json::to_string(&res).unwrap();
+        let back: Envelope = serde_json::from_str(&s).unwrap();
+        match back.body {
+            Body::Response {
+                response: Response::SessionLiveStatus { statuses },
+                ..
+            } => {
+                assert_eq!(statuses.len(), 1);
+                assert!(statuses[0].has_active_jobs);
+                assert!(!statuses[0].processing);
+            }
+            other => panic!("expected SessionLiveStatus response, got {other:?}"),
+        }
     }
 
     #[test]

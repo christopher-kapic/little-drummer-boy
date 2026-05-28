@@ -283,6 +283,13 @@ pub fn orchestrator_build(args: &SpawnArgs) -> Agent {
             // Structural: intercepted by the engine and routed to the
             // driver-owned async-job authority.
             .with(Arc::new(crate::tools::jobs::JobsTool))
+            // `question` (GOALS §3b): structural — blocks the turn until
+            // the user answers. Only `orchestrator-build` + `coder` get
+            // it; `explore`/`docs` are leaf-terminated and report up.
+            .with(Arc::new(crate::tools::question::QuestionTool))
+            // `skill` (GOALS §5): manual on-demand skill loading. Both
+            // interactive primaries get it; leaf agents don't.
+            .with(Arc::new(crate::tools::skill::SkillTool))
             .with(Arc::new(crate::tools::task::TaskTool::with_subagents(&[
                 "coder", "explore", "docs",
             ]))),
@@ -315,6 +322,10 @@ pub fn coder(args: &SpawnArgs) -> Agent {
         .with(Arc::new(crate::tools::intel::CircularTool))
         .with(Arc::new(crate::tools::intel::WordTool))
         .with(Arc::new(crate::tools::intel::SearchTool))
+        // `question` (GOALS §3b): blocks the turn until the user answers.
+        .with(Arc::new(crate::tools::question::QuestionTool))
+        // `skill` (GOALS §5): manual on-demand skill loading.
+        .with(Arc::new(crate::tools::skill::SkillTool))
         // `coder` delegates dependency-usage questions to the `docs`
         // pipeline (GOALS §3a: coder → docs). Noninteractive; the docs
         // unit returns one leaf report.

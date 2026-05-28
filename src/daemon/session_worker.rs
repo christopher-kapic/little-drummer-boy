@@ -16,6 +16,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use anyhow::Result;
 use tokio::sync::{broadcast, mpsc};
@@ -39,6 +40,32 @@ const EVENT_BROADCAST_CAPACITY: usize = 1024;
 /// and resolves are tiny.
 const WORK_QUEUE_CAPACITY: usize = 64;
 
+/// Live in-daemon status of a session, maintained by the event
+/// forwarder (GOALS §17f / §22). The `JobAuthority` and the driver turn
+/// loop are the authorities for jobs and turn-state respectively; their
+/// emissions all funnel through the worker's single forwarding seam, so
+/// observing them there keeps the single-authority rule intact while
+/// giving the browser a cheap, lock-free read for tiers 1-2.
+#[derive(Default)]
+pub struct LiveState {
+    /// Count of live async jobs (loop/timer/background). `JobStarted`
+    /// increments, `JobCompleted` decrements.
+    active_jobs: AtomicUsize,
+    /// Whether a turn is in flight: set on `ThinkingStarted`, cleared on
+    /// `AgentIdle`.
+    processing: AtomicBool,
+}
+
+impl LiveState {
+    pub fn has_active_jobs(&self) -> bool {
+        self.active_jobs.load(Ordering::Relaxed) > 0
+    }
+
+    pub fn processing(&self) -> bool {
+        self.processing.load(Ordering::Relaxed)
+    }
+}
+
 /// Handle one or more client tasks hold to drive a session. Cheap to
 /// clone — both channels inside are reference-counted.
 #[derive(Clone)]
@@ -48,6 +75,8 @@ pub struct SessionWorkerHandle {
     pub active_agent_name: String,
     work_tx: mpsc::Sender<SessionWork>,
     event_tx: broadcast::Sender<proto::Event>,
+    /// Live job/turn status for the `/sessions` browser (GOALS §17f).
+    live: Arc<LiveState>,
 }
 
 impl SessionWorkerHandle {
@@ -62,6 +91,11 @@ impl SessionWorkerHandle {
     /// own receiver; a lagging receiver drops events (per the design).
     pub fn subscribe(&self) -> broadcast::Receiver<proto::Event> {
         self.event_tx.subscribe()
+    }
+
+    /// Live job/turn status snapshot for the browser's tiers 1-2.
+    pub fn live_status(&self) -> (bool, bool) {
+        (self.live.has_active_jobs(), self.live.processing())
     }
 }
 
@@ -110,6 +144,7 @@ pub fn spawn(
     let session_id = session.id;
     let (work_tx, work_rx) = mpsc::channel::<SessionWork>(WORK_QUEUE_CAPACITY);
     let (event_tx, _initial_rx) = broadcast::channel::<proto::Event>(EVENT_BROADCAST_CAPACITY);
+    let live = Arc::new(LiveState::default());
 
     let handle = SessionWorkerHandle {
         session_id,
@@ -117,6 +152,7 @@ pub fn spawn(
         active_agent_name: "orchestrator-build".into(),
         work_tx,
         event_tx: event_tx.clone(),
+        live: live.clone(),
     };
 
     tokio::spawn(run_worker(
@@ -127,11 +163,13 @@ pub fn spawn(
         project_root,
         work_rx,
         event_tx,
+        live,
     ));
 
     handle
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_worker(
     session: Arc<Session>,
     locks: Arc<LockManager>,
@@ -140,6 +178,7 @@ async fn run_worker(
     project_root: PathBuf,
     mut work_rx: mpsc::Receiver<SessionWork>,
     event_tx: broadcast::Sender<proto::Event>,
+    live: Arc<LiveState>,
 ) {
     let session_id = session.id;
 
@@ -156,11 +195,38 @@ async fn run_worker(
         mpsc::channel::<crate::engine::driver::DriverControl>(WORK_QUEUE_CAPACITY);
     let (engine_event_tx, mut engine_event_rx) = mpsc::channel::<TurnEvent>(WORK_QUEUE_CAPACITY);
 
-    // Forward engine events → broadcast channel as proto::Event.
+    // Forward engine events → broadcast channel as proto::Event, and
+    // maintain the live job/turn status (GOALS §17f) off the same
+    // authoritative stream. These signals originate from the driver turn
+    // loop (`ThinkingStarted` / `AgentIdle`) and the single `JobAuthority`
+    // (`JobStarted` / `JobCompleted`); the forwarder is the one seam they
+    // all pass through, so updating here never duplicates the authority.
     let event_tx_for_forward = event_tx.clone();
+    let live_for_forward = live.clone();
     let forward = tokio::spawn(async move {
         while let Some(event) = engine_event_rx.recv().await {
             for ev in turn_event_to_proto(event, session_id) {
+                match &ev {
+                    proto::Event::ThinkingStarted { .. } => {
+                        live_for_forward.processing.store(true, Ordering::Relaxed);
+                    }
+                    proto::Event::AgentIdle { .. } => {
+                        live_for_forward.processing.store(false, Ordering::Relaxed);
+                    }
+                    proto::Event::JobStarted { .. } => {
+                        live_for_forward.active_jobs.fetch_add(1, Ordering::Relaxed);
+                    }
+                    proto::Event::JobCompleted { .. } => {
+                        // Saturating: never underflow if a completion is
+                        // ever seen without its start (defensive).
+                        let _ = live_for_forward.active_jobs.fetch_update(
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                            |n| Some(n.saturating_sub(1)),
+                        );
+                    }
+                    _ => {}
+                }
                 // `send` returns `Err` only when there are no
                 // subscribers — that's fine, nobody is listening.
                 let _ = event_tx_for_forward.send(ev);
@@ -181,6 +247,21 @@ async fn run_worker(
         max_concurrent_jobs,
     );
     let job_cmd_tx = driver.job_command_sender();
+    // Capture the driver's cancel handle (GOALS §3a) before moving it into
+    // its task, so a user ctrl+c (`SessionWork::Cancel`) can abort the
+    // in-flight user-message run — aborting the streaming inference and
+    // killing any running `bash` subprocess.
+    let cancel_handle = driver.cancel_handle();
+
+    // Interrupt wakeup hub (GOALS §3b): wire the driver's tool calls to
+    // the client event fan-out so the `question` tool can raise an
+    // interrupt and block on the answer. We keep the same `Arc` so the
+    // `ResolveInterrupt` handler below can wake the blocked tool. The
+    // hub must be installed before the driver loop starts.
+    let interrupts = Arc::new(crate::engine::interrupt::InterruptHub::new(
+        event_tx.clone(),
+    ));
+    driver.set_interrupt_hub(interrupts.clone());
 
     // Seed-tool re-execution (`/compact` handoff, T6.e): if this session
     // was created by `/compact`, its derived seed-tool plan was persisted
@@ -218,14 +299,16 @@ async fn run_worker(
                 }
             }
             SessionWork::Cancel => {
-                // v1: log only. Cancellation propagation through
-                // `Model::complete` lands in a follow-up — it needs a
-                // CancellationToken plumbed into rig's streaming
-                // future. The wire path is in place so the TUI can
-                // emit the request today; the engine acknowledges it
-                // and the next inference will pick up any queued
-                // messages.
-                tracing::info!(session_id = %session_id, "Cancel requested (no-op in v1)");
+                // User ctrl+c (`CancelTurn`). Fire the in-flight run's
+                // cancellation token: the driver's `turn` aborts the
+                // streaming inference (returning an `InferenceCancelled`
+                // sentinel that unwinds the run cleanly), and any running
+                // `bash` subprocess is killed via its process group. Safe
+                // and idempotent at idle / mid-cancel — `CancelHandle::cancel`
+                // is a no-op when no run is in flight. The driver then emits
+                // `AgentIdle`, clearing the TUI's busy state.
+                tracing::info!(session_id = %session_id, "cancel requested");
+                cancel_handle.cancel();
             }
             SessionWork::ResolveInterrupt {
                 interrupt_id,
@@ -238,9 +321,12 @@ async fn run_worker(
                     session_id,
                     interrupt_id,
                 });
-                // Engine-side wakeup happens once the approval router
-                // lands; for v1 the DB row update is sufficient to
-                // record the response.
+                // Engine-side wakeup (GOALS §3b): hand the resolution to
+                // whatever tool call is blocked on this interrupt id (the
+                // `question` tool). `false` just means nobody was blocked
+                // locally — e.g. a `jobs` needs-attention nudge — and the
+                // DB row update above is the only effect.
+                interrupts.resolve(interrupt_id, response);
             }
             SessionWork::SetActiveModel { provider, model } => {
                 if let Err(e) = session.set_active_model(&provider, &model) {
@@ -414,6 +500,12 @@ fn turn_event_to_proto(event: TurnEvent, session_id: Uuid) -> Vec<proto::Event> 
             }]
         }
         TurnEvent::AgentIdle => vec![proto::Event::AgentIdle { session_id }],
+        // Engine→proto direction never produces this — the `question`
+        // tool emits `proto::Event::InterruptRaised` directly through
+        // the interrupt hub, and the TUI-client direction
+        // (`proto_event_to_turn_event`) is the only place that
+        // synthesizes the `TurnEvent` form. No wire event to forward.
+        TurnEvent::InterruptRaised { .. } => vec![],
         TurnEvent::JobStarted {
             job_id,
             label,

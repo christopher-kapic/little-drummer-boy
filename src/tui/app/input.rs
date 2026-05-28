@@ -67,13 +67,23 @@ impl App {
             }
         }
 
-        // Ctrl+C / Ctrl+D quit. Explicitly exclude Shift so that
-        // Ctrl+Shift+C (copy-selection, plan.md T8.f) doesn't trigger
-        // an exit on terminals that report the shift state in
-        // `modifiers` even when the key code is lowercase.
+        // Ctrl+C: interrupt the running agent; exit only on a second press
+        // within the 0.5s window (GOALS §3a). Routed through the
+        // double-press state machine. Explicitly exclude Shift so that
+        // Ctrl+Shift+C (copy-selection, plan.md T8.f) isn't mistaken for it
+        // on terminals that report the shift state in `modifiers` even when
+        // the key code is lowercase.
         if key.modifiers.contains(KeyModifiers::CONTROL)
             && !key.modifiers.contains(KeyModifiers::SHIFT)
-            && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('d'))
+            && matches!(key.code, KeyCode::Char('c'))
+        {
+            return self.handle_ctrl_c();
+        }
+        // Ctrl+D still quits immediately (out of scope for the ctrl+c
+        // double-press change; left as the existing direct-exit path).
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && !key.modifiers.contains(KeyModifiers::SHIFT)
+            && matches!(key.code, KeyCode::Char('d'))
         {
             return true;
         }
@@ -194,6 +204,22 @@ impl App {
             return false;
         }
 
+        // Answering dialog (GOALS §3b) — same modal rule. It replaces the
+        // composer, so it routes before the settings dialog / picker. On
+        // close, send the resolution back to the daemon as
+        // `ResolveInterrupt`; the agent's blocked `question` tool wakes.
+        if let Some(dialog) = self.question_dialog.as_mut() {
+            let should_close = dialog.handle_key(key);
+            if should_close {
+                let result = dialog.take_result();
+                self.question_dialog = None;
+                if let Some(result) = result {
+                    self.resolve_question_dialog(result);
+                }
+            }
+            return false;
+        }
+
         if self.dialog.is_active() {
             if self.dialog.handle_key(key) {
                 // Closing the settings dialog can change the active
@@ -237,6 +263,24 @@ impl App {
         if let Some(pane) = self.stats_pane.as_mut() {
             if pane.handle_key(key) {
                 self.stats_pane = None;
+            }
+            return false;
+        }
+
+        // `/sessions` + `/resume` browser (GOALS §17f). Same modal rule.
+        // The pane returns an outcome: Close drops it; Resume drops it and
+        // switches the runner onto the chosen session via the existing
+        // resume path. Always consume the key.
+        if let Some(pane) = self.sessions_pane.as_mut() {
+            match pane.handle_key(key) {
+                Some(crate::tui::sessions_pane::SessionsOutcome::Close) => {
+                    self.sessions_pane = None;
+                }
+                Some(crate::tui::sessions_pane::SessionsOutcome::Resume(session_id)) => {
+                    self.sessions_pane = None;
+                    self.resume_session(session_id);
+                }
+                None => {}
             }
             return false;
         }

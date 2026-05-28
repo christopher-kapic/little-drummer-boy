@@ -32,6 +32,7 @@ use rig::providers::openai;
 use rig::streaming::StreamedAssistantContent;
 use serde_json::json;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use crate::engine::agent::TurnEvent;
 
@@ -68,6 +69,21 @@ use crate::engine::message::{AssistantContent, OneOrMany, ToolDefinition};
 use crate::providers::models_fetch;
 use crate::tokens::TokenUsage;
 use rig::completion::GetTokenUsage;
+
+/// Sentinel error returned by [`Model::complete_captured`] when the
+/// in-flight inference was aborted by a user ctrl+c (a `CancelTurn`
+/// request). Distinct from a provider/transport failure so the driver
+/// can unwind the turn cleanly (back to idle) rather than logging it as
+/// a real error. Downcast through the `anyhow` chain to detect it.
+#[derive(Debug, thiserror::Error)]
+#[error("inference cancelled by user")]
+pub struct InferenceCancelled;
+
+/// Returns `true` when `err`'s chain carries an [`InferenceCancelled`]
+/// sentinel — i.e. the turn was aborted by the user, not a real failure.
+pub fn is_cancelled(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<InferenceCancelled>().is_some()
+}
 
 /// One concrete provider-flavor of completion model. Add variants here
 /// as we wire more providers.
@@ -141,7 +157,23 @@ impl Model {
     /// [`TurnEvent::AssistantTextDelta`] for every `Message(...)`
     /// chunk (and drop `Reasoning`/`ReasoningDelta` — the TUI shows
     /// `Thinking…` instead per user spec).
-    pub async fn complete(
+    ///
+    /// **Also returns the full assembled request body** that was handed
+    /// to the provider — exactly what hit the wire, after the driver's
+    /// upstream redaction (session-log-export Part A). The caller persists
+    /// it via
+    /// [`crate::session::Session::record_inference_request`] keyed by the
+    /// same `call_id` it uses for the `inference_calls` metadata row.
+    ///
+    /// The body is assembled here, at the engine→provider boundary,
+    /// because this is the only place that knows the post-strip-reasoning
+    /// history + resolved model id. We do not (cannot) read rig's exact
+    /// serialized HTTP body — rig builds and sends it internally without
+    /// exposing the bytes — so the faithful capture is the same
+    /// `(model, provider, params, system, tools, history, prompt)` tuple
+    /// rig receives (verified via kcl `rig-core`).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn complete_captured(
         &self,
         system: &str,
         history: &[Message],
@@ -150,10 +182,14 @@ impl Model {
         params: ModelParams,
         agent_name: &str,
         event_tx: &mpsc::Sender<TurnEvent>,
+        cancel: &CancellationToken,
     ) -> Result<(
-        Option<String>,
-        OneOrMany<AssistantContent>,
-        Option<TokenUsage>,
+        (
+            Option<String>,
+            OneOrMany<AssistantContent>,
+            Option<TokenUsage>,
+        ),
+        serde_json::Value,
     )> {
         // Strip reasoning content from every prior assistant turn
         // before sending it back to the model. Past thinking blocks
@@ -163,19 +199,35 @@ impl Model {
         // next inference.
         let history: Vec<Message> = history.iter().map(strip_reasoning).collect();
 
+        // Assemble the as-sent request body once: it's both the
+        // `--debug-last-message` dump and the always-on capture payload.
+        let captured = assembled_request(
+            self.model_id(),
+            self.provider_label(),
+            system,
+            &history,
+            &prompt,
+            tools,
+            &params,
+        );
+
         if let Some(path) = debug_last_message_path() {
-            dump_request(
-                path,
-                self.model_id(),
-                system,
-                &history,
-                &prompt,
-                tools,
-                &params,
-            );
+            write_dump(path, &captured);
         }
 
-        match self {
+        type CompleteOut = (
+            Option<String>,
+            OneOrMany<AssistantContent>,
+            Option<TokenUsage>,
+        );
+        // Bail before doing any provider work if cancellation already
+        // fired (e.g. the user pressed ctrl+c between turns). Cheap and
+        // keeps the cancel path from racing a fresh round-trip.
+        if cancel.is_cancelled() {
+            return Err(anyhow::Error::new(InferenceCancelled));
+        }
+
+        let out: Result<CompleteOut> = match self {
             Model::OpenAi { client, model_id } => {
                 let agent = build_agent(client, model_id, system, tools, &params);
 
@@ -183,8 +235,28 @@ impl Model {
                 if params.tools_required && !tools.is_empty() {
                     req = req.tool_choice(ToolChoice::Required);
                 }
-                let mut stream = req.stream().await?;
-                while let Some(item) = stream.next().await {
+                // Build the stream, racing the build against cancellation so
+                // a ctrl+c during the initial round-trip aborts promptly.
+                let mut stream = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return Err(anyhow::Error::new(InferenceCancelled)),
+                    built = req.stream() => built?,
+                };
+                loop {
+                    // Race each chunk against cancellation: a ctrl+c aborts
+                    // the in-flight stream instead of waiting for the model
+                    // to finish. Dropping `stream` on the cancel arm closes
+                    // the underlying HTTP body.
+                    let item = tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => {
+                            return Err(anyhow::Error::new(InferenceCancelled));
+                        }
+                        next = stream.next() => match next {
+                            Some(item) => item,
+                            None => break,
+                        },
+                    };
                     match item? {
                         StreamedAssistantContent::Text(text) if !text.text.is_empty() => {
                             let _ = event_tx
@@ -233,12 +305,22 @@ impl Model {
                     .filter(|u| !u.is_empty());
                 Ok((stream.message_id.clone(), stream.choice.clone(), usage))
             }
-        }
+        };
+        Ok((out?, captured))
     }
 
     fn model_id(&self) -> &str {
         match self {
             Model::OpenAi { model_id, .. } => model_id,
+        }
+    }
+
+    /// Provider-flavor label for the captured request body. Coarse —
+    /// the exact configured provider id lives on the session row; this
+    /// is the wire-flavor the model client speaks.
+    fn provider_label(&self) -> &str {
+        match self {
+            Model::OpenAi { .. } => "openai-compatible",
         }
     }
 }
@@ -376,20 +458,27 @@ fn collect_reasoning_text(r: &Reasoning) -> String {
         .join("\n")
 }
 
-/// Write the outbound request to `path` for debugging. Best-effort —
-/// any error is traced but never propagated, because losing a debug
-/// dump must not break a live turn.
-fn dump_request(
-    path: &Path,
+/// Assemble the full as-sent outbound request body. This is the exact
+/// tuple rig receives — `(model, provider, params, system, tools,
+/// history, prompt)` — serialized to JSON. rig does not expose its own
+/// serialized HTTP body (verified via kcl `rig-core`), so this faithful
+/// reconstruction is the canonical capture for both the
+/// `--debug-last-message` dump and the always-on inference-request store
+/// (session-log-export Part A). It is built *after* the driver's upstream
+/// `redact::scrub`, so it is the post-redaction, as-sent form — no second
+/// redaction pass is ever applied on top.
+fn assembled_request(
     model_id: &str,
+    provider: &str,
     system: &str,
     history: &[Message],
     prompt: &Message,
     tools: &[ToolDefinition],
     params: &ModelParams,
-) {
-    let body = json!({
+) -> serde_json::Value {
+    json!({
         "model": model_id,
+        "provider": provider,
         "system": system,
         "tools": tools,
         "params": {
@@ -399,8 +488,14 @@ fn dump_request(
         },
         "history": history,
         "prompt": prompt,
-    });
-    let pretty = match serde_json::to_string_pretty(&body) {
+    })
+}
+
+/// Write a pre-assembled request body to `path` for `--debug-last-message`.
+/// Best-effort — any error is traced but never propagated, because losing
+/// a debug dump must not break a live turn.
+fn write_dump(path: &Path, body: &serde_json::Value) {
+    let pretty = match serde_json::to_string_pretty(body) {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!(error = %e, "debug-last-message: serialization failed");

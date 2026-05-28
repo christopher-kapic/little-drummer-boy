@@ -139,32 +139,88 @@ impl Tool for BashTool {
         let mut cmd = tokio::process::Command::new("sh");
         cmd.arg("-c").arg(&prefixed).current_dir(&cwd);
         scrub_env(&mut cmd);
-
-        let child = cmd
-            .stdin(std::process::Stdio::null())
+        cmd.stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
-            .spawn();
-        let child = match child {
+            // If this future is dropped (e.g. the worker task is torn down)
+            // the immediate child dies too — a leaked subprocess would
+            // outlive its turn. The process-group kill below handles the
+            // descendant tree on an explicit ctrl+c cancel.
+            .kill_on_drop(true);
+        // Unix: put the child in its own process group so a cancel can kill
+        // the whole tree (the `sh -c` plus anything it spawned — a test
+        // runner, a `make`, …), not just the immediate shell. We signal the
+        // negative pgid below. `tokio::process::Command::process_group` is
+        // the inherent wrapper over the `CommandExt` setting. Windows has no
+        // process groups; we fall back to `Child::kill` on cancel.
+        #[cfg(unix)]
+        cmd.process_group(0);
+
+        let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => return Ok(ToolOutput::text(format!("Error spawning shell: {e}"))),
         };
+        #[cfg(unix)]
+        let child_pid = child.id();
+
+        // Drain stdout/stderr on background tasks so `wait()` can't deadlock
+        // on a full pipe buffer, while keeping `child` borrowable (rather
+        // than consumed by `wait_with_output`) so the cancel branch can kill
+        // it. The reader tasks end naturally when the pipes close.
+        use tokio::io::AsyncReadExt;
+        let mut stdout_pipe = child.stdout.take();
+        let mut stderr_pipe = child.stderr.take();
+        let stdout_task = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            if let Some(pipe) = stdout_pipe.as_mut() {
+                let _ = pipe.read_to_end(&mut buf).await;
+            }
+            buf
+        });
+        let stderr_task = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            if let Some(pipe) = stderr_pipe.as_mut() {
+                let _ = pipe.read_to_end(&mut buf).await;
+            }
+            buf
+        });
 
         let timeout = std::time::Duration::from_millis(timeout_ms);
-        let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
-            Ok(Ok(o)) => o,
-            Ok(Err(e)) => return Ok(ToolOutput::text(format!("Error running command: {e}"))),
-            Err(_) => {
-                return Ok(ToolOutput::truncated_text(format!(
-                    "Error: timeout after {timeout_ms} ms"
-                )));
+        // Race the command against (a) its timeout and (b) a turn-cancel
+        // (user ctrl+c). On cancel we terminate the process group promptly
+        // so a long-running test run dies instead of holding the turn open.
+        let status = tokio::select! {
+            biased;
+            _ = ctx.cancel.cancelled() => {
+                kill_child(&mut child, #[cfg(unix)] child_pid).await;
+                stdout_task.abort();
+                stderr_task.abort();
+                return Ok(ToolOutput::truncated_text(
+                    "Error: command cancelled by user (ctrl+c)".to_string(),
+                ));
             }
+            res = tokio::time::timeout(timeout, child.wait()) => match res {
+                Ok(Ok(s)) => s,
+                Ok(Err(e)) => return Ok(ToolOutput::text(format!("Error running command: {e}"))),
+                Err(_) => {
+                    // Timed out: kill the group so a hung command can't
+                    // linger past its deadline, then report.
+                    kill_child(&mut child, #[cfg(unix)] child_pid).await;
+                    stdout_task.abort();
+                    stderr_task.abort();
+                    return Ok(ToolOutput::truncated_text(format!(
+                        "Error: timeout after {timeout_ms} ms"
+                    )));
+                }
+            },
         };
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let exit = output.status.code().unwrap_or(-1);
-        let signaled = !output.status.success() && output.status.code().is_none();
+        let stdout_bytes = stdout_task.await.unwrap_or_default();
+        let stderr_bytes = stderr_task.await.unwrap_or_default();
+        let stdout = String::from_utf8_lossy(&stdout_bytes);
+        let stderr = String::from_utf8_lossy(&stderr_bytes);
+        let exit = status.code().unwrap_or(-1);
+        let signaled = !status.success() && status.code().is_none();
 
         let body = format_combined(&stdout, &stderr, exit, signaled);
         if body.len() > OUTPUT_BYTE_CAP {
@@ -177,6 +233,47 @@ impl Tool for BashTool {
         } else {
             Ok(ToolOutput::text(body))
         }
+    }
+}
+
+/// Terminate a cancelled `bash` child. On Unix the child was spawned in
+/// its own process group (`process_group(0)`), so we signal the **negated
+/// pgid** to take down the `sh -c` and every descendant it spawned (a test
+/// runner, a `make`, …) — killing only the immediate child would orphan
+/// the real work. We send `SIGTERM` for a graceful stop, give it a brief
+/// grace window, then `SIGKILL` anything still alive. On Windows there is
+/// no process group; `Child::kill` (the immediate child) is the fallback.
+async fn kill_child(child: &mut tokio::process::Child, #[cfg(unix)] pid: Option<u32>) {
+    #[cfg(unix)]
+    {
+        if let Some(pid) = pid {
+            // SAFETY: `libc::kill` with a negative pid signals the process
+            // group; passing a valid pgid (== the leader pid, since we set
+            // `process_group(0)`) is sound. Failure (ESRCH — already gone)
+            // is ignored.
+            let pgid = pid as i32;
+            unsafe {
+                libc::kill(-pgid, libc::SIGTERM);
+            }
+            // Brief grace period for a clean shutdown, then SIGKILL the
+            // group. We don't block the turn long — 200ms is plenty for a
+            // shell to forward the signal and reap.
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            unsafe {
+                libc::kill(-pgid, libc::SIGKILL);
+            }
+        } else {
+            // No pid (already reaped) — fall back to the immediate child.
+            let _ = child.kill().await;
+        }
+        // Reap the leader so it doesn't linger as a zombie.
+        let _ = child.wait().await;
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows: no process groups. Kill the immediate child and reap.
+        let _ = child.kill().await;
+        let _ = child.wait().await;
     }
 }
 
@@ -225,5 +322,86 @@ fn scrub_env(cmd: &mut tokio::process::Command) {
         if upper.ends_with("_KEY") || upper.ends_with("_SECRET") || upper.ends_with("_TOKEN") {
             cmd.env_remove(&k);
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// A turn-cancel (ctrl+c) terminates a long-running `bash` command
+    /// promptly — the tool returns the cancelled marker in well under the
+    /// command's natural runtime — and the killed command's *descendant*
+    /// (spawned in the same process group) dies too, so a runaway test
+    /// runner can't outlive its turn.
+    #[tokio::test]
+    async fn cancel_kills_process_group_promptly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = crate::tools::common::test_ctx(tmp.path());
+        let tool = BashTool::new();
+
+        // A descendant subshell touches a heartbeat file every 100ms. If the
+        // process group is killed, the heartbeat stops; if only the immediate
+        // `sh -c` died, the descendant would keep updating it.
+        let heartbeat = tmp.path().join("heartbeat");
+        let hb = heartbeat.to_string_lossy().to_string();
+        let command = format!("( while true; do touch '{hb}'; sleep 0.1; done ) & sleep 30",);
+
+        let cancel = ctx.cancel.clone();
+        // Fire the cancel shortly after the command starts.
+        let canceller = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            cancel.cancel();
+        });
+
+        let start = Instant::now();
+        let out = tool
+            .call(serde_json::json!({ "command": command }), &ctx)
+            .await
+            .expect("bash call returns");
+        let elapsed = start.elapsed();
+        canceller.await.unwrap();
+
+        // Returned promptly (well under the 30s sleep) with the cancel marker.
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "cancel should return promptly, took {elapsed:?}"
+        );
+        assert!(
+            out.content.contains("cancelled by user"),
+            "expected cancel marker, got: {}",
+            out.content
+        );
+
+        // Give the SIGTERM→SIGKILL window time to land, then confirm the
+        // descendant heartbeat has stopped (process group was killed).
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let mtime_after_kill = std::fs::metadata(&heartbeat)
+            .ok()
+            .and_then(|m| m.modified().ok());
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let mtime_later = std::fs::metadata(&heartbeat)
+            .ok()
+            .and_then(|m| m.modified().ok());
+        assert_eq!(
+            mtime_after_kill, mtime_later,
+            "descendant heartbeat kept updating — process group was not killed"
+        );
+    }
+
+    /// A normal (uncancelled) command still runs to completion and returns
+    /// its output + exit line.
+    #[tokio::test]
+    async fn normal_command_completes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = crate::tools::common::test_ctx(tmp.path());
+        let tool = BashTool::new();
+        let out = tool
+            .call(serde_json::json!({ "command": "printf hello" }), &ctx)
+            .await
+            .expect("bash call returns");
+        assert!(out.content.contains("hello"), "got: {}", out.content);
+        assert!(out.content.contains("exit: 0"), "got: {}", out.content);
     }
 }

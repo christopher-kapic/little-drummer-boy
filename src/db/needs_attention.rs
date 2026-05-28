@@ -13,7 +13,7 @@ use chrono::Utc;
 use rusqlite::params;
 use uuid::Uuid;
 
-use crate::daemon::proto::{InterruptQuestion, ResolveResponse};
+use crate::daemon::proto::{InterruptQuestion, InterruptQuestionSet, ResolveResponse};
 use crate::db::Db;
 
 #[derive(Debug, Clone)]
@@ -23,6 +23,10 @@ pub struct NeedsAttentionRow {
     pub agent_id: String,
     pub description: String,
     pub question: Option<InterruptQuestion>,
+    /// Multi-question batch (GOALS §3b). Stored in the same
+    /// `question_json` column as a single question — the column holds
+    /// whichever wire shape the interrupt carried. A row never has both.
+    pub questions: Option<InterruptQuestionSet>,
     pub raised_at: i64,
     pub resolved_at: Option<i64>,
     pub response: Option<ResolveResponse>,
@@ -62,6 +66,40 @@ impl Db {
         Ok(interrupt_id)
     }
 
+    /// Persist a multi-question interrupt (GOALS §3b). Sibling of
+    /// [`Self::raise_interrupt`]: identical except the payload is a
+    /// [`InterruptQuestionSet`] stored in `questions_json` (the legacy
+    /// `question_json` column stays NULL). Used by the `question` tool.
+    pub fn raise_interrupt_questions(
+        &self,
+        session_id: Uuid,
+        agent_id: &str,
+        description: &str,
+        questions: &InterruptQuestionSet,
+    ) -> Result<Uuid> {
+        let interrupt_id = Uuid::new_v4();
+        let raised_at = Utc::now().timestamp();
+        let questions_json = serde_json::to_string(questions).context("serializing questions")?;
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO needs_attention
+                 (interrupt_id, session_id, agent_id, description, questions_json, raised_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    interrupt_id.to_string(),
+                    session_id.to_string(),
+                    agent_id,
+                    description,
+                    questions_json,
+                    raised_at,
+                ],
+            )
+            .context("inserting needs_attention (questions)")?;
+            Ok(())
+        })?;
+        Ok(interrupt_id)
+    }
+
     pub fn resolve_interrupt(&self, interrupt_id: Uuid, response: &ResolveResponse) -> Result<()> {
         let now = Utc::now().timestamp();
         let response_json =
@@ -87,7 +125,7 @@ impl Db {
             let mut stmt = conn
                 .prepare(
                     "SELECT interrupt_id, session_id, agent_id, description,
-                            question_json, raised_at, resolved_at, response_json
+                            question_json, questions_json, raised_at, resolved_at, response_json
                        FROM needs_attention
                       WHERE session_id = ?1 AND resolved_at IS NULL
                       ORDER BY raised_at ASC",
@@ -121,6 +159,13 @@ fn decode_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<NeedsAttentionRow> {
         })?),
         None => None,
     };
+    let questions_json: Option<String> = row.get("questions_json")?;
+    let questions = match questions_json {
+        Some(s) => Some(serde_json::from_str(&s).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+        })?),
+        None => None,
+    };
     let response_json: Option<String> = row.get("response_json")?;
     let response = match response_json {
         Some(s) => Some(serde_json::from_str(&s).map_err(|e| {
@@ -134,6 +179,7 @@ fn decode_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<NeedsAttentionRow> {
         agent_id: row.get("agent_id")?,
         description: row.get("description")?,
         question,
+        questions,
         raised_at: row.get("raised_at")?,
         resolved_at: row.get("resolved_at")?,
         response,
@@ -143,7 +189,9 @@ fn decode_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<NeedsAttentionRow> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::daemon::proto::{InterruptOption, InterruptQuestion, ResolveResponse};
+    use crate::daemon::proto::{
+        InterruptOption, InterruptQuestion, InterruptQuestionSet, ResolveResponse,
+    };
 
     #[test]
     fn raise_and_resolve_round_trip() {
@@ -180,6 +228,50 @@ mod tests {
         .unwrap();
         let open = db.list_open_interrupts(s.session_id).unwrap();
         assert_eq!(open.len(), 0);
+    }
+
+    #[test]
+    fn raise_questions_batch_round_trip() {
+        let db = Db::open_in_memory().unwrap();
+        let s = db.create_session("p", "/x", "coder").unwrap();
+        let set = InterruptQuestionSet {
+            questions: vec![
+                InterruptQuestion::Single {
+                    prompt: "which?".into(),
+                    options: vec![InterruptOption {
+                        id: "a".into(),
+                        label: "A".into(),
+                    }],
+                    allow_freetext: true,
+                },
+                InterruptQuestion::Freetext {
+                    prompt: "name?".into(),
+                },
+            ],
+        };
+        let iid = db
+            .raise_interrupt_questions(s.session_id, "coder", "needs input", &set)
+            .unwrap();
+
+        let open = db.list_open_interrupts(s.session_id).unwrap();
+        assert_eq!(open.len(), 1);
+        // The batch round-trips in `questions`, not the legacy `question`.
+        assert!(open[0].question.is_none());
+        assert_eq!(open[0].questions.as_ref().unwrap().questions.len(), 2);
+
+        db.resolve_interrupt(
+            iid,
+            &ResolveResponse::Batch {
+                responses: vec![
+                    ResolveResponse::Single {
+                        selected_id: "a".into(),
+                    },
+                    ResolveResponse::Freetext { text: "Ada".into() },
+                ],
+            },
+        )
+        .unwrap();
+        assert_eq!(db.list_open_interrupts(s.session_id).unwrap().len(), 0);
     }
 
     #[test]
