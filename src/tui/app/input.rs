@@ -145,8 +145,18 @@ impl App {
         if let Some(picker) = self.model_picker.as_mut() {
             let should_close = picker.handle_key(key);
             if should_close {
+                // `is_done()` distinguishes an accepted pick from an Esc
+                // cancel — only the former counts toward the tally.
+                let accepted = picker.is_done();
                 self.model_picker = None;
                 self.reload_launch_info();
+                if accepted && let Some((p, m)) = self.launch.active_model.clone() {
+                    self.record_usage(
+                        crate::daemon::proto::UsageKind::Model,
+                        format!("{p}/{m}"),
+                        None,
+                    );
+                }
                 let line = self.model_summary_history_line();
                 self.history.push(HistoryEntry::Plain { line });
             }
@@ -536,6 +546,15 @@ impl App {
             // pass (file_tag) can wrap them — keeps the display clean
             // while the wire payload stays unambiguous.
             self.note_accepted_tag(&sug.replacement);
+            // Tally the committed tag (per-project) for frequency-ranked
+            // autocomplete. Tab-descending into a directory isn't a
+            // commit, so it's deliberately not counted here.
+            let project_id = self.project_id.clone();
+            self.record_usage(
+                crate::daemon::proto::UsageKind::Tag,
+                sug.replacement.clone(),
+                project_id,
+            );
             // Trailing space terminates the tag and closes the popup.
             self.composer.insert_char(' ');
             self.at_dismissed = true;
@@ -782,7 +801,7 @@ impl App {
 
     pub(super) fn complete_or_submit(&mut self) -> bool {
         if let Some(query) = self.slash_query() {
-            if let Some(cmd) = slash_matches(query).first() {
+            if let Some(cmd) = slash_matches(query, &self.usage_slash).first() {
                 return self.execute_slash(**cmd);
             }
             return false;
@@ -817,15 +836,21 @@ impl App {
         // If a turn is in flight, the daemon will queue this message
         // and fold it into the next inference call (GOALS §1c). Track
         // it locally so the user sees what's pending; cleared when the
-        // daemon emits `ThinkingStarted` (its drain signal).
-        let agent_busy = self.pending.is_some();
-        if agent_busy {
+        // daemon emits `ThinkingStarted` (its drain signal). We gate on
+        // the span-long `busy` state rather than `pending.is_some()`:
+        // the latter drops to `None` between tool rounds, so a message
+        // typed during tool execution would otherwise be mistaken for a
+        // fresh turn.
+        if self.busy {
             self.queue.push(submitted.clone());
             // Defer the tool-call entries so they render right after the
             // folded user message (on the next `ThinkingStarted`).
             self.queued_tag_calls.extend(expanded.expansions);
         } else {
-            // No queueing — render as the user's turn immediately.
+            // Fresh human message: start a new working span (resets the
+            // cumulative clock and re-rolls the working line) and render
+            // as the user's turn immediately.
+            self.begin_working_span();
             self.history.push(HistoryEntry::User {
                 text: submitted.clone(),
                 timestamp: chrono::Local::now(),

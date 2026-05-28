@@ -115,6 +115,12 @@ pub enum TurnEvent {
         agent: String,
         usage: crate::tokens::TokenUsage,
     },
+    /// The driver loop unwound to the root and drained its queue: the
+    /// agent is idle, waiting for the next user message. Emitted by the
+    /// driver (not by [`turn`]) as the falling edge that stops the
+    /// TUI's span-long working indicator. No agent name — it's a
+    /// whole-stack signal, not a per-agent one.
+    AgentIdle,
 }
 
 /// Outcome of one [`turn`] call. The driver loops on the result.
@@ -198,10 +204,33 @@ pub async fn turn(
         .await
         .with_context(|| format!("completion call for agent `{}`", agent.name))?;
 
+    // Assistant output text, extracted once: used both for the
+    // calibration text basis below and the AssistantText emit further
+    // down.
+    let text = extract_text(&choice);
+
     if let Some(u) = usage {
         if let Err(e) = session.record_usage(u) {
             tracing::warn!(error = %e, "session.record_usage failed");
         }
+        // Feed the round into tokenizer calibration. The basis is a
+        // consistent text proxy for what was sent + produced (the
+        // messages already in history + this prompt + the assistant
+        // output); the scale factor absorbs system/tool/serialization
+        // overhead, so we deliberately don't reconstruct rig's exact
+        // request wire format.
+        let mut basis = String::new();
+        for m in history.iter() {
+            if let Ok(s) = serde_json::to_string(m) {
+                basis.push_str(&s);
+            }
+        }
+        if let Ok(s) = serde_json::to_string(&prompt) {
+            basis.push_str(&s);
+        }
+        basis.push_str(&text);
+        session.note_calibration_sample(&basis, u);
+
         let _ = tx
             .send(TurnEvent::Usage {
                 agent: agent.name.clone(),
@@ -219,8 +248,7 @@ pub async fn turn(
 
     // Even with streaming, emit a final AssistantText so the TUI knows
     // to freeze the live-streaming entry into a static history row.
-    // Non-streaming paths land here directly.
-    let text = extract_text(&choice);
+    // Non-streaming paths land here directly. `text` was extracted above.
     if !text.trim().is_empty() {
         let _ = tx
             .send(TurnEvent::AssistantText {

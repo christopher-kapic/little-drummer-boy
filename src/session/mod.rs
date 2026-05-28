@@ -72,6 +72,11 @@ pub struct Session {
     /// call. The TUI prefers this over the local tiktoken estimate
     /// when it's `Some(_)`.
     last_usage: Mutex<Option<crate::tokens::TokenUsage>>,
+    /// In-memory tokenizer-calibration accumulator. Samples inference
+    /// calls until a window closes, then fits + persists the best
+    /// `(strategy, scale)` for the active `(provider, model)`. Never
+    /// persisted in-progress.
+    calibrator: Mutex<crate::tokens::Calibrator>,
 }
 
 impl Session {
@@ -136,6 +141,7 @@ impl Session {
             last_time_prelude: Mutex::new(None),
             user_content_tokens: AtomicUsize::new(0),
             last_usage: Mutex::new(None),
+            calibrator: Mutex::new(crate::tokens::Calibrator::new()),
         })
     }
 
@@ -322,6 +328,49 @@ impl Session {
     /// finishes — callers fall back to a local tiktoken estimate.
     pub fn last_usage(&self) -> Option<crate::tokens::TokenUsage> {
         *self.last_usage.lock().unwrap()
+    }
+
+    /// Feed one inference round into the tokenizer-calibration window.
+    /// `basis` is a consistent text proxy for the round-trip (the
+    /// messages sent + the assistant output); `usage` is the provider's
+    /// report. Samples are skipped when usage is empty or any input was
+    /// cached (caching muddies the input count), and when a fresh
+    /// calibration row already exists for the active `(provider,
+    /// model)`. When the window closes, the best `(strategy, scale)` is
+    /// fitted and persisted with a 90-day expiry.
+    pub fn note_calibration_sample(&self, basis: &str, usage: crate::tokens::TokenUsage) {
+        if usage.is_empty() || usage.cached_input_tokens != 0 {
+            return;
+        }
+        let (Some(provider), Some(model)) = (self.active_provider(), self.active_model()) else {
+            return;
+        };
+        let now = Utc::now().timestamp();
+        if self.db.tokenizer_calibration_fresh(&provider, &model, now) {
+            return;
+        }
+        let actual = usage.input_tokens.saturating_add(usage.output_tokens);
+        let mut cal = self.calibrator.lock().unwrap();
+        cal.add_sample(basis, actual);
+        if cal.window_closed()
+            && let Some((strategy, scale)) = cal.result()
+        {
+            let total = cal.cumulative_actual() as i64;
+            let calls = cal.sample_calls() as i64;
+            if let Err(e) = self.db.upsert_tokenizer_calibration(
+                &provider,
+                &model,
+                strategy.as_str(),
+                scale,
+                now,
+                now + crate::db::tokenizer_calibration::CALIBRATION_TTL_SECS,
+                total,
+                calls,
+            ) {
+                tracing::warn!(error = %e, "upsert tokenizer_calibration failed");
+            }
+            *cal = crate::tokens::Calibrator::new();
+        }
     }
 }
 

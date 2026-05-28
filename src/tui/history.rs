@@ -1307,6 +1307,26 @@ pub fn thinking_dots(elapsed_ms: u128) -> &'static str {
     }
 }
 
+/// [`thinking_dots`] space-padded to a fixed width of 3 (`"" → "   "`,
+/// `"..." → "..."`). Used by the status indicator so the trailing
+/// timer stays horizontally fixed instead of jiggling as the dots
+/// cycle.
+pub fn thinking_dots_padded(elapsed_ms: u128) -> String {
+    format!("{:<3}", thinking_dots(elapsed_ms))
+}
+
+/// Format an elapsed span for the working / thinking status indicator:
+/// `(Xs)` under a minute, `(Xm Ys)` at or beyond. Whole seconds only —
+/// the indicator advances once a second; sub-second precision is noise.
+pub fn format_status_elapsed(d: Duration) -> String {
+    let secs = d.as_secs();
+    if secs < 60 {
+        format!("({secs}s)")
+    } else {
+        format!("({}m {}s)", secs / 60, secs % 60)
+    }
+}
+
 /// Format a thinking duration. Examples: `0.4 seconds`, `7 seconds`,
 /// `2m 14s` for longer pauses. Single-precision feels right for the
 /// in-chat chip — exact milliseconds are noise.
@@ -1355,6 +1375,26 @@ mod tests {
         assert_eq!(format_think_duration(Duration::from_secs(7)), "7.0 seconds");
         assert_eq!(format_think_duration(Duration::from_secs(45)), "45 seconds");
         assert_eq!(format_think_duration(Duration::from_secs(134)), "2m 14s");
+    }
+
+    #[test]
+    fn padded_dots_are_always_width_three() {
+        for ms in [0u128, 333, 700, 1000] {
+            assert_eq!(thinking_dots_padded(ms).chars().count(), 3);
+        }
+        assert_eq!(thinking_dots_padded(0), "   ");
+        assert_eq!(thinking_dots_padded(1000), "...");
+    }
+
+    #[test]
+    fn status_elapsed_switches_to_minutes_at_sixty_seconds() {
+        assert_eq!(format_status_elapsed(Duration::from_secs(0)), "(0s)");
+        assert_eq!(format_status_elapsed(Duration::from_secs(5)), "(5s)");
+        assert_eq!(format_status_elapsed(Duration::from_secs(59)), "(59s)");
+        assert_eq!(format_status_elapsed(Duration::from_secs(60)), "(1m 0s)");
+        assert_eq!(format_status_elapsed(Duration::from_secs(134)), "(2m 14s)");
+        // Sub-second is floored, not rounded up.
+        assert_eq!(format_status_elapsed(Duration::from_millis(1900)), "(1s)");
     }
 
     #[test]

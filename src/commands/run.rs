@@ -205,6 +205,7 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         | Usage { session_id, .. }
         | InterruptRaised { session_id, .. }
         | InterruptResolved { session_id, .. }
+        | AgentIdle { session_id, .. }
         | SessionEnded { session_id, .. } => *session_id,
     })
 }

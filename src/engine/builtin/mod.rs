@@ -85,7 +85,7 @@ fn compose_system_prompt(role_prompt: &str, session_short_id: &str, cwd: &Path) 
 /// `cwd` then its ancestors up to (and including) the git worktree root
 /// when there is one — otherwise stop at the filesystem root. Returns
 /// the absolute path + file body.
-fn load_agent_guidance(cwd: &Path) -> Option<(std::path::PathBuf, String)> {
+pub(crate) fn load_agent_guidance(cwd: &Path) -> Option<(std::path::PathBuf, String)> {
     let cfg = discover_config_dirs(cwd)
         .into_iter()
         .find_map(|d| ExtendedConfigDoc::load(&d.path.join("extended-config.json")).ok())

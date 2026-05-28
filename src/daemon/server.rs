@@ -56,6 +56,12 @@ impl DaemonContext {
 pub fn boot(paths: DaemonPaths) -> Result<DaemonContext> {
     let db = Db::open_default().context("opening session DB")?;
     let locks = Arc::new(LockManager::from_db(db.clone()).context("loading lock state")?);
+    // Drop autocomplete-tally rows that have aged out of the 30-day
+    // window. Best-effort — a prune failure shouldn't block boot.
+    let before = chrono::Utc::now().timestamp() - crate::db::usage_events::USAGE_WINDOW_SECS;
+    if let Err(e) = db.prune_usage_events(before) {
+        tracing::warn!(error = %e, "pruning usage_events on boot failed");
+    }
     Ok(DaemonContext::new(db, locks, paths))
 }
 
@@ -355,6 +361,74 @@ async fn handle_request(
                 }
             }
             Ok(Response::Ack)
+        }
+
+        Request::RecordUsage {
+            kind,
+            key,
+            project_id,
+        } => {
+            // Global tally — no attached session required.
+            ctx.db
+                .record_usage(
+                    kind.as_str(),
+                    &key,
+                    project_id.as_deref(),
+                    chrono::Utc::now().timestamp(),
+                )
+                .map_err(internal)?;
+            Ok(Response::Ack)
+        }
+
+        Request::GetUsageCounts { project_id } => {
+            let since = chrono::Utc::now().timestamp() - crate::db::usage_events::USAGE_WINDOW_SECS;
+            let models = ctx
+                .db
+                .usage_counts("model", None, since)
+                .map_err(internal)?;
+            let slash = ctx
+                .db
+                .usage_counts("slash", None, since)
+                .map_err(internal)?;
+            // Tags are per-project; with no project there's nothing to
+            // scope to, so the map is empty rather than a global mash-up.
+            let tags = match project_id.as_deref() {
+                Some(pid) => ctx
+                    .db
+                    .usage_counts("tag", Some(pid), since)
+                    .map_err(internal)?,
+                None => std::collections::HashMap::new(),
+            };
+            Ok(Response::UsageCounts {
+                models,
+                slash,
+                tags,
+            })
+        }
+
+        Request::GuidanceEstimate {
+            project_root,
+            provider,
+            model,
+        } => {
+            // Resolve the single guidance file the engine would load, and
+            // estimate its body with the calibrated tokenizer for the
+            // active model (cl100k fallback when uncalibrated).
+            match crate::engine::builtin::load_agent_guidance(Path::new(&project_root)) {
+                Some((path, body)) => {
+                    let (strategy, scale) = ctx.db.resolve_tokenizer(
+                        provider.as_deref().unwrap_or(""),
+                        model.as_deref().unwrap_or(""),
+                    );
+                    let tokens = crate::tokens::scaled_estimate(&body, strategy, scale);
+                    let file = path.file_name().map(|n| n.to_string_lossy().into_owned());
+                    Ok(Response::GuidanceEstimate { file, tokens })
+                }
+                None => Ok(Response::GuidanceEstimate {
+                    file: None,
+                    tokens: 0,
+                }),
+            }
         }
 
         Request::StopDaemon => {

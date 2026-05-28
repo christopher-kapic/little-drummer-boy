@@ -127,6 +127,10 @@ impl Driver {
             drain_queue(&mut input_rx, &mut batch);
             let folded = self.redact.scrub(&fold_messages(batch));
             self.run_user_input(folded, &mut input_rx, tx).await?;
+            // Stack has unwound to the root and the queue is drained —
+            // the agent is idle until the next message. Emit the falling
+            // edge so the TUI can stop its working-indicator clock.
+            let _ = tx.send(TurnEvent::AgentIdle).await;
         }
         Ok(())
     }

@@ -25,7 +25,9 @@ pub mod lang;
 pub mod locks;
 pub mod needs_attention;
 pub mod sessions;
+pub mod tokenizer_calibration;
 pub mod tool_calls;
+pub mod usage_events;
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -168,6 +170,8 @@ fn apply_connection_pragmas(conn: &Connection, on_disk: bool) -> Result<()> {
 const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0001_initial.sql"),
     include_str!("migrations/0002_sessions_fork.sql"),
+    include_str!("migrations/0003_usage_events.sql"),
+    include_str!("migrations/0004_tokenizer_calibration.sql"),
 ];
 
 fn migrate(conn: &Connection) -> Result<()> {

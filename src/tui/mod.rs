@@ -14,6 +14,7 @@
 
 pub mod agent_runner;
 pub mod app;
+pub mod banner_box;
 pub mod chat;
 pub mod chrome;
 pub mod composer;

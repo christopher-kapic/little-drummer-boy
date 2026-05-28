@@ -6,6 +6,7 @@
 //! into a fenced `<file …>` / `<dir …>` block bounded by the read tool's
 //! byte cap.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use ignore::WalkBuilder;
@@ -56,7 +57,7 @@ pub struct Suggestion {
 /// Return up to `MAX_SUGGESTIONS` candidates matching `query`, walked
 /// from `cwd`. Outside a git repo `ignore` falls back to walking
 /// everything readable; inside, gitignored + hidden entries are filtered.
-pub fn suggestions(cwd: &Path, query: &str) -> Vec<Suggestion> {
+pub fn suggestions(cwd: &Path, query: &str, counts: &HashMap<String, u64>) -> Vec<Suggestion> {
     let query = query.trim_start_matches('@');
     let (dir_part, name_part) = split_query(query);
     let search_root = if dir_part.is_empty() {
@@ -124,13 +125,19 @@ pub fn suggestions(cwd: &Path, query: &str) -> Vec<Suggestion> {
                 break;
             }
         }
-        // Directories first, then files; alphabetical within each group,
-        // applied within this depth level so shallower matches stay on
-        // top and the deepening fill sits below them.
+        // Directories first, then 30-day usage count desc (keyed on the
+        // replacement path), then alphabetical — applied within this
+        // depth level so shallower matches stay on top and the deepening
+        // fill sits below them. Dirs stay pinned above a more-frequent
+        // file.
         level.sort_by(|a, b| match (a.is_dir, b.is_dir) {
             (true, false) => std::cmp::Ordering::Less,
             (false, true) => std::cmp::Ordering::Greater,
-            _ => a.display.cmp(&b.display),
+            _ => {
+                let ca = counts.get(&a.replacement).copied().unwrap_or(0);
+                let cb = counts.get(&b.replacement).copied().unwrap_or(0);
+                cb.cmp(&ca).then_with(|| a.display.cmp(&b.display))
+            }
         });
         out.extend(level);
         if bailed || out.len() >= DEEPEN_TARGET || out.len() >= MAX_RESULTS {
@@ -569,6 +576,12 @@ mod tests {
         tempfile::tempdir().expect("tempdir")
     }
 
+    /// Suggestions with an empty frequency map — these tests exercise
+    /// the dirs-first/alpha ordering, not the count tie-breaker.
+    fn sug(cwd: &Path, q: &str) -> Vec<Suggestion> {
+        suggestions(cwd, q, &HashMap::new())
+    }
+
     #[test]
     fn parse_range_single_and_pair() {
         assert_eq!(parse_range("42"), Some((42, 42)));
@@ -748,7 +761,7 @@ mod tests {
         fs::write(root.path().join("alpha.rs"), "").unwrap();
         fs::write(root.path().join("beta.rs"), "").unwrap();
         fs::create_dir(root.path().join("zeta")).unwrap();
-        let s = suggestions(root.path(), "");
+        let s = sug(root.path(), "");
         let names: Vec<&str> = s.iter().map(|x| x.display.as_str()).collect();
         // Dir first.
         assert_eq!(names.first().copied(), Some("zeta/"));
@@ -756,11 +769,37 @@ mod tests {
     }
 
     #[test]
+    fn suggestions_rank_by_count_then_dirs_pinned() {
+        let root = tmp_root();
+        fs::write(root.path().join("alpha.rs"), "").unwrap();
+        fs::write(root.path().join("beta.rs"), "").unwrap();
+        fs::create_dir(root.path().join("zeta")).unwrap();
+        // beta is picked more often → ranks above alpha even though alpha
+        // sorts first alphabetically. The directory stays pinned on top
+        // regardless of the file counts.
+        let mut counts = HashMap::new();
+        counts.insert("beta.rs".to_string(), 5u64);
+        let s = suggestions(root.path(), "", &counts);
+        let names: Vec<&str> = s.iter().map(|x| x.display.as_str()).collect();
+        assert_eq!(
+            names.first().copied(),
+            Some("zeta/"),
+            "dir not pinned: {names:?}"
+        );
+        let a = names.iter().position(|n| *n == "alpha.rs").unwrap();
+        let b = names.iter().position(|n| *n == "beta.rs").unwrap();
+        assert!(
+            b < a,
+            "more-frequent beta.rs should outrank alpha.rs: {names:?}"
+        );
+    }
+
+    #[test]
     fn suggestions_prefix_filter() {
         let root = tmp_root();
         fs::write(root.path().join("alpha.rs"), "").unwrap();
         fs::write(root.path().join("beta.rs"), "").unwrap();
-        let s = suggestions(root.path(), "alp");
+        let s = sug(root.path(), "alp");
         let names: Vec<&str> = s.iter().map(|x| x.display.as_str()).collect();
         assert_eq!(names, vec!["alpha.rs"]);
     }
@@ -776,7 +815,7 @@ mod tests {
         for n in ["a.rs", "b.rs", "c.rs", "d.rs"] {
             fs::write(sub.join(n), "").unwrap();
         }
-        let s = suggestions(root.path(), "");
+        let s = sug(root.path(), "");
         let names: Vec<&str> = s.iter().map(|x| x.display.as_str()).collect();
         // Level 1 (sub/, top.rs) is only 2 entries → deepen into sub/.
         assert!(names.contains(&"sub/"));
@@ -793,7 +832,7 @@ mod tests {
         let nested = root.path().join("router");
         fs::create_dir(&nested).unwrap();
         fs::write(nested.join("match.ts"), "").unwrap();
-        let s = suggestions(root.path(), "match");
+        let s = sug(root.path(), "match");
         let names: Vec<&str> = s.iter().map(|x| x.display.as_str()).collect();
         assert!(names.contains(&"router/match.ts"), "got {names:?}");
     }
@@ -806,7 +845,7 @@ mod tests {
         for n in 0..10 {
             fs::write(root.path().join(format!("file{n}.rs")), "").unwrap();
         }
-        let s = suggestions(root.path(), "file");
+        let s = sug(root.path(), "file");
         assert_eq!(s.len(), 10, "expected all matches, got {}", s.len());
     }
 
@@ -815,7 +854,7 @@ mod tests {
         let root = tmp_root();
         fs::write(root.path().join(".hidden"), "").unwrap();
         fs::write(root.path().join("visible.txt"), "").unwrap();
-        let s = suggestions(root.path(), "");
+        let s = sug(root.path(), "");
         let names: Vec<&str> = s.iter().map(|x| x.display.as_str()).collect();
         assert!(names.iter().all(|n| *n != ".hidden"));
         assert!(names.iter().any(|n| *n == "visible.txt"));

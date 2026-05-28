@@ -3,6 +3,8 @@
 //! toast overlay). Cluster moved here so `mod.rs` reads as event-loop
 //! plumbing instead of paragraph wrangling.
 
+use std::time::Duration;
+
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -10,13 +12,23 @@ use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
 
 use crate::tui::chrome;
 use crate::tui::composer::{INPUT_PREFIX, VimMode, input_prefix_width};
-use crate::tui::history::{HistoryEntry, Rendered, render_entry, render_pending, thinking_dots};
+use crate::tui::history::{
+    HistoryEntry, Rendered, format_status_elapsed, render_entry, render_pending, thinking_dots,
+    thinking_dots_padded,
+};
 use crate::tui::theme::MUTED_COLOR_INDEX;
 
 use super::{
     AUTOCOMPLETE_ROWS, App, INPUT_BORDER, MAX_INPUT_CONTENT, MIN_INPUT_CONTENT, Selection, Toast,
-    ToastKind, slash_matches,
+    ToastKind, WORKING_MESSAGES, slash_matches,
 };
+
+/// Startup grace before the working indicator first appears — prevents
+/// quick turns from flashing it on and off.
+const STATUS_GRACE: Duration = Duration::from_secs(2);
+/// A reasoning block must last at least this long before the indicator
+/// flips from the working line to the yellow `Thinking` override.
+const THINKING_FLIP_AFTER: Duration = Duration::from_secs(2);
 
 impl App {
     pub(super) fn model_summary_history_line(&self) -> String {
@@ -57,7 +69,7 @@ impl App {
                 return cached.clone();
             }
         }
-        let walked = crate::tui::file_tag::suggestions(&self.launch.cwd, q);
+        let walked = crate::tui::file_tag::suggestions(&self.launch.cwd, q, &self.usage_tags);
         *self.at_cache.borrow_mut() = Some((q.to_string(), walked.clone()));
         walked
     }
@@ -117,6 +129,62 @@ impl App {
             visual = visual.saturating_add(n.max(1));
         }
         (visual as u16).clamp(MIN_INPUT_CONTENT, MAX_INPUT_CONTENT) + INPUT_BORDER
+    }
+
+    /// Elapsed time on the cumulative span clock, but only once the
+    /// agent has been busy past the startup grace. `None` (→ indicator
+    /// hidden) when idle or still inside the grace window.
+    pub(super) fn status_span_elapsed(&self) -> Option<Duration> {
+        if !self.busy {
+            return None;
+        }
+        let elapsed = self.span_started_at?.elapsed();
+        (elapsed >= STATUS_GRACE).then_some(elapsed)
+    }
+
+    /// 1 when the working indicator should occupy a row above the queue
+    /// strip, else 0.
+    pub(super) fn indicator_lines(&self) -> u16 {
+        u16::from(self.status_span_elapsed().is_some())
+    }
+
+    /// Render the "agent is working" status indicator. Ground state is
+    /// the playful working line (muted, span clock); it flips to a
+    /// yellow `Thinking` override only while the current reasoning block
+    /// has itself lasted past [`THINKING_FLIP_AFTER`], reading as
+    /// "working" otherwise so there are no blank gaps after the grace
+    /// period. No-op when the indicator shouldn't show.
+    pub(super) fn render_status_indicator(&self, frame: &mut ratatui::Frame, area: Rect) {
+        let Some(span_elapsed) = self.status_span_elapsed() else {
+            return;
+        };
+        let dots = thinking_dots_padded(self.started_at.elapsed().as_millis());
+        let block_elapsed = self.pending.as_ref().map(|p| p.started_at.elapsed());
+        let thinking =
+            self.in_thinking_block() && block_elapsed.is_some_and(|e| e >= THINKING_FLIP_AFTER);
+
+        let (label, elapsed, color) = if thinking {
+            (
+                "Thinking",
+                block_elapsed.unwrap_or(span_elapsed),
+                Color::Yellow,
+            )
+        } else {
+            let msg = WORKING_MESSAGES
+                .get(self.working_msg_idx)
+                .copied()
+                .unwrap_or("Working");
+            (msg, span_elapsed, Color::Indexed(MUTED_COLOR_INDEX))
+        };
+        let text = format!("{label}{dots} {}", format_status_elapsed(elapsed));
+        let line = Line::from(vec![
+            Span::raw(" "),
+            Span::styled(
+                text,
+                Style::default().fg(color).add_modifier(Modifier::ITALIC),
+            ),
+        ]);
+        frame.render_widget(Paragraph::new(line), area);
     }
 
     pub(super) fn total_history_lines(&self) -> u16 {
@@ -186,6 +254,9 @@ impl App {
             picker.render(frame, rects.body);
         } else {
             self.render_history(frame, rects.body);
+            if geom.indicator > 0 {
+                self.render_status_indicator(frame, rects.indicator);
+            }
             if geom.queue > 0 {
                 self.render_queue(frame, rects.queue);
             }
@@ -223,11 +294,11 @@ impl App {
         if area.height < 2 || area.width < 5 || self.queue.is_empty() {
             return;
         }
-        // Border tracks the input box: dark grey while an agent turn
-        // is in flight (matches the "agent is working, hold off" cue
-        // on the input border), white when idle. Indexed(238) — same
-        // shade the input uses.
-        let border_color = if self.pending.is_some() {
+        // Border tracks the input box: dark grey for the whole span the
+        // agent is busy (matches the "agent is working, hold off" cue on
+        // the input border), white when idle. Indexed(238) — same shade
+        // the input uses.
+        let border_color = if self.busy {
             Color::Indexed(238)
         } else {
             Color::White
@@ -292,6 +363,13 @@ impl App {
         )]));
 
         frame.render_widget(Paragraph::new(lines), area);
+    }
+
+    /// Build the launch-banner box lines for the current pane, or an
+    /// empty `Vec` when the banner is suppressed or doesn't fit. See
+    /// [`crate::tui::banner_box`].
+    fn banner_box_lines(&self, pane_w: u16, pane_h: u16) -> Vec<Line<'static>> {
+        crate::tui::banner_box::build(&self.launch, pane_w, pane_h).unwrap_or_default()
     }
 
     pub(super) fn render_history(&mut self, frame: &mut ratatui::Frame, area: Rect) {
@@ -371,44 +449,94 @@ impl App {
             all.extend(pending_lines);
         }
 
-        // Track totals so the mouse-wheel handler can clamp scrollback
-        // to a valid range.
-        self.chat_total_lines = all.len();
-        self.chat_visible_lines = area_h;
-        // Clamp the user's scroll offset to "can't scroll past the
-        // top of the buffer". Max offset = total - visible (so the
-        // top of the buffer can sit at the top of the pane).
-        let max_offset = all.len().saturating_sub(area_h);
-        if self.chat_scroll_offset > max_offset {
-            self.chat_scroll_offset = max_offset;
-        }
+        // The launch-banner box is the topmost scroll entry (GOALS
+        // §1g): it floats centered in an under-full pane and scrolls
+        // off the top with the oldest messages once the transcript
+        // grows tall enough to reach it.
+        let box_lines = self.banner_box_lines(area.width, area.height);
+        let b = box_lines.len();
+        let m = all.len();
 
-        // Bottom-align the visible window over `all`, then walk back by
-        // `chat_scroll_offset` logical lines so the user can scroll up
-        // into history with the wheel (T8.f wheel-scroll path).
+        // Total scrollable content height, box included — drives the
+        // mouse-wheel scrollback clamp.
+        self.chat_total_lines = b + m;
+        self.chat_visible_lines = area_h;
+
         let (visible, visible_targets, visible_box, visible_conts): (
             Vec<Line<'static>>,
             Vec<Option<usize>>,
             Vec<Option<usize>>,
             Vec<bool>,
-        ) = if all.len() < area_h {
-            let pad = area_h - all.len();
-            let mut v: Vec<Line<'static>> = (0..pad).map(|_| Line::default()).collect();
-            let mut t: Vec<Option<usize>> = (0..pad).map(|_| None).collect();
-            let mut b: Vec<Option<usize>> = (0..pad).map(|_| None).collect();
-            let mut c: Vec<bool> = (0..pad).map(|_| false).collect();
-            v.extend(all);
-            t.extend(targets);
-            b.extend(box_targets);
-            c.extend(conts);
-            (v, t, b, c)
+        ) = if b > 0 && b + m <= area_h {
+            // Fits with room to spare: messages stay bottom-aligned and
+            // the box floats at the vertical center, sliding up to sit
+            // directly above the messages once they'd reach it. Content
+            // fits, so there's no scrollback.
+            self.chat_scroll_offset = 0;
+            let centered_top = (area_h - b) / 2;
+            let box_top = centered_top.min(area_h - m - b);
+            let msg_top = area_h - m;
+            let mut v: Vec<Line<'static>> = (0..area_h).map(|_| Line::default()).collect();
+            let mut t: Vec<Option<usize>> = vec![None; area_h];
+            let mut bx: Vec<Option<usize>> = vec![None; area_h];
+            let mut c: Vec<bool> = vec![false; area_h];
+            for (i, line) in box_lines.into_iter().enumerate() {
+                v[box_top + i] = line;
+            }
+            for (i, line) in all.into_iter().enumerate() {
+                v[msg_top + i] = line;
+            }
+            for (i, val) in targets.into_iter().enumerate() {
+                t[msg_top + i] = val;
+            }
+            for (i, val) in box_targets.into_iter().enumerate() {
+                bx[msg_top + i] = val;
+            }
+            for (i, val) in conts.into_iter().enumerate() {
+                c[msg_top + i] = val;
+            }
+            (v, t, bx, c)
         } else {
-            let drop = all.len() - area_h - self.chat_scroll_offset;
-            let v: Vec<Line<'static>> = all.into_iter().skip(drop).take(area_h).collect();
-            let t: Vec<Option<usize>> = targets.into_iter().skip(drop).take(area_h).collect();
-            let b: Vec<Option<usize>> = box_targets.into_iter().skip(drop).take(area_h).collect();
-            let c: Vec<bool> = conts.into_iter().skip(drop).take(area_h).collect();
-            (v, t, b, c)
+            // No box, or box + messages overflow the pane: the box is
+            // the top of one contiguous, bottom-aligned scroll buffer
+            // and scrolls off the top with the oldest messages. Box rows
+            // are non-interactive (None / false). With no box this is
+            // exactly the previous behavior over `all`.
+            let mut combined = box_lines;
+            let prefix = combined.len();
+            combined.extend(all);
+            let mut ctargets = vec![None; prefix];
+            ctargets.extend(targets);
+            let mut cbox = vec![None; prefix];
+            cbox.extend(box_targets);
+            let mut cconts = vec![false; prefix];
+            cconts.extend(conts);
+
+            let total = combined.len();
+            let max_offset = total.saturating_sub(area_h);
+            if self.chat_scroll_offset > max_offset {
+                self.chat_scroll_offset = max_offset;
+            }
+
+            if total < area_h {
+                let pad = area_h - total;
+                let mut v: Vec<Line<'static>> = (0..pad).map(|_| Line::default()).collect();
+                let mut t: Vec<Option<usize>> = vec![None; pad];
+                let mut bx: Vec<Option<usize>> = vec![None; pad];
+                let mut c: Vec<bool> = vec![false; pad];
+                v.extend(combined);
+                t.extend(ctargets);
+                bx.extend(cbox);
+                c.extend(cconts);
+                (v, t, bx, c)
+            } else {
+                let drop = total - area_h - self.chat_scroll_offset;
+                let v: Vec<Line<'static>> = combined.into_iter().skip(drop).take(area_h).collect();
+                let t: Vec<Option<usize>> = ctargets.into_iter().skip(drop).take(area_h).collect();
+                let bx: Vec<Option<usize>> = cbox.into_iter().skip(drop).take(area_h).collect();
+                let c: Vec<bool> = cconts.into_iter().skip(drop).take(area_h).collect();
+                (v, t, bx, c)
+            }
         };
         self.clickable_rows = visible_targets;
         self.box_rows = visible_box;
@@ -462,15 +590,14 @@ impl App {
         } else {
             Borders::ALL
         };
-        // Dark grey border while the agent loop is in flight; white
-        // when we're idle. The same `pending` slot the renderer uses
-        // to drive the "Thinking…" placeholder gates this, so the
-        // border stays dim across reasoning, streaming, and tool
-        // dispatch and flips back to white the moment the turn
-        // finalizes. We use a darker grey than MUTED_COLOR_INDEX so
-        // the "agent is working, hold off typing" signal reads at a
-        // glance against the surrounding chrome.
-        let border_color = if self.pending.is_some() {
+        // Dark grey border for the whole span the agent is busy; white
+        // when idle. Gated on `busy` (not `pending.is_some()`) so it
+        // stays dim across reasoning, streaming, AND tool execution —
+        // `pending` drops to `None` between tool rounds, which used to
+        // flicker the border white mid-turn. We use a darker grey than
+        // MUTED_COLOR_INDEX so the "agent is working, hold off typing"
+        // signal reads at a glance against the surrounding chrome.
+        let border_color = if self.busy {
             Color::Indexed(238)
         } else {
             Color::White
@@ -565,6 +692,18 @@ impl App {
     /// `prunable` is a placeholder zero until the pruning estimator
     /// (plan §10) lands.
     pub(super) fn context_indicator_text(&self) -> String {
+        // Fresh chat (nothing sent, no provider usage yet): replace the
+        // useless `0% prunable` placeholder with the instruction-file
+        // size the daemon estimated. Reverts to the usual form once the
+        // first round-trip returns usage or any history exists. No
+        // guidance file → fall through to the usual form entirely.
+        if let Some(label) = fresh_chat_guidance_label(
+            self.history.is_empty(),
+            self.last_usage.is_some(),
+            self.guidance_estimate.as_ref(),
+        ) {
+            return label;
+        }
         let tokens = self.context_tokens();
         let prunable = 0u32; // placeholder
         match self.launch.active_model_max_context {
@@ -644,7 +783,7 @@ impl App {
             return;
         }
         let query = self.slash_query().unwrap_or("");
-        let mut matches = slash_matches(query);
+        let mut matches = slash_matches(query, &self.usage_slash);
         // Cap to the autocomplete-rows budget; pad blanks below so the
         // popup keeps a stable 6-row footprint regardless of match count.
         matches.truncate(AUTOCOMPLETE_ROWS as usize);
@@ -982,6 +1121,24 @@ fn format_token_count(n: u32) -> String {
     }
 }
 
+/// The fresh-chat context-indicator label (`X tokens in <file>`), or
+/// `None` to fall back to the normal context display. Shown only on a
+/// truly fresh chat — no history and no provider usage yet — and only
+/// when the daemon found a guidance file. Pure so the trigger/revert
+/// logic is unit-testable without standing up an `App`.
+fn fresh_chat_guidance_label(
+    history_empty: bool,
+    has_usage: bool,
+    estimate: Option<&(String, u64)>,
+) -> Option<String> {
+    if !history_empty || has_usage {
+        return None;
+    }
+    let (file, tokens) = estimate?;
+    let n = (*tokens).min(u32::MAX as u64) as u32;
+    Some(format!("{} tokens in {file}", format_token_count(n)))
+}
+
 /// First line of `s`, hard-clipped to `width` columns with a trailing
 /// `…` when truncated. Used by the queue strip; only previews the first
 /// line of multi-line queued messages to keep the box compact.
@@ -1125,4 +1282,30 @@ pub(super) fn toolbox_row_estimate(calls: &[crate::tui::history::ToolCall], expa
         }
     }
     rows.max(1)
+}
+
+#[cfg(test)]
+mod guidance_label_tests {
+    use super::fresh_chat_guidance_label;
+
+    #[test]
+    fn shows_on_fresh_chat_with_estimate() {
+        let est = ("AGENTS.md".to_string(), 1234u64);
+        let label = fresh_chat_guidance_label(true, false, Some(&est));
+        assert_eq!(label.as_deref(), Some("1.2k tokens in AGENTS.md"));
+    }
+
+    #[test]
+    fn reverts_once_history_or_usage_exists() {
+        let est = ("AGENTS.md".to_string(), 1234u64);
+        // History present → revert.
+        assert!(fresh_chat_guidance_label(false, false, Some(&est)).is_none());
+        // Usage reported → revert.
+        assert!(fresh_chat_guidance_label(true, true, Some(&est)).is_none());
+    }
+
+    #[test]
+    fn no_guidance_file_falls_back() {
+        assert!(fresh_chat_guidance_label(true, false, None).is_none());
+    }
 }

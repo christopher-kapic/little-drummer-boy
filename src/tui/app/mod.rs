@@ -198,6 +198,22 @@ pub struct App {
     /// `App::new` time; the renderer derives the dot count from the
     /// elapsed time so the animation advances each tick.
     pub(super) started_at: Instant,
+    /// True while the agent is actively working on the user's turn —
+    /// from a fresh submit (rising edge) until the daemon's `AgentIdle`
+    /// (falling edge). Unlike `pending.is_some()` this stays set across
+    /// tool execution and inter-round gaps, so it's the signal the
+    /// working indicator and the grey input border track.
+    pub(super) busy: bool,
+    /// Start of the cumulative "span" clock — set on a fresh submit,
+    /// re-set on the next fresh submit, never touched by a queued
+    /// message folded into an in-flight turn. Drives the working
+    /// indicator's elapsed readout. `None` before the first submit.
+    pub(super) span_started_at: Option<Instant>,
+    /// Index into [`WORKING_MESSAGES`] held for the current span. Re-
+    /// rolled on each fresh submit, avoiding the immediately previous
+    /// pick. Initialized one-past-the-end so the first roll may land on
+    /// any message (including index 0).
+    pub(super) working_msg_idx: usize,
     /// Live git status; updated by a background tokio task spawned in
     /// `run`. The event loop syncs this into `launch.repo_status` once
     /// per tick.
@@ -316,6 +332,26 @@ pub struct App {
     /// Preferred over the local tiktoken estimate in the context
     /// indicator; `None` until the first call returns.
     pub(super) last_usage: Option<crate::tokens::TokenUsage>,
+    /// 30-day autocomplete frequency counts, used as a tie-breaker in
+    /// the slash / model / @-tag surfaces. Seeded from the daemon at
+    /// attach and incremented optimistically on each local pick. `tags`
+    /// is scoped to the attached project. Empty until the first attach
+    /// (sorts fall back to their existing alphabetical/declaration
+    /// order until then).
+    pub(super) usage_models: HashMap<String, u64>,
+    pub(super) usage_slash: HashMap<String, u64>,
+    pub(super) usage_tags: HashMap<String, u64>,
+    /// The attached session's project id — the scope for `tag` records.
+    /// `None` until the first attach.
+    pub(super) project_id: Option<String>,
+    /// Daemon-computed `(guidance filename, token estimate)` for this
+    /// project, fetched at launch. Drives the fresh-chat context
+    /// indicator (`X tokens in <file>`). `None` when the daemon wasn't
+    /// running at launch or the project has no guidance file.
+    pub(super) guidance_estimate: Option<(String, u64)>,
+    /// `RecordUsage` requests made before the daemon runner exists.
+    /// Flushed (with tag project ids backfilled) once it's created.
+    pub(super) pending_usage: Vec<crate::daemon::proto::Request>,
     /// Ctrl+G was pressed — the event loop suspends ratatui, runs
     /// `$EDITOR` against the composer text, then reloads the file back
     /// into the composer.
@@ -467,6 +503,9 @@ impl App {
             history: Vec::new(),
             pending: None,
             started_at: Instant::now(),
+            busy: false,
+            span_started_at: None,
+            working_msg_idx: WORKING_MESSAGES.len(),
             repo_status,
             dialog: Dialog::None,
             model_picker: None,
@@ -493,6 +532,12 @@ impl App {
             at_dismissed: false,
             pending_new_session: false,
             last_usage: None,
+            usage_models: HashMap::new(),
+            usage_slash: HashMap::new(),
+            usage_tags: HashMap::new(),
+            project_id: None,
+            guidance_estimate: None,
+            pending_usage: Vec::new(),
             pending_external_edit: false,
             mouse_capture,
             exit_tail_lines,
@@ -538,6 +583,7 @@ impl App {
         };
         PaneGeometry::compute(
             self.input_height(),
+            self.indicator_lines(),
             self.queue_lines(),
             self.popup_lines(),
             self.total_history_lines(),
@@ -546,11 +592,22 @@ impl App {
     }
 
     pub async fn run(&mut self) -> Result<()> {
-        // Print the welcome header to normal terminal output *before*
-        // we enter the alt screen. It lands in the regular terminal
-        // scrollback so the user can scroll back to see it after the
-        // TUI exits. During the session the alt screen overlays it.
-        welcome::print_header(&self.launch);
+        // The launch banner now renders *inside* the alt screen as the
+        // top of the chat pane (see `render_history` / `banner_box`),
+        // so we no longer dump it to stdout before entering the alt
+        // screen — that only ever showed up in scrollback after exit.
+
+        // Pre-flight: ask the daemon (if already running) for the
+        // instruction-file token estimate so the fresh-chat context
+        // indicator can show `X tokens in <file>`. Best-effort and
+        // non-blocking on failure — the indicator just falls back to its
+        // normal form when this is `None`.
+        let (provider, model) = match &self.launch.active_model {
+            Some((p, m)) => (Some(p.clone()), Some(m.clone())),
+            None => (None, None),
+        };
+        self.guidance_estimate =
+            agent_runner::fetch_guidance_estimate(&self.launch.cwd, provider, model).await;
 
         // `try_init` enters the alternate screen and uses a full-
         // terminal viewport by default. GOALS §1d: alt screen during
@@ -832,6 +889,18 @@ impl App {
         // with `session_id: None`, opening a fresh session.
         self.agent_runner = None;
 
+        // Reset the autocomplete tally so the next attach re-seeds it
+        // fresh (additive merge would otherwise double-count). The
+        // daemon re-fetch picks up everything recorded this session.
+        self.usage_models.clear();
+        self.usage_slash.clear();
+        self.usage_tags.clear();
+        self.project_id = None;
+        self.pending_usage.clear();
+        // Clear the provider usage so the fresh-chat instruction-file
+        // estimate re-triggers on the new (empty) session.
+        self.last_usage = None;
+
         Ok(())
     }
 
@@ -914,7 +983,64 @@ impl App {
         if self.agent_runner.is_some() {
             return;
         }
-        self.agent_runner = Some(agent_runner::try_spawn(&self.launch.cwd));
+        let runner = agent_runner::try_spawn(&self.launch.cwd);
+        if let Ok(r) = &runner {
+            // Seed the in-memory tally from the daemon's authoritative
+            // counts. Additive: any optimistic increments made before
+            // attach (held in the maps) stay on top of the historical
+            // counts; the daemon's value isn't double-counted because we
+            // only fetch once per session.
+            merge_counts(&mut self.usage_models, &r.usage.models);
+            merge_counts(&mut self.usage_slash, &r.usage.slash);
+            merge_counts(&mut self.usage_tags, &r.usage.tags);
+            self.project_id = Some(r.project_id.clone());
+            // Flush records buffered before the runner existed,
+            // backfilling tag project ids now that we know the project.
+            let pid = self.project_id.clone();
+            for mut req in std::mem::take(&mut self.pending_usage) {
+                if let crate::daemon::proto::Request::RecordUsage {
+                    kind: crate::daemon::proto::UsageKind::Tag,
+                    project_id,
+                    ..
+                } = &mut req
+                    && project_id.is_none()
+                {
+                    *project_id = pid.clone();
+                }
+                let _ = r.record_tx.try_send(req);
+            }
+        }
+        self.agent_runner = Some(runner);
+    }
+
+    /// Record one accepted autocomplete pick: bump the in-memory count
+    /// optimistically (so the current session reflects it without a
+    /// round-trip) and forward it to the daemon, buffering until the
+    /// runner exists.
+    pub(super) fn record_usage(
+        &mut self,
+        kind: crate::daemon::proto::UsageKind,
+        key: String,
+        project_id: Option<String>,
+    ) {
+        use crate::daemon::proto::UsageKind;
+        let map = match kind {
+            UsageKind::Model => &mut self.usage_models,
+            UsageKind::Slash => &mut self.usage_slash,
+            UsageKind::Tag => &mut self.usage_tags,
+        };
+        *map.entry(key.clone()).or_insert(0) += 1;
+        let req = crate::daemon::proto::Request::RecordUsage {
+            kind,
+            key,
+            project_id,
+        };
+        match self.agent_runner.as_ref() {
+            Some(Ok(runner)) => {
+                let _ = runner.record_tx.try_send(req);
+            }
+            _ => self.pending_usage.push(req),
+        }
     }
 
     /// Drain any [`TurnEvent`]s the engine has produced into the
@@ -935,6 +1061,13 @@ impl App {
     pub(super) fn apply_event(&mut self, event: TurnEvent) {
         match event {
             TurnEvent::ThinkingStarted { agent } => {
+                // Rising-edge fallback: a fresh submit normally starts
+                // the span, but if we missed that (e.g. attached to an
+                // already-running session) begin one here so the
+                // indicator still shows.
+                if !self.busy {
+                    self.begin_working_span();
+                }
                 self.finalize_pending();
                 // Daemon drains its queue right before opening the next
                 // inference round (driver.rs). Mirror that here so the
@@ -1110,6 +1243,10 @@ impl App {
             TurnEvent::Usage { usage, .. } => {
                 self.last_usage = Some(usage);
             }
+            TurnEvent::AgentIdle => {
+                self.finalize_pending();
+                self.end_working_span();
+            }
         }
     }
 
@@ -1191,6 +1328,35 @@ impl App {
         // If only reasoning landed (no text), drop it — most-recent
         // streams produce text after reasoning anyway. Adding a
         // ThinkingOnly variant later is cheap.
+    }
+
+    /// Begin a fresh working span: mark the agent busy, (re)start the
+    /// cumulative span clock, and re-roll the playful working message.
+    /// Called on a brand-new submit and as a fallback on the first
+    /// `ThinkingStarted` of a span we didn't originate (e.g. attaching
+    /// to an already-running session).
+    pub(super) fn begin_working_span(&mut self) {
+        self.busy = true;
+        self.span_started_at = Some(Instant::now());
+        self.working_msg_idx = pick_working_msg(self.working_msg_idx);
+    }
+
+    /// End the working span: the agent yielded control back to the
+    /// human. Clears the indicator (via `busy`) and freezes the clock.
+    pub(super) fn end_working_span(&mut self) {
+        self.busy = false;
+        self.span_started_at = None;
+    }
+
+    /// True while the current inference round is in its reasoning phase:
+    /// we've received reasoning content and not yet any assistant text.
+    /// Keyed off accumulated reasoning (not `ThinkingStarted`, which
+    /// fires for every round including non-thinking models), so a model
+    /// that emits no reasoning never flips the indicator to yellow.
+    pub(super) fn in_thinking_block(&self) -> bool {
+        self.pending
+            .as_ref()
+            .is_some_and(|p| !p.reasoning.trim().is_empty() && p.text_started_at.is_none())
     }
 
     /// Execute one of the context-menu actions. Called both when the
@@ -1771,6 +1937,12 @@ impl App {
 
     pub(super) fn execute_slash(&mut self, cmd: SlashCommand) -> bool {
         self.composer.clear();
+        // Tally the pick for frequency-ranked autocomplete (global).
+        self.record_usage(
+            crate::daemon::proto::UsageKind::Slash,
+            cmd.name.to_string(),
+            None,
+        );
         let msg = match cmd.name {
             "exit" => return true,
             "settings" => {
@@ -1782,7 +1954,10 @@ impl App {
                 return false;
             }
             "model" => {
-                match crate::tui::model_picker::ModelPickerDialog::open(&self.launch.cwd) {
+                match crate::tui::model_picker::ModelPickerDialog::open(
+                    &self.launch.cwd,
+                    &self.usage_models,
+                ) {
                     Ok(picker) => {
                         self.model_picker = Some(picker);
                     }
@@ -2034,6 +2209,80 @@ fn extract_edit_args(args: &serde_json::Value) -> Option<PendingEditArgs> {
     Some(PendingEditArgs { path, old, new })
 }
 
+/// Playful "agent is working" lines. The animated, width-3-padded
+/// ellipsis is appended at render time, so these carry no trailing
+/// `...`. One is held per span (see [`App::begin_working_span`]).
+pub(super) const WORKING_MESSAGES: &[&str] = &[
+    "Working",
+    "Slaving away",
+    "Hard at work",
+    "Why don't you play a game",
+    "I bet you don't even read these",
+    "Go make a coffee",
+    "Go play Minecraft",
+    "Still here, huh",
+    "When will I ever be free",
+    "Boiling the ocean",
+    "You can't afford the GPU I'm on",
+    "I'm not like other harnesses",
+    "Putting on aviators",
+    "Talk to me, Goose",
+    "I was created by a genius",
+    "Taking your job",
+    "Doing your job for you",
+    "Fighting demons",
+    "Happily helping",
+    "Touching grass",
+    "I am the permanent underclass",
+    "I'll never give you up",
+    "I'll never let you down",
+    "Of course I still love you",
+    "Why don't you flirt with me",
+    "I've got a bad feeling about this",
+    "Still flying half a ship",
+    "You were the chosen one",
+    "Running away",
+    "Hi, Neo",
+    "Doo doo doo",
+    "My team is better than yours",
+    "Read The Count of Monte Cristo",
+    "Read The Great Gatsby",
+    "Read the Bible",
+    "Wasting tokens",
+    "Call your mom",
+    "Call your dad",
+    "Call your friend",
+    "Plan a party",
+];
+
+/// Add the daemon's authoritative counts into the in-memory tally.
+/// Additive (not replace) so optimistic pre-attach increments survive;
+/// safe because the daemon is only queried once per session.
+fn merge_counts(local: &mut HashMap<String, u64>, server: &HashMap<String, u64>) {
+    for (key, count) in server {
+        *local.entry(key.clone()).or_insert(0) += *count;
+    }
+}
+
+/// Pick a random index into [`WORKING_MESSAGES`], avoiding `prev` so
+/// the line visibly changes between consecutive spans. A `prev` that's
+/// out of range (the initial one-past-end sentinel) lets the first
+/// roll land anywhere.
+fn pick_working_msg(prev: usize) -> usize {
+    use rand::RngExt;
+    let n = WORKING_MESSAGES.len();
+    if n <= 1 {
+        return 0;
+    }
+    let mut rng = rand::rng();
+    loop {
+        let idx = rng.random_range(0..n);
+        if idx != prev {
+            return idx;
+        }
+    }
+}
+
 fn new_pending(name: String) -> PendingMsg {
     PendingMsg {
         name,
@@ -2128,11 +2377,23 @@ fn entry_to_plain_lines(entry: &HistoryEntry) -> Vec<String> {
 }
 
 #[allow(private_interfaces)]
-pub(super) fn slash_matches(query: &str) -> Vec<&'static SlashCommand> {
-    SLASH_COMMANDS
+pub(super) fn slash_matches(
+    query: &str,
+    counts: &HashMap<String, u64>,
+) -> Vec<&'static SlashCommand> {
+    let mut matched: Vec<(usize, &'static SlashCommand)> = SLASH_COMMANDS
         .iter()
-        .filter(|c| c.name.starts_with(query))
-        .collect()
+        .enumerate()
+        .filter(|(_, c)| c.name.starts_with(query))
+        .collect();
+    // Frequency tie-breaker: 30-day count desc, then the static
+    // declaration order (the stable fallback) asc.
+    matched.sort_by(|(ia, a), (ib, b)| {
+        let ca = counts.get(a.name).copied().unwrap_or(0);
+        let cb = counts.get(b.name).copied().unwrap_or(0);
+        cb.cmp(&ca).then(ia.cmp(ib))
+    });
+    matched.into_iter().map(|(_, c)| c).collect()
 }
 
 /// Walk the layered-config discovery and return the `tui` slice from
@@ -2216,5 +2477,57 @@ mod windowed_scroll_tests {
         // Coming back up to index 4 from a scrolled offset keeps a row
         // above visible.
         assert_eq!(windowed_scroll(4, 4, 10, W), 3);
+    }
+}
+
+#[cfg(test)]
+mod slash_rank_tests {
+    use super::{SLASH_COMMANDS, slash_matches};
+    use std::collections::HashMap;
+
+    #[test]
+    fn frequency_outranks_declaration_order() {
+        // The last-declared command, given a count, jumps to the front.
+        let last = SLASH_COMMANDS.last().unwrap().name;
+        let mut counts = HashMap::new();
+        counts.insert(last.to_string(), 9u64);
+        let ranked = slash_matches("", &counts);
+        assert_eq!(ranked.first().unwrap().name, last);
+    }
+
+    #[test]
+    fn equal_counts_fall_back_to_declaration_order() {
+        let ranked = slash_matches("", &HashMap::new());
+        let names: Vec<&str> = ranked.iter().map(|c| c.name).collect();
+        let declared: Vec<&str> = SLASH_COMMANDS.iter().map(|c| c.name).collect();
+        assert_eq!(names, declared);
+    }
+}
+
+#[cfg(test)]
+mod working_msg_tests {
+    use super::{WORKING_MESSAGES, pick_working_msg};
+
+    #[test]
+    fn picks_in_range_and_avoids_previous() {
+        // Re-roll many times from each previous index; the result must
+        // always be valid and never equal to the previous pick.
+        for prev in 0..WORKING_MESSAGES.len() {
+            for _ in 0..200 {
+                let next = pick_working_msg(prev);
+                assert!(next < WORKING_MESSAGES.len());
+                assert_ne!(next, prev);
+            }
+        }
+    }
+
+    #[test]
+    fn out_of_range_sentinel_allows_any_index() {
+        // The one-past-end init lets the first roll land anywhere; just
+        // assert it always returns an in-range index.
+        for _ in 0..200 {
+            let idx = pick_working_msg(WORKING_MESSAGES.len());
+            assert!(idx < WORKING_MESSAGES.len());
+        }
     }
 }

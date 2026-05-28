@@ -223,9 +223,63 @@ pub enum Request {
     /// requiring `cockpit daemon restart`.
     RefreshEnv { vars: HashMap<String, String> },
 
+    /// Record one accepted autocomplete pick into the 30-day frequency
+    /// tally (GOALS §1; tie-breaker for the model / slash / @-tag
+    /// surfaces). Fire-and-forget — acked immediately; no attached
+    /// session is required since the tally is global. `project_id` is
+    /// set only for `tag` picks.
+    RecordUsage {
+        kind: UsageKind,
+        key: String,
+        #[serde(default)]
+        project_id: Option<String>,
+    },
+
+    /// Fetch the three 30-day autocomplete count maps. `project_id`
+    /// scopes the `tag` map (model + slash are global); `None` yields an
+    /// empty `tags` map.
+    GetUsageCounts {
+        #[serde(default)]
+        project_id: Option<String>,
+    },
+
+    /// Pre-flight estimate of the project's single instruction/guidance
+    /// file size, for the fresh-chat context indicator. The daemon
+    /// resolves the guidance file for `project_root` and estimates its
+    /// body with the tokenizer calibrated for `(provider, model)`. The
+    /// TUI can't see the guidance file (it's engine-side), so this must
+    /// be computed daemon-side.
+    GuidanceEstimate {
+        project_root: String,
+        #[serde(default)]
+        provider: Option<String>,
+        #[serde(default)]
+        model: Option<String>,
+    },
+
     /// Request orderly shutdown. The daemon flushes in-flight writes
     /// (session DB, lock state) before exiting.
     StopDaemon,
+}
+
+/// Which autocomplete surface a [`Request::RecordUsage`] belongs to.
+/// Serializes to the `kind` column verbatim (`model` / `slash` / `tag`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageKind {
+    Model,
+    Slash,
+    Tag,
+}
+
+impl UsageKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Model => "model",
+            Self::Slash => "slash",
+            Self::Tag => "tag",
+        }
+    }
 }
 
 // ---- Responses -------------------------------------------------------------
@@ -283,6 +337,25 @@ pub enum Response {
         uptime_secs: u64,
         active_sessions: u32,
         socket_path: String,
+    },
+
+    /// The three 30-day autocomplete count maps. `models` and `slash`
+    /// are global; `tags` is scoped to the requested project. Answer to
+    /// [`Request::GetUsageCounts`].
+    UsageCounts {
+        models: HashMap<String, u64>,
+        slash: HashMap<String, u64>,
+        tags: HashMap<String, u64>,
+    },
+
+    /// Estimated token size of the project's guidance file. `file` is the
+    /// basename of the matched guidance file, or `None` when none was
+    /// found (the TUI then falls back to its normal context display).
+    /// Answer to [`Request::GuidanceEstimate`].
+    GuidanceEstimate {
+        #[serde(default)]
+        file: Option<String>,
+        tokens: u64,
     },
 }
 
@@ -399,6 +472,18 @@ pub enum Event {
         session_id: Uuid,
         interrupt_id: Uuid,
     },
+
+    /// The agent yielded control back to the human: the driver loop
+    /// finished the current user message (and any folded queue) and is
+    /// now awaiting input. Distinct from the mid-turn gaps where no
+    /// model call is in flight (between tools, between inference
+    /// rounds) — this fires only when the stack unwinds to the root and
+    /// the queue is empty. The TUI keys its span-long "agent is
+    /// working" indicator off the user-submit (rising) / this (falling)
+    /// edges. Forward-compat: it means "no longer actively working," so
+    /// a future agent that is *waiting* (agent-invoked timers/loops)
+    /// emits it too.
+    AgentIdle { session_id: Uuid },
 
     /// The session ended (user requested, daemon shutting down,
     /// crash recovery couldn't restore it, …).

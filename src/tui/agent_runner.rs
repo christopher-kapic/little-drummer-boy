@@ -10,6 +10,7 @@
 //! the boundary so the TUI rendering paths don't need to know they
 //! talk to a daemon.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -19,17 +20,34 @@ use crate::daemon::client::{LifecycleMode, probe_or_spawn};
 use crate::daemon::proto::{self, Request, Response};
 use crate::engine::TurnEvent;
 
+/// The three 30-day autocomplete count maps fetched at session start.
+/// `models` and `slash` are global; `tags` is scoped to this session's
+/// project. Empty when the daemon predates `GetUsageCounts`.
+#[derive(Default, Clone)]
+pub struct UsageCounts {
+    pub models: HashMap<String, u64>,
+    pub slash: HashMap<String, u64>,
+    pub tags: HashMap<String, u64>,
+}
+
 /// Handle the TUI keeps to talk to the engine (now via the daemon).
 pub struct AgentRunner {
     /// Send user-typed messages here. Each line becomes one
     /// `SendUserMessage` request; the daemon's queue-folding (GOALS
     /// §1c) is performed inside the worker, not here.
     pub input_tx: mpsc::Sender<String>,
+    /// Fire-and-forget `RecordUsage` requests (autocomplete tally).
+    pub record_tx: mpsc::Sender<Request>,
     /// Drained per tick into [`crate::tui::app::App::history`].
     pub events: Arc<Mutex<Vec<TurnEvent>>>,
     /// Name of whoever's currently on top of the agent stack. The
     /// chrome reads this for the active-agent slot (GOALS §1a).
     pub active_agent: Arc<Mutex<String>>,
+    /// This session's project id — the scope for `tag` usage records.
+    pub project_id: String,
+    /// Frequency counts fetched at attach; the TUI seeds its in-memory
+    /// maps from these once.
+    pub usage: UsageCounts,
 }
 
 /// Probe for the daemon (auto-promoting one if needed), attach a
@@ -71,20 +89,49 @@ pub fn try_spawn(cwd: &Path) -> Result<AgentRunner, String> {
                 })
                 .await
                 .map_err(|e| format!("attach: {e}"))?;
-            let (session_id, active_agent_name) = match attached {
+            let (session_id, active_agent_name, project_id) = match attached {
                 Response::Attached {
                     session_id,
                     active_agent,
+                    project_id,
                     ..
-                } => (session_id, active_agent),
+                } => (session_id, active_agent, project_id),
                 other => return Err(format!("unexpected attach response: {other:?}")),
             };
-            Ok::<_, String>((daemon.client, session_id, active_agent_name))
+            // Fetch the autocomplete frequency maps for this session's
+            // project. Best-effort: a daemon that doesn't speak
+            // `GetUsageCounts` just leaves the maps empty (no ranking).
+            let usage = match daemon
+                .client
+                .request_ok(Request::GetUsageCounts {
+                    project_id: Some(project_id.clone()),
+                })
+                .await
+            {
+                Ok(Response::UsageCounts {
+                    models,
+                    slash,
+                    tags,
+                }) => UsageCounts {
+                    models,
+                    slash,
+                    tags,
+                },
+                _ => UsageCounts::default(),
+            };
+            Ok::<_, String>((
+                daemon.client,
+                session_id,
+                active_agent_name,
+                project_id,
+                usage,
+            ))
         })
     })?;
-    let (client, session_id, initial_active_agent) = attached;
+    let (client, session_id, initial_active_agent, project_id, usage) = attached;
 
     let (input_tx, mut input_rx) = mpsc::channel::<String>(32);
+    let (record_tx, mut record_rx) = mpsc::channel::<Request>(32);
     let events = Arc::new(Mutex::new(Vec::new()));
     let active_agent = Arc::new(Mutex::new(initial_active_agent));
 
@@ -97,6 +144,18 @@ pub fn try_spawn(cwd: &Path) -> Result<AgentRunner, String> {
                 if let Err(e) = client.request(Request::SendUserMessage { text }).await {
                     tracing::warn!(error = ?e, "send_user_message transport failed");
                     break;
+                }
+            }
+        });
+    }
+
+    // Outbound: fire-and-forget autocomplete usage records.
+    {
+        let client = client.clone();
+        tokio::spawn(async move {
+            while let Some(req) = record_rx.recv().await {
+                if let Err(e) = client.request(req).await {
+                    tracing::warn!(error = ?e, "record_usage transport failed");
                 }
             }
         });
@@ -123,9 +182,48 @@ pub fn try_spawn(cwd: &Path) -> Result<AgentRunner, String> {
 
     Ok(AgentRunner {
         input_tx,
+        record_tx,
         events,
         active_agent,
+        project_id,
+        usage,
     })
+}
+
+/// Fetch the daemon-computed guidance-file token estimate for `cwd` and
+/// the active model (Feature 1, fresh-chat context indicator). Connects
+/// to an already-running daemon only — no attach, no spawn — so calling
+/// it at launch never creates a session. Returns `None` when the daemon
+/// isn't running or the project has no guidance file. The estimate must
+/// come from the daemon: the TUI can't see the guidance file.
+pub async fn fetch_guidance_estimate(
+    cwd: &Path,
+    provider: Option<String>,
+    model: Option<String>,
+) -> Option<(String, u64)> {
+    use crate::daemon::{DaemonPaths, DaemonStatus, probe};
+    let paths = DaemonPaths::resolve().ok()?;
+    if !matches!(probe(&paths).await, DaemonStatus::Running) {
+        return None;
+    }
+    let client = crate::daemon::client::DaemonClient::connect(&paths.socket)
+        .await
+        .ok()?;
+    let resp = client
+        .request_ok(Request::GuidanceEstimate {
+            project_root: cwd.to_string_lossy().into_owned(),
+            provider,
+            model,
+        })
+        .await
+        .ok()?;
+    match resp {
+        Response::GuidanceEstimate {
+            file: Some(file),
+            tokens,
+        } => Some((file, tokens)),
+        _ => None,
+    }
 }
 
 fn update_active_agent(event: &proto::Event, slot: &Arc<Mutex<String>>) {
@@ -158,6 +256,7 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         | Usage { session_id, .. }
         | InterruptRaised { session_id, .. }
         | InterruptResolved { session_id, .. }
+        | AgentIdle { session_id, .. }
         | SessionEnded { session_id, .. } => *session_id,
     })
 }
@@ -234,6 +333,7 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
                 cached_input_tokens,
             },
         },
+        AgentIdle { .. } => TurnEvent::AgentIdle,
         // Interrupts and SessionEnded don't have TurnEvent analogues
         // yet — the TUI's needs-attention surface lands with the
         // approval router.

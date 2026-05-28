@@ -13,6 +13,7 @@
 //! The dialog is independent of `tui/settings.rs` to keep that file's
 //! state machine focused on settings editing.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crossterm::event::{KeyCode, KeyEvent};
@@ -93,7 +94,7 @@ enum Step {
 impl ModelPickerDialog {
     /// Try to open the picker for the given cwd. Returns `Err` if no
     /// config is reachable; callers should show the message inline.
-    pub fn open(cwd: &Path) -> Result<Self, String> {
+    pub fn open(cwd: &Path, counts: &HashMap<String, u64>) -> Result<Self, String> {
         let dirs = discover_config_dirs(cwd);
         let dir = dirs
             .first()
@@ -114,11 +115,17 @@ impl ModelPickerDialog {
                 });
             }
         }
-        // Stable order: favorites first (by label), then non-favorites
-        // (by label).
+        // Stable order: favorites first, then 30-day usage count desc,
+        // then label asc (the original alphabetical fallback). Favorites
+        // stay pinned above a more-frequent non-favorite.
         entries.sort_by(|a, b| {
             b.is_favorite
                 .cmp(&a.is_favorite)
+                .then_with(|| {
+                    let ca = counts.get(&a.label()).copied().unwrap_or(0);
+                    let cb = counts.get(&b.label()).copied().unwrap_or(0);
+                    cb.cmp(&ca)
+                })
                 .then_with(|| a.label().cmp(&b.label()))
         });
 

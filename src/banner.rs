@@ -17,6 +17,8 @@
 use std::io::IsTerminal;
 
 use crossterm::terminal;
+use ratatui::style::{Color, Style};
+use ratatui::text::Span;
 
 /// Plane grid as 12 rows of 36 single-char cells. `.` = transparent;
 /// `a`-`h` keys into [`PALETTE`].
@@ -85,6 +87,17 @@ pub fn render_lines(enabled: bool) -> Option<Vec<String>> {
     Some(render_unconditional())
 }
 
+/// Whether the banner is suppressed for the *in-TUI* box (GOALS §1g
+/// rules minus the TTY/width checks, which the TUI handles itself —
+/// it's always a TTY, and the box does its own pane-fit check). Returns
+/// `true` (suppress) on `enabled = false`, `NO_COLOR`, or
+/// `COCKPIT_ROOSTER`.
+pub fn suppressed_for_tui(enabled: bool) -> bool {
+    !enabled
+        || std::env::var_os("NO_COLOR").is_some()
+        || std::env::var_os("COCKPIT_ROOSTER").is_some()
+}
+
 fn terminal_wide_enough() -> bool {
     match terminal::size() {
         Ok((cols, _)) => cols >= MIN_TERMINAL_WIDTH,
@@ -119,7 +132,33 @@ pub fn render_unconditional() -> Vec<String> {
     out
 }
 
-/// Render one 2×2 cell group. Mirrors `draw_cell` in `p51-6.sh`:
+/// The art as ratatui styled spans — one row per `Vec<Span>`, one span
+/// per 2×2 cell group, with no left indent (the in-TUI banner box
+/// centers and borders the art itself). Parallel to
+/// [`render_unconditional`], which bakes ANSI escapes + an indent for
+/// the raw-stdout path.
+pub fn render_styled_lines() -> Vec<Vec<Span<'static>>> {
+    let mut out = Vec::with_capacity(RENDERED_HEIGHT);
+    for y in (0..PLANE_HEIGHT).step_by(2) {
+        let top = PLANE[y].as_bytes();
+        let bot = PLANE[y + 1].as_bytes();
+        let mut row = Vec::with_capacity(RENDERED_WIDTH);
+        for x in (0..PLANE_WIDTH).step_by(2) {
+            row.push(cell_span(
+                top[x] as char,
+                top[x + 1] as char,
+                bot[x] as char,
+                bot[x + 1] as char,
+            ));
+        }
+        out.push(row);
+    }
+    out
+}
+
+/// Resolve one 2×2 cell group into `(glyph, fg, optional bg)`, or `None`
+/// for an all-transparent group (rendered as a space). Mirrors
+/// `draw_cell` in `p51-6.sh`:
 ///
 /// 1. Find at most two distinct non-`.` colors in the four positions.
 /// 2. The first (call it A) becomes the foreground; the second (B,
@@ -127,7 +166,7 @@ pub fn render_unconditional() -> Vec<String> {
 /// 3. The four boolean "is this cell A?" bits index into a fixed
 ///    glyph table (16 entries, since the all-zero case is handled
 ///    separately as a single space).
-fn draw_cell(ul: char, ur: char, ll: char, lr: char) -> String {
+fn cell_parts(ul: char, ur: char, ll: char, lr: char) -> Option<(&'static str, u8, Option<u8>)> {
     let mut unique = [None; 4];
     let mut count = 0;
     for &c in &[ul, ur, ll, lr] {
@@ -142,19 +181,37 @@ fn draw_cell(ul: char, ur: char, ll: char, lr: char) -> String {
     }
 
     if count == 0 {
-        return " ".to_string();
+        return None;
     }
 
     let a = unique[0].expect("count >= 1");
     let bits = [(ul == a), (ur == a), (ll == a), (lr == a)];
     let glyph = glyph_for_pattern(bits);
     let fg = color_for(a);
+    let bg = unique[1].map(color_for);
+    Some((glyph, fg, bg))
+}
 
-    if let Some(b) = unique[1] {
-        let bg = color_for(b);
-        format!("\x1b[38;5;{fg};48;5;{bg}m{glyph}{RESET}")
-    } else {
-        format!("\x1b[38;5;{fg}m{glyph}{RESET}")
+/// One 2×2 cell group as an ANSI-styled string (raw-stdout path).
+fn draw_cell(ul: char, ur: char, ll: char, lr: char) -> String {
+    match cell_parts(ul, ur, ll, lr) {
+        None => " ".to_string(),
+        Some((glyph, fg, Some(bg))) => format!("\x1b[38;5;{fg};48;5;{bg}m{glyph}{RESET}"),
+        Some((glyph, fg, None)) => format!("\x1b[38;5;{fg}m{glyph}{RESET}"),
+    }
+}
+
+/// One 2×2 cell group as a ratatui [`Span`] (in-TUI path).
+fn cell_span(ul: char, ur: char, ll: char, lr: char) -> Span<'static> {
+    match cell_parts(ul, ur, ll, lr) {
+        None => Span::raw(" "),
+        Some((glyph, fg, Some(bg))) => Span::styled(
+            glyph,
+            Style::default()
+                .fg(Color::Indexed(fg))
+                .bg(Color::Indexed(bg)),
+        ),
+        Some((glyph, fg, None)) => Span::styled(glyph, Style::default().fg(Color::Indexed(fg))),
     }
 }
 
