@@ -26,6 +26,7 @@ pub mod geometry;
 pub mod history;
 pub mod markdown;
 pub mod model_picker;
+pub mod pty;
 pub mod settings;
 pub mod slash;
 pub mod textfield;

@@ -176,6 +176,19 @@ after a few cycles.
   tabs (GOALS §2c) should make this as smooth as possible. Flag for
   a follow-up design pass when `/config` TUI is implemented.
 
+- **D12. Embedded editor/lazygit + `!`/`/git`?** → **DECIDED
+  2026-05-28**: Ship all four as client-side TUI features (GOALS
+  §1i–§1l, plan T9). Editor and lazygit are live PTY panes
+  (`portable-pty` + `vt100` + `tui-term`), carved out of the chat-body
+  region (chrome stays, composer stays). One pane at a time; `Ctrl+O`
+  focus-toggle, `Ctrl+X` force-close, auto-close on child exit. `!` is
+  a one-shot local shell capture, local-only (never sent, excluded
+  from the token estimate via a dedicated `HistoryEntry::LocalCommand`
+  variant). `/git` runs locally and buffers a `<git cmd="…">…</git>`
+  block onto the next user message (~2k-token cap), riding the normal
+  `input_tx` → `SendUserMessage` path through `redact::scrub` — no new
+  RPC.
+
 - **D10. Auto-compact mid-tool-call safety predicate?** → **DECIDED
   2026-05-27**: Yes, formalize as
   `engine::is_at_safe_compaction_boundary()`. Predicate:

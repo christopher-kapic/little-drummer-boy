@@ -41,6 +41,15 @@ pulldown-cmark = { version = "0.13", default-features = false, features = ["html
 # multi-format set (plain text + HTML) which OSC52 cannot do, so
 # rich-text copy goes through arboard when not running over SSH.
 arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }
+# Embedded-PTY panes for `/editor` + `/lazygit` (GOALS §1i/§1j, plan
+# T9). `portable-pty` (wezterm's pure-Rust PTY layer) spawns + resizes
+# the child; `vt100` is the terminal-screen state machine fed by the
+# reader thread; `tui-term` renders a `vt100::Screen` into a ratatui
+# `PseudoTerminal` widget. `tui-term` 0.3 pins `ratatui ^0.30` — a
+# ratatui bump must be matched by a `tui-term` bump.
+portable-pty = "0.9"
+vt100 = "0.16"
+tui-term = { version = "0.3", default-features = false, features = ["vt100"] }
 
 # HTTP / providers
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream"] }

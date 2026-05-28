@@ -19,8 +19,8 @@ use crate::tui::history::{
 use crate::tui::theme::MUTED_COLOR_INDEX;
 
 use super::{
-    AUTOCOMPLETE_ROWS, App, INPUT_BORDER, MAX_INPUT_CONTENT, MIN_INPUT_CONTENT, Selection, Toast,
-    ToastKind, WORKING_MESSAGES, slash_matches,
+    AUTOCOMPLETE_ROWS, App, INPUT_BORDER, MAX_INPUT_CONTENT, MIN_INPUT_CONTENT, PaneSide,
+    Selection, Toast, ToastKind, WORKING_MESSAGES, slash_matches,
 };
 
 /// Startup grace before the working indicator first appears — prevents
@@ -199,6 +199,10 @@ impl App {
             total = total.saturating_add(match entry {
                 HistoryEntry::Plain { .. } => 1,
                 HistoryEntry::ToolLine { .. } => 2, // line + trailing gap
+                HistoryEntry::LocalCommand { output, .. } => {
+                    // label row + output rows + trailing gap.
+                    (output.lines().count() as u16).saturating_add(2)
+                }
                 HistoryEntry::ToolBox {
                     calls, expanded, ..
                 } => toolbox_row_estimate(calls, *expanded).saturating_add(1),
@@ -253,7 +257,15 @@ impl App {
         } else if let Some(picker) = self.model_picker.as_ref() {
             picker.render(frame, rects.body);
         } else {
-            self.render_history(frame, rects.body);
+            // Carve the body for an embedded pane (GOALS §1i) when one
+            // is open: fullscreen fills the body, splits divide it. The
+            // chat history renders into whatever's left (or nowhere when
+            // fullscreen). Returns the chat rect, or `None` if hidden.
+            let chat_rect = self.render_pane(frame, rects.body);
+            match chat_rect {
+                Some(chat) => self.render_history(frame, chat),
+                None => self.chat_area = None,
+            }
             if geom.indicator > 0 {
                 self.render_status_indicator(frame, rects.indicator);
             }
@@ -264,7 +276,17 @@ impl App {
             if geom.popup > 0 {
                 self.render_popup(frame, rects.popup);
             }
-            frame.set_cursor_position(cursor_pos);
+            // Park the real cursor: in the focused pane (when the child
+            // shows one), otherwise in the composer.
+            if self.pane.is_some() && self.pane_focused {
+                if let (Some(rect), Some(pane)) = (self.pane_rect, self.pane.as_ref())
+                    && let Some((x, y)) = pane.cursor_in(rect)
+                {
+                    frame.set_cursor_position(Position::new(x, y));
+                }
+            } else {
+                frame.set_cursor_position(cursor_pos);
+            }
         }
         self.render_status(frame, rects.status);
 
@@ -597,15 +619,30 @@ impl App {
         // flicker the border white mid-turn. We use a darker grey than
         // MUTED_COLOR_INDEX so the "agent is working, hold off typing"
         // signal reads at a glance against the surrounding chrome.
-        let border_color = if self.busy {
+        // Shell mode (GOALS §1k): a leading `!` swaps the top border for
+        // a "shell mode" label and tints the border green. Leaves the
+        // moment the `!` is gone.
+        let shell_mode = self.composer.text().starts_with('!');
+        let border_color = if shell_mode {
+            Color::Indexed(70)
+        } else if self.busy {
             Color::Indexed(238)
         } else {
             Color::White
         };
-        let input_block = Block::default()
+        let mut input_block = Block::default()
             .borders(borders)
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(border_color));
+        if shell_mode && !queue_above {
+            input_block = input_block.title(Line::from(Span::styled(
+                " shell mode ",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Indexed(70))
+                    .add_modifier(Modifier::BOLD),
+            )));
+        }
         let input_inner = input_block.inner(area);
 
         let prefix_width = input_prefix_width();
@@ -752,10 +789,19 @@ impl App {
                 HistoryEntry::Agent {
                     text, reasoning, ..
                 } => crate::tokens::count(text) + crate::tokens::count(reasoning),
+                // Local-command output is never sent to the agent
+                // (GOALS §1k); `/git`'s agent-bound cost is accounted
+                // via `pending_git_blocks` below, not here.
+                HistoryEntry::LocalCommand { .. } => 0,
             };
         }
         if let Some(p) = &self.pending {
             tokens += crate::tokens::count(&p.text) + crate::tokens::count(&p.reasoning);
+        }
+        // Buffered `<git>` blocks (GOALS §1l) ride the next user
+        // message; surface their cost before the user commits to send.
+        for block in &self.pending_git_blocks {
+            tokens += crate::tokens::count(block);
         }
         tokens.min(u32::MAX as usize) as u32
     }
@@ -869,6 +915,54 @@ impl App {
             lines.push(Line::default());
         }
         frame.render_widget(Paragraph::new(lines), area);
+    }
+
+    /// Lay out and render the embedded pane (GOALS §1i) inside `body`,
+    /// resizing the PTY to fit. Returns the rect the chat history should
+    /// use (the whole body when no pane, the chat side of a split, or
+    /// `None` when a fullscreen pane covers the body). Also stashes the
+    /// pane/divider/body rects for the mouse handler.
+    pub(super) fn render_pane(&mut self, frame: &mut ratatui::Frame, body: Rect) -> Option<Rect> {
+        if self.pane.is_none() {
+            self.pane_rect = None;
+            self.divider = None;
+            self.pane_body = None;
+            return Some(body);
+        }
+        let (chat_rect, pane_rect, divider) = split_body(self.pane_side, self.pane_ratio, body);
+        if let Some(pane) = self.pane.as_mut() {
+            pane.resize(pane_rect.height, pane_rect.width);
+        }
+        self.pane_rect = Some(pane_rect);
+        self.divider = divider;
+        self.pane_body = Some(body);
+        if let Some((drect, vertical)) = divider {
+            self.render_divider(frame, drect, vertical);
+        }
+        if let Some(pane) = self.pane.as_ref() {
+            pane.render(frame, pane_rect);
+        }
+        chat_rect
+    }
+
+    /// Draw the split divider. Brighter when the pane is focused so the
+    /// divider doubles as a focus indicator.
+    fn render_divider(&self, frame: &mut ratatui::Frame, rect: Rect, vertical: bool) {
+        let color = if self.pane_focused {
+            Color::Indexed(250)
+        } else {
+            Color::Indexed(238)
+        };
+        let style = Style::default().fg(color);
+        if vertical {
+            let lines: Vec<Line<'static>> = (0..rect.height)
+                .map(|_| Line::from(Span::styled("│", style)))
+                .collect();
+            frame.render_widget(Paragraph::new(lines), rect);
+        } else {
+            let bar = "─".repeat(rect.width as usize);
+            frame.render_widget(Paragraph::new(Line::from(Span::styled(bar, style))), rect);
+        }
     }
 
     pub(super) fn render_status(&self, frame: &mut ratatui::Frame, area: Rect) {
@@ -1086,6 +1180,9 @@ fn entry_rendered_rows(entry: &HistoryEntry) -> u16 {
     match entry {
         HistoryEntry::Plain { .. } => 1,
         HistoryEntry::ToolLine { .. } => 1,
+        HistoryEntry::LocalCommand { output, .. } => {
+            (output.lines().count() as u16).saturating_add(1)
+        }
         HistoryEntry::ToolBox {
             calls, expanded, ..
         } => toolbox_row_estimate(calls, *expanded),
@@ -1137,6 +1234,60 @@ fn fresh_chat_guidance_label(
     let (file, tokens) = estimate?;
     let n = (*tokens).min(u32::MAX as u64) as u32;
     Some(format!("{} tokens in {file}", format_token_count(n)))
+}
+
+/// Split `body` for an embedded pane (GOALS §1i). Returns
+/// `(chat_rect, pane_rect, divider)` where `divider` is
+/// `(rect, is_vertical)`. Fullscreen — and bodies too small to split —
+/// give the whole body to the pane with no chat rect and no divider.
+fn split_body(
+    side: PaneSide,
+    ratio: f32,
+    body: Rect,
+) -> (Option<Rect>, Rect, Option<(Rect, bool)>) {
+    let ratio = ratio.clamp(0.15, 0.85);
+    match side {
+        PaneSide::Full => (None, body, None),
+        PaneSide::Left | PaneSide::Right => {
+            if body.width < 3 {
+                return (None, body, None);
+            }
+            // Reserve ≥1 col for chat and 1 for the divider.
+            let max_pane = body.width.saturating_sub(2);
+            let pane_w = ((body.width as f32 * ratio).round() as u16).clamp(1, max_pane);
+            let chat_w = body.width - pane_w - 1;
+            if side == PaneSide::Left {
+                let pane = Rect::new(body.x, body.y, pane_w, body.height);
+                let div = Rect::new(body.x + pane_w, body.y, 1, body.height);
+                let chat = Rect::new(body.x + pane_w + 1, body.y, chat_w, body.height);
+                (Some(chat), pane, Some((div, true)))
+            } else {
+                let chat = Rect::new(body.x, body.y, chat_w, body.height);
+                let div = Rect::new(body.x + chat_w, body.y, 1, body.height);
+                let pane = Rect::new(body.x + chat_w + 1, body.y, pane_w, body.height);
+                (Some(chat), pane, Some((div, true)))
+            }
+        }
+        PaneSide::Top | PaneSide::Bottom => {
+            if body.height < 3 {
+                return (None, body, None);
+            }
+            let max_pane = body.height.saturating_sub(2);
+            let pane_h = ((body.height as f32 * ratio).round() as u16).clamp(1, max_pane);
+            let chat_h = body.height - pane_h - 1;
+            if side == PaneSide::Top {
+                let pane = Rect::new(body.x, body.y, body.width, pane_h);
+                let div = Rect::new(body.x, body.y + pane_h, body.width, 1);
+                let chat = Rect::new(body.x, body.y + pane_h + 1, body.width, chat_h);
+                (Some(chat), pane, Some((div, false)))
+            } else {
+                let chat = Rect::new(body.x, body.y, body.width, chat_h);
+                let div = Rect::new(body.x, body.y + chat_h, body.width, 1);
+                let pane = Rect::new(body.x, body.y + chat_h + 1, body.width, pane_h);
+                (Some(chat), pane, Some((div, false)))
+            }
+        }
+    }
 }
 
 /// First line of `s`, hard-clipped to `width` columns with a trailing

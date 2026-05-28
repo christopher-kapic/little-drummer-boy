@@ -435,6 +435,106 @@ Implementation: port the data structure in `p51-6.sh` (palette +
 cell grid) into Rust. Rendering uses crossterm's 256-color ANSI
 sequences. The banner is one-shot; no animation.
 
+### 1i. Embedded `$EDITOR` pane (`/editor`)
+
+A live `$EDITOR` running **inside** a ratatui pane — not the
+suspend-the-whole-TUI handoff (that's §1f / Ctrl+G, which edits the
+*composer text*; this edits the *project*). The editor child runs in
+a PTY and is rendered into a pane carved out of the chat body region.
+This is what makes splits and live resize possible.
+
+- The command only exists in the slash menu when `$EDITOR` is set;
+  hidden otherwise.
+- `/editor` (no arg) opens the editor **fullscreen** — it fills the
+  history+composer body region. `/editor right`, `/editor left`,
+  `/editor bottom` (alias `down`), `/editor top` (alias `up`) open a
+  split: the named side is the **editor** pane, the chat occupies the
+  remainder. Default split ratio 50/50, persisted for the session.
+- The child launches with the TUI's cwd as its working directory and
+  **no file argument** — the editor does its own thing (empty buffer
+  or its own file browser). `$EDITOR` may carry args (`code -w`); it
+  is shell-word-split, not treated as a bare program name.
+- If a pane is already open, **any** `/editor …` (or `/lazygit`) is a
+  no-op — one embedded pane at a time.
+- The PTY is resized (pty resize + SIGWINCH) whenever the pane rect
+  changes, so the child reflows on splits, divider drags, and
+  terminal resizes.
+
+**Chrome stays.** "Fullscreen" fills the body region only; the
+always-on chrome (cwd + git branch + context indicator + active
+agent, §1a) remains visible, and the composer stays below the pane so
+the user can keep talking to the agent. This honors the documented
+always-on invariant — the pane never hides chrome.
+
+**Focus & close.** A pane auto-closes when its child exits (`:q`).
+`Ctrl+O` toggles focus between the pane and the composer; clicking a
+pane focuses it. `Ctrl+X` force-closes a pane even if the child is
+still running (terminates and reaps it). Closing returns focus to the
+composer. These two binds are reserved by cockpit while a pane is
+open and are not delivered to the child (the unavoidable cost of an
+embedded terminal — documented, and chosen to not collide with the
+*composer's* vim mode or existing TUI handlers).
+
+This is a **COPY of the embedded-terminal pattern** from editors like
+helix/zellij, adapted to cockpit's chat-body layout.
+
+### 1j. Embedded `lazygit` pane (`/lazygit`)
+
+Same embedded-PTY machinery as §1i, for `lazygit`.
+
+- The command only exists when `lazygit` is on `PATH`; hidden
+  otherwise.
+- `/lazygit` opens **fullscreen only** (no split args).
+- Same focus / force-close / auto-close behavior as the editor pane.
+- lazygit drives its own mouse: when the pane is focused and the
+  child has requested a mouse-tracking mode, mouse events are
+  forwarded to the child PTY (SGR-encoded). See §1k's cross-cutting
+  mouse note in plan T9.
+
+### 1k. `!` one-shot shell mode (local-only)
+
+A leading `!` in the composer puts the input in **shell mode** — a
+one-shot command runner, not an interactive shell pane.
+
+- While the composer buffer starts with `!`, the input box swaps its
+  top border for a **"shell mode" label** (reusing the existing
+  top-border-swap hook) and tints the border. Shell mode ends the
+  moment the leading `!` is gone.
+- On submit: strip the leading `!`, run the rest via the shell
+  (`$SHELL -c`, fallback `/bin/sh`; Windows `cmd /C`) with cwd = the
+  TUI's cwd. One-shot capture of stdout+stderr.
+- The command and its (capped) output render as a chat entry so the
+  user sees it; output is truncated in the display with a note to
+  re-run in a real terminal for the full text.
+- **Never sent to the agent.** The output is local-only: it is not
+  added to the wire, is excluded from any future message, and does
+  **not** count toward the context-token estimate (it uses a history
+  variant the estimator ignores).
+
+### 1l. `/git` — share command output with the agent
+
+`/git <args>` runs `git <args>` locally (pager disabled, ANSI
+stripped) with cwd = the TUI's cwd, **immediately**, and renders the
+result in chat now — but it does **not** trigger a request.
+
+- The agent-bound copy is packaged as
+  `<git cmd="status">…output…</git>`, matching the existing
+  `<file>` / `<dir>` wire convention (§1e), and **buffered**: it is
+  silently attached to the **next** user message's wire text.
+  - Agent idle → the block waits until the user actually sends a
+    message; `/git` alone never starts a turn.
+  - Agent busy → it still attaches to the next user message (which
+    rides the existing queue path).
+  - Multiple `/git` calls accumulate in order and all ride the next
+    message.
+- Because the block becomes outbound prompt content, it flows through
+  `redact::scrub()` like any wire text — it is not bypassed.
+- The agent-bound copy is capped (~2k tokens, §10) with a truncation
+  marker; the chat display is capped separately with a re-run note.
+- Buffered-but-unsent `<git>` blocks are surfaced in the context
+  indicator's pre-first-response estimate so their token cost is
+  visible before the user commits to sending.
+
 ---
 
 ## 2. cockpit-native config

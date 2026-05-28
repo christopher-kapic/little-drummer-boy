@@ -94,6 +94,10 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "Compress the conversation to save context",
     },
     SlashCommand {
+        name: "editor",
+        description: "Open $EDITOR in an embedded pane (arg: left/right/top/bottom)",
+    },
+    SlashCommand {
         name: "exit",
         description: "Quit cockpit",
     },
@@ -108,6 +112,14 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
     SlashCommand {
         name: "fork",
         description: "Branch a new conversation from the current point",
+    },
+    SlashCommand {
+        name: "git",
+        description: "Run a git command and share its output with the agent",
+    },
+    SlashCommand {
+        name: "lazygit",
+        description: "Open lazygit in an embedded pane",
     },
     SlashCommand {
         name: "model",
@@ -142,6 +154,44 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "Open the settings dialog",
     },
 ];
+
+impl SlashCommand {
+    /// Whether the command should appear in the menu and accept a typed
+    /// invocation. `/editor` needs `$EDITOR`; `/lazygit` needs `lazygit`
+    /// on `PATH` (GOALS §1i/§1j). Everything else is always available.
+    fn is_available(&self) -> bool {
+        match self.name {
+            "editor" => std::env::var_os("EDITOR").is_some(),
+            "lazygit" => program_on_path("lazygit"),
+            _ => true,
+        }
+    }
+}
+
+/// True when `prog` is found as a file on any `PATH` entry. On Windows
+/// also probes `prog.exe`. Used to gate `/lazygit`.
+fn program_on_path(prog: &str) -> bool {
+    let Some(paths) = std::env::var_os("PATH") else {
+        return false;
+    };
+    let names: Vec<String> = if cfg!(windows) {
+        vec![format!("{prog}.exe"), prog.to_string()]
+    } else {
+        vec![prog.to_string()]
+    };
+    std::env::split_paths(&paths).any(|dir| names.iter().any(|n| dir.join(n).is_file()))
+}
+
+/// Where an embedded pane (`/editor`, `/lazygit`) sits in the chat-body
+/// region (GOALS §1i). `Full` fills the body; the others split it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PaneSide {
+    Full,
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
 
 #[allow(private_interfaces)]
 pub struct App {
@@ -376,6 +426,36 @@ pub struct App {
     /// (TUI-design-philosophy §7). 3-second TTL; dismissed early by
     /// any user interaction (keystroke or mouse click/wheel).
     pub(super) toast: Option<Toast>,
+    /// Live embedded `$EDITOR` / `lazygit` pane (GOALS §1i/§1j). One at
+    /// a time; `None` when no pane is open. Auto-closes when the child
+    /// exits, serviced once per event-loop tick.
+    pub(super) pane: Option<crate::tui::pty::PtyPane>,
+    /// Where the open pane sits in the chat-body region.
+    pub(super) pane_side: PaneSide,
+    /// Pane's share of the body in a split (0.0–1.0), persisted for the
+    /// session. Ignored when `pane_side` is `Full`.
+    pub(super) pane_ratio: f32,
+    /// True when keyboard/mouse route to the pane; false when they go to
+    /// the composer. Toggled by `Ctrl+O` and by clicking a pane.
+    pub(super) pane_focused: bool,
+    /// Last-rendered pane content rect (absolute coords). Used for mouse
+    /// hit-testing, PTY resize, and parking the real cursor.
+    pub(super) pane_rect: Option<Rect>,
+    /// Last-rendered split-divider rect, and whether it's a vertical
+    /// rule (left/right split) vs. a horizontal one (top/bottom). Used
+    /// to start a divider drag-resize. `None` in fullscreen.
+    pub(super) divider: Option<(Rect, bool)>,
+    /// Last-rendered body rect the split was computed from. Lets the
+    /// mouse handler convert a divider drag into a new ratio without a
+    /// frame.
+    pub(super) pane_body: Option<Rect>,
+    /// True while a left-drag that began on the divider is resizing the
+    /// split.
+    pub(super) dragging_divider: bool,
+    /// Buffered `<git cmd="…">…</git>` blocks from `/git` (GOALS §1l),
+    /// attached to the next user message's wire text and cleared on
+    /// send (and on `/new`).
+    pub(super) pending_git_blocks: Vec<String>,
 }
 
 /// Toast intent — drives the message's foreground color.
@@ -544,6 +624,15 @@ impl App {
             rich_text_copy,
             context_menu: None,
             toast: None,
+            pane: None,
+            pane_side: PaneSide::Full,
+            pane_ratio: 0.5,
+            pane_focused: false,
+            pane_rect: None,
+            divider: None,
+            pane_body: None,
+            dragging_divider: false,
+            pending_git_blocks: Vec::new(),
         };
         // First-run convenience: if the daemon prompt doesn't gate
         // startup, open the Add-Provider wizard immediately when no
@@ -716,6 +805,9 @@ impl App {
             self.sync_mouse_capture_from_dialog();
             self.tick_toast();
             self.dialog.tick();
+            // Auto-close the embedded pane when its child has exited
+            // (GOALS §1i — e.g. `:q`).
+            self.service_pane();
             // In alt-screen mode the viewport is always the full
             // terminal; no need to grow it or spill history into
             // scrollback (alt screen doesn't have scrollback). The
@@ -878,6 +970,9 @@ impl App {
         // prompt_history is shell-style across sessions — keep it.
         self.prompt_history_cursor = 0;
         self.staged_draft = None;
+        // Drop any buffered `/git` blocks — they belong to the old
+        // session's next-message that will never be sent now.
+        self.pending_git_blocks.clear();
         // Reload from disk in case settings changed.
         self.reload_launch_info();
         self.reload_tui_config();
@@ -977,6 +1072,135 @@ impl App {
         }
         let _ = std::fs::remove_file(&path);
         Ok(())
+    }
+
+    /// Open `$EDITOR` in an embedded pane (GOALS §1i). No-op if a pane
+    /// is already open (one at a time). `side` is `Full` for the bare
+    /// `/editor`, or a split side.
+    pub(super) fn open_editor(&mut self, side: PaneSide) {
+        if self.pane.is_some() {
+            return;
+        }
+        let Some(editor) = std::env::var_os("EDITOR") else {
+            self.history.push(HistoryEntry::Plain {
+                line: "/editor: no `$EDITOR` set".to_string(),
+            });
+            return;
+        };
+        let argv = crate::tui::pty::shell_split(&editor.to_string_lossy());
+        if argv.is_empty() {
+            self.history.push(HistoryEntry::Plain {
+                line: "/editor: `$EDITOR` is empty".to_string(),
+            });
+            return;
+        }
+        self.spawn_pane(crate::tui::pty::PaneKind::Editor, &argv, side);
+    }
+
+    /// Open `lazygit` fullscreen in an embedded pane (GOALS §1j).
+    pub(super) fn open_lazygit(&mut self) {
+        if self.pane.is_some() {
+            return;
+        }
+        if !program_on_path("lazygit") {
+            self.history.push(HistoryEntry::Plain {
+                line: "/lazygit: `lazygit` not found on `PATH`".to_string(),
+            });
+            return;
+        }
+        self.spawn_pane(
+            crate::tui::pty::PaneKind::Lazygit,
+            &["lazygit".to_string()],
+            PaneSide::Full,
+        );
+    }
+
+    /// Spawn a pane. Initial PTY size is a placeholder corrected by the
+    /// first render's resize. Focus moves to the new pane.
+    fn spawn_pane(&mut self, kind: crate::tui::pty::PaneKind, argv: &[String], side: PaneSide) {
+        match crate::tui::pty::PtyPane::spawn(kind, argv, &self.launch.cwd, 24, 80) {
+            Ok(pane) => {
+                self.pane = Some(pane);
+                self.pane_side = side;
+                self.pane_focused = true;
+                self.dragging_divider = false;
+            }
+            Err(e) => {
+                self.history.push(HistoryEntry::Plain {
+                    line: format!("/{}: {e}", kind.label()),
+                });
+            }
+        }
+    }
+
+    /// Close the open pane and return focus to the composer. `force`
+    /// terminates a still-running child (Ctrl+X); otherwise the child
+    /// has already exited and we just reap it (auto-close).
+    pub(super) fn close_pane(&mut self, force: bool) {
+        if let Some(mut pane) = self.pane.take() {
+            if force {
+                pane.terminate();
+            } else {
+                pane.reap();
+            }
+        }
+        self.pane_focused = false;
+        self.dragging_divider = false;
+        self.pane_rect = None;
+        self.divider = None;
+    }
+
+    /// Service the open pane once per event-loop tick: auto-close when
+    /// the child has exited (GOALS §1i).
+    pub(super) fn service_pane(&mut self) {
+        let exited = self.pane.as_mut().is_some_and(|p| p.has_exited());
+        if exited {
+            self.close_pane(false);
+        }
+    }
+
+    /// `!` shell mode (GOALS §1k): run a one-shot command via the shell,
+    /// capture stdout+stderr, and render it locally. Never sent to the
+    /// agent.
+    pub(super) fn run_shell_command(&mut self, cmd: &str) {
+        let cmd = cmd.trim();
+        if cmd.is_empty() {
+            return;
+        }
+        let (raw, failed) = exec_capture_shell(cmd, &self.launch.cwd);
+        let clean = strip_ansi(&raw);
+        self.history.push(HistoryEntry::LocalCommand {
+            label: format!("! {cmd}"),
+            output: cap_display_lines(&clean),
+            failed,
+        });
+        self.chat_scroll_offset = 0;
+    }
+
+    /// `/git` (GOALS §1l): run `git <args>` locally, render it now, and
+    /// buffer a `<git>` block (~2k-token cap) for the next user message.
+    pub(super) fn run_git_command(&mut self, args: &str) {
+        let args = args.trim();
+        if args.is_empty() {
+            self.history.push(HistoryEntry::Plain {
+                line: "/git: usage `/git <args>` (e.g. `/git status`)".to_string(),
+            });
+            return;
+        }
+        let (raw, failed) = exec_capture_git(args, &self.launch.cwd);
+        let clean = strip_ansi(&raw);
+        self.history.push(HistoryEntry::LocalCommand {
+            label: format!("/git {args}"),
+            output: cap_display_lines(&clean),
+            failed,
+        });
+        self.chat_scroll_offset = 0;
+        let capped = cap_tokens(&clean, GIT_AGENT_TOKEN_CAP);
+        self.pending_git_blocks.push(format!(
+            "<git cmd=\"{}\">\n{}\n</git>",
+            xml_escape(args),
+            capped
+        ));
     }
 
     pub(super) fn ensure_agent_runner(&mut self) {
@@ -1580,6 +1804,13 @@ impl App {
         {
             self.toast = None;
         }
+        // Embedded pane (GOALS §1i/§1e): divider drag-resize, click-to-
+        // focus, and PTY mouse forwarding. Consumes the event when it
+        // lands on the divider or inside the pane so the chat handlers
+        // below don't also see it.
+        if self.pane.is_some() && self.handle_pane_mouse(&mouse) {
+            return;
+        }
         // Context menu is modal too — clicks either hit an item or
         // dismiss. Wheel events while it's open are eaten so we don't
         // accidentally scroll chat underneath.
@@ -1744,6 +1975,72 @@ impl App {
             focus: (mouse.column, mouse.row),
             active: true,
         });
+    }
+
+    /// Route a mouse event to the embedded pane (GOALS §1i). Returns
+    /// `true` when consumed: a divider drag-resize, a click that focuses
+    /// the pane, or an event forwarded to the child's PTY. Returns
+    /// `false` when the event missed the pane and divider, so the chat /
+    /// composer handlers below get their normal turn (split mode).
+    fn handle_pane_mouse(&mut self, mouse: &MouseEvent) -> bool {
+        // Continue / end an in-progress divider drag wherever the mouse
+        // goes (so dragging past the divider still tracks).
+        if self.dragging_divider {
+            match mouse.kind {
+                MouseEventKind::Drag(MouseButton::Left) => {
+                    self.resize_split_to(mouse.column, mouse.row);
+                    return true;
+                }
+                MouseEventKind::Up(MouseButton::Left) => {
+                    self.dragging_divider = false;
+                    return true;
+                }
+                _ => return true,
+            }
+        }
+        // Start a divider drag when a left-down lands on the divider.
+        if let MouseEventKind::Down(MouseButton::Left) = mouse.kind
+            && let Some((drect, _)) = self.divider
+            && point_in(drect, mouse.column, mouse.row)
+        {
+            self.dragging_divider = true;
+            return true;
+        }
+        // Inside the pane content rect: a click focuses it; mouse events
+        // forward to the child when focused and it requested tracking.
+        if let Some(prect) = self.pane_rect
+            && point_in(prect, mouse.column, mouse.row)
+        {
+            if matches!(mouse.kind, MouseEventKind::Down(_)) {
+                self.pane_focused = true;
+            }
+            if self.pane_focused
+                && let Some(pane) = self.pane.as_mut()
+            {
+                pane.forward_mouse(mouse, prect);
+            }
+            return true;
+        }
+        false
+    }
+
+    /// Recompute the split ratio from a divider drag to `(col, row)`.
+    fn resize_split_to(&mut self, col: u16, row: u16) {
+        let Some(body) = self.pane_body else {
+            return;
+        };
+        let ratio = match self.pane_side {
+            PaneSide::Left => col.saturating_sub(body.x) as f32 / (body.width.max(1) as f32),
+            PaneSide::Right => {
+                (body.x + body.width).saturating_sub(col) as f32 / (body.width.max(1) as f32)
+            }
+            PaneSide::Top => row.saturating_sub(body.y) as f32 / (body.height.max(1) as f32),
+            PaneSide::Bottom => {
+                (body.y + body.height).saturating_sub(row) as f32 / (body.height.max(1) as f32)
+            }
+            PaneSide::Full => return,
+        };
+        self.pane_ratio = ratio.clamp(0.15, 0.85);
     }
 
     /// Clamp `(col, row)` into the current chat area. Used while
@@ -1936,6 +2233,9 @@ impl App {
     }
 
     pub(super) fn execute_slash(&mut self, cmd: SlashCommand) -> bool {
+        // Capture the full composer line before clearing so arg-bearing
+        // commands (`/git`, `/editor`) can read their arguments.
+        let raw = self.composer.text().to_string();
         self.composer.clear();
         // Tally the pick for frequency-ranked autocomplete (global).
         self.record_usage(
@@ -1945,6 +2245,18 @@ impl App {
         );
         let msg = match cmd.name {
             "exit" => return true,
+            "editor" => {
+                self.open_editor(parse_pane_side(&slash_args(&raw)));
+                return false;
+            }
+            "lazygit" => {
+                self.open_lazygit();
+                return false;
+            }
+            "git" => {
+                self.run_git_command(&slash_args(&raw));
+                return false;
+            }
             "settings" => {
                 self.dialog = Dialog::open(&self.launch.cwd);
                 return false;
@@ -2296,9 +2608,181 @@ fn new_pending(name: String) -> PendingMsg {
     }
 }
 
+/// Max output lines shown in chat for `!` / `/git` before truncation
+/// with a "re-run in a real terminal" note (GOALS §1k).
+const LOCAL_CMD_DISPLAY_LINES: usize = 100;
+/// Token cap for the agent-bound `<git>` block (GOALS §1l, §10).
+const GIT_AGENT_TOKEN_CAP: usize = 2000;
+
+/// True when `(col, row)` falls inside `rect` (absolute coords).
+fn point_in(rect: Rect, col: u16, row: u16) -> bool {
+    col >= rect.x && col < rect.x + rect.width && row >= rect.y && row < rect.y + rect.height
+}
+
+/// Map a `/editor` argument to a pane side. Empty / unknown → fullscreen.
+pub(super) fn parse_pane_side(arg: &str) -> PaneSide {
+    match arg.trim().to_ascii_lowercase().as_str() {
+        "left" => PaneSide::Left,
+        "right" => PaneSide::Right,
+        "top" | "up" => PaneSide::Top,
+        "bottom" | "down" => PaneSide::Bottom,
+        _ => PaneSide::Full,
+    }
+}
+
+/// Extract the argument string from a full slash line. The command
+/// token (whatever was typed before the first space) is dropped; the
+/// remainder is the args. `/git status` → `status`; `/git` → ``.
+fn slash_args(raw: &str) -> String {
+    let rest = raw.strip_prefix('/').unwrap_or(raw);
+    match rest.find(char::is_whitespace) {
+        Some(idx) => rest[idx..].trim().to_string(),
+        None => String::new(),
+    }
+}
+
+/// Run a one-shot shell command, capturing stdout+stderr. Returns
+/// `(combined_output, failed)`. Cross-platform: `cmd /C` on Windows,
+/// `$SHELL -c` (fallback `/bin/sh`) elsewhere.
+fn exec_capture_shell(cmd: &str, cwd: &Path) -> (String, bool) {
+    let mut command;
+    #[cfg(windows)]
+    {
+        command = std::process::Command::new("cmd");
+        command.arg("/C").arg(cmd);
+    }
+    #[cfg(not(windows))]
+    {
+        let shell =
+            std::env::var_os("SHELL").unwrap_or_else(|| std::ffi::OsString::from("/bin/sh"));
+        command = std::process::Command::new(shell);
+        command.arg("-c").arg(cmd);
+    }
+    command.current_dir(cwd);
+    run_capture(command)
+}
+
+/// Run `git --no-pager <args>` with the pager disabled and prompts off,
+/// capturing stdout+stderr. Returns `(combined_output, failed)`.
+fn exec_capture_git(args: &str, cwd: &Path) -> (String, bool) {
+    let mut command = std::process::Command::new("git");
+    command.arg("--no-pager");
+    for a in crate::tui::pty::shell_split(args) {
+        command.arg(a);
+    }
+    command.current_dir(cwd);
+    command.env("GIT_PAGER", "cat");
+    command.env("GIT_TERMINAL_PROMPT", "0");
+    run_capture(command)
+}
+
+fn run_capture(mut command: std::process::Command) -> (String, bool) {
+    match command.output() {
+        Ok(out) => {
+            let mut s = String::from_utf8_lossy(&out.stdout).into_owned();
+            if !out.stderr.is_empty() {
+                if !s.is_empty() && !s.ends_with('\n') {
+                    s.push('\n');
+                }
+                s.push_str(&String::from_utf8_lossy(&out.stderr));
+            }
+            (s, !out.status.success())
+        }
+        Err(e) => (format!("failed to run command: {e}"), true),
+    }
+}
+
+/// Strip ANSI escape sequences (CSI + OSC) and bare carriage returns
+/// from captured command output (GOALS §1k/§1l: "strip ANSI").
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\x1b' => match chars.peek() {
+                Some('[') => {
+                    chars.next();
+                    // CSI: consume params until a final byte (0x40–0x7e).
+                    for f in chars.by_ref() {
+                        if ('\x40'..='\x7e').contains(&f) {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    chars.next();
+                    // OSC: consume until BEL or ST (ESC \).
+                    while let Some(f) = chars.next() {
+                        if f == '\x07' {
+                            break;
+                        }
+                        if f == '\x1b' {
+                            if chars.peek() == Some(&'\\') {
+                                chars.next();
+                            }
+                            break;
+                        }
+                    }
+                }
+                Some(_) => {
+                    chars.next();
+                }
+                None => {}
+            },
+            '\r' => {} // drop bare CRs (CRLF → LF)
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Truncate display output to [`LOCAL_CMD_DISPLAY_LINES`] with a note.
+fn cap_display_lines(s: &str) -> String {
+    let lines: Vec<&str> = s.lines().collect();
+    if lines.len() <= LOCAL_CMD_DISPLAY_LINES {
+        return s.trim_end_matches('\n').to_string();
+    }
+    let mut out = lines[..LOCAL_CMD_DISPLAY_LINES].join("\n");
+    out.push_str(&format!(
+        "\n… [{} more lines — re-run in a real terminal for full output]",
+        lines.len() - LOCAL_CMD_DISPLAY_LINES
+    ));
+    out
+}
+
+/// Cap text to roughly `max_tokens` (cl100k estimate) with a marker.
+fn cap_tokens(s: &str, max_tokens: usize) -> String {
+    if crate::tokens::count(s) <= max_tokens {
+        return s.to_string();
+    }
+    let mut budget = max_tokens.saturating_mul(4).max(64);
+    loop {
+        let truncated: String = s.chars().take(budget).collect();
+        if budget < 64 || crate::tokens::count(&truncated) <= max_tokens {
+            return format!("{truncated}\n… [truncated to ~{max_tokens} tokens]");
+        }
+        budget = budget * 3 / 4;
+    }
+}
+
+/// Escape a string for an XML attribute value (the `/git cmd="…"`).
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
 fn entry_to_plain_lines(entry: &HistoryEntry) -> Vec<String> {
     match entry {
         HistoryEntry::Plain { line } => vec![line.clone()],
+        HistoryEntry::LocalCommand { label, output, .. } => {
+            let mut out = vec![label.clone()];
+            for line in output.lines() {
+                out.push(format!("  {line}"));
+            }
+            out
+        }
         HistoryEntry::ToolLine { tool, summary, .. } => {
             let (_, label) = crate::tui::history::tool_glyph_label(tool, false);
             vec![format!("  {label}: {summary}")]
@@ -2384,7 +2868,7 @@ pub(super) fn slash_matches(
     let mut matched: Vec<(usize, &'static SlashCommand)> = SLASH_COMMANDS
         .iter()
         .enumerate()
-        .filter(|(_, c)| c.name.starts_with(query))
+        .filter(|(_, c)| c.name.starts_with(query) && c.is_available())
         .collect();
     // Frequency tie-breaker: 30-day count desc, then the static
     // declaration order (the stable fallback) asc.
@@ -2499,7 +2983,14 @@ mod slash_rank_tests {
     fn equal_counts_fall_back_to_declaration_order() {
         let ranked = slash_matches("", &HashMap::new());
         let names: Vec<&str> = ranked.iter().map(|c| c.name).collect();
-        let declared: Vec<&str> = SLASH_COMMANDS.iter().map(|c| c.name).collect();
+        // `slash_matches` hides unavailable commands (`/editor` without
+        // `$EDITOR`, `/lazygit` off `PATH`), so compare against the
+        // available subset — otherwise this is env-dependent on CI.
+        let declared: Vec<&str> = SLASH_COMMANDS
+            .iter()
+            .filter(|c| c.is_available())
+            .map(|c| c.name)
+            .collect();
         assert_eq!(names, declared);
     }
 }
@@ -2529,5 +3020,71 @@ mod working_msg_tests {
             let idx = pick_working_msg(WORKING_MESSAGES.len());
             assert!(idx < WORKING_MESSAGES.len());
         }
+    }
+}
+
+#[cfg(test)]
+mod local_cmd_tests {
+    use super::{
+        GIT_AGENT_TOKEN_CAP, PaneSide, cap_tokens, parse_pane_side, slash_args, strip_ansi,
+        xml_escape,
+    };
+
+    #[test]
+    fn strip_ansi_removes_csi_and_cr() {
+        assert_eq!(strip_ansi("\x1b[31mred\x1b[0m\r\nplain"), "red\nplain");
+    }
+
+    #[test]
+    fn strip_ansi_removes_osc() {
+        assert_eq!(strip_ansi("\x1b]0;window title\x07body"), "body");
+    }
+
+    #[test]
+    fn slash_args_splits_off_command_token() {
+        assert_eq!(slash_args("/git status -s"), "status -s");
+        assert_eq!(slash_args("/git"), "");
+        assert_eq!(slash_args("/editor right"), "right");
+        // A bare prefix (popup-accepted before any space) has no args.
+        assert_eq!(slash_args("/g"), "");
+    }
+
+    #[test]
+    fn parse_pane_side_aliases() {
+        assert_eq!(parse_pane_side("up"), PaneSide::Top);
+        assert_eq!(parse_pane_side("down"), PaneSide::Bottom);
+        assert_eq!(parse_pane_side("LEFT"), PaneSide::Left);
+        assert_eq!(parse_pane_side(""), PaneSide::Full);
+        assert_eq!(parse_pane_side("garbage"), PaneSide::Full);
+    }
+
+    #[test]
+    fn xml_escape_attr() {
+        assert_eq!(xml_escape("a\"b<c>&d"), "a&quot;b&lt;c&gt;&amp;d");
+    }
+
+    #[test]
+    fn cap_tokens_keeps_small_input() {
+        let small = "short git output";
+        assert_eq!(cap_tokens(small, GIT_AGENT_TOKEN_CAP), small);
+    }
+
+    #[test]
+    fn cap_tokens_truncates_large_input() {
+        let big = "word ".repeat(5000);
+        let capped = cap_tokens(&big, 100);
+        assert!(capped.contains("truncated"));
+        assert!(crate::tokens::count(&capped) <= 200);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exec_capture_shell_captures_stdout_and_status() {
+        use super::exec_capture_shell;
+        let (out, failed) = exec_capture_shell("printf hello", std::path::Path::new("."));
+        assert!(!failed);
+        assert!(out.contains("hello"));
+        let (_o, failed) = exec_capture_shell("exit 3", std::path::Path::new("."));
+        assert!(failed);
     }
 }

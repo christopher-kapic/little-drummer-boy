@@ -12,6 +12,28 @@ use crate::tui::settings::Dialog;
 
 impl App {
     pub(super) fn handle_key(&mut self, key: KeyEvent) -> bool {
+        // Embedded pane (GOALS §1i): while a pane is open, `Ctrl+X`
+        // force-closes it and `Ctrl+O` toggles focus — both reserved by
+        // cockpit and not delivered to the child. When the pane is
+        // focused, every other key (incl. Ctrl+C) is forwarded to the
+        // child PTY rather than handled by the TUI.
+        if self.pane.is_some() {
+            if is_pane_force_close(&key) {
+                self.close_pane(true);
+                return false;
+            }
+            if is_pane_focus_toggle(&key) {
+                self.pane_focused = !self.pane_focused;
+                return false;
+            }
+            if self.pane_focused {
+                if let Some(pane) = self.pane.as_mut() {
+                    pane.forward_key(&key);
+                }
+                return false;
+            }
+        }
+
         // Ctrl+C / Ctrl+D quit. Explicitly exclude Shift so that
         // Ctrl+Shift+C (copy-selection, plan.md T8.f) doesn't trigger
         // an exit on terminals that report the shift state in
@@ -800,6 +822,20 @@ impl App {
     }
 
     pub(super) fn complete_or_submit(&mut self) -> bool {
+        // Shell mode: a leading `!` runs the rest as a one-shot local
+        // command (GOALS §1k). Never reaches the agent or the wire.
+        if self.composer.text().starts_with('!') {
+            let cmd = self.composer.text()[1..].to_string();
+            self.composer.clear();
+            self.run_shell_command(&cmd);
+            self.at_dismissed = false;
+            self.at_selected = 0;
+            self.at_scroll = 0;
+            if self.composer.vim_enabled() {
+                self.composer.set_vim_mode(VimMode::Insert);
+            }
+            return false;
+        }
         if let Some(query) = self.slash_query() {
             if let Some(cmd) = slash_matches(query, &self.usage_slash).first() {
                 return self.execute_slash(**cmd);
@@ -826,7 +862,20 @@ impl App {
         // the scanner reads them as one token (the composer stays clean).
         let quoted = crate::tui::file_tag::quote_tracked_tags(&submitted, &self.accepted_tags);
         let expanded = crate::tui::file_tag::expand_tags(&quoted, &self.launch.cwd);
-        let wire = expanded.wire;
+        // Attach any buffered `/git` blocks to this message's wire text
+        // (GOALS §1l). The displayed user message keeps the original
+        // text (wire/user split); only the agent-bound wire carries the
+        // block, so it flows through `redact::scrub` like any wire text.
+        let wire = if self.pending_git_blocks.is_empty() {
+            expanded.wire
+        } else {
+            let blocks = std::mem::take(&mut self.pending_git_blocks).join("\n\n");
+            if expanded.wire.is_empty() {
+                blocks
+            } else {
+                format!("{}\n\n{}", expanded.wire, blocks)
+            }
+        };
         // Per-tag entries are surfaced as harness-automatic tool calls in
         // the chat (GOALS §1e); the agent didn't invoke them, the
         // composer did. Cleared the accepted-tags tracker now that the
@@ -931,6 +980,21 @@ fn is_modifier_only(key: &KeyEvent) -> bool {
         key.code,
         KeyCode::Modifier(_) | KeyCode::CapsLock | KeyCode::NumLock | KeyCode::ScrollLock
     )
+}
+
+/// `Ctrl+X` — force-close the embedded pane (GOALS §1i). Excludes Shift
+/// so it's unambiguous under the kitty keyboard protocol.
+fn is_pane_force_close(key: &KeyEvent) -> bool {
+    key.modifiers.contains(KeyModifiers::CONTROL)
+        && !key.modifiers.contains(KeyModifiers::SHIFT)
+        && matches!(key.code, KeyCode::Char('x') | KeyCode::Char('X'))
+}
+
+/// `Ctrl+O` — toggle focus between the embedded pane and the composer.
+fn is_pane_focus_toggle(key: &KeyEvent) -> bool {
+    key.modifiers.contains(KeyModifiers::CONTROL)
+        && !key.modifiers.contains(KeyModifiers::SHIFT)
+        && matches!(key.code, KeyCode::Char('o') | KeyCode::Char('O'))
 }
 
 fn is_ws_byte(b: u8) -> bool {

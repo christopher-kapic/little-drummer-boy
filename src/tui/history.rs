@@ -93,6 +93,19 @@ pub enum HistoryEntry {
         summary: String,
         state: ToolCallState,
     },
+    /// A locally-run command and its captured (display-capped) output,
+    /// shown in chat (GOALS §1k/§1l). `!` shell runs are local-only;
+    /// `/git` runs also buffer a `<git>` block onto the next user
+    /// message. Either way the displayed copy is **not** sent to the
+    /// agent and `estimate_context_tokens` ignores it.
+    LocalCommand {
+        /// Display label, e.g. `! ls -la` or `/git status`.
+        label: String,
+        /// Captured, ANSI-stripped, display-capped output.
+        output: String,
+        /// True when the command exited non-zero — tints the label red.
+        failed: bool,
+    },
 }
 
 /// Lifecycle state of one tool call. Drives the line color: yellow
@@ -319,6 +332,32 @@ pub fn render_entry(
                 lines: vec![Line::from(spans)],
                 chip_row: None,
                 continuations: vec![false],
+            }
+        }
+        HistoryEntry::LocalCommand {
+            label,
+            output,
+            failed,
+        } => {
+            let label_color = if *failed { Color::Red } else { Color::Cyan };
+            let mut lines: Vec<Line<'static>> = Vec::new();
+            lines.push(Line::from(vec![Span::styled(
+                label.clone(),
+                Style::default()
+                    .fg(label_color)
+                    .add_modifier(Modifier::BOLD),
+            )]));
+            for raw in output.lines() {
+                lines.push(Line::from(vec![
+                    Span::raw("  ".to_string()),
+                    Span::styled(raw.to_string(), Style::default().fg(TOOL_OUTPUT_FG)),
+                ]));
+            }
+            let continuations = vec![false; lines.len()];
+            Rendered {
+                lines,
+                chip_row: None,
+                continuations,
             }
         }
         HistoryEntry::Agent {

@@ -3341,6 +3341,120 @@ Risks:
 
 ---
 
+### T9. Embedded panes (`/editor`, `/lazygit`), `!` shell mode, `/git`
+
+Four client-side TUI features (GOALS §1i–§1l). The editor and lazygit
+panes run live child processes in PTYs rendered inside ratatui; `!`
+and `/git` are one-shot local command runners. Only `/git`'s buffered
+`<git>` block ever crosses to the daemon, and only as part of a normal
+user message — no new RPC.
+
+Cheap-model relevance (T7): none direct. These are operator-ergonomics
+features. The token-economy constraint (§10) is the load-bearing one
+here — `/git` injects content into context, so both `!` and `/git`
+cap their output (UI display cap + ~2k-token agent cap) and `!` never
+touches context at all.
+
+New dependencies (pure Rust, no node/bun/deno per CLAUDE.md):
+[`portable-pty`](https://docs.rs/portable-pty) 0.9 (wezterm's PTY
+layer) for spawning/resizing the child, [`vt100`](https://docs.rs/vt100)
+0.16 for the terminal-screen state machine, and
+[`tui-term`](https://docs.rs/tui-term) 0.3 (vt100 feature) for the
+ratatui `PseudoTerminal` widget. `tui-term` 0.3 requires
+`ratatui ^0.30`, matching our pin.
+
+**T9.a — `src/tui/pty.rs` embedded-PTY pane.** `PtyPane` owns the
+`portable_pty` master/child, a background reader thread that feeds an
+`Arc<Mutex<vt100::Parser>>`, and a writer for input forwarding.
+`resize(rows, cols)` calls `master.resize` (which raises SIGWINCH) and
+`parser.set_size`. `has_exited()` checks the reader-EOF flag and
+`child.try_wait()`; `reap()` waits the child. Rendered via
+`tui_term::widget::PseudoTerminal::new(screen)`. A `key_to_bytes`
+encoder (crossterm `KeyEvent` → terminal bytes, DECCKM-aware for
+arrows) and an SGR `mouse_to_bytes` encoder (gated on the child's
+`screen.mouse_protocol_mode()`) forward input. `shell_split` splits
+`$EDITOR` like a shell word-split.
+
+**T9.b — `/editor` slash command.** Hidden from the menu unless
+`$EDITOR` is set (`SlashCommand::is_available()`). Args parse to a
+`PaneSide` (`Full` default; `left`/`right`/`top`(`up`)/`bottom`(`down`)).
+Opens a `PtyPane` with the TUI cwd and no file arg; no-op if a pane is
+already open. Initial PTY size is a placeholder corrected by the first
+render's resize.
+
+**T9.c — `/lazygit` slash command.** Hidden unless `lazygit` is on
+`PATH`. Fullscreen only. Same pane machinery.
+
+**T9.d — Layout, focus, render.** The pane is carved out of
+`PaneRects.body` only (history region) — fullscreen fills it, splits
+divide it with a 1-cell divider; the composer and status chrome stay
+put. `Ctrl+O` toggles focus pane↔composer; `Ctrl+X` force-closes
+(both reserved while a pane is open, intercepted before key
+forwarding). Auto-close on child exit is serviced once per event-loop
+tick. The real terminal cursor is parked at the child's vt100 cursor
+while the pane is focused, in the composer otherwise. Divider color
+signals focus.
+
+**T9.e — Mouse: divider drag + PTY forwarding.** A left-drag that
+*begins on the split divider* is intercepted by the TUI to resize the
+panes (ratio clamped to sensible minimums, persisted for the session).
+A click inside the pane focuses it; mouse events over a focused pane
+are SGR-forwarded to the child when it requested mouse tracking.
+Everything else (chat scroll/select, composer click-to-position,
+context menu) is unchanged and still applies to the chat side in split
+mode.
+
+**T9.f — `!` shell mode.** `complete_or_submit` intercepts a leading
+`!`: strip it, run via `$SHELL -c` (fallback `/bin/sh`; Windows
+`cmd /C`) with the TUI cwd, capture stdout+stderr, ANSI-strip,
+display-cap, push a `HistoryEntry::LocalCommand`. The new variant
+returns 0 from `estimate_context_tokens` and is never serialized to
+the wire. `render_input` swaps the top border for a "shell mode"
+label + tint while the buffer starts with `!`.
+
+**T9.g — `/git` shared output.** `run_git_command` runs
+`git --no-pager <args>` (`GIT_PAGER=cat`, `GIT_TERMINAL_PROMPT=0`)
+with the TUI cwd, ANSI-strips, renders a `LocalCommand` entry now, and
+buffers a `<git cmd="…">…</git>` block (capped ~2k tokens) in
+`App.pending_git_blocks`. `submit_input` appends accumulated blocks to
+the next message's `wire` (after `expand_tags`, before
+`input_tx.try_send`) and clears the buffer — so the block rides a
+normal user message through `redact::scrub` like any wire text. The
+displayed user message keeps the wire/user split (block not shown in
+the bubble). `estimate_context_tokens` adds the buffered blocks'
+tokens so their cost is visible pre-send; the displayed `LocalCommand`
+itself returns 0 to avoid double-counting. `/new` clears the buffer.
+
+Tracking:
+
+- M1: T9.a–T9.g land together (one coherent UI feature; splitting the
+  PTY plumbing from the slash wiring would leave dead code).
+
+Risks:
+
+- **`tui-term` / ratatui version coupling.** `tui-term` tracks
+  ratatui's minor releases exactly; a ratatui bump must be matched by
+  a `tui-term` bump. Called out so the next ratatui upgrade checks it.
+- **Key/mouse forwarding fidelity.** The hand-rolled `key_to_bytes`
+  covers the common vim/lazygit surface (printable, control codes,
+  arrows w/ DECCKM, nav keys, function keys, modified arrows); exotic
+  sequences may not round-trip. Acceptable for v1; widen on report.
+- **Child shadowing of `Ctrl+O`/`Ctrl+X`.** vim binds nearly every
+  Ctrl-letter in insert mode, so any reserved bind shadows something
+  in the child. The brief's actual constraint is no collision with
+  *cockpit's* composer/handlers, which these satisfy; the child
+  shadow is inherent to embedding and documented.
+- **Blocking one-shot commands.** `!` and `/git` run synchronously on
+  the event-loop thread. A long-running `!cmd` blocks the UI until it
+  returns — by design these are one-shot captures, not interactive;
+  the UI/agent output caps and the "re-run in a real terminal" note
+  set the expectation.
+- **Token economy.** `/git` is the only path that adds to context;
+  the agent copy is hard-capped at ~2k tokens. `!` is local-only and
+  excluded from the estimate entirely.
+
+---
+
 ## What this plan deliberately leaves out
 
 - **LSP integration** — v2. See [`features/pi.md` §13](./features/pi.md)
