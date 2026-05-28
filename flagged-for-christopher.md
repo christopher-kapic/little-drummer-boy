@@ -22,9 +22,19 @@ Items deferred from the multi-feature implementation pass (2026-05-26).
 - **Config knobs** — `composer.tagging.allow_gitignored_files`,
   `composer.tagging.list_hidden_in_directories`. Schema not added yet.
 
-- **Paths with spaces.** Tag parsing stops on whitespace (the `@` syntax
-  is whitespace-terminated per spec). A `@path with spaces/file.rs` tag
-  isn't expressible. Probably needs a quoted form (`@"path with spaces"`).
+- ~~**Paths with spaces.**~~ **DONE (2026-05-28).** Quoted form
+  `@"path with spaces"` is supported; autocompleted spaced paths are
+  quoted automatically on submit (composer stays unquoted), and the
+  popup keeps narrowing inside an open quote.
+
+Shipped in the same pass (2026-05-28): breadth-first deepening
+suggestions, all-matches scroll window (shared with `/model`), Tab-vs-
+Enter (Enter finalizes, Tab descends into dirs), line-numbered file
+inlining via the shared `read_slice` formatter, over-cap files left as a
+reference instead of a truncated inline, whole-`@`-tag delete on
+Backspace/forward-Delete, and `@`-tag expansions rendered as automatic
+tool-call entries in the chat. The **gitignore-enforcement-on-submit**
+item above remains the main open `@`-tagging gap.
 
 ## Redaction edge case (GOALS §7)
 

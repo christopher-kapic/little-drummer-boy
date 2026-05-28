@@ -232,33 +232,45 @@ Syntax:
 
 Behavior:
 
-- **The `read` tool is what does the inlining.** The composer
-  calls `read(path, offset?, limit?)` (per the relational-
-  default rules in §12, where defaulting `limit` to 2000 lines
-  prepends a one-line note) and pastes the result into the user
-  message between fenced markers (`<file path="...">...</file>`)
-  so the model can disambiguate user prose from inlined content.
-  Same chokepoint as the model-invoked `read` — same truncation
-  marker, same redaction, same byte cap.
-- **Directory listings have their own cap.** Default 100
-  entries, sorted (directories first, then alphabetical). If
-  the directory has more, the footer is `... N more entries;
-  @-tag a subdirectory or ask explore for a search`. **All
-  files are listed by default**, including hidden
-  (`.`-prefixed) files and files matching `.gitignore`
-  patterns — knowing a file exists is much lower-risk than
-  sharing its contents, and the user usually wants to see
-  the whole directory when they tag it. Users who want
-  quieter listings can set
-  `composer.tagging.list_hidden_in_directories = false` to
-  drop dot-prefixed entries from `@dir/` output.
-- **Long files are partial-read by default.** If the inlined
-  content would exceed the `read` tool's standard byte cap
-  (~8 KB), the trailing portion is truncated with the same
-  marker the model sees: `... [truncated, ask read with
-  offset/limit to see more]`. The model can then re-`read` the
-  rest itself. The user can also pass an explicit range to
-  override the default cap.
+- **The inliner reuses the `read` tool's formatter, but is an
+  *automatic* tool the model cannot invoke.** `@`-tag expansion
+  is a composer-side helper, not a model-facing tool: the model
+  never calls it, and (per the Anthropic API, which forbids
+  `tool_use` blocks inside a user turn) the fetched content rides
+  *inline* in the user message between fenced markers
+  (`<file path="...">...</file>`) rather than as a real tool turn.
+  Files route through the shared `read_slice` formatter, so the
+  inlined content is **line-numbered** with the same 2000-line /
+  ~8 KB caps, the same truncation marker, and the same redaction
+  as the model-invoked `read`. (If the model wants a directory
+  listing *its* way, it runs `bash ls` or `glob` — those are the
+  model-facing tools; the `@`-tag inliner is not.)
+- **Each expansion shows in the chat as a harness-automatic
+  tool-call entry.** When a tagged message is sent, every `@`-tag
+  renders a one-line tool-call entry in the transcript
+  (`→ read(path) ✓ 142 lines`, `→ list(src/) ✓ 23 entries`,
+  `→ read(big.rs) ✗ 9001 lines — referenced, not inlined`) in the
+  same idiom the agent's own tools use — so the user sees exactly
+  what the composer fetched and what it cost. The agent didn't
+  invoke them; the composer did.
+- **Directory listings are produced internally (no shell-out),**
+  cap 100 entries, sorted (directories first, then alphabetical).
+  Beyond the cap the footer is `... N more entries; @-tag a
+  subdirectory or ask explore for a search`. An internal
+  `std::fs::read_dir` listing is portable across Linux/macOS/
+  Windows and gives deterministic name + type + size output —
+  preferred over invoking `ls` (which would need a per-OS command
+  map and a working shell). All entries are listed, including
+  hidden (`.`-prefixed) ones.
+- **Over-cap files are referenced, not inlined.** A full-file tag
+  whose content exceeds the `read` cap (2000 lines or ~8 KB) is
+  **not** inlined — the `@path` survives verbatim with a one-line
+  note (`[note: @big.rs is N lines — not inlined; ask read with
+  offset/limit]`) so the model knows it exists and can pull what
+  it needs on demand. Auto-dumping a multi-thousand-line file the
+  user may not need is exactly the context bloat the token economy
+  (§10) avoids. A tag with an explicit range (`@file:10-80`,
+  `@"my file.rs":10-80`) is always inlined — the slice is bounded.
 - **Redaction runs over inlined content.** A `.env` file
   tagged with `@.env` is scanned for secret-shaped values
   before the request is built (§7). Same chokepoint, no
@@ -268,6 +280,37 @@ Behavior:
   indicator (§1c) gains an "attached: N files, ≈M tokens"
   affordance so the user sees how much they're spending on
   this turn before they hit Enter.
+- **Suggestion popup: deepening search + scroll window.** Typing
+  `@` opens a popup of cwd entries (gitignore- and hidden-aware).
+  As the query narrows, if fewer than 6 matches remain at the
+  current depth the search widens **breadth-first one directory at
+  a time** (matching basename prefixes) until it reaches 6 or
+  exhausts the subtree — so the popup stays useful in sparse
+  directories. All matches are kept (not just the visible 6); the
+  popup shows a 6-row window and scrolls with a one-row margin so
+  the next / previous candidate is always visible except at the
+  true ends of the list. The `/model` picker uses the identical
+  scroll window.
+- **Tab vs Enter.** `Enter` commits the highlighted candidate
+  (file or directory), appends a trailing space, and closes the
+  popup. `Tab` does the same for a file, but on a **directory**
+  descends into it (no trailing space; the popup stays open and
+  re-queries inside the directory) so the user can keep navigating.
+- **Spaces are quoted automatically; the composer stays clean.** A
+  path with spaces is shown unquoted in the composer; on submit
+  the runtime wraps autocompleted spaced paths in quotes
+  (`@"my file.rs"`) on a throwaway copy so the tokenizer reads them
+  as one tag — the visible buffer never shows the quotes. To
+  hand-type a spaced path the user types the quotes themselves
+  (`@"path with spaces"`); the popup keeps narrowing inside an open
+  quote, and a bare typed space otherwise ends the tag.
+- **Backspace over a completed tag deletes the whole tag.** Once a
+  tag is completed (autocompleted, or typed and terminated),
+  Backspace at its right edge removes the entire `@tag` atomically
+  rather than one character; a tag still being composed (popup
+  open) deletes character-by-character. The trailing space is two
+  keystrokes (space, then the tag). Forward-`Delete` from the
+  tag's left edge mirrors this.
 
 - **Gitignored files cannot be `@`-tagged by default.** If
   the cwd is inside a git repo, cockpit parses the active
@@ -284,6 +327,15 @@ Behavior:
   and surfaces the choice to the user. Outside a git repo,
   no `.gitignore` semantics apply — all readable files are
   tag-able.
+
+  > **Implementation status (2026-05-28):** the *suggestion
+  > popup* already excludes gitignored + hidden entries (the
+  > `ignore`-crate walk), so autocomplete never offers them.
+  > Blocking a *manually typed* gitignored path at the inline
+  > boundary is **not yet wired** (it needs the gitignore
+  > matcher + the `allow_gitignored_files` config threaded into
+  > expansion). Until then redaction (§7) is the backstop for a
+  > hand-typed `@.env`. Tracked in `flagged-for-christopher.md`.
 
 Failure modes:
 
@@ -1278,10 +1330,16 @@ that touches every subsystem.
 - **AGENTS.md walk-up is one file, not a chain.** We load the **first**
   matching guidance file (per `agent_guidance_files` in `config.json`) and
   stop. We do not concatenate AGENTS.md from every ancestor directory.
-- **Tool results are bounded.** `bash` output, `read` of large files,
-  `grep` with many matches all clip at a configurable limit (default
-  ~8 KB) with a `... [truncated, use offset/limit to see more]`
-  trailer that tells the model how to page through.
+- **Tool results are bounded.** Every tool result clips at a
+  configurable limit (default ~8 KB), always on a UTF-8 char
+  boundary. Paginated tools (`read`, and `@`-tag inlining which
+  shares its formatter) clip with a `... [truncated, ask read with
+  offset N to see more]` trailer that tells the model how to page
+  through. Non-paginated tools (`bash`, custom shell tools like
+  `webfetch`) clip **head + tail** with a `... [truncated N bytes]
+  ...` marker in the middle, so the failure signal — which usually
+  surfaces at the tail (stderr, a non-zero `exit:` line, a panic) —
+  is never lost to head-only truncation.
 - **Two complementary context-reduction commands.** `/prune` is
   deterministic, mechanical, and reviewable — it collapses superseded
   snapshot tool results (older `read`/`ls`/`grep`/`git status` calls

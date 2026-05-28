@@ -46,10 +46,20 @@ impl App {
     }
 
     pub(super) fn at_suggestions(&self) -> Vec<crate::tui::file_tag::Suggestion> {
-        match self.composer.at_query() {
-            Some(q) => crate::tui::file_tag::suggestions(&self.launch.cwd, q),
-            None => Vec::new(),
+        let Some(q) = self.composer.at_query() else {
+            self.at_cache.borrow_mut().take();
+            return Vec::new();
+        };
+        // Memo hit: same query as last walk → reuse (cheap clone of a
+        // bounded list; far cheaper than re-walking the tree).
+        if let Some((cached_q, cached)) = self.at_cache.borrow().as_ref() {
+            if cached_q == q {
+                return cached.clone();
+            }
         }
+        let walked = crate::tui::file_tag::suggestions(&self.launch.cwd, q);
+        *self.at_cache.borrow_mut() = Some((q.to_string(), walked.clone()));
+        walked
     }
 
     pub(super) fn popup_lines(&self) -> u16 {
@@ -661,11 +671,21 @@ impl App {
                 Span::styled("no matching file", Style::default().fg(Color::Red)),
             ])]
         } else {
+            let window = AUTOCOMPLETE_ROWS as usize;
             let selected = self.at_selected.min(suggestions.len().saturating_sub(1));
+            // Clamp the stored scroll offset defensively (the list can
+            // shrink between a keypress and this render).
+            let offset = crate::tui::app::windowed_scroll(
+                selected,
+                self.at_scroll,
+                suggestions.len(),
+                window,
+            );
             suggestions
                 .iter()
-                .take(AUTOCOMPLETE_ROWS as usize)
                 .enumerate()
+                .skip(offset)
+                .take(window)
                 .map(|(i, sug)| {
                     let is_sel = i == selected;
                     let marker = if is_sel { "▸ " } else { "  " };

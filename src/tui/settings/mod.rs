@@ -123,9 +123,8 @@ pub(super) enum Page {
 use providers::{AddState, AddStep, ProvidersPage};
 use tools_page::ToolsPage;
 pub use tools_page::{builtin_tool_names, default_template_for};
-pub(crate) use ui_page::UiPage;
 use ui_page::InstructionsPage;
-
+pub(crate) use ui_page::UiPage;
 
 /// Navigation intent returned by an inner page handler. The outer
 /// [`SettingsDialog::handle_providers_key`] applies it *after* swapping
@@ -573,7 +572,6 @@ impl SettingsDialog {
         false
     }
 
-
     // ── Rendering ────────────────────────────────────────────────────────
 
     fn render(&self, frame: &mut Frame, area: Rect) {
@@ -693,10 +691,7 @@ impl SettingsDialog {
             Page::Providers(ProvidersPage::CopilotSetup(_)) => "enter: apply  esc: cancel",
         }
     }
-
 }
-
-
 
 // ── Helpers / freestanding renderers ─────────────────────────────────────
 
@@ -727,7 +722,6 @@ struct NavNode {
 }
 
 const AGENTS_STUB: &str = "(stub) Agent editor — list agent definitions, edit their system prompts, tool grants, and model overrides.";
-
 
 pub(super) fn save_status(r: Result<(), String>) -> Option<String> {
     match r {
@@ -784,8 +778,6 @@ fn render_stub(frame: &mut Frame, area: Rect, title: &str, body: &str) {
     ];
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
 }
-
-
 
 enum ListAction {
     Stay,
@@ -918,8 +910,6 @@ fn pad_right(s: &str, target: usize) -> String {
         out
     }
 }
-
-
 
 // ── Public API for slash-command-triggered flows ─────────────────────────
 

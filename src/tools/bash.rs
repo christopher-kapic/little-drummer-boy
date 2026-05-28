@@ -23,7 +23,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use crate::engine::tool::{Tool, ToolCtx, ToolOutput};
-use crate::tools::common::OUTPUT_BYTE_CAP;
+use crate::tools::common::{OUTPUT_BYTE_CAP, truncate_head_tail};
 
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 const MAX_TIMEOUT_MS: u64 = 600_000;
@@ -168,9 +168,12 @@ impl Tool for BashTool {
 
         let body = format_combined(&stdout, &stderr, exit, signaled);
         if body.len() > OUTPUT_BYTE_CAP {
-            let mut truncated: String = body.chars().take(OUTPUT_BYTE_CAP).collect();
-            truncated.push_str("\n... [truncated]");
-            Ok(ToolOutput::truncated_text(truncated))
+            // Head+tail so the `exit:` line and any stderr at the tail
+            // survive — the failure signal usually lives there.
+            Ok(ToolOutput::truncated_text(truncate_head_tail(
+                &body,
+                OUTPUT_BYTE_CAP,
+            )))
         } else {
             Ok(ToolOutput::text(body))
         }

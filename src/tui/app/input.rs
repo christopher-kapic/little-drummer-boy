@@ -240,23 +240,48 @@ impl App {
                 KeyCode::Up => {
                     let n = self.at_suggestions().len();
                     if n > 0 {
-                        self.at_selected = (self.at_selected + n - 1) % n;
+                        // Hard stop at the top (no wrap) + scrolloff so
+                        // the previous item stays visible until index 0.
+                        self.at_selected = self.at_selected.saturating_sub(1);
+                        self.at_scroll = super::windowed_scroll(
+                            self.at_selected,
+                            self.at_scroll,
+                            n,
+                            super::AUTOCOMPLETE_ROWS as usize,
+                        );
                     }
                     return false;
                 }
                 KeyCode::Down => {
                     let n = self.at_suggestions().len();
                     if n > 0 {
-                        self.at_selected = (self.at_selected + 1) % n;
+                        self.at_selected = (self.at_selected + 1).min(n - 1);
+                        self.at_scroll = super::windowed_scroll(
+                            self.at_selected,
+                            self.at_scroll,
+                            n,
+                            super::AUTOCOMPLETE_ROWS as usize,
+                        );
                     }
                     return false;
                 }
-                KeyCode::Tab | KeyCode::Enter => {
-                    if self.accept_at_suggestion() {
+                KeyCode::Tab => {
+                    // Tab finalizes a file (space + close) but *descends*
+                    // into a directory (no space, popup stays open).
+                    if self.accept_at_suggestion(false) {
+                        return false;
+                    }
+                    // No suggestion to take — Tab is otherwise inert.
+                    return false;
+                }
+                KeyCode::Enter => {
+                    // Enter finalizes whatever is highlighted, file or
+                    // dir: append a space and close the @ session.
+                    if self.accept_at_suggestion(true) {
                         return false;
                     }
                     // Fall through to default Enter handling if accept
-                    // failed (e.g. no suggestions to take).
+                    // failed (e.g. no suggestions to take) — submits.
                 }
                 _ => {}
             }
@@ -298,13 +323,42 @@ impl App {
                 false
             }
             KeyCode::Backspace => {
+                // Whole-tag delete: when not actively composing a tag
+                // (popup closed) and the cursor sits at a completed
+                // tag's right edge, one Backspace removes the whole tag.
+                if !self.at_popup_active()
+                    && let Some((s, e)) = self.completed_tag_left()
+                {
+                    self.composer.delete_range(s, e);
+                    self.refresh_at_dismiss();
+                    self.reset_at_window();
+                    return false;
+                }
                 self.composer.delete_left();
-                self.refresh_at_dismiss();
+                // Two-keystroke trailing space: if we just removed a
+                // space that sat right after a completed tag, keep the
+                // popup suppressed so the *next* Backspace deletes the
+                // whole tag rather than re-opening the popup on it.
+                if self.completed_tag_left().is_some() {
+                    self.at_dismissed = true;
+                } else {
+                    self.refresh_at_dismiss();
+                }
+                self.reset_at_window();
                 false
             }
             KeyCode::Delete => {
+                if !self.at_popup_active()
+                    && let Some((s, e)) = self.completed_tag_right()
+                {
+                    self.composer.delete_range(s, e);
+                    self.refresh_at_dismiss();
+                    self.reset_at_window();
+                    return false;
+                }
                 self.composer.delete_right();
                 self.refresh_at_dismiss();
+                self.reset_at_window();
                 false
             }
             KeyCode::Left => {
@@ -340,7 +394,7 @@ impl App {
                 // staged draft — matching the user-visible spec for
                 // history navigation.
                 self.refresh_at_dismiss();
-                self.at_selected = 0;
+                self.reset_at_window();
                 false
             }
             _ => false,
@@ -421,28 +475,102 @@ impl App {
         if self.composer.at_query().is_none() {
             self.at_dismissed = false;
             self.at_selected = 0;
+            self.at_scroll = 0;
         }
+    }
+
+    /// Span of a completed `@`-tag whose right edge is at the cursor (for
+    /// Backspace whole-tag delete), or `None`.
+    pub(super) fn completed_tag_left(&self) -> Option<(usize, usize)> {
+        completed_tag_span(
+            self.composer.text(),
+            self.composer.cursor(),
+            &self.accepted_tags,
+        )
+    }
+
+    /// Span of a completed `@`-tag whose left edge is at the cursor (for
+    /// forward-`Delete` whole-tag delete), or `None`.
+    pub(super) fn completed_tag_right(&self) -> Option<(usize, usize)> {
+        completed_tag_span_forward(
+            self.composer.text(),
+            self.composer.cursor(),
+            &self.accepted_tags,
+        )
+    }
+
+    /// Reset the `@`-popup highlight + scroll window to the top. Called
+    /// after any composer edit that changes the active `@`-query (typing
+    /// narrows the list, so the selection should jump back to the first
+    /// match). Harmless when no popup is active.
+    pub(super) fn reset_at_window(&mut self) {
+        self.at_selected = 0;
+        self.at_scroll = 0;
     }
 
     /// Accept the currently-highlighted `@`-suggestion: replace the
     /// active `@partial` with the chosen path (trailing `/` for dirs).
     /// Returns true if a replacement was applied.
-    pub(super) fn accept_at_suggestion(&mut self) -> bool {
+    ///
+    /// `enter` distinguishes the two accept keys:
+    /// - `Enter` (`enter = true`) **finalizes** any selection — file or
+    ///   directory: appends a trailing space and closes the popup.
+    /// - `Tab` (`enter = false`) finalizes a **file** the same way, but
+    ///   on a **directory** *descends* — no trailing space, popup stays
+    ///   open, and `at_query` now returns `<dir>/` so suggestions
+    ///   re-query inside it.
+    pub(super) fn accept_at_suggestion(&mut self, enter: bool) -> bool {
         let suggestions = self.at_suggestions();
         if suggestions.is_empty() {
             return false;
         }
         let idx = self.at_selected.min(suggestions.len() - 1);
-        let sug = &suggestions[idx];
+        let sug = suggestions[idx].clone();
         self.composer.replace_at_token(&sug.replacement);
         self.at_selected = 0;
-        // If this was a file, the popup auto-closes (no further token to
-        // expand). For directories we leave the `@dir/` open so the user
-        // can keep narrowing — `at_query` will return the new partial.
-        if !sug.is_dir {
+        self.at_scroll = 0;
+
+        let finalize = enter || !sug.is_dir;
+        if finalize {
+            // Record spaced/special paths so the submit-time quoting
+            // pass (file_tag) can wrap them — keeps the display clean
+            // while the wire payload stays unambiguous.
+            self.note_accepted_tag(&sug.replacement);
+            // Trailing space terminates the tag and closes the popup.
+            self.composer.insert_char(' ');
             self.at_dismissed = true;
         }
+        // Dir-descend (Tab on a directory): `replacement` ends with `/`,
+        // so the active `@`-query is now `<dir>/` and the popup re-walks
+        // inside it. Nothing else to do.
         true
+    }
+
+    /// Render each `@`-tag expansion as a harness-automatic tool-call
+    /// line in the chat (GOALS §1e). One line per tag, in the same
+    /// `→ tool(path)` idiom the agent's own tools use, with a ✓/✗ + the
+    /// detail (lines read / entries listed / why it was skipped).
+    pub(super) fn push_tag_call_entries(
+        &mut self,
+        expansions: &[crate::tui::file_tag::TagExpansion],
+    ) {
+        for e in expansions {
+            let mark = if e.ok { '✓' } else { '✗' };
+            self.history.push(HistoryEntry::Plain {
+                line: format!("  → {}({}) {mark} {}", e.tool, e.path, e.detail),
+            });
+        }
+    }
+
+    /// Remember an accepted tag path that contains a space or other
+    /// shell-special character, so the submit-time pass can quote it.
+    /// Plain paths need no tracking and are skipped.
+    pub(super) fn note_accepted_tag(&mut self, path: &str) {
+        if crate::tui::file_tag::needs_quoting(path)
+            && !self.accepted_tags.contains(&path.to_string())
+        {
+            self.accepted_tags.push(path.to_string());
+        }
     }
 
     pub(super) fn handle_key_normal(&mut self, key: KeyEvent) -> bool {
@@ -675,7 +803,16 @@ impl App {
         // Expand any `@path[:range]` tags into fenced file/dir blocks
         // before dispatch (GOALS §1e). The displayed user message keeps
         // the original `@`-form; only the wire payload gets inlined.
-        let wire = crate::tui::file_tag::expand_tags(&submitted, &self.launch.cwd);
+        // Autocompleted spaced paths are quoted on this submit copy so
+        // the scanner reads them as one token (the composer stays clean).
+        let quoted = crate::tui::file_tag::quote_tracked_tags(&submitted, &self.accepted_tags);
+        let expanded = crate::tui::file_tag::expand_tags(&quoted, &self.launch.cwd);
+        let wire = expanded.wire;
+        // Per-tag entries are surfaced as harness-automatic tool calls in
+        // the chat (GOALS §1e); the agent didn't invoke them, the
+        // composer did. Cleared the accepted-tags tracker now that the
+        // submit copy has consumed it.
+        self.accepted_tags.clear();
 
         // If a turn is in flight, the daemon will queue this message
         // and fold it into the next inference call (GOALS §1c). Track
@@ -684,12 +821,16 @@ impl App {
         let agent_busy = self.pending.is_some();
         if agent_busy {
             self.queue.push(submitted.clone());
+            // Defer the tool-call entries so they render right after the
+            // folded user message (on the next `ThinkingStarted`).
+            self.queued_tag_calls.extend(expanded.expansions);
         } else {
             // No queueing — render as the user's turn immediately.
             self.history.push(HistoryEntry::User {
                 text: submitted.clone(),
                 timestamp: chrono::Local::now(),
             });
+            self.push_tag_call_entries(&expanded.expansions);
 
             // Track for Up/Down history navigation.
             self.prompt_history.push(submitted.clone());
@@ -723,6 +864,7 @@ impl App {
         self.composer.clear();
         self.at_dismissed = false;
         self.at_selected = 0;
+        self.at_scroll = 0;
         // Re-enter Normal mode on submit when vim is enabled, so the
         // composer is ready to be navigated without typing into it.
         // Mirror Insert otherwise.
@@ -731,7 +873,6 @@ impl App {
         }
         false
     }
-
 }
 
 impl App {
@@ -767,6 +908,131 @@ fn is_modifier_only(key: &KeyEvent) -> bool {
     )
 }
 
+fn is_ws_byte(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | b'\r')
+}
+
+/// Detect a *completed* `@`-tag whose right edge is exactly at `cursor`,
+/// returning its `[start, cursor)` byte span. "Completed" means the tag
+/// is terminated on the right (whitespace or end-of-buffer) and matches
+/// one of: a quoted span `@"…"`, a tracked spaced path `@<accepted>`, or
+/// a bare whitespace-free `@token`. Returns `None` when the cursor is
+/// mid-tag or no completed tag ends here. This is what makes Backspace
+/// at a tag's edge delete the whole tag atomically (GOALS §1e).
+fn completed_tag_span(buffer: &str, cursor: usize, accepted: &[String]) -> Option<(usize, usize)> {
+    if cursor == 0 {
+        return None;
+    }
+    let bytes = buffer.as_bytes();
+    let terminated = cursor >= buffer.len() || is_ws_byte(bytes[cursor]);
+    if !terminated {
+        return None;
+    }
+
+    // A — quoted: ends with a closing quote whose opener is `@"` at a
+    // word boundary.
+    if bytes[cursor - 1] == b'"'
+        && let Some(qpos) = buffer[..cursor - 1].rfind('"')
+        && qpos >= 1
+        && bytes[qpos - 1] == b'@'
+        && (qpos - 1 == 0 || is_ws_byte(bytes[qpos - 2]))
+    {
+        return Some((qpos - 1, cursor));
+    }
+
+    // B — tracked spaced path stored unquoted in the buffer: `@<accepted>`.
+    // Longest first so a longer accepted path wins over a prefix.
+    let mut tracked: Vec<&String> = accepted.iter().collect();
+    tracked.sort_by_key(|p| std::cmp::Reverse(p.len()));
+    for p in tracked {
+        let need = p.len() + 1;
+        if cursor >= need {
+            let at = cursor - need;
+            if bytes[at] == b'@'
+                && &buffer[at + 1..cursor] == p.as_str()
+                && (at == 0 || is_ws_byte(bytes[at - 1]))
+            {
+                return Some((at, cursor));
+            }
+        }
+    }
+
+    // C — bare whitespace-free `@token`.
+    if let Some(at) = buffer[..cursor].rfind('@') {
+        let seg = &buffer[at + 1..cursor];
+        if at + 1 < cursor
+            && !seg.chars().any(char::is_whitespace)
+            && (at == 0 || is_ws_byte(bytes[at - 1]))
+        {
+            return Some((at, cursor));
+        }
+    }
+    None
+}
+
+/// Mirror of [`completed_tag_span`] for forward-`Delete`: detect a tag
+/// whose left edge (`@`) is exactly at `cursor`, returning `[cursor, end)`.
+fn completed_tag_span_forward(
+    buffer: &str,
+    cursor: usize,
+    accepted: &[String],
+) -> Option<(usize, usize)> {
+    let bytes = buffer.as_bytes();
+    if cursor >= buffer.len() || bytes[cursor] != b'@' {
+        return None;
+    }
+    if !(cursor == 0 || is_ws_byte(bytes[cursor - 1])) {
+        return None;
+    }
+    let rest = &buffer[cursor + 1..];
+
+    // A — quoted.
+    if rest.starts_with('"') {
+        if let Some(close_rel) = buffer[cursor + 2..].find('"') {
+            let mut end = cursor + 2 + close_rel + 1;
+            if buffer[end..].starts_with(':') {
+                let rs = end + 1;
+                let re = buffer[rs..]
+                    .find(char::is_whitespace)
+                    .map(|o| rs + o)
+                    .unwrap_or(buffer.len());
+                if re > rs
+                    && buffer[rs..re]
+                        .chars()
+                        .all(|c| c.is_ascii_digit() || c == '-')
+                {
+                    end = re;
+                }
+            }
+            return Some((cursor, end));
+        }
+        return None;
+    }
+
+    // B — tracked spaced path.
+    let mut tracked: Vec<&String> = accepted.iter().collect();
+    tracked.sort_by_key(|p| std::cmp::Reverse(p.len()));
+    for p in tracked {
+        if rest.starts_with(p.as_str()) {
+            let end = cursor + 1 + p.len();
+            if end >= buffer.len() || is_ws_byte(bytes[end]) {
+                return Some((cursor, end));
+            }
+        }
+    }
+
+    // C — bare.
+    let end = rest
+        .find(char::is_whitespace)
+        .map(|o| cursor + 1 + o)
+        .unwrap_or(buffer.len());
+    if end > cursor + 1 {
+        Some((cursor, end))
+    } else {
+        None
+    }
+}
+
 /// Render a toast over the status-line rect. Single line; left-padded
 /// one cell; foreground color encodes intent (green/red/grey).
 pub(super) fn accepts_key(key: &KeyEvent) -> bool {
@@ -787,4 +1053,75 @@ fn cursor_on_first_line(text: &str, cursor: usize) -> bool {
 fn cursor_on_last_line(text: &str, cursor: usize) -> bool {
     let after = &text[cursor.min(text.len())..];
     !after.contains('\n')
+}
+
+#[cfg(test)]
+mod tag_delete_tests {
+    use super::{completed_tag_span, completed_tag_span_forward};
+
+    fn none() -> Vec<String> {
+        Vec::new()
+    }
+
+    #[test]
+    fn bare_tag_at_eof_is_deletable() {
+        // `@foo` with cursor at end (terminated by EOF).
+        let b = "@foo";
+        assert_eq!(completed_tag_span(b, b.len(), &none()), Some((0, 4)));
+    }
+
+    #[test]
+    fn bare_tag_before_space_is_deletable() {
+        // `@foo bar`, cursor right after `@foo` (index 4, space follows).
+        assert_eq!(completed_tag_span("@foo bar", 4, &none()), Some((0, 4)));
+    }
+
+    #[test]
+    fn cursor_mid_tag_is_not_deletable() {
+        // cursor inside `@foo` (index 2) → normal char delete.
+        assert_eq!(completed_tag_span("@foo", 2, &none()), None);
+    }
+
+    #[test]
+    fn trailing_space_is_not_a_tag_edge() {
+        // `@foo ` cursor after the space → first backspace removes space.
+        assert_eq!(completed_tag_span("@foo ", 5, &none()), None);
+    }
+
+    #[test]
+    fn quoted_tag_is_deletable_as_a_whole() {
+        let b = "@\"my file.rs\"";
+        assert_eq!(completed_tag_span(b, b.len(), &none()), Some((0, b.len())));
+    }
+
+    #[test]
+    fn tracked_spaced_path_is_deletable() {
+        let accepted = vec!["src/my file.rs".to_string()];
+        let b = "@src/my file.rs";
+        assert_eq!(
+            completed_tag_span(b, b.len(), &accepted),
+            Some((0, b.len()))
+        );
+    }
+
+    #[test]
+    fn email_at_is_not_a_tag() {
+        // `user@host` — `@` not at a word boundary.
+        assert_eq!(completed_tag_span("user@host", 9, &none()), None);
+    }
+
+    #[test]
+    fn forward_delete_bare_tag() {
+        // cursor at the `@` of `@foo bar`.
+        assert_eq!(
+            completed_tag_span_forward("@foo bar", 0, &none()),
+            Some((0, 4))
+        );
+    }
+
+    #[test]
+    fn forward_delete_quoted_tag() {
+        let b = "@\"my file.rs\" rest";
+        assert_eq!(completed_tag_span_forward(b, 0, &none()), Some((0, 13)));
+    }
 }

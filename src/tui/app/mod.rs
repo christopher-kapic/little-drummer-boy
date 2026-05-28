@@ -25,8 +25,8 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyboardEnhancementFlags, MouseButton, MouseEvent, MouseEventKind,
-    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyboardEnhancementFlags, MouseButton,
+    MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use ratatui::DefaultTerminal;
 use ratatui::layout::Rect;
@@ -38,10 +38,7 @@ use crate::git::{self, RepoStatus};
 use crate::tui::agent_runner::{self, AgentRunner};
 use crate::tui::composer::{Composer, VimMode, input_prefix_width};
 use crate::tui::geometry::PaneGeometry;
-use crate::tui::history::{
-    HistoryEntry, MarkdownOpts, PendingMsg,
-    route_text_delta,
-};
+use crate::tui::history::{HistoryEntry, MarkdownOpts, PendingMsg, route_text_delta};
 use crate::tui::settings::{self, Dialog};
 use crate::welcome::{self, LaunchInfo};
 
@@ -56,6 +53,32 @@ const EVENT_TICK: Duration = Duration::from_millis(100);
 /// composer doesn't visibly shift as the user types and the candidate
 /// set narrows. Keeps layout pinned to a 6-row reservation.
 pub(crate) const AUTOCOMPLETE_ROWS: u16 = 6;
+
+/// Recompute a scroll-window top offset so `selected` stays visible with
+/// a one-row margin (scrolloff=1) above and below — i.e. the next and
+/// previous items are always shown — except at the true ends of the
+/// list. Hard stops, no wrap. Shared by the `@`-popup and the model
+/// picker so their scrolling feels identical.
+pub(super) fn windowed_scroll(
+    selected: usize,
+    mut offset: usize,
+    len: usize,
+    window: usize,
+) -> usize {
+    if len <= window {
+        return 0;
+    }
+    const SCROLLOFF: usize = 1;
+    // Keep a margin above the selection.
+    if selected < offset + SCROLLOFF {
+        offset = selected.saturating_sub(SCROLLOFF);
+    }
+    // Keep a margin below the selection.
+    if selected + SCROLLOFF + 1 > offset + window {
+        offset = (selected + SCROLLOFF + 1).saturating_sub(window);
+    }
+    offset.min(len - window)
+}
 
 #[derive(Clone, Copy)]
 struct SlashCommand {
@@ -248,6 +271,28 @@ pub struct App {
     /// composer's at-query changes; bumped by Up/Down while the popup
     /// is open.
     pub(super) at_selected: usize,
+    /// Top visible index of the `@`-popup scroll window. Maintained with
+    /// a 1-row scrolloff so the next/prev candidate is always visible
+    /// except at the true ends of the list (see [`super::windowed_scroll`]).
+    pub(super) at_scroll: usize,
+    /// Per-query memo of the suggestion walk so the filesystem isn't
+    /// re-walked on every render / arrow keypress. Keyed by the exact
+    /// `@`-query string; recomputed when the query changes. `RefCell`
+    /// because `at_suggestions` is called from `&self` render paths.
+    pub(super) at_cache:
+        std::cell::RefCell<Option<(String, Vec<crate::tui::file_tag::Suggestion>)>>,
+    /// Accepted `@`-tag paths that contain a space / shell-special char.
+    /// Tracked so the submit-time pass can wrap them in quotes (the
+    /// composer shows them unquoted; the wire payload needs the quotes
+    /// to disambiguate the path boundary). Content-matched at submit, so
+    /// editing elsewhere in the buffer can't desync it; cleared on
+    /// submit and on `/new`.
+    pub(super) accepted_tags: Vec<String>,
+    /// `@`-tag expansions from messages submitted while the agent was
+    /// busy. Flushed into history as tool-call entries right after the
+    /// folded user message appears (on the next `ThinkingStarted`), so
+    /// they render in order with their message.
+    pub(super) queued_tag_calls: Vec<crate::tui::file_tag::TagExpansion>,
     /// True once the user dismissed the `@`-popup with `Esc`. Stays
     /// suppressed until the active `@partial` token is dropped (e.g.
     /// whitespace appears after `@` or the `@` is deleted).
@@ -428,6 +473,10 @@ impl App {
             clickable_rows: Vec::new(),
             last_cursor_shape: None,
             at_selected: 0,
+            at_scroll: 0,
+            at_cache: std::cell::RefCell::new(None),
+            accepted_tags: Vec::new(),
+            queued_tag_calls: Vec::new(),
             at_dismissed: false,
             pending_new_session: false,
             last_usage: None,
@@ -730,7 +779,10 @@ impl App {
     /// attached runner so the next user message opens a fresh session.
     /// In alt-screen mode the chat pane is the whole canvas, so the
     /// "fresh session" visual is simply an empty pane.
-    pub(super) fn maybe_service_new_session(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
+    pub(super) fn maybe_service_new_session(
+        &mut self,
+        terminal: &mut DefaultTerminal,
+    ) -> Result<()> {
         if !self.pending_new_session {
             return Ok(());
         }
@@ -772,7 +824,10 @@ impl App {
     /// Ctrl+G was pressed: pop the composer text out into `$EDITOR`,
     /// then reload whatever the user wrote back into the buffer. Quits
     /// raw mode for the duration so the editor owns the terminal.
-    pub(super) fn maybe_service_external_edit(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
+    pub(super) fn maybe_service_external_edit(
+        &mut self,
+        terminal: &mut DefaultTerminal,
+    ) -> Result<()> {
         if !self.pending_external_edit {
             return Ok(());
         }
@@ -878,6 +933,12 @@ impl App {
                         text: folded,
                         timestamp: chrono::Local::now(),
                     });
+                    // Flush the @-tag tool-call entries for those queued
+                    // messages so they render right under the folded turn.
+                    if !self.queued_tag_calls.is_empty() {
+                        let calls = std::mem::take(&mut self.queued_tag_calls);
+                        self.push_tag_call_entries(&calls);
+                    }
                 }
                 self.pending = Some(new_pending(agent));
             }
@@ -1024,7 +1085,6 @@ impl App {
         // ThinkingOnly variant later is cheap.
     }
 
-
     /// Execute one of the context-menu actions. Called both when the
     /// user clicks an item and when they hit Enter on a focused item.
     /// `clicked_chat_row` is the chat-relative row that was
@@ -1084,7 +1144,10 @@ impl App {
     /// multi-line message still resolves to that message). Returns
     /// `(title, full message text)` or `None` if no agent message
     /// precedes the click.
-    pub(super) fn agent_message_at_or_before(&self, clicked_chat_row: usize) -> Option<(String, String)> {
+    pub(super) fn agent_message_at_or_before(
+        &self,
+        clicked_chat_row: usize,
+    ) -> Option<(String, String)> {
         let Some(area) = self.chat_area else {
             return None;
         };
@@ -1836,7 +1899,6 @@ fn load_tui_config(cwd: &Path) -> crate::config::extended::TuiConfig {
     crate::config::extended::TuiConfig::default()
 }
 
-
 /// Background task that polls `git status` every `GIT_REFRESH_INTERVAL`
 /// without blocking the event-loop thread. The result lands in `shared`;
 /// the event loop reads it on the next tick.
@@ -1860,4 +1922,46 @@ fn spawn_git_refresh(
             }
         }
     })
+}
+
+#[cfg(test)]
+mod windowed_scroll_tests {
+    use super::windowed_scroll;
+
+    const W: usize = 6;
+
+    #[test]
+    fn no_scroll_when_list_fits() {
+        assert_eq!(windowed_scroll(0, 0, 5, W), 0);
+        assert_eq!(windowed_scroll(4, 0, 5, W), 0);
+    }
+
+    #[test]
+    fn top_has_no_margin_at_index_zero() {
+        // n=10: selecting 0 keeps offset 0 (nothing above to show).
+        assert_eq!(windowed_scroll(0, 0, 10, W), 0);
+        // selecting 1 still shows index 0 above it.
+        assert_eq!(windowed_scroll(1, 0, 10, W), 0);
+    }
+
+    #[test]
+    fn scrolls_when_reaching_last_visible_row() {
+        // From offset 0 (rows 0..5 visible), moving to index 5 must
+        // scroll one so index 6 (the next item) is visible.
+        assert_eq!(windowed_scroll(5, 0, 10, W), 1);
+    }
+
+    #[test]
+    fn end_of_list_fills_last_window_without_bottom_margin() {
+        // Last index of a 10-item list with window 6 → offset 4 so the
+        // final six (4..10) show, selection on the bottom row.
+        assert_eq!(windowed_scroll(9, 4, 10, W), 4);
+    }
+
+    #[test]
+    fn moving_up_keeps_previous_item_visible() {
+        // Coming back up to index 4 from a scrolled offset keeps a row
+        // above visible.
+        assert_eq!(windowed_scroll(4, 4, 10, W), 3);
+    }
 }

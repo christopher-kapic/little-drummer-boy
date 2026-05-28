@@ -19,7 +19,7 @@ use serde_json::Value;
 
 use crate::config::extended::ToolCommandTemplate;
 use crate::engine::tool::{Tool, ToolCtx, ToolOutput};
-use crate::tools::common::OUTPUT_BYTE_CAP;
+use crate::tools::common::{OUTPUT_BYTE_CAP, truncate_head_tail};
 
 const SHELL_TIMEOUT_SECS: u64 = 30;
 
@@ -108,9 +108,12 @@ impl Tool for CustomBashTool {
         }
 
         if combined.len() > OUTPUT_BYTE_CAP {
-            combined.truncate(OUTPUT_BYTE_CAP);
-            combined.push_str("\n... [truncated]");
-            return Ok(ToolOutput::truncated_text(combined));
+            // Byte-boundary-safe; `String::truncate` would panic on a
+            // multibyte boundary. Head+tail keeps any appended stderr.
+            return Ok(ToolOutput::truncated_text(truncate_head_tail(
+                &combined,
+                OUTPUT_BYTE_CAP,
+            )));
         }
         Ok(ToolOutput::text(combined))
     }

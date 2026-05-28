@@ -29,12 +29,20 @@ use crate::tui::theme::MUTED_COLOR_INDEX;
 
 pub const DIALOG_HEIGHT: u16 = 18;
 
+/// Visible model rows in the pick step. The dialog reserves the rest of
+/// its height for the border, filter line, section headers, and help
+/// line. Drives the scroll window (same scrolloff=1 behavior as the
+/// composer `@`-popup).
+const MODEL_WINDOW: usize = 11;
+
 pub struct ModelPickerDialog {
     config_path: PathBuf,
     cfg: ProvidersConfig,
     entries: Vec<Entry>,
     filter: TextField,
     cursor: usize,
+    /// Top visible index of the scroll window over the filtered list.
+    scroll: usize,
     step: Step,
     error: Option<String>,
     done: bool,
@@ -120,6 +128,7 @@ impl ModelPickerDialog {
             entries,
             filter: TextField::default(),
             cursor: 0,
+            scroll: 0,
             step: Step::Pick,
             error: None,
             done: false,
@@ -156,9 +165,21 @@ impl ModelPickerDialog {
         match key.code {
             KeyCode::Up => {
                 self.cursor = self.cursor.saturating_sub(1);
+                self.scroll = crate::tui::app::windowed_scroll(
+                    self.cursor,
+                    self.scroll,
+                    visible.len(),
+                    MODEL_WINDOW,
+                );
             }
             KeyCode::Down => {
                 self.cursor = (self.cursor + 1).min(max);
+                self.scroll = crate::tui::app::windowed_scroll(
+                    self.cursor,
+                    self.scroll,
+                    visible.len(),
+                    MODEL_WINDOW,
+                );
             }
             KeyCode::Enter => {
                 if let Some(&i) = visible.get(self.cursor) {
@@ -184,6 +205,7 @@ impl ModelPickerDialog {
                 self.filter.handle_key(key);
                 if before != self.filter.text() {
                     self.cursor = 0;
+                    self.scroll = 0;
                 }
             }
         }
@@ -294,7 +316,14 @@ impl ModelPickerDialog {
         } else {
             let mut seen_fav = false;
             let mut seen_other = false;
-            for (i, &idx) in visible.iter().enumerate() {
+            // Scroll window: same scrolloff=1 behavior as the @-popup.
+            let offset = crate::tui::app::windowed_scroll(
+                self.cursor,
+                self.scroll,
+                visible.len(),
+                MODEL_WINDOW,
+            );
+            for (i, &idx) in visible.iter().enumerate().skip(offset).take(MODEL_WINDOW) {
                 let e = &self.entries[idx];
                 if e.is_favorite && !seen_fav {
                     lines.push(Line::from(Span::styled(
@@ -469,6 +498,7 @@ mod tests {
             entries: Vec::new(),
             filter: TextField::default(),
             cursor: 0,
+            scroll: 0,
             step: Step::Pick,
             error: None,
             done: false,

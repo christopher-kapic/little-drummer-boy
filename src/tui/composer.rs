@@ -231,6 +231,17 @@ impl Composer {
         self.cursor = previous;
     }
 
+    /// Drain the byte range `[start, end)` and place the cursor at
+    /// `start`. Used by the whole-`@`-tag delete (the range comes from a
+    /// tag-boundary scan, so it is always on char boundaries).
+    pub fn delete_range(&mut self, start: usize, end: usize) {
+        if start >= end || end > self.buffer.len() {
+            return;
+        }
+        self.buffer.drain(start..end);
+        self.cursor = start;
+    }
+
     pub fn delete_right(&mut self) {
         if self.cursor >= self.buffer.len() {
             return;
@@ -547,6 +558,16 @@ impl Composer {
             }
         }
         let body = &before[at_idx + 1..];
+        // Quoted tag in progress (`@"path with `): the query continues
+        // across spaces until the closing quote, so the popup keeps
+        // narrowing on a name with spaces. A closing quote before the
+        // cursor means the tag is finished — no active query.
+        if let Some(inner) = body.strip_prefix('"') {
+            if inner.contains('"') {
+                return None;
+            }
+            return Some(inner);
+        }
         if body.chars().any(char::is_whitespace) {
             return None;
         }
@@ -731,6 +752,21 @@ mod tests {
     #[test]
     fn at_query_none_when_whitespace_between_at_and_cursor() {
         let c = at("@foo bar", 8);
+        assert_eq!(c.at_query(), None);
+    }
+
+    #[test]
+    fn at_query_quoted_keeps_narrowing_across_spaces() {
+        // `@"src/my ` — open quote, cursor after the space.
+        let c = at("@\"src/my ", 9);
+        assert_eq!(c.at_query(), Some("src/my "));
+    }
+
+    #[test]
+    fn at_query_quoted_closed_is_not_active() {
+        // `@"src/my file.rs"` — closing quote present → tag finished.
+        let s = "@\"src/my file.rs\"";
+        let c = at(s, s.len());
         assert_eq!(c.at_query(), None);
     }
 

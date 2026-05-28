@@ -9,9 +9,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use crate::engine::tool::{Tool, ToolCtx, ToolOutput};
-use crate::tools::common::{
-    OUTPUT_BYTE_CAP, READ_LINE_CAP, line_number, looks_binary, resolve, truncation_marker,
-};
+use crate::tools::common::{READ_LINE_CAP, looks_binary, read_slice, resolve, truncation_marker};
 
 pub struct ReadTool;
 
@@ -72,8 +70,7 @@ pub(crate) fn read_impl(args: Value, ctx: &ToolCtx, was_locked: bool) -> Result<
         _ => (READ_LINE_CAP, true),
     };
 
-    let mut all_lines: Vec<&str> = text.lines().collect();
-    let total = all_lines.len();
+    let total = text.lines().count();
     if offset > total {
         let mut out = String::new();
         if default_offset && default_limit {
@@ -87,27 +84,8 @@ pub(crate) fn read_impl(args: Value, ctx: &ToolCtx, was_locked: bool) -> Result<
         ctx.locks.note_read(&path, &ctx.agent_id, ctx.session.id);
         return Ok(ToolOutput::text(out));
     }
-    let mut start_idx = offset - 1;
-    let mut chunk: Vec<&str> = all_lines.drain(start_idx..).collect();
 
-    let mut truncated = false;
-    if chunk.len() > limit {
-        chunk.truncate(limit);
-        truncated = true;
-    }
-
-    let chunk_text = chunk.join("\n");
-    let mut numbered = line_number(&chunk_text, offset);
-
-    let byte_truncate_to = OUTPUT_BYTE_CAP.saturating_sub(80);
-    if numbered.len() > byte_truncate_to {
-        let safe_truncate = floor_char_boundary(&numbered, byte_truncate_to);
-        numbered.truncate(safe_truncate);
-        if !numbered.ends_with('\n') {
-            numbered.push('\n');
-        }
-        truncated = true;
-    }
+    let slice = read_slice(&text, offset, limit);
 
     let mut prelude = String::new();
     if was_locked {
@@ -116,37 +94,19 @@ pub(crate) fn read_impl(args: Value, ctx: &ToolCtx, was_locked: bool) -> Result<
             path.display()
         ));
     }
-    if default_offset && default_limit && truncated {
+    if default_offset && default_limit && slice.truncated {
         prelude.push_str(
             "Note: `limit` defaulted to 2000; pass both `offset` and `limit` to override.\n",
         );
     }
-    if truncated {
-        // The "next offset" is the first line we *didn't* show.
-        let next_offset = offset + chunk.len();
-        let _ = next_offset; // start_idx unused below; keep variable mute
-        let mut tail = numbered;
-        tail.push_str(&truncation_marker(offset + chunk.len()));
+    if slice.truncated {
+        let mut tail = slice.numbered;
+        tail.push_str(&truncation_marker(slice.next_offset));
         tail.push('\n');
-        start_idx = 0; // silence unused
-        let _ = start_idx;
         ctx.locks.note_read(&path, &ctx.agent_id, ctx.session.id);
         return Ok(ToolOutput::truncated_text(format!("{prelude}{tail}")));
     }
 
     ctx.locks.note_read(&path, &ctx.agent_id, ctx.session.id);
-    Ok(ToolOutput::text(format!("{prelude}{numbered}")))
-}
-
-/// `floor_char_boundary` polyfill — `str::floor_char_boundary` is still
-/// nightly-only.
-fn floor_char_boundary(s: &str, index: usize) -> usize {
-    if index >= s.len() {
-        return s.len();
-    }
-    let mut i = index;
-    while !s.is_char_boundary(i) && i > 0 {
-        i -= 1;
-    }
-    i
+    Ok(ToolOutput::text(format!("{prelude}{}", slice.numbered)))
 }
