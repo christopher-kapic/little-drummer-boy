@@ -378,10 +378,22 @@ pub struct App {
     /// history spills to scrollback before the welcome header is
     /// reprinted above the viewport).
     pub(super) pending_new_session: bool,
-    /// Provider-reported usage from the most recent round-trip.
-    /// Preferred over the local tiktoken estimate in the context
-    /// indicator; `None` until the first call returns.
+    /// Provider-reported usage from the most recent round-trip. Anchors
+    /// the live context counter (see `context_tokens`): the displayed
+    /// value is this total plus a local estimate of everything streamed
+    /// since it arrived. `None` until the first call returns.
     pub(super) last_usage: Option<crate::tokens::TokenUsage>,
+    /// Local cl100k_base estimate captured the instant `last_usage` was
+    /// set — the baseline the live counter measures streamed tokens
+    /// against, so the number climbs per token and re-snaps to the
+    /// provider's exact count on the next report.
+    pub(super) estimate_at_last_usage: u32,
+    /// Memoized `(length-signature, token count)` for the finalized
+    /// history portion of the context estimate. History is static while
+    /// a turn streams, so the per-frame live counter only re-tokenizes
+    /// the growing `pending` buffer instead of the whole transcript.
+    /// `Cell` because the estimate runs from `&self` render paths.
+    pub(super) history_estimate_cache: std::cell::Cell<Option<(u64, u32)>>,
     /// 30-day autocomplete frequency counts, used as a tie-breaker in
     /// the slash / model / @-tag surfaces. Seeded from the daemon at
     /// attach and incremented optimistically on each local pick. `tags`
@@ -612,6 +624,8 @@ impl App {
             at_dismissed: false,
             pending_new_session: false,
             last_usage: None,
+            estimate_at_last_usage: 0,
+            history_estimate_cache: std::cell::Cell::new(None),
             usage_models: HashMap::new(),
             usage_slash: HashMap::new(),
             usage_tags: HashMap::new(),
@@ -995,6 +1009,7 @@ impl App {
         // Clear the provider usage so the fresh-chat instruction-file
         // estimate re-triggers on the new (empty) session.
         self.last_usage = None;
+        self.estimate_at_last_usage = 0;
 
         Ok(())
     }
@@ -1466,6 +1481,13 @@ impl App {
             }
             TurnEvent::Usage { usage, .. } => {
                 self.last_usage = Some(usage);
+                // Re-anchor the live counter: the provider's fresh total
+                // becomes the baseline and the local streamed-token delta
+                // resets to zero. `pending` still holds this round's
+                // assistant turn here (Usage is emitted before the
+                // finalizing `AssistantText`), so the snapshot already
+                // accounts for it.
+                self.estimate_at_last_usage = self.estimate_context_tokens();
             }
             TurnEvent::AgentIdle => {
                 self.finalize_pending();

@@ -758,23 +758,61 @@ impl App {
         }
     }
 
-    /// Best available token count for the current context. Prefers the
-    /// provider's `input + output` from the most recent round-trip
-    /// (authoritative for what the model actually saw + produced) and
-    /// falls back to the local tiktoken estimate over visible history
-    /// when no provider count is available yet.
+    /// Live token count for the current context. Before the first
+    /// round-trip it's the pure local estimate. Once the provider has
+    /// reported usage, it's a hybrid: the provider's last authoritative
+    /// `input + output` total (anchor) plus a local cl100k_base estimate
+    /// of everything streamed since that report. The number therefore
+    /// climbs per streamed token and re-snaps to the exact provider
+    /// count each time fresh usage arrives, correcting any drift.
     pub(super) fn context_tokens(&self) -> u32 {
-        if let Some(u) = self.last_usage {
-            return u.total().min(u32::MAX as u64) as u32;
+        let estimate = self.estimate_context_tokens();
+        match self.last_usage {
+            Some(u) => {
+                let anchor = u.total().min(u32::MAX as u64) as u32;
+                hybrid_context_tokens(anchor, estimate, self.estimate_at_last_usage)
+            }
+            None => estimate,
         }
-        self.estimate_context_tokens()
     }
 
     /// cl100k_base token count over visible chat content. Tools and
     /// system prompts aren't included — they live on the engine side.
     /// Provider-native counts will replace this where available
     /// (GOALS §10 / plan §3h); cl100k_base is the documented fallback.
+    /// The finalized-history portion is memoized (see
+    /// `history_estimate_tokens`) so the per-frame live counter only
+    /// re-tokenizes the small, growing `pending` buffer.
     pub(super) fn estimate_context_tokens(&self) -> u32 {
+        let mut tokens = self.history_estimate_tokens() as usize;
+        if let Some(p) = &self.pending {
+            tokens += crate::tokens::count(&p.text) + crate::tokens::count(&p.reasoning);
+        }
+        // Buffered `<git>` blocks (GOALS §1l) ride the next user
+        // message; surface their cost before the user commits to send.
+        for block in &self.pending_git_blocks {
+            tokens += crate::tokens::count(block);
+        }
+        tokens.min(u32::MAX as usize) as u32
+    }
+
+    /// cl100k_base count over finalized history only, memoized on a cheap
+    /// length signature. History is static while a turn streams, so this
+    /// returns from cache on every draw mid-stream — only re-tokenizing
+    /// when an entry is appended or edited in place.
+    fn history_estimate_tokens(&self) -> u32 {
+        let sig = self.history_signature();
+        if let Some((cached_sig, val)) = self.history_estimate_cache.get()
+            && cached_sig == sig
+        {
+            return val;
+        }
+        let val = self.compute_history_tokens();
+        self.history_estimate_cache.set(Some((sig, val)));
+        val
+    }
+
+    fn compute_history_tokens(&self) -> u32 {
         let mut tokens: usize = 0;
         for entry in &self.history {
             tokens += match entry {
@@ -793,19 +831,37 @@ impl App {
                 } => crate::tokens::count(text) + crate::tokens::count(reasoning),
                 // Local-command output is never sent to the agent
                 // (GOALS §1k); `/git`'s agent-bound cost is accounted
-                // via `pending_git_blocks` below, not here.
+                // via `pending_git_blocks`, not here.
                 HistoryEntry::LocalCommand { .. } => 0,
             };
         }
-        if let Some(p) = &self.pending {
-            tokens += crate::tokens::count(&p.text) + crate::tokens::count(&p.reasoning);
-        }
-        // Buffered `<git>` blocks (GOALS §1l) ride the next user
-        // message; surface their cost before the user commits to send.
-        for block in &self.pending_git_blocks {
-            tokens += crate::tokens::count(block);
-        }
         tokens.min(u32::MAX as usize) as u32
+    }
+
+    /// Cheap content-length fingerprint over the same fields
+    /// `compute_history_tokens` reads. Detects appends *and* in-place
+    /// edits (e.g. tool output landing on an existing `ToolBox`) without
+    /// tokenizing; a same-length edit only costs a stale count until the
+    /// next real change — fine for a display estimate.
+    fn history_signature(&self) -> u64 {
+        let mut sig = self.history.len() as u64;
+        for entry in &self.history {
+            let len = match entry {
+                HistoryEntry::User { text, .. } => text.len(),
+                HistoryEntry::Plain { line } => line.len(),
+                HistoryEntry::ToolLine { summary, .. } => summary.len(),
+                HistoryEntry::ToolBox { calls, .. } => {
+                    calls.iter().map(|c| c.summary.len() + c.output.len()).sum()
+                }
+                HistoryEntry::Diff { old, new, .. } => old.len() + new.len(),
+                HistoryEntry::Agent {
+                    text, reasoning, ..
+                } => text.len() + reasoning.len(),
+                HistoryEntry::LocalCommand { .. } => 0,
+            };
+            sig = sig.wrapping_mul(31).wrapping_add(len as u64);
+        }
+        sig
     }
 
     pub(super) fn render_popup(&self, frame: &mut ratatui::Frame, area: Rect) {
@@ -1437,6 +1493,16 @@ pub(super) fn toolbox_row_estimate(calls: &[crate::tui::history::ToolCall], expa
     rows.max(1)
 }
 
+/// Hybrid live context count: the provider's last authoritative total
+/// (`anchor`) plus the local estimate of tokens streamed since it was
+/// reported (`estimate - estimate_at_anchor`). The delta saturates at
+/// zero so a post-prune estimate dip can't pull the displayed value
+/// below the provider's own count; a fresh provider report re-anchors
+/// and zeroes the delta, correcting any accumulated drift.
+fn hybrid_context_tokens(anchor: u32, estimate: u32, estimate_at_anchor: u32) -> u32 {
+    anchor.saturating_add(estimate.saturating_sub(estimate_at_anchor))
+}
+
 #[cfg(test)]
 mod guidance_label_tests {
     use super::fresh_chat_guidance_label;
@@ -1460,5 +1526,28 @@ mod guidance_label_tests {
     #[test]
     fn no_guidance_file_falls_back() {
         assert!(fresh_chat_guidance_label(true, false, None).is_none());
+    }
+}
+
+#[cfg(test)]
+mod hybrid_context_tokens_tests {
+    use super::hybrid_context_tokens;
+
+    #[test]
+    fn climbs_as_estimate_grows_past_anchor_baseline() {
+        // Provider reported 1000 total; the local estimate was 800 at
+        // that instant. As streamed tokens push the estimate to 950, the
+        // displayed count climbs by the 150-token delta.
+        assert_eq!(hybrid_context_tokens(1000, 800, 800), 1000);
+        assert_eq!(hybrid_context_tokens(1000, 850, 800), 1050);
+        assert_eq!(hybrid_context_tokens(1000, 950, 800), 1150);
+    }
+
+    #[test]
+    fn delta_floors_at_zero_when_estimate_dips_below_baseline() {
+        // A prune can shrink the estimate below the snapshot; the
+        // displayed value stays pinned to the provider's total rather
+        // than going backwards.
+        assert_eq!(hybrid_context_tokens(1000, 700, 800), 1000);
     }
 }
