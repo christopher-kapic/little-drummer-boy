@@ -391,30 +391,16 @@ pub fn render_entry(
     }
 }
 
-/// Render an in-flight pending message. Text is whatever's accumulated
-/// so far; if empty we render `Thinking <dots>` with `dots` driven by
-/// the animation phase. Reasoning is captured but not displayed live
-/// (the user can expand once the turn finalizes).
-pub fn render_pending(msg: &PendingMsg, dots: &str, width: u16) -> Vec<Line<'static>> {
+/// Render an in-flight pending message: the agent's text as it streams
+/// in. The live "Thinking…"/status readout (with its elapsed clock) is
+/// owned by the status indicator (`render_status_indicator`), so before
+/// any text arrives this renders nothing — keeping a single live status
+/// line on screen instead of a duplicate "Thinking" in two places.
+/// Reasoning is captured but not displayed live (the user can expand
+/// once the turn finalizes).
+pub fn render_pending(msg: &PendingMsg, width: u16) -> Vec<Line<'static>> {
     if msg.text.trim().is_empty() {
-        // Pure "thinking" state — animated placeholder, no agent name.
-        // Matches the horizontal padding of agent body text so the
-        // placeholder doesn't jump when the first text delta arrives.
-        let mut spans: Vec<Span<'static>> = vec![Span::raw(" ".repeat(AGENT_INDENT))];
-        if !AGENT_BULLET.is_empty() {
-            spans.push(Span::styled(
-                format!("{AGENT_BULLET} "),
-                Style::default().fg(agent_color(&msg.name)),
-            ));
-        }
-        spans.push(Span::styled(
-            format!("Thinking{dots}"),
-            Style::default()
-                .fg(THINKING_FG)
-                .add_modifier(Modifier::ITALIC),
-        ));
-        let line = render_with_timestamp(spans, msg.timestamp, width);
-        return line;
+        return Vec::new();
     }
     // Text streaming in — same rendering as Agent (no expansion in
     // live state; reasoning shown after finalization). Markdown is

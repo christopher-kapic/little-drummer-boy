@@ -13,7 +13,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
 use crate::tui::chrome;
 use crate::tui::composer::{INPUT_PREFIX, VimMode, input_prefix_width};
 use crate::tui::history::{
-    HistoryEntry, Rendered, format_status_elapsed, render_entry, render_pending, thinking_dots,
+    AGENT_INDENT, HistoryEntry, Rendered, format_status_elapsed, render_entry, render_pending,
     thinking_dots_padded,
 };
 use crate::tui::theme::MUTED_COLOR_INDEX;
@@ -178,7 +178,10 @@ impl App {
         };
         let text = format!("{label}{dots} {}", format_status_elapsed(elapsed));
         let line = Line::from(vec![
-            Span::raw(" "),
+            // Match the original in-body "Thinking…" placeholder's left
+            // indent so the live status reads as a continuation of the
+            // agent column rather than jumping a column.
+            Span::raw(" ".repeat(AGENT_INDENT)),
             Span::styled(
                 text,
                 Style::default().fg(color).add_modifier(Modifier::ITALIC),
@@ -461,8 +464,7 @@ impl App {
             }
         }
         if let Some(pending) = &self.pending {
-            let dots = thinking_dots(self.started_at.elapsed().as_millis());
-            let pending_lines = render_pending(pending, dots, area.width);
+            let pending_lines = render_pending(pending, area.width);
             for _ in 0..pending_lines.len() {
                 targets.push(None);
                 box_targets.push(None);

@@ -45,7 +45,7 @@ pub struct ProviderTemplate {
 }
 
 /// The catalog the wizard cycles through. `openai-compatible` is first
-/// (per the user spec) so it's the default when the user types `c`.
+/// (per the user spec) so it's the default landing entry in the picker.
 pub const TEMPLATES: &[ProviderTemplate] = &[
     ProviderTemplate {
         id: "openai-compatible",

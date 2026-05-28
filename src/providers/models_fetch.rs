@@ -130,9 +130,11 @@ pub fn resolve_provider_request(
             "Authorization for provider `{provider_id}` references unset env var(s): {}",
             auth_missing.join(", ")
         );
-    } else {
-        anyhow::bail!("provider `{provider_id}` has no Authorization header configured");
     }
+    // No Authorization header at all (and not Copilot): fetch
+    // unauthenticated. Fully-local endpoints like LM Studio don't
+    // require auth; a provider that actually needs it surfaces a clear
+    // 401 from `fetch_models`.
 
     Ok(ResolvedRequest {
         base_url: resolve_provider_base_url(provider_id, entry),
@@ -565,6 +567,27 @@ mod tests {
         let err = resolve_provider_request("some-vendor", &entry).unwrap_err();
         assert!(err.to_string().contains("TOTALLY_UNSET_VAR_PROBE"));
         clear_copilot_env();
+    }
+
+    #[test]
+    fn non_copilot_provider_without_auth_resolves_unauthenticated() {
+        // A fully-local endpoint (e.g. LM Studio) has no Authorization
+        // header. That must resolve cleanly so /models can be fetched
+        // unauthenticated rather than erroring out.
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_copilot_env();
+        let entry = ProviderEntry {
+            url: "http://localhost:1234/v1".into(),
+            headers: vec![],
+            ..ProviderEntry::default()
+        };
+        let resolved = resolve_provider_request("lmstudio", &entry).unwrap();
+        assert!(
+            !resolved
+                .headers
+                .iter()
+                .any(|h| h.name.eq_ignore_ascii_case("authorization"))
+        );
     }
 
     #[test]

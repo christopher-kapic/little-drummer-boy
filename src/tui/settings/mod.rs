@@ -30,7 +30,7 @@ mod ui_page;
 
 use std::path::{Path, PathBuf};
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -486,7 +486,31 @@ impl SettingsDialog {
         self.advance_codex_login();
     }
 
+    /// True while a header add/edit popup or its browsing list is on
+    /// screen — the header editor owns `Tab`/`Shift+Tab` itself, so the
+    /// field-nav rewrite in [`Self::handle_key`] must leave them alone.
+    fn in_header_editor(&self) -> bool {
+        match &self.page {
+            Page::Providers(ProvidersPage::Headers { .. }) => true,
+            Page::Providers(ProvidersPage::Add(s)) => matches!(s.step, AddStep::EditHeaders),
+            _ => false,
+        }
+    }
+
     fn handle_key(&mut self, key: KeyEvent) -> bool {
+        // Tab / Shift+Tab move between fields like ↓/↑ across settings
+        // screens. The header editor owns Tab itself (the popup switches
+        // name↔value; its browse list treats Tab as ↓), so skip the
+        // rewrite whenever one is on screen.
+        let key = if self.in_header_editor() {
+            key
+        } else {
+            match key.code {
+                KeyCode::Tab => KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+                KeyCode::BackTab => KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+                _ => key,
+            }
+        };
         // Esc semantics differ per page: in deep pages it goes back one
         // level; only at root does it close.
         let cursor = match &self.page {
@@ -659,7 +683,7 @@ impl SettingsDialog {
                 AddStep::EditId | AddStep::EditUrl => "type to edit  enter: next  esc: cancel",
                 AddStep::EditHeaders => {
                     if s.headers.is_editing() {
-                        "type to edit  Tab: name/value  enter: apply  esc: cancel"
+                        "type to edit  Tab: switch field  enter: save  esc: cancel"
                     } else {
                         "↑/↓  a: add  enter: edit  d: delete  enter on continue: save  esc: back"
                     }
@@ -680,7 +704,7 @@ impl SettingsDialog {
             }
             Page::Providers(ProvidersPage::Headers { editor, .. }) => {
                 if editor.is_editing() {
-                    "type to edit  Tab: name/value  enter: apply  esc: cancel"
+                    "type to edit  Tab: switch field  enter: save  esc: cancel"
                 } else {
                     "↑/↓  a: add  enter: edit  d: delete  h: back"
                 }
@@ -788,13 +812,13 @@ enum ListAction {
 fn list_key_action(key: KeyEvent, cursor: &mut usize, len: usize) -> ListAction {
     match key.code {
         KeyCode::Esc => ListAction::Close,
-        KeyCode::Up | KeyCode::Char('k') => {
+        KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => {
             if *cursor > 0 {
                 *cursor -= 1;
             }
             ListAction::Stay
         }
-        KeyCode::Down | KeyCode::Char('j') => {
+        KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
             if *cursor + 1 < len {
                 *cursor += 1;
             }
@@ -1508,11 +1532,14 @@ mod tests {
         d.handle_key(press(KeyCode::Enter)); // → Edit
         d.handle_key(press(KeyCode::Char('j'))); // cursor → row 1 (Headers)
         d.handle_key(press(KeyCode::Enter)); // → Headers sub-page
-        // Add a header from the Browse-mode `a` action.
+        // Add a header via the Browse-mode `a` action, which opens the
+        // name/value popup focused on the name field.
         d.handle_key(press(KeyCode::Char('a')));
-        // We're now inline-editing a header name. Tab to value, Enter
-        // commits, then Esc to leave Browse, then `h` to go back.
-        d.handle_key(press(KeyCode::Enter)); // commit (empty name+value, still adds the row)
+        // Type a name — a new header with an empty name is discarded on
+        // save — then Enter commits and closes the popup.
+        d.handle_key(press(KeyCode::Char('x')));
+        d.handle_key(press(KeyCode::Enter));
+        // `h` from Browse mode returns to the Edit page.
         d.handle_key(press(KeyCode::Char('h')));
         match &d.page {
             Page::Providers(ProvidersPage::Edit(s)) => {
@@ -1525,6 +1552,55 @@ mod tests {
                 );
             }
             other => panic!("expected Edit after back, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cancel_add_leaves_no_header() {
+        // Opening the add popup and pressing Esc must not leave a blank
+        // row behind — the row is only committed on Enter.
+        let tmp = TempDir::new().unwrap();
+        let mut d = dialog_with_one_provider(&tmp);
+        d.handle_key(press(KeyCode::Enter)); // → Edit
+        d.handle_key(press(KeyCode::Char('j'))); // cursor → Headers row
+        d.handle_key(press(KeyCode::Enter)); // → Headers sub-page
+        let before = match &d.page {
+            Page::Providers(ProvidersPage::Headers { editor, .. }) => editor.rows().len(),
+            other => panic!("expected Headers sub-page, got {other:?}"),
+        };
+        d.handle_key(press(KeyCode::Char('a'))); // open add popup
+        d.handle_key(press(KeyCode::Char('x'))); // type a name
+        d.handle_key(press(KeyCode::Esc)); // cancel — discards the add
+        match &d.page {
+            Page::Providers(ProvidersPage::Headers { editor, .. }) => {
+                assert_eq!(editor.rows().len(), before, "cancelled add leaves no row");
+                assert!(!editor.is_editing(), "popup is closed after cancel");
+            }
+            other => panic!("expected Headers sub-page, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn popup_tab_routes_typing_to_value_field() {
+        // In the add/edit popup, Tab switches focus from name to value
+        // so subsequent keystrokes land in the value field.
+        let tmp = TempDir::new().unwrap();
+        let mut d = dialog_with_one_provider(&tmp);
+        d.handle_key(press(KeyCode::Enter)); // → Edit
+        d.handle_key(press(KeyCode::Char('j'))); // cursor → Headers row
+        d.handle_key(press(KeyCode::Enter)); // → Headers sub-page
+        d.handle_key(press(KeyCode::Char('a'))); // open add popup (name focus)
+        d.handle_key(press(KeyCode::Char('n'))); // → name buffer
+        d.handle_key(press(KeyCode::Tab)); // focus → value
+        d.handle_key(press(KeyCode::Char('v'))); // → value buffer
+        d.handle_key(press(KeyCode::Enter)); // commit
+        match &d.page {
+            Page::Providers(ProvidersPage::Headers { editor, .. }) => {
+                let row = editor.rows().last().expect("a header row was added");
+                assert_eq!(row.name, "n");
+                assert_eq!(row.value, "v");
+            }
+            other => panic!("expected Headers sub-page, got {other:?}"),
         }
     }
 

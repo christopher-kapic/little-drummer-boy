@@ -22,7 +22,7 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
 
 use crate::auth::copilot_setup::{self, Shell as CopilotShell};
 use crate::config::providers::{HeaderSpec, OnUnlistedModelsFetch, ProviderEntry};
@@ -167,22 +167,28 @@ pub(super) enum EditField {
     Url,
 }
 
-/// Multi-row header list with inline editing.
+/// Multi-row header list. Browsing the rows is inline; adding or
+/// editing a header opens a name/value popup (see
+/// [`render_header_edit_popup`]).
 ///
-/// Layout (visible "rows" cursor can land on):
+/// Layout (visible "rows" the cursor can land on):
 ///   - 0..n               actual header rows
 ///   - n                  `[+ add header]`
 ///   - n+1                `[continue →]` (used by the Add wizard)
 ///
-/// In Browse mode the cursor selects a row; in `EditName(i)` /
-/// `EditValue(i)` keystrokes go to the matching field. Tab toggles
-/// between name and value while editing.
+/// In Browse mode the cursor selects a row and `Tab`/`Shift+Tab` move
+/// like `↓`/`↑`. With the popup open, `Tab`/`Shift+Tab` switch between
+/// the name and value fields, `enter` saves, and `esc` cancels.
 pub(super) struct HeaderEditor {
     pub(super) rows: Vec<HeaderSpec>,
     pub(super) cursor: usize,
     pub(super) mode: HeaderMode,
     pub(super) name_buf: TextField,
     pub(super) value_buf: TextField,
+    /// Row the popup is editing; `None` while adding a brand-new header.
+    /// A new header is committed to `rows` only on save, so cancelling
+    /// an add leaves no blank row behind.
+    pub(super) edit_target: Option<usize>,
     /// If false, the synthetic `[continue →]` row is suppressed (used
     /// from the Edit page, where there's no next step).
     pub(super) show_continue: bool,
@@ -190,8 +196,10 @@ pub(super) struct HeaderEditor {
 
 pub(super) enum HeaderMode {
     Browse,
-    EditName(usize),
-    EditValue(usize),
+    /// Popup open, focused on the name field.
+    EditName,
+    /// Popup open, focused on the value field.
+    EditValue,
 }
 
 pub(super) enum HeaderResult {
@@ -208,6 +216,7 @@ impl HeaderEditor {
             mode: HeaderMode::Browse,
             name_buf: TextField::default(),
             value_buf: TextField::default(),
+            edit_target: None,
             show_continue,
         }
     }
@@ -232,45 +241,73 @@ impl HeaderEditor {
         self.continue_idx().unwrap_or(self.add_row_idx())
     }
 
-    fn commit_edit(&mut self) {
-        match self.mode {
-            HeaderMode::EditName(i) => {
-                if let Some(row) = self.rows.get_mut(i) {
-                    row.name = self.name_buf.text().to_string();
-                }
-            }
-            HeaderMode::EditValue(i) => {
-                if let Some(row) = self.rows.get_mut(i) {
-                    row.value = self.value_buf.text().to_string();
-                }
-            }
-            HeaderMode::Browse => {}
+    /// Open the popup to add a brand-new header. The row is committed to
+    /// `rows` only on save (see [`Self::commit_edit`]).
+    fn begin_add(&mut self) {
+        self.edit_target = None;
+        self.name_buf = TextField::default();
+        self.value_buf = TextField::default();
+        self.mode = HeaderMode::EditName;
+    }
+
+    /// Open the popup to edit an existing row.
+    fn begin_edit(&mut self, i: usize) {
+        if let Some(row) = self.rows.get(i) {
+            self.edit_target = Some(i);
+            self.name_buf = TextField::new(row.name.clone());
+            self.value_buf = TextField::new(row.value.clone());
+            // Start on the value — the field most often changed when
+            // editing an existing header.
+            self.mode = HeaderMode::EditValue;
         }
     }
 
-    fn start_edit(&mut self, i: usize) {
-        if let Some(row) = self.rows.get(i) {
-            self.name_buf = TextField::new(row.name.clone());
-            self.value_buf = TextField::new(row.value.clone());
-            // Start on the value (the field the user usually wants to edit).
-            self.mode = HeaderMode::EditValue(i);
+    /// Save the popup buffers and close it. A new header with an empty
+    /// name is discarded so a stray `a` leaves no blank row; edits to an
+    /// existing row are always written so a field can be cleared.
+    fn commit_edit(&mut self) {
+        let name = self.name_buf.text().trim().to_string();
+        let value = self.value_buf.text().to_string();
+        match self.edit_target {
+            Some(i) => {
+                if let Some(row) = self.rows.get_mut(i) {
+                    row.name = name;
+                    row.value = value;
+                    self.cursor = i;
+                }
+            }
+            None => {
+                if !name.is_empty() {
+                    self.rows.push(HeaderSpec { name, value });
+                    self.cursor = self.rows.len() - 1;
+                }
+            }
         }
+        self.edit_target = None;
+        self.mode = HeaderMode::Browse;
+    }
+
+    /// Close the popup without saving.
+    fn cancel_edit(&mut self) {
+        self.edit_target = None;
+        self.mode = HeaderMode::Browse;
     }
 
     pub(super) fn handle_key(&mut self, key: KeyEvent) -> HeaderResult {
-        match &mut self.mode {
+        match self.mode {
             HeaderMode::Browse => self.handle_browse_key(key),
-            HeaderMode::EditName(_) | HeaderMode::EditValue(_) => self.handle_edit_key(key),
+            HeaderMode::EditName | HeaderMode::EditValue => self.handle_edit_key(key),
         }
     }
 
     fn handle_browse_key(&mut self, key: KeyEvent) -> HeaderResult {
         match key.code {
-            KeyCode::Up | KeyCode::Char('k') => {
+            // `Tab`/`Shift+Tab` move like `↓`/`↑` while browsing rows.
+            KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => {
                 self.cursor = self.cursor.saturating_sub(1);
                 HeaderResult::Stay
             }
-            KeyCode::Down | KeyCode::Char('j') => {
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
                 self.cursor = (self.cursor + 1).min(self.max_cursor());
                 HeaderResult::Stay
             }
@@ -278,15 +315,7 @@ impl HeaderEditor {
                 HeaderResult::Back
             }
             KeyCode::Char('a') => {
-                self.rows.push(HeaderSpec {
-                    name: String::new(),
-                    value: String::new(),
-                });
-                let i = self.rows.len() - 1;
-                self.cursor = i;
-                self.name_buf = TextField::default();
-                self.value_buf = TextField::default();
-                self.mode = HeaderMode::EditName(i);
+                self.begin_add();
                 HeaderResult::Stay
             }
             KeyCode::Char('d') | KeyCode::Delete => {
@@ -300,19 +329,10 @@ impl HeaderEditor {
             }
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
                 if self.cursor < self.rows.len() {
-                    self.start_edit(self.cursor);
+                    self.begin_edit(self.cursor);
                     HeaderResult::Stay
                 } else if self.cursor == self.add_row_idx() {
-                    // [+ add header]
-                    self.rows.push(HeaderSpec {
-                        name: String::new(),
-                        value: String::new(),
-                    });
-                    let i = self.rows.len() - 1;
-                    self.cursor = i;
-                    self.name_buf = TextField::default();
-                    self.value_buf = TextField::default();
-                    self.mode = HeaderMode::EditName(i);
+                    self.begin_add();
                     HeaderResult::Stay
                 } else if Some(self.cursor) == self.continue_idx() {
                     HeaderResult::Continue
@@ -327,32 +347,27 @@ impl HeaderEditor {
     fn handle_edit_key(&mut self, key: KeyEvent) -> HeaderResult {
         match key.code {
             KeyCode::Esc => {
-                // Cancel the in-flight edit by reverting the buffers
-                // (committed values came from the row originally, so
-                // just exit Browse without commit).
-                self.mode = HeaderMode::Browse;
-                HeaderResult::Stay
-            }
-            KeyCode::Tab => {
-                self.commit_edit();
-                self.mode = match self.mode {
-                    HeaderMode::EditName(i) => HeaderMode::EditValue(i),
-                    HeaderMode::EditValue(i) => HeaderMode::EditName(i),
-                    HeaderMode::Browse => HeaderMode::Browse,
-                };
+                self.cancel_edit();
                 HeaderResult::Stay
             }
             KeyCode::Enter => {
                 self.commit_edit();
-                self.mode = HeaderMode::Browse;
+                HeaderResult::Stay
+            }
+            // Two fields, so forward and backward both toggle focus.
+            KeyCode::Tab | KeyCode::BackTab => {
+                self.mode = match self.mode {
+                    HeaderMode::EditName => HeaderMode::EditValue,
+                    _ => HeaderMode::EditName,
+                };
                 HeaderResult::Stay
             }
             _ => {
                 match self.mode {
-                    HeaderMode::EditName(_) => {
+                    HeaderMode::EditName => {
                         self.name_buf.handle_key(key);
                     }
-                    HeaderMode::EditValue(_) => {
+                    HeaderMode::EditValue => {
                         self.value_buf.handle_key(key);
                     }
                     HeaderMode::Browse => {}
@@ -1251,7 +1266,7 @@ impl SettingsDialog {
         let ids: Vec<&String> = self.config.providers.keys().collect();
         if ids.is_empty() {
             lines.push(Line::from(Span::styled(
-                "  (no providers configured — press `c` to add one)".to_string(),
+                "  (no providers configured)".to_string(),
                 muted,
             )));
         } else {
@@ -1504,6 +1519,9 @@ impl SettingsDialog {
             lines.push(Line::from(Span::styled(err.clone(), style)));
         }
         frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+        if matches!(s.step, AddStep::EditHeaders) && s.headers.is_editing() {
+            render_header_edit_popup(frame, area, &s.headers);
+        }
     }
 
     fn render_edit(&self, frame: &mut Frame, area: Rect, s: &EditState) {
@@ -1643,6 +1661,9 @@ impl SettingsDialog {
         ];
         render_header_editor(&mut lines, editor);
         frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+        if editor.is_editing() {
+            render_header_edit_popup(frame, area, editor);
+        }
     }
 
     fn render_fetch_all(&self, frame: &mut Frame, area: Rect, s: &FetchAllState) {
@@ -1855,58 +1876,17 @@ fn render_header_editor(lines: &mut Vec<Line<'static>>, h: &HeaderEditor) {
     for (i, row) in h.rows().iter().enumerate() {
         let cursor_here = h.cursor == i;
         let marker = if cursor_here { "  ▸ " } else { "    " };
-        let editing_name = matches!(h.mode, HeaderMode::EditName(j) if j == i);
-        let editing_value = matches!(h.mode, HeaderMode::EditValue(j) if j == i);
-        let name_text = if editing_name {
-            h.name_buf.text().to_string()
-        } else {
-            row.name.clone()
-        };
-        let value_text = if editing_value {
-            h.value_buf.text().to_string()
-        } else {
-            row.value.clone()
-        };
-        let name_style = if editing_name {
-            Style::default().fg(Color::Yellow)
-        } else if cursor_here {
+        let name_style = if cursor_here {
             yellow.add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(Color::White)
         };
-        let value_style = if editing_value {
-            Style::default().fg(Color::White)
-        } else {
-            muted
-        };
         lines.push(Line::from(vec![
             Span::raw(marker.to_string()),
-            Span::styled(format!("{:<width$}", name_text, width = name_w), name_style),
+            Span::styled(format!("{:<width$}", row.name, width = name_w), name_style),
             Span::raw("  "),
-            Span::styled(value_text.clone(), value_style),
+            Span::styled(row.value.clone(), muted),
         ]));
-
-        // Missing-env warning for the row currently being edited.
-        if editing_value {
-            let resolved = envref::resolve(&value_text);
-            if resolved.has_missing() {
-                lines.push(Line::from(Span::styled(
-                    format!(
-                        "      Environment variable not detected, make sure to set it: ${}",
-                        resolved.missing.join(", $")
-                    ),
-                    yellow,
-                )));
-            } else if !resolved.referenced.is_empty() {
-                lines.push(Line::from(Span::styled(
-                    format!(
-                        "      env var(s) detected: ${}",
-                        resolved.referenced.join(", $")
-                    ),
-                    muted,
-                )));
-            }
-        }
     }
 
     let add_idx = h.add_row_idx();
@@ -1934,6 +1914,80 @@ fn render_header_editor(lines: &mut Vec<Line<'static>>, h: &HeaderEditor) {
             Span::raw(marker.to_string()),
             Span::styled("[continue → save & fetch /models]".to_string(), style),
         ]));
+    }
+}
+
+/// Centered name/value popup for adding or editing a header. Drawn on
+/// top of the header list when the editor is in `EditName`/`EditValue`
+/// mode. The `Clear` widget wipes the cells underneath so the list
+/// doesn't bleed through.
+fn render_header_edit_popup(frame: &mut Frame, area: Rect, h: &HeaderEditor) {
+    let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+    let yellow = Style::default().fg(Color::Yellow);
+
+    let name_focus = matches!(h.mode, HeaderMode::EditName);
+
+    let mut body: Vec<Line<'static>> = Vec::new();
+    render_field_row(&mut body, "Name ", &h.name_buf, name_focus);
+    render_field_row(&mut body, "Value", &h.value_buf, !name_focus);
+
+    // Env-var status for the value (headers commonly reference `$VAR`).
+    let resolved = envref::resolve(h.value_buf.text());
+    if resolved.has_missing() {
+        body.push(Line::from(Span::styled(
+            format!(
+                "  Environment variable not detected, make sure to set it: ${}",
+                resolved.missing.join(", $")
+            ),
+            yellow,
+        )));
+    } else if !resolved.referenced.is_empty() {
+        body.push(Line::from(Span::styled(
+            format!(
+                "  env var(s) detected: ${}",
+                resolved.referenced.join(", $")
+            ),
+            muted,
+        )));
+    } else {
+        body.push(Line::default());
+    }
+    body.push(Line::default());
+    body.push(Line::from(Span::styled(
+        "Tab: switch field   enter: save   esc: cancel".to_string(),
+        muted,
+    )));
+
+    let title = if h.edit_target.is_some() {
+        " Edit header "
+    } else {
+        " Add header "
+    };
+    let width = area.width.saturating_sub(6).clamp(24, 70);
+    let height = (body.len() as u16) + 2; // +2 for the top/bottom border
+    let rect = centered_rect(area, width, height);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(yellow)
+        .title(title);
+    let inner = block.inner(rect);
+    frame.render_widget(Clear, rect);
+    frame.render_widget(block, rect);
+    frame.render_widget(Paragraph::new(body).wrap(Wrap { trim: false }), inner);
+}
+
+/// A `width`×`height` rect centered within `area`, clamped to fit.
+fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
+    let width = width.min(area.width);
+    let height = height.min(area.height);
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    Rect {
+        x,
+        y,
+        width,
+        height,
     }
 }
 
