@@ -38,6 +38,22 @@ directories at runtime.
 debating / skipping, and `miscellaneous.md` for cross-cutting concerns
 (Windows, distribution, …).
 
+## Install
+
+From a local checkout:
+
+```bash
+cargo install --locked --path .
+```
+
+Always pass `--locked`. Without it, `cargo install` ignores the
+committed `Cargo.lock` and re-resolves every dependency to its latest
+compatible version — which can pull a newer `bitflags` whose
+`bitflags!` macro recurses past `dispatch2`'s `recursion_limit` and
+fails to compile (notably on x86_64 macOS, via the `arboard` /
+`keepawake` → `objc2` chain). `--locked` builds the tested dependency
+set and sidesteps it.
+
 ## Project docs
 
 - [`GOALS.md`](./GOALS.md) — what `cockpit` is for.

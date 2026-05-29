@@ -203,9 +203,12 @@ Compare ralph-rs's `.github/workflows/` for the existing pattern.
 
 ## 3. Distribution
 
-- **Cargo:** `cargo install cockpit-cli` (crate name); installs
-  the `cockpit` binary. The crate name needs to be reserved
-  early.
+- **Cargo:** `cargo install --locked cockpit-cli` (crate name);
+  installs the `cockpit` binary. The crate name needs to be reserved
+  early. Always document `--locked`: without it `cargo install`
+  re-resolves past the published `Cargo.lock` and can pull a newer
+  `bitflags` that overflows `dispatch2`'s `recursion_limit` (x86_64
+  macOS, via the `arboard`/`keepawake` → `objc2` chain).
 - **Homebrew:** `brew install cockpit-cli` via a tap (`brew tap
   christopher-kapic/tap`). ralph-rs and kctx-local both publish this
   way; copy their `scripts/` workflow.
