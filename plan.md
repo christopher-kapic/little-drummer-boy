@@ -1122,7 +1122,7 @@ context-economy-fatal at the 32B end. Defer-loading turns that into
 *names* of everything else" — under 1K tokens. Schemas load on
 first-use only. Lazy is the default on every cockpit tool; opt-out is
 deliberate (e.g., `bash` is always loaded because the cheap
-orchestrator almost always wants it).
+primary agent almost always wants it).
 
 **Output spillover** ([`features/opencode.md` §16](./features/opencode.md)):
 every tool result that exceeds the per-tool cap (default 8 KB, GOALS
@@ -1160,7 +1160,7 @@ Whitelisting is opt-in per tool-call; the default denies.
 ([`features/oh-my-codex.md` §7](./features/oh-my-codex.md)).
 **T7-load-bearing.** Bulky bash/tool output is the most common
 cheap-model context killer; this is *the* feature that makes cheap
-orchestrators viable on real codebases.
+Build and Plan viable on real codebases.
 
 Decision tree per tool call:
 
@@ -1182,8 +1182,8 @@ line-chars). Especially valuable for `bash` search output
 usually wants the *shape* of the result, not all 50,000 matches.
 
 The summary is produced by whatever the user has mapped to the
-`smol` category (§4.6) — for cheap-orchestrator sessions this is
-typically the same cheap model the orchestrator is running, just
+`smol` category (§4.6) — for cheap primary-agent sessions this is
+typically the same cheap model the primary agent is running, just
 with a tighter task brief. The summarizer is itself a one-shot
 subagent (fresh context, no history) so its output is a faithful
 distillation rather than narrative.
@@ -1248,14 +1248,14 @@ is **who is in the foreground while the child runs**:
   the child to completion without user interaction. The parent
   continues whatever it was doing (typical in graph plans:
   multiple noninteractive subagents fan out under one
-  `orchestrator-plan` turn). The parent receives only the final
+  `Plan` turn). The parent receives only the final
   structured report. Used for "delegate this scoped piece of
   work; report back."
 - **Interactive.** `task(mode: "subagent_interactive", ...)`
   spawns the child and **swaps it into the foreground** as the
   primary agent — the user is now talking to the subagent
   directly, in the same TUI, in the same composer. The parent
-  (typically an orchestrator) is **paused**: its conversation is
+  (typically the active primary agent) is **paused**: its conversation is
   preserved on disk, its turn is not advanced, no model calls
   are made on its behalf. On child completion (the child returns
   its report via `task_done`, or the user invokes `/return`),
@@ -1275,11 +1275,11 @@ is **who is in the foreground while the child runs**:
 
   The TUI shows the current foreground agent's name in the chrome
   (per `GOALS.md` §1a) so the user always knows whether they're
-  talking to `orchestrator-build`, `coder`, etc.
+  talking to `Build`, `coder`, etc.
 
 The `mode` defaults to `"subagent"` (noninteractive) when omitted
-unless the spawning agent specifies otherwise; the active
-orchestrator chooses interactively when handing off coding work
+unless the spawning agent specifies otherwise; the active primary agent
+chooses interactively when handing off coding work
 that the user is likely to want to steer mid-flight.
 
 **Seed-tools on subagent invocation.** A `task` invocation may
@@ -1318,12 +1318,12 @@ debuggable. Same mechanism powers `/compact` handoff (T6.e step 3).
 
 **Background agents = ralph plan executions** (GOALS §3b). Not a
 separate primitive. The same `coder`/`explore`/`docs` binaries
-that orchestrators spawn interactively are spawned
+that Build and Plan spawn interactively are spawned
 **noninteractively** by the **ralph executor** (a daemon-resident
 process — GOALS §8) when a plan run is triggered. The differences
 are caller semantics, not different agent kinds:
 
-- Caller is the ralph executor, not `orchestrator-build` → reports
+- Caller is the ralph executor, not `Build` → reports
   flow back to the executor and surface in the plan's status, not
   in the user's foreground turn.
 - Multiple `coder` instances may run in parallel across plan
@@ -1335,7 +1335,7 @@ are caller semantics, not different agent kinds:
   dashboard (GOALS §8d).
 
 A subagent's mode (interactive vs noninteractive) is set by the
-caller, not by the subagent. The orchestrator-spawned variant is
+caller, not by the subagent. The primary-agent-spawned variant is
 interactive — it becomes the primary agent while it works and the
 user can steer it directly. The ralph-spawned variant is
 noninteractive — it produces reports, not real-time conversation.
@@ -1362,22 +1362,22 @@ is the contract for `mode: "subagent"`: `objective`, `scope`,
 are a design smell. Forks don't need a `TaskPacket` — they inherit
 the parent's context which already carries the necessary state.
 
-### 3d-bis. Multi-task episode sequencing (`orchestrator-build`)
+### 3d-bis. Multi-task episode sequencing (`Build`)
 
 Per GOALS §3a, a multi-task user prompt is run as **one fresh
-`orchestrator-build` episode per task, sequentially** — not as one
-long context, and not as `orchestrator-build` spawning itself. The
+`Build` episode per task, sequentially** — not as one
+long context, and not as `Build` spawning itself. The
 **runtime owns the task queue**; each episode is a fresh primary
 context for one ordered task. This is *not* a new delegation primitive
 — it reuses the existing primary-agent lifecycle, just torn down and
 re-stood-up per queue entry by the scheduler. Implications:
 
 - **Decomposition + ordering** is produced by the first
-  `orchestrator-build` turn (it emits an ordered task list); the
+  `Build` turn (it emits an ordered task list); the
   runtime enqueues it. A single small task short-circuits the queue
   entirely (no episode machinery).
 - **TUI seamlessness is a hard requirement.** The chrome's
-  active-agent label stays `orchestrator-build` across episode
+  active-agent label stays `Build` across episode
   boundaries; the composer/turn flow looks identical to a normal
   session. No "subagent returned" seam between episodes. (This is the
   one constraint the user pinned: episode sequencing must be invisible
@@ -1385,14 +1385,14 @@ re-stood-up per queue entry by the scheduler. Implications:
 - **Mid-flight add** rides `task_request` (§3d / GOALS §3b): urgency
   `now` folds into the current episode, `after_current` appends to the
   runtime queue at the right position.
-- **Cheap `coder` hop.** Because `orchestrator-build` stays
+- **Cheap `coder` hop.** Because `Build` stays
   delegation-only (single-writer invariant, §4.1), small edits still
   go through `coder`; the spawn path is kept minimal-ceremony so the
-  round-trip cost is low. Direct-write on `orchestrator-build` is
+  round-trip cost is low. Direct-write on `Build` is
   deferred — `design-need-to-discuss-or-test.md` D17, gated on
   per-agent tool descriptions.
 - **Sequential only.** Parallel task execution is *not* offered here;
-  it is `orchestrator-plan` + the ralph executor's job (the routing
+  it is `Plan` + the ralph executor's job (the routing
   table in §4.2 reflects this split).
 
 ### 3e. Approval router (`session/approvals.rs`)
@@ -1617,11 +1617,51 @@ This is the founder's "labor efficiency" goal: parallel work doesn't
 block waiting on the human; only the specific subgraph that needs the
 answer blocks.
 
-**Storage.** Graph plans live in the same SQLite DB as conversations,
-under `graph_plans` and `graph_nodes` tables. They can reference an
-existing ralph plan by slug (so `cockpit graph from-ralph <slug>` is a
-one-line import that turns a linear plan into a degenerate
-one-node-per-step DAG).
+**Storage.** Graph plans live in the same SQLite DB as conversations.
+They can reference an existing ralph plan by slug (so `cockpit graph
+from-ralph <slug>` is a one-line import that turns a linear plan into a
+degenerate one-node-per-step DAG).
+
+**Storage — as built (migration `0014_plans.sql`, prompt 1).** The
+user-facing vocabulary is **plan** / **step**; "graph"/"node"/"DAG" stay
+internal. The tables are named for the user-facing words:
+
+- `plans` — `id, slug (UNIQUE), title, description (one-line summary for
+  fit judgment), status (pending|in_progress|done), base_branch,
+  target_branch, isolation_mode (worktree|shared_tree), created_at,
+  updated_at`. `base_branch`/`target_branch` are the branch policy
+  (written by the authoring flow, prompt 2); the suggested target is
+  `${planBranchRoot}/<feature>` (see config §2/`planBranchRoot`).
+- `plan_steps` (§4.1's *nodes*) — `id, plan_id, title,
+  feature_description (JSON TaskPacket per claw.md §8), status, position
+  (authoring order), created_at, updated_at`.
+- `plan_step_deps` — dependency edges; `from_step_id` depends on (runs
+  after) `to_step_id`, both in the same plan, `UNIQUE(from, to)`. Steps
+  + edges form a DAG. Cycle prevention is enforced at the **tool layer**
+  (`db::plans::add_step_dependency`) before insert: a path search proves
+  the edge would close a loop, and the error **names the offending
+  cycle**; a cyclic state is never persisted.
+- `plan_step_tests` — per-step tests: `command`, `phase`
+  (`post_step` | `branch_stable` — the `branch_stable` trigger semantics
+  are finalized in prompt 4; the field is modeled and stored now),
+  `concurrency` (`parallel` default | `exclusive`) + `resource_key`
+  (non-NULL iff `exclusive`).
+
+**Test-concurrency decision (settled, prompt 1).** `exclusive:<key>`
+(an opaque resource key like `"port:8080"` or `"gpu0"`) is the **v1
+mechanism** for tests that contend on a shared resource: two tests
+holding the same key never run concurrently across worktrees; different
+keys still parallelize. The exclusive-serialization machinery itself is
+prompt 4. Per-worktree **parameterized resource injection ("Way B")** —
+rewriting a port/env per worktree so contending tests can run in
+parallel — is an **explicitly deferred** future opt-in: no column is
+reserved and no code ships for it in v1; a future migration adds it
+additively if it ships.
+
+The agent-facing authoring tools (`plan_create`, `add_step`,
+`add_step_dependency`, `plan_list`) live in `src/tools/plan.rs` and are
+the load-bearing path for the planning agent (prompt 2); the `cockpit
+graph …` CLI below is the human mirror.
 
 **CLI surface.**
 
@@ -1804,8 +1844,8 @@ The two primitives together cover the full design space of
 | "Try fix A and fix B from this turn" | two forks (shared setup, diverge after) |
 | "Ask Opus and Sonnet the same hard question from here" | two forks, different `category` per fork |
 | "Generate 5 candidate optimizations to bench" | 5 forks under an evaluator-gated graph node |
-| "Do these 3 things one after another, hands-on" | `orchestrator-build` multi-task decomposition → sequential episodes (§3d-bis) |
-| "Decompose this big task and run the steps in parallel" | graph plan with subagent nodes (`orchestrator-plan` + ralph) |
+| "Do these 3 things one after another, hands-on" | `Build` multi-task decomposition → sequential episodes (§3d-bis) |
+| "Decompose this big task and run the steps in parallel" | graph plan with subagent nodes (`Plan` + ralph) |
 
 ### 4.3 Prompt-injection guard
 
@@ -2093,7 +2133,7 @@ default; advanced opt-in via `allow_re_delegate: true` in the agent
 frontmatter.
 
 **Interactive scope changes use `task_request`, not nested interactive
-delegation.** Real `task(...)` spawning remains the orchestrator's
+delegation.** Real `task(...)` spawning remains the active primary agent's
 delegation primitive (and the graph executor's / `coder -> docs`
 structural primitive). But when an **interactive** specialist is asked
 to do something outside its current brief, it does not directly spawn
@@ -2213,10 +2253,10 @@ cockpit ships a small, generic-named default cast in
 
 | Agent                 | Mode     | Default category | Cwd | Purpose |
 |-----------------------|----------|------------------|-----|---------|
-| `orchestrator-build`  | primary  | `default`        | project | Traditional coding-harness experience. Owns the conversation when the focus is *making the change*. Delegates to `explore` / `docs` / `coder`. No direct `write`/`edit`; no file locks. `/build` slash command swaps to this one. |
-| `orchestrator-plan`   | primary  | `slow` (thinking)| project | Ralph-style planner. Owns the conversation when the focus is *deciding what to do*. Sees the full feature dependency graph(s) (§4.1), can create new graph plans, can append to existing ones. Produces / mutates plan structures; does not write code directly. `/plan` slash command swaps to this one. |
+| `Build`               | primary  | `default`        | project | Traditional coding-harness experience. Owns the conversation when the focus is *making the change*. Delegates to `explore` / `docs` / `coder`. No direct `write`/`edit`; no file locks. `/build` slash command swaps to this one. |
+| `Plan`                | primary  | `slow` (thinking)| project | Ralph-style planner. Owns the conversation when the focus is *deciding what to do*. Sees the full feature dependency graph(s) (§4.1), can create new graph plans, can append to existing ones. Produces / mutates plan structures; does not write code directly. `/plan` slash command swaps to this one. |
 | `explore`             | subagent | `default`        | project | Read-only investigator over the *current* project. Tools: `read`, `bash` (raw `rg`/`fd`), and the read-only codebase-intelligence tools (GOALS §21). Designed as a search engine — returns `file:line` citations, not prose summaries. |
-| `coder`               | subagent | `slow`           | project | The only agent that holds locks and writes/edits. Receives a scoped task from an orchestrator, makes the changes, returns a structured report. |
+| `coder`               | subagent | `slow`           | project | The only agent that holds locks and writes/edits. Receives a scoped task from the active primary agent, makes the changes, returns a structured report. |
 | `docs`                | subagent | `default`        | pipeline (caller cwd → package dir) | Fixed two-stage noninteractive pipeline that answers "how do I use this dependency?" from its real source. Docs.1 (resolver, caller cwd) confirms/shallow-clones the dependency into cockpit's package registry; Docs.2 (answerer, package dir) reads it with `read` + sandboxed `grep`/`glob` (no bash/network/write) and returns `file:line` citations. To the caller it's one leaf invocation. See GOALS §3a / §4d-bis. |
 
 Names are generic, not personality-themed. The cast is **deliberately
@@ -2228,17 +2268,17 @@ or who want a reviewer / committer / researcher role, write their
 own agent files. Resist the temptation to expand the bundled cast
 beyond what's load-bearing.
 
-**Why two orchestrators.** Planning and building are different
+**Why Build and Plan.** Planning and building are different
 cognitive modes — a planning conversation talks about the *graph*
 (nodes, edges, dependencies, what to do next); a building
 conversation talks about the *code* (this file, this function,
 this diff). Bundling both into one agent forces the model to
 context-switch every turn and produces worse output in both modes.
-`/plan` and `/build` slash commands swap which orchestrator owns
+`/plan` and `/build` slash commands swap which primary agent owns
 the conversation; the user can switch any time. The two share the
 session DB and the lock manager, so a graph plan authored under
-`orchestrator-plan` is immediately consumable when the user
-switches to `orchestrator-build`.
+`Plan` is immediately consumable when the user
+switches to `Build`.
 
 **The package registry (replaces the old docs directory).** cockpit
 owns a user-global `packages` registry (a table in the global cockpit
@@ -2254,13 +2294,12 @@ runs in the caller's cwd to resolve/clone; Docs.2 runs in the resolved
 package directory and answers from the source. Citations from Docs.2
 are relative to the package root.
 
-**Why this cast composes well.** The two orchestrators
-(`orchestrator-build`, `orchestrator-plan`) are the only primary
-agents — exactly one owns the user's session at a time, swapped
-via `/build` / `/plan`. When the active orchestrator needs to
+**Why this cast composes well.** Build and Plan
+are the only primary agents — exactly one owns the user's session at a time, swapped
+via `/build` / `/plan`. When the active primary agent needs to
 understand the current project it spawns `explore`; when it
 needs to understand a dependency it spawns `docs` (via `coder`
-under `orchestrator-build`; not available to `orchestrator-plan`
+under `Build`; not available to `Plan`
 directly per §3a). When it decides what to change it spawns
 `coder`. Only `coder` writes, so the file-lock manager (§4.1)
 has a single writer per delegation tree — drastically simpler
@@ -2312,10 +2351,10 @@ For Docs.2, citation paths are relative to the package root
 (e.g. `src/router/match.ts:42-78` within the cloned dependency).
 The answer is surfaced to the caller as the single `docs` tool result.
 
-The orchestrator reads the citations, then uses its own `read`
+The active primary agent reads the citations, then uses its own `read`
 tool (or dispatches `coder`) to pull the specific lines it cares
 about. The investigator does the expensive directory walking
-inside its own fresh context; the orchestrator only ever sees the
+inside its own fresh context; the active primary agent only ever sees the
 curated index.
 
 **Why this pattern works for cheap models.** Cheap models are
@@ -2323,7 +2362,7 @@ reasonable at retrieval-and-ranking (`bash rg`, the `search` /
 `symbol_find` intel tools, then "which of these matches is most
 relevant?") and bad at multi-page
 synthesis. The two investigators exploit the strength and sidestep
-the weakness. The orchestrator does the synthesis using focused,
+the weakness. The active primary agent does the synthesis using focused,
 model-curated reads — much cheaper context, much higher signal.
 
 **System prompt discipline.** Both agents' system prompts are
@@ -2361,7 +2400,7 @@ incoming prompt by **intent + size**:
   of `explore | coder | docs` (the bundled subagents per §4.6.d).
   User-authored agents may register additional triage destinations
   by setting `triage_destination: true` in their frontmatter.
-- `Triage::Heavy` — orchestrator territory; spawn the graph plan
+- `Triage::Heavy` — primary-agent territory; spawn the graph plan
   or team-mode flow.
 
 Plus prompt-prefix escape hatches (`quick:`, `small:`, `just:`,
@@ -2541,7 +2580,7 @@ What cockpit absorbs from kctx (re-implementation, not vendoring):
   cwd-parameterized noninteractive spawn via `SpawnArgs.cwd` override;
   `docs-resolver`/`docs-answerer` factories + prompts in `engine/builtin/`;
   `docs` registered in `is_noninteractive()` and added to the
-  `orchestrator-build` and `coder` `task` allowlists. Auto-clone
+  `Build` and `coder` `task` allowlists. Auto-clone
   resolves repo URLs only from registry metadata (`packages/resolve.rs`).
 
 What's *better* in cockpit's implementation than the shell-out path:
@@ -3088,14 +3127,14 @@ banner so they're not just scattered nice-haves):
   models won't notice external file changes; explicit notes are
   required. They also misweight when duplicate reads are in
   history; T6.b removes the wrong-anchor failure mode.
-- **Triage classification (§4.6.e, M3).** A cheap orchestrator that
+- **Triage classification (§4.6.e, M3).** A cheap primary agent that
   routes everything to a slow category burns the slow budget. The
-  Pass/Light/Heavy classifier keeps the cheap orchestrator
+  Pass/Light/Heavy classifier keeps the cheap primary agent
   appropriately self-directed.
 - **Risk-keyword auto-escalation (§4.6, M3).** Cheap models
   shouldn't make auth/migration/production-change decisions
   silently. The regex bump-up-the-category rule is what protects
-  against expensive cheap-orchestrator mistakes.
+  against expensive cheap primary-agent mistakes.
 - **Researcher subagent (§3i + §4.6.d, M2).** The reason kcl
   functionality is absorbed (T7-driven §5b rewrite): cheap-model
   research over external packages requires in-process context
@@ -3136,8 +3175,8 @@ making the decision so we don't ship one of each.
 
 ### Q14. Bundled named-agent cast — DECIDED (five agents)
 
-§4.6.d ships exactly five agents: `orchestrator-build`,
-`orchestrator-plan`, `explore`, `coder`, `docs`. See `GOALS.md`
+§4.6.d ships exactly five agents: `Build`,
+`Plan`, `explore`, `coder`, `docs`. See `GOALS.md`
 §3a for the canonical statement of the cast.
 
 Earlier drafts considered a cast of ~7 (`deep-worker`, `consultant`,
@@ -3150,9 +3189,9 @@ We deliberately shrunk because:
 - The two read-only investigators (`explore` and `docs`) differ
   only in cwd — same prompt template, same tool surface, same
   output schema. Two agents, one design.
-- The two orchestrators (`-build` and `-plan`) are the one place
+- Build and Plan are the one place
   we *did* split rather than shrink: planning and building are
-  different cognitive modes and one merged orchestrator does both
+  different cognitive modes and one merged primary agent does both
   poorly. The split is structural, not just naming.
 - A larger cast is a docs/maintenance burden and obscures what each
   agent *mechanically does* behind a memorable name.
@@ -3202,7 +3241,7 @@ override, graph-node directive). Things to align on:
 - **Q11c.** How do we handle a model role pointing at a provider
   the user hasn't authed against? Lean: **fail fast at the dispatch
   site**, return a structured error (exit code 1, NDJSON event), and
-  the orchestrator can choose to retry with a different role.
+  the active primary agent can choose to retry with a different role.
 - **Q11d.** The `guard` role is special — it's load-bearing for
   security. Should we ship a **hard-coded fallback** (e.g., if
   `guard` is unmapped, use whatever `default` is) or fail to start?
@@ -3266,7 +3305,7 @@ step's dependencies cheap.
 - `cockpit init|doctor|version|stats|models resolve` with
   `--output-format json`.
 - Bundled 5-agent cast shipped under `~/.config/cockpit/agents/builtin/`:
-  `orchestrator-build`, `orchestrator-plan`, `explore`, `coder`,
+  `Build`, `Plan`, `explore`, `coder`,
   `docs` (per GOALS §3a / §4.6.d).
 - Categories scaffolded (`default`, `smol`, `slow`, `guard`,
   `commit`) but unmapped by default; the TUI's `/providers` flow

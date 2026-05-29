@@ -24,6 +24,7 @@ pub mod glob;
 pub mod grep;
 pub mod intel;
 pub mod jobs;
+pub mod plan;
 pub mod question;
 pub mod read;
 pub mod readlock;

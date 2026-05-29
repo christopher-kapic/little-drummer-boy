@@ -26,6 +26,7 @@ pub mod lang;
 pub mod locks;
 pub mod needs_attention;
 pub mod packages;
+pub mod plans;
 pub mod seed_tools;
 pub mod session_log;
 pub mod session_search;
@@ -187,6 +188,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0011_approval_grants.sql"),
     include_str!("migrations/0012_loop_guard_rules.sql"),
     include_str!("migrations/0013_session_search_fts.sql"),
+    include_str!("migrations/0014_plans.sql"),
 ];
 
 fn migrate(conn: &Connection) -> Result<()> {

@@ -93,6 +93,17 @@ pub struct ExtendedConfig {
     /// auto-`!`-command toggle.
     #[serde(default)]
     pub skills: SkillsConfig,
+
+    /// Branch-name prefix for suggested plan branches (`plan.md` §4.1).
+    /// The planning flow (orchestrator-plan) suggests a plan's target
+    /// branch as `${planBranchRoot}/<feature-branch>`. Default
+    /// `"cockpit-plan"`.
+    #[serde(rename = "planBranchRoot", default = "default_plan_branch_root")]
+    pub plan_branch_root: String,
+}
+
+fn default_plan_branch_root() -> String {
+    "cockpit-plan".to_string()
 }
 
 /// Skills subsystem config (GOALS §5).
@@ -536,6 +547,7 @@ impl Default for ExtendedConfig {
             loop_guard: LoopGuardConfig::default(),
             dialog: DialogConfig::default(),
             skills: SkillsConfig::default(),
+            plan_branch_root: default_plan_branch_root(),
         }
     }
 }
@@ -776,6 +788,30 @@ mod tests {
         let cfg2 = doc2.config();
         assert!(cfg2.tui.caffeinate_display_awake);
         assert_eq!(cfg2.tui.sleep_scope(), SleepScope::SystemAndDisplay);
+    }
+
+    #[test]
+    fn plan_branch_root_defaults_to_cockpit_plan() {
+        let cfg = ExtendedConfig::default();
+        assert_eq!(cfg.plan_branch_root, "cockpit-plan");
+        // A config that omits the field still reads the default.
+        let parsed: ExtendedConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(parsed.plan_branch_root, "cockpit-plan");
+    }
+
+    #[test]
+    fn plan_branch_root_round_trips_through_extended_doc() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("extended-config.json");
+        std::fs::write(&path, "{}").unwrap();
+        let mut doc = ExtendedConfigDoc::load(&path).unwrap();
+        let mut cfg = doc.config();
+        cfg.plan_branch_root = "wip".to_string();
+        doc.write(&cfg).unwrap();
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(on_disk.contains("\"planBranchRoot\""), "{on_disk}");
+        let doc2 = ExtendedConfigDoc::load(&path).unwrap();
+        assert_eq!(doc2.config().plan_branch_root, "wip");
     }
 
     #[test]

@@ -43,6 +43,7 @@ pub(super) enum UiField {
     Name,
     PackagesDir,
     UtilityModel,
+    PlanBranchRoot,
     LoopGuardThreshold,
 }
 
@@ -74,9 +75,9 @@ pub(super) struct GrabState {
 
 /// Rows on the UI page (vim mode, thinking, render-agent-markdown,
 /// render-user-markdown, mouse, rich-text-copy, emojis, caffeinate
-/// display-awake, name, packages dir, utility model, loop-guard
-/// threshold, instructions file).
-pub(super) const UI_ROWS: usize = 13;
+/// display-awake, name, packages dir, utility model, plan branch root,
+/// loop-guard threshold, instructions file).
+pub(super) const UI_ROWS: usize = 14;
 
 pub(super) fn bool_label(on: bool, on_label: &str, off_label: &str) -> String {
     if on {
@@ -169,6 +170,15 @@ impl SettingsDialog {
                         UiField::UtilityModel => {
                             self.extended.utility_model =
                                 if new.is_empty() { None } else { Some(new) };
+                        }
+                        UiField::PlanBranchRoot => {
+                            // A blank value resets to the default rather
+                            // than storing an empty prefix.
+                            self.extended.plan_branch_root = if new.is_empty() {
+                                "cockpit-plan".to_string()
+                            } else {
+                                new
+                            };
                         }
                         UiField::LoopGuardThreshold => {
                             // Parse a positive integer; clamp to the
@@ -270,11 +280,15 @@ impl SettingsDialog {
                     p.editing = Some(UiField::UtilityModel);
                 }
                 11 => {
+                    p.buf = TextField::new(self.extended.plan_branch_root.clone());
+                    p.editing = Some(UiField::PlanBranchRoot);
+                }
+                12 => {
                     p.buf =
                         TextField::new(self.extended.loop_guard.effective_threshold().to_string());
                     p.editing = Some(UiField::LoopGuardThreshold);
                 }
-                12 => {
+                13 => {
                     return Nav::Replace(Page::Instructions(InstructionsPage {
                         cursor: 0,
                         grabbed: None,
@@ -299,7 +313,7 @@ impl SettingsDialog {
         )));
         lines.push(Line::default());
 
-        let rows: [(&str, String); 13] = [
+        let rows: [(&str, String); 14] = [
             (
                 "vim mode",
                 vim_label(self.extended.tui.vim_mode).to_string(),
@@ -381,6 +395,13 @@ impl SettingsDialog {
                     .unwrap_or_else(|| "(unset — provider:model-id)".to_string()),
             ),
             (
+                "plan branch root",
+                format!(
+                    "{} (prefix for suggested plan branches: <root>/<feature>)",
+                    self.extended.plan_branch_root
+                ),
+            ),
+            (
                 "loop-guard threshold",
                 format!(
                     "{} (consecutive identical tool calls before approval prompt; 2 = first repeat)",
@@ -423,6 +444,7 @@ impl SettingsDialog {
                 UiField::Name => "name: ",
                 UiField::PackagesDir => "packages dir: ",
                 UiField::UtilityModel => "utility model (provider:model-id): ",
+                UiField::PlanBranchRoot => "plan branch root: ",
                 UiField::LoopGuardThreshold => "loop-guard threshold (>= 2): ",
             };
             lines.push(Line::default());
@@ -511,7 +533,7 @@ impl SettingsDialog {
             KeyCode::Esc | KeyCode::Char('q') => return Nav::Close,
             KeyCode::Left | KeyCode::Backspace | KeyCode::Char('h') => {
                 return Nav::Replace(Page::Ui(UiPage {
-                    cursor: 12,
+                    cursor: 13,
                     editing: None,
                     buf: TextField::default(),
                     status: None,

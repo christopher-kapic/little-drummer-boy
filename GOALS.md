@@ -101,7 +101,7 @@ the chrome.
   user notices when the decision matters but isn't trained to ignore a
   constantly-screaming number.
 - active agent: the name of the agent currently driving the
-  conversation (e.g. `orchestrator-build`, `coder`, `explore`).
+  conversation (e.g. `Build`, `coder`, `explore`).
   Required because interactive subagents become the primary while
   they work (§3b) — the user must always know who they're talking
   to. Visually distinct from the cwd / branch slot.
@@ -226,7 +226,7 @@ returning control to the shell.
   turns.
 - **Formatting:** transcript is rendered in a copy-friendly form —
   no box characters, no color codes (or stripped via `NO_COLOR`
-  semantics), agent names prefixed (`orchestrator-build:`,
+  semantics), agent names prefixed (`Build:`,
   `coder:`) so multi-agent sessions stay readable. Code blocks
   preserved verbatim. The point is: commands the agent gave you
   should paste cleanly.
@@ -728,41 +728,41 @@ agent uses keys that opencode doesn't recognize.
 
 ### 3a. Bundled agent cast (v1)
 
-cockpit ships five built-in agents (two orchestrator variants + three
+cockpit ships five built-in agents (Build and Plan + three
 specialists). The cast is deliberately minimal — these compose into
 "plan ↔ build → look at project → look at deps → write." Anything
 else is a user-authored agent.
 
 | Agent                 | Mode     | Cwd | Purpose |
 |-----------------------|----------|-----|---------|
-| `orchestrator-build`  | primary  | project root | The traditional coding-harness experience. Owns the user's conversation when the focus is *making the change*. Tools: `read` (shallow inspection of files the user references; not for searching), `task` (delegation), `skill`. May invoke `explore` interactively (one at a time) or in the background (multiple in parallel). May invoke `coder` interactively (one at a time). Does not directly `write`/`edit` and does not hold file locks. |
-| `orchestrator-plan`   | primary  | project root | Ralph-style planner. Owns the user's conversation when the focus is *deciding what to do*. Tools: `read` (shallow inspection), `task`, `skill`, plus plan-graph tools (create / append / update / delete / trigger). Sees in-progress and not-yet-implemented plans (completed plans are hidden by default; see "plan visibility" below). Triggering hands the plan off to the ralph executor (see §3b "Background agents") — `orchestrator-plan` does **not** hold the user's conversation while the plan runs; the user keeps talking to `orchestrator-plan` about other plans. Delegates to `explore` (interactive one-at-a-time, or background multi-parallel). Does not write code. |
+| `Build`  | primary  | project root | The traditional coding-harness experience. Owns the user's conversation when the focus is *making the change*. Tools: `read` (shallow inspection of files the user references; not for searching), `task` (delegation), `skill`. May invoke `explore` interactively (one at a time) or in the background (multiple in parallel). May invoke `coder` interactively (one at a time). Does not directly `write`/`edit` and does not hold file locks. |
+| `Plan`   | primary  | project root | Ralph-style planner. Owns the user's conversation when the focus is *deciding what to do*. Tools: `read` (shallow inspection), `task`, `skill`, plus plan-graph tools (create / append / update / delete / trigger). Sees in-progress and not-yet-implemented plans (completed plans are hidden by default; see "plan visibility" below). Triggering hands the plan off to the ralph executor (see §3b "Background agents") — `Plan` does **not** hold the user's conversation while the plan runs; the user keeps talking to `Plan` about other plans. Delegates to `explore` (interactive one-at-a-time, or background multi-parallel). Does not write code. |
 | `explore`             | subagent | project root | Read-only investigator over the **current project**. Tools: `read`, `bash` (raw `rg`/`fd`), and the read-only codebase-intelligence tools (§21). Cannot invoke subagents. Returns `file:line` citations, not prose summaries. |
-| `coder`               | subagent | project root | The only agent that holds file locks and writes/edits. Tools: `read`/`readlock`/`write`/`writeunlock`/`unlock`/`edit`/`bash`/`task` plus the codebase-intelligence tools (§21). The `task` permission is scoped to `docs` only (noninteractive, may run multiple in parallel). Receives a scoped task from its caller, makes the changes, returns a structured report. Mode is set by caller: interactive when invoked by `orchestrator-build`, noninteractive when invoked by the ralph executor (see §3b). |
+| `coder`               | subagent | project root | The only agent that holds file locks and writes/edits. Tools: `read`/`readlock`/`write`/`writeunlock`/`unlock`/`edit`/`bash`/`task` plus the codebase-intelligence tools (§21). The `task` permission is scoped to `docs` only (noninteractive, may run multiple in parallel). Receives a scoped task from its caller, makes the changes, returns a structured report. Mode is set by caller: interactive when invoked by `Build`, noninteractive when invoked by the ralph executor (see §3b). |
 | `docs`                | subagent | (pipeline; see below) | A **fixed two-stage, fully-noninteractive pipeline** that answers a caller's question about how to use a third-party dependency, by reading that dependency's *actual source code*. Not a single read/bash investigator and not general delegation — the driver routes it (`engine::docs_pipeline`). **Docs.1 (resolver)** runs in the caller's cwd with `list-packages` / `add-package` / `bash` / `webfetch` / `websearch`; it confirms or shallow-clones the dependency into cockpit's package registry (§4d-bis) and sees **only** the package name (the question never enters its context — token economy §10). **Docs.2 (answerer)** then runs in the resolved package directory with `read` + the sandboxed `grep` / `glob` only — no bash, no network, no write — and produces `file:line`-cited output from the dependency source. Cannot invoke subagents. |
 
-**Why two orchestrators.** "Plan" and "build" are different
+**Why Build and Plan.** "Plan" and "build" are different
 cognitive modes, not different priorities of the same mode. A
 planning conversation talks about the *graph* (nodes, edges,
 dependencies, what to do next); a building conversation talks
 about the *code* (this file, this function, this diff). Bundling
 both into one agent forces the model to context-switch every turn
 and produces worse output in both modes. `/plan` and `/build`
-slash commands swap which orchestrator owns the conversation.
+slash commands swap which primary agent owns the conversation.
 
 **Structural payoff of the specialist split.** Only `coder`
 writes. The file-lock manager (`plan.md` §4.1) therefore has a
 single writer per delegation tree — much simpler concurrency
 reasoning than "any agent might write at any time." Parallel
-`coder` instances (under graph plans driven by `orchestrator-plan`)
+`coder` instances (under graph plans driven by `Plan`)
 are arbitrated by the lock manager as designed.
 
 **Invocation tree (who can spawn whom).** The hierarchy is
 deliberately shallow and leaf-terminated:
 
 ```
-orchestrator-build → explore, coder
-orchestrator-plan  → explore   (+ triggers plans via the ralph executor)
+Build → explore, coder
+Plan  → explore   (+ triggers plans via the ralph executor)
 coder              → docs
 explore            → (leaf, cannot spawn)
 docs               → (leaf, cannot spawn)
@@ -776,56 +776,56 @@ the cast table and §4d-bis), but to its caller it is a single
 noninteractive leaf — the two stages are an implementation detail of
 the `docs` unit, not additional delegation, so leaf-termination holds.
 
-**Multi-task decomposition on `orchestrator-build` (sequential, fresh
+**Multi-task decomposition on `Build` (sequential, fresh
 context per task).** A single user prompt often contains several
 distinct tasks. Rather than carry all of them in one ever-growing
-context, `orchestrator-build` **orders them and the runtime runs one
-fresh `orchestrator-build` episode per task, sequentially** — each task
+context, `Build` **orders them and the runtime runs one
+fresh `Build` episode per task, sequentially** — each task
 starts with clean context for maximum reasoning quality (priority #1,
 the weak-model target). This is **runtime-owned episode sequencing, not
-self-spawn**: `orchestrator-build` does *not* appear in its own
+self-spawn**: `Build` does *not* appear in its own
 invocation-tree children, the scheduler owns the task queue, and the
 "one interactive agent at a time / interactive agents don't spawn
 interactive agents" rules (§3b) are preserved unchanged.
 
 - **Single small task** is the common case: no decomposition, no
-  episode machinery — `orchestrator-build` briefs `coder` directly. The
+  episode machinery — `Build` briefs `coder` directly. The
   `coder` hop is kept *cheap* (fast-path spawn, minimal ceremony) so a
   one-line change isn't penalized for not being a write-capable
-  orchestrator. (`orchestrator-build` stays delegation-only in v1;
+  primary agent. (`Build` stays delegation-only in v1;
   direct-write for small tasks is deferred — see
   `design-need-to-discuss-or-test.md` D17, contingent on per-agent tool
   descriptions.)
 - **TUI invariant.** Episode sequencing must be indistinguishable from
-  a normal session: the chrome keeps showing `orchestrator-build` across
+  a normal session: the chrome keeps showing `Build` across
   episode boundaries, there is no visible "subagent returned / new agent
   started" seam, and the next task's episode simply begins the way a
   fresh turn does today. The user is always "talking to
-  `orchestrator-build`."
+  `Build`."
 - **Mid-flight task add.** When the user adds a task while an episode is
   running, the active episode decides *now vs later* and uses
   `task_request` (§3b; urgency `now` / `after_current`) to either fold
   it into the current episode or append it to the runtime queue at the
   right position.
-- **No parallel fan-out from `orchestrator-build`.** Tasks run one at a
+- **No parallel fan-out from `Build`.** Tasks run one at a
   time. A user who wants tasks executed in parallel uses
-  `orchestrator-plan` + the ralph executor (§3b) — that is the only
-  parallel-execution path; `orchestrator-build` is not made ralph-like.
+  `Plan` + the ralph executor (§3b) — that is the only
+  parallel-execution path; `Build` is not made ralph-like.
 
-**Orchestrators may read, but should delegate searches.** Both
-orchestrators get `read` so the user can `@`-tag a file (see §1e)
+**Build and Plan may read, but should delegate searches.** Both
+Build and Plan get `read` so the user can `@`-tag a file (see §1e)
 or ask "what does foo.rs say on line 42?" without a subagent
 round-trip. The `read` tool's description, when surfaced to
-orchestrators, includes a one-line nudge: *"For multi-file
+Build and Plan, includes a one-line nudge: *"For multi-file
 investigation, codebase searches, or anything you'd describe
 as 'figuring out where X lives,' spawn an `explore` subagent
 instead — it returns `file:line` citations under a token cap."*
-Orchestrators do **not** get `bash` or the codebase-intelligence
+Build and Plan do **not** get `bash` or the codebase-intelligence
 search tools directly — those are the routes that earn the explore
 round-trip.
 
-**Plan visibility on `orchestrator-plan`.** To keep the context
-manageable on long-lived projects, `orchestrator-plan` sees only
+**Plan visibility on `Plan`.** To keep the context
+manageable on long-lived projects, `Plan` sees only
 **in-progress** and **not-yet-implemented** plans by default.
 Completed plans are hidden from the default view but remain
 accessible on request (`/plans completed`, or by name). A config
@@ -852,7 +852,7 @@ but serve very different purposes:
 
 #### Subagents
 
-A subagent is spawned by an orchestrator (or by another
+A subagent is spawned by the active primary agent (or by another
 non-leaf agent like `coder` → `docs`) for a *scoped piece of work*.
 Subagents run in two modes; **the mode is set by the caller, not
 by the subagent**.
@@ -862,7 +862,7 @@ by the subagent**.
   report. Reports are token-capped (see §10). This is the
   classic delegate-and-report pattern (`plan.md` §3d). Multiple
   noninteractive subagents may run in parallel under a single
-  caller — this is how `orchestrator-build` / `orchestrator-plan`
+  caller — this is how `Build` / `Plan`
   fan out `explore`, and how `coder` fans out `docs`.
 
 - **Interactive.** The subagent **becomes the primary agent**
@@ -880,7 +880,7 @@ by the subagent**.
 
   In interactive mode, the user sometimes asks the subagent for
   things that are *outside its assigned task* — "while you're at
-  it, also check X" or "what was the orchestrator going to do
+  it, also check X" or "what was the primary agent going to do
   next?". The subagent doesn't try to do them itself (scope
   discipline is what makes the report contract work). Instead it
   uses `task_request(...)` to hand the new work back to the
@@ -903,7 +903,7 @@ by the subagent**.
 **Caller-based mode selection for `coder`.** `coder` is a special
 case because it has two callers with opposite needs:
 
-- Invoked by `orchestrator-build` (the user is hands-on): `coder`
+- Invoked by `Build` (the user is hands-on): `coder`
   runs **interactive** (the user can intervene mid-edit, see what's
   about to be written, approve actions). One coder at a time per
   user session.
@@ -996,13 +996,13 @@ the user's interactive conversation.
 
 Concretely:
 
-- When `orchestrator-plan` (or the user directly, via slash
+- When `Plan` (or the user directly, via slash
   command) triggers a plan, control passes to the **ralph
   executor**, a daemon-resident process (see §8) that walks the
   plan graph and spawns `coder` / `explore` / `docs` subagents to
   execute each node.
 - The ralph executor is the *caller* for all subagents it spawns,
-  so subagent reports flow back to it (not to `orchestrator-plan`,
+  so subagent reports flow back to it (not to `Plan`,
   which has moved on to the user's next request).
 - These subagents run **noninteractive** by default — they
   produce reports, not real-time conversation. When a `coder` in
@@ -1017,7 +1017,7 @@ Concretely:
 
 **Why "background agent" is just a perspective, not a kind.**
 The same `coder` binary running the same prompt has different
-*caller semantics* depending on whether `orchestrator-build` or
+*caller semantics* depending on whether `Build` or
 the ralph executor spawned it. Modeling them as one primitive
 keeps the file-lock manager, redaction layer, and tool registry
 single-implementation. The difference is purely about which
@@ -1050,6 +1050,7 @@ merge mode the resolver uses when combining layers:
 | `tui.*`                                               | `replace` per scalar |
 | `composer.tagging.*`                                  | `replace` per scalar |
 | `utility_model`                                       | `replace` |
+| `planBranchRoot`                                      | `replace` |
 | `prompt_injection_guard.*`                            | `replace` per scalar |
 | `system_prompt.*`                                     | `replace` per scalar |
 | `permission` (added per §6a)                          | `key-merge` by `tool` pattern, smaller-scope ordered first — *pending confirmation* |
@@ -1207,6 +1208,12 @@ Initial schema:
   // disables every utility-model-dependent feature — auto-titling
   // is skipped and sessions display their session-ID as the label.
   "utility_model": null,
+
+  // 4h-bis. Plan branch root (§24, plan.md §4.1).
+  // Prefix for suggested plan branches: the planning flow proposes a
+  // plan's target branch as "${planBranchRoot}/<feature>". Default
+  // "cockpit-plan".
+  "planBranchRoot": "cockpit-plan",
 
   // 4i. Prompt-injection guard.
   // Scans user-authored input (composer prose + `@`-tagged inlined
@@ -1687,7 +1694,7 @@ that touches every subsystem.
   `tiktoken-rs`) as the budget enforcer when the active provider
   doesn't expose its own counter, and prefers the provider's
   counter when available. This matters most at fan-out: five
-  parallel `explore` subagents reporting back to `orchestrator-plan`
+  parallel `explore` subagents reporting back to `Plan`
   with 2K each is 10K of citations to weigh; with no cap it could be
   50K. Across deep delegation trees the savings compound.
 - **Redaction placeholder is short.** `***redacted-by-cockpit***`
@@ -3249,8 +3256,8 @@ radius) and a trigram search index are Phase 2.
 **Per-agent assignment (starting default; revisit later).** `explore`:
 all. `coder`: `read`(line-range), `outline`, `symbol_find`, `deps`,
 `circular`, `word`, `search` (+ its write tools and `task→docs`;
-`impact` joins in Phase 2). `orchestrator-plan`: `tree`, `deps`,
-`circular`, `hot`. `orchestrator-build`: `tree`, `hot`. The `docs`
+`impact` joins in Phase 2). `Plan`: `tree`, `deps`,
+`circular`, `hot`. `Build`: `tree`, `hot`. The `docs`
 answerer (Docs.2) does **not** use the intel index — it uses
 `read` + the sandboxed `grep`/`glob` (a clean seam is left to add the
 intel tools to Docs.2 later, but they are not wired here).
@@ -3368,6 +3375,40 @@ thresholds for autocache/autoprune live in the per-model config layer
 (§4; the three-knob cap per `design-need-to-discuss-or-test.md` D8),
 so adding the threshold UI later is additive — the `shrink` config block
 is where the threshold field lands.
+
+---
+
+## 24. Plans and steps — the planning substrate
+
+A **plan** is cockpit's user-facing name for `plan.md §4.1`'s *graph
+plan*: a DAG of **steps** (§4.1's *nodes*) connected by dependency edges.
+User-facing vocabulary is **plan** / **step**; "graph"/"node"/"DAG" stay
+internal. A plan carries a `slug`, `title`, one-line `description`, a
+`status` (`pending` | `in_progress` | `done`), a **branch policy** (base
+branch + target branch), and an **isolation mode** (`worktree` default |
+`shared_tree`). A step carries a `title`, its `feature_description` (the
+`TaskPacket` of `features/claw.md §8` — objective / scope /
+acceptance_tests / commit_policy / reporting_contract / escalation_policy),
+its dependency edges, per-step tests, and a status.
+
+Per-step **tests** carry a `command`, a `phase` (`post_step` |
+`branch_stable`), and a `concurrency` (`parallel` default | `exclusive`
+with an opaque resource key). `exclusive` is the v1 mechanism for tests
+that contend on a shared resource (a port, a GPU); per-worktree
+parameterized resource injection ("Way B") is an explicitly deferred
+future opt-in (see `plan.md §4.1`).
+
+Plans live in the global cockpit DB (migration `0014_plans.sql`). The
+storage + query layer and cycle detection are `src/db/plans.rs`; the
+agent-facing authoring tools (`plan_create`, `add_step`,
+`add_step_dependency`, `plan_list`) are `src/tools/plan.rs`. Adding a
+dependency edge that would close a cycle is rejected before insert with
+an error naming the offending cycle — the acyclic guarantee is never
+violated on disk. `planBranchRoot` (config §4, default `"cockpit-plan"`)
+is the prefix for suggested plan branches: `${planBranchRoot}/<feature>`.
+The planning agent (`Plan`), the `/plans` TUI, and worktree
+execution are built in the follow-on prompts; this section is the
+storage + tool substrate they consume.
 
 ---
 

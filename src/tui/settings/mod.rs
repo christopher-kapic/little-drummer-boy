@@ -1377,11 +1377,12 @@ mod tests {
         // Instructions page. Rows 0-3 are vim/thinking/markdown, 4-5 are
         // mouse/rich-text-copy (T8.c/T8.g), 6 is emojis, 7 is caffeinate
         // display-awake, 8-9 are name/packages, 10 is utility model, 11 is
-        // the loop-guard threshold, 12 is instructions.
+        // the plan branch root, 12 is the loop-guard threshold, 13 is
+        // instructions.
         let tmp = TempDir::new().unwrap();
         let mut d = fresh_dialog(&tmp);
         enter_ui_from_root(&mut d);
-        for _ in 0..12 {
+        for _ in 0..13 {
             d.handle_key(press(KeyCode::Char('j')));
         }
         d.handle_key(press(KeyCode::Enter));
@@ -1477,10 +1478,10 @@ mod tests {
     fn fresh_instructions_dialog(tmp: &TempDir) -> SettingsDialog {
         let mut d = fresh_dialog(tmp);
         enter_ui_from_root(&mut d);
-        // Move cursor to the instructions row (idx 12: utility model at
-        // 10 and the loop-guard threshold at 11 push instructions to the
-        // last position) and Enter to nav.
-        for _ in 0..12 {
+        // Move cursor to the instructions row (idx 13: utility model at
+        // 10, plan branch root at 11, and the loop-guard threshold at 12
+        // push instructions to the last position) and Enter to nav.
+        for _ in 0..13 {
             d.handle_key(press(KeyCode::Char('j')));
         }
         d.handle_key(press(KeyCode::Enter));
