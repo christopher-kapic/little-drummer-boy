@@ -1006,6 +1006,7 @@ mod tests {
                     context_length: None,
                     favorite: false,
                     cache: None,
+                    shrink: None,
                     extra: Default::default(),
                 })
                 .collect(),
@@ -1067,6 +1068,7 @@ mod tests {
                 context_length: None,
                 favorite: false,
                 cache: None,
+                shrink: None,
                 extra: Default::default(),
             },
             ModelEntry {
@@ -1077,6 +1079,7 @@ mod tests {
                 context_length: None,
                 favorite: false,
                 cache: None,
+                shrink: None,
                 extra: Default::default(),
             },
         ]);

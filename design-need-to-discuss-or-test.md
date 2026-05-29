@@ -206,6 +206,36 @@ Decisions that have been made and graduated to `GOALS.md` / `plan.md`.
 Kept here briefly so the rationale is searchable; will be cleaned out
 after a few cycles.
 
+- **D19. Compact-after-delegation (parent-context shrink across a
+  sub-agent run).** → **DECIDED 2026-05-29**, spec
+  `prompts/compact-after-delegation.md`. When the main agent delegates,
+  the wait can outlast the provider's prompt-cache TTL so the *parent*
+  prefix goes cold. The driver prepares a smaller version of the parent
+  context and, on the sub-agent's return, resumes from the cheapest
+  correct context: **cache hot → full** (no quality loss), **cache cold
+  → shrunk**. Eager (no-cache provider: shrink immediately at delegation
+  start, latency hidden under the delegation) vs lazy (cache-capable:
+  only kick the parallel shrink off at `ttl - margin` so a fast
+  delegation wastes nothing). Strategy is per-model configurable —
+  **`prune`** (default; lossless snapshot-dedup; cheap/sync) or
+  **`compact`** (LLM summarization reusing `/compact`'s brief machinery;
+  heavier, lossier, saves more). **Correctness trap:** the parent's
+  staleness is measured from an `Instant` captured at *delegation start*
+  (the turn that emitted the `task` call), NEVER
+  `Session::seconds_since_last_send` — the child shares the `Session` and
+  resets that timer on every turn. The cold decision reuses the single
+  `prune::cache_state` predicate (no second heuristic). Both interactive
+  (`SpawnSubagent`) and noninteractive (`SpawnNoninteractive`) delegation
+  paths are wired; the `compact` strategy's model call is behind a
+  `BriefDrafter` trait so the decision logic is testable without a
+  network call. **Background-fork delegations (GOALS §22):** seamed, not
+  wired — see note in §22. Config in the per-model layer (`ShrinkConfig`
+  alongside `CacheConfig`) so a future per-model context-usage threshold
+  is additive. Implemented in `src/engine/deleg_shrink.rs` + the two
+  delegation paths in `src/engine/driver.rs`; config in
+  `src/config/providers.rs`. Graduated to GOALS §10 + §8 (session
+  worker) and `plan.md` T6.g.
+
 - **D1. Mimo — which one?** → **DECIDED 2026-05-27**: Xiaomi MiMo
   (`platform.xiaomimimo.com`). Added as the `xiaomi-mimo` provider
   template (`src/providers/mod.rs`). API base

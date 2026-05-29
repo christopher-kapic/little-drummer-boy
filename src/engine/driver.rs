@@ -176,6 +176,24 @@ pub struct Driver {
     /// interrupt hub); seed-tool re-execution before that runs with no
     /// approver (skips the prompt, never denies).
     approver: Option<Arc<crate::approval::Approver>>,
+    /// Compact-after-delegation trackers for **interactive** subagent
+    /// delegations (`SpawnSubagent`), keyed by the paused parent frame's
+    /// stack depth (its index in `self.stack`). The lazy shrink for the
+    /// parent runs in a background task whose handle rides alongside the
+    /// tracker; on the child's `Done` pop we resolve full-vs-shrunk for the
+    /// now-top parent frame (`prompts/compact-after-delegation.md`). A
+    /// `Vec` indexed by depth would also work, but the map makes the
+    /// "no tracker at this depth" case explicit.
+    deleg_shrinks: std::collections::HashMap<usize, PendingDelegationShrink>,
+}
+
+/// An in-flight compact-after-delegation: the decision tracker plus the
+/// background shrink task's join handle (`None` once joined, or when the
+/// shrink was synchronous). Held per delegation so the parent can resolve
+/// full-vs-shrunk on the sub-agent's return.
+struct PendingDelegationShrink {
+    tracker: crate::engine::deleg_shrink::DelegationShrink,
+    handle: Option<tokio::task::JoinHandle<Vec<Message>>>,
 }
 
 /// Inbound channel capacity for job events / commands. Generous; job
@@ -248,6 +266,7 @@ impl Driver {
             skills_no_utility_model_logged: false,
             cancel_current: Arc::new(std::sync::Mutex::new(None)),
             approver: None,
+            deleg_shrinks: std::collections::HashMap::new(),
         }
     }
 
@@ -590,22 +609,41 @@ impl Driver {
     /// (cold) when the config can't be loaded — the conservative choice
     /// is "pruning is free," matching local/no-cache providers.
     fn resolve_cache_config(&self) -> crate::config::providers::CacheConfig {
-        use crate::config::dirs::discover_config_dirs;
-        use crate::config::providers::{CacheConfig, ConfigDoc};
-        let (Some(provider), Some(model)) =
-            (self.session.active_provider(), self.session.active_model())
-        else {
-            return CacheConfig::default();
+        let Some((providers, provider, model)) = self.active_providers_config() else {
+            return crate::config::providers::CacheConfig::default();
         };
-        // First `config.json` in the layered-config chain (same first-hit
-        // rule as `daemon::server::load_configs`).
-        discover_config_dirs(&self.cwd)
+        providers.resolve_cache(&provider, &model)
+    }
+
+    /// Resolve the delegation-shrink config for the session's active
+    /// (provider, model). Defaults to (`prune`, 30s margin) when the
+    /// config can't be loaded — the lossless, lowest-quality-loss
+    /// strategy (priority #1).
+    fn resolve_shrink_config(&self) -> crate::config::providers::ShrinkConfig {
+        let Some((providers, provider, model)) = self.active_providers_config() else {
+            return crate::config::providers::ShrinkConfig::default();
+        };
+        providers.resolve_shrink(&provider, &model)
+    }
+
+    /// Load the layered providers config plus the session's active
+    /// (provider, model). `None` when no model is selected or the config
+    /// can't be loaded — callers fall back to conservative defaults. Same
+    /// first-hit rule as `daemon::server::load_configs`.
+    fn active_providers_config(
+        &self,
+    ) -> Option<(crate::config::providers::ProvidersConfig, String, String)> {
+        use crate::config::dirs::discover_config_dirs;
+        use crate::config::providers::ConfigDoc;
+        let provider = self.session.active_provider()?;
+        let model = self.session.active_model()?;
+        let providers = discover_config_dirs(&self.cwd)
             .first()
             .map(|d| d.path.join("config.json"))
             .filter(|p| p.exists())
             .and_then(|p| ConfigDoc::load(&p).ok())
-            .map(|doc| doc.providers().resolve_cache(&provider, &model))
-            .unwrap_or_default()
+            .map(|doc| doc.providers())?;
+        Some((providers, provider, model))
     }
 
     /// Compute and emit the live "% prunable" projection for the
@@ -857,6 +895,115 @@ impl Driver {
             // Prepend to the first user message rather than pushing a bare
             // user turn (which would put two user messages back-to-back).
             self.pending_seed_context = Some(combined);
+        }
+    }
+
+    /// Begin compact-after-delegation tracking for the paused parent frame
+    /// (`prompts/compact-after-delegation.md`). `parent_full` is a clone of
+    /// the parent's full history at delegation start. Resolves the cache +
+    /// shrink config, decides eager-vs-lazy timing, and — for the
+    /// no-cache (eager) case — spawns the shrink task immediately so its
+    /// latency hides under the (synchronous or interactive) child run. For
+    /// the cache-capable (lazy) case the task sleeps until `ttl - margin`
+    /// and only then shrinks: a child that returns first means the task is
+    /// still sleeping and produces nothing (no wasted shrink).
+    ///
+    /// Returns the decision tracker plus the background task handle (if a
+    /// task was spawned). The tracker measures elapsed-since-delegation
+    /// from its own captured instant, NEVER the session-global send timer
+    /// the child resets every turn (the staleness trap).
+    fn begin_delegation_shrink(
+        &self,
+        parent_full: Vec<Message>,
+    ) -> (
+        crate::engine::deleg_shrink::DelegationShrink,
+        Option<tokio::task::JoinHandle<Vec<Message>>>,
+    ) {
+        use crate::engine::deleg_shrink::{DelegationShrink, ShrinkTiming};
+
+        let cache = self.resolve_cache_config();
+        let shrink_cfg = self.resolve_shrink_config();
+        let tracker = DelegationShrink::new(cache.clone(), &shrink_cfg);
+        let timing = crate::engine::deleg_shrink::decide_timing(&cache, &shrink_cfg);
+
+        // The shrink runs on a clone of the parent history; the parent
+        // frame's own history is never touched until we resolve.
+        let agent = self.stack.last().expect("stack never empty").agent.clone();
+        let strategy = tracker.strategy();
+        // Reuse the run-scoped cancel so a user ctrl+c aborts a `compact`
+        // shrink's model call too — never a parallel cancel.
+        let cancel = self
+            .cancel_current
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_default();
+
+        let delay = match timing {
+            ShrinkTiming::Eager => std::time::Duration::ZERO,
+            ShrinkTiming::LazyAt(d) => d,
+        };
+
+        let handle = tokio::spawn(async move {
+            // Lazy: wait until `ttl - margin`. If the child returns first,
+            // the parent aborts this task before the sleep elapses, so no
+            // shrink runs. Eager: ZERO delay → runs immediately.
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+            run_shrink(strategy, &parent_full, agent, cancel).await
+        });
+
+        (tracker, Some(handle))
+    }
+
+    /// Resolve a finished delegation: collect any shrunk history the
+    /// parallel task produced, decide full-vs-shrunk via the cache-cold
+    /// predicate (elapsed-since-delegation), and — when cold — replace the
+    /// **top** (now-resumed parent) frame's history with the shrunk copy.
+    /// A hot return keeps the full context (the lazy task is aborted before
+    /// it ever shrinks). Idempotent: a missing/None handle is a no-op.
+    async fn finish_delegation_shrink(
+        &mut self,
+        mut tracker: crate::engine::deleg_shrink::DelegationShrink,
+        handle: Option<tokio::task::JoinHandle<Vec<Message>>>,
+        tx: &mpsc::Sender<TurnEvent>,
+    ) {
+        if let Some(handle) = handle {
+            if handle.is_finished() {
+                // The (eager, or lazy-and-already-fired) shrink completed
+                // while the child ran — adopt its result.
+                if let Ok(shrunk) = handle.await {
+                    tracker.set_shrunk(shrunk);
+                }
+            } else {
+                // The child returned before the lazy trigger fired: abort
+                // the still-sleeping task so no shrink ever runs (the
+                // fast-delegation case wastes nothing).
+                handle.abort();
+            }
+        }
+        // `resolve` reuses the single cache-cold predicate
+        // (`prune::cache_state`) over elapsed-since-delegation: cold with a
+        // computed shrink ⇒ `Some(shrunk)`; hot, or cold-without-shrink ⇒
+        // `None` (keep the full context).
+        match tracker.resolve() {
+            Some(shrunk) => {
+                let before = self.stack.last().expect("stack never empty").history.len();
+                let after = shrunk.len();
+                self.stack.last_mut().expect("stack never empty").history = shrunk;
+                tracing::info!(
+                    before,
+                    after,
+                    "delegation-shrink: parent cache cold, resumed on shrunk context"
+                );
+                // Refresh the prunable projection from the now-shrunk
+                // foreground history.
+                self.emit_context_projection(tx).await;
+            }
+            None => {
+                tracing::debug!("delegation-shrink: parent resuming on full context");
+            }
         }
     }
 
@@ -1208,6 +1355,15 @@ impl Driver {
                                 tracing::warn!(error = ?e, agent = %parent.agent.name, "resume_agent on pop failed");
                             }
                         }
+                        // Resolve compact-after-delegation for the
+                        // now-resumed parent frame (the new top). Cold ⇒
+                        // swap in the shrunk parent context; hot ⇒ keep
+                        // full and abort the still-sleeping lazy shrink.
+                        let parent_depth = self.stack.len() - 1;
+                        if let Some(pending) = self.deleg_shrinks.remove(&parent_depth) {
+                            let PendingDelegationShrink { tracker, handle } = pending;
+                            self.finish_delegation_shrink(tracker, handle, tx).await;
+                        }
                         let report = collect_final_text(&child.history);
                         if let Err(e) = self.session.record_event(
                             crate::db::session_log::SessionEventKind::SubagentReport,
@@ -1271,6 +1427,24 @@ impl Driver {
                             tracing::warn!(error = ?e, agent = %parent.agent.name, "suspend_agent on push failed");
                         }
                     }
+                    // Begin compact-after-delegation tracking for the
+                    // parent frame about to be paused below the interactive
+                    // child (`prompts/compact-after-delegation.md`). Keyed
+                    // by the parent's depth (its index, = pre-push height
+                    // minus one). Captured here so elapsed-since-delegation
+                    // measures from the parent's last inference — the turn
+                    // that emitted this `task` call — not the session-global
+                    // send timer the child resets every turn (the trap).
+                    let parent_depth = self.stack.len() - 1;
+                    let parent_full = self
+                        .stack
+                        .last()
+                        .expect("stack never empty")
+                        .history
+                        .clone();
+                    let (tracker, handle) = self.begin_delegation_shrink(parent_full);
+                    self.deleg_shrinks
+                        .insert(parent_depth, PendingDelegationShrink { tracker, handle });
                     let child = crate::engine::builtin::load(&child_agent, &self.spawn_args())?;
                     self.stack.push(AgentSession {
                         agent: Arc::new(child),
@@ -1304,6 +1478,22 @@ impl Driver {
                             args: args_json,
                         })
                         .await;
+                    // Begin compact-after-delegation tracking for the
+                    // paused parent frame (the current top of the stack).
+                    // The shrink runs IN PARALLEL with the synchronous
+                    // child below; on return we pick full-vs-shrunk
+                    // (`prompts/compact-after-delegation.md`). Captured here
+                    // — the parent's last inference was the turn that
+                    // emitted this `task` call — so elapsed-since-delegation
+                    // is immune to the child's `note_send()` (the trap).
+                    let parent_full = self
+                        .stack
+                        .last()
+                        .expect("stack never empty")
+                        .history
+                        .clone();
+                    let (tracker, shrink_handle) = self.begin_delegation_shrink(parent_full);
+
                     // `docs` is a fixed two-stage pipeline (Docs.1
                     // resolver in caller cwd → Docs.2 answerer in the
                     // resolved package dir). Everything else is a single
@@ -1341,6 +1531,12 @@ impl Driver {
                             Err(e) => format!("Error: {e:#}"),
                         }
                     };
+
+                    // The child returned. Fold in any shrink that the
+                    // parallel task produced, then decide full-vs-shrunk
+                    // and apply to the paused parent frame.
+                    self.finish_delegation_shrink(tracker, shrink_handle, tx)
+                        .await;
                     // Timeline event (Part B): the noninteractive subagent's
                     // report. This path emits ToolStart/End directly (not
                     // through `turn`'s dispatch loop), so the report is
@@ -1595,6 +1791,29 @@ pub(crate) async fn run_noninteractive(
         "noninteractive agent `{}` exceeded {MAX_NONINTERACTIVE_TURNS} turns",
         agent.name
     )
+}
+
+/// Produce the shrunk version of a parent history for a delegation
+/// (`prompts/compact-after-delegation.md`). `prune` is lossless + sync
+/// (snapshot-dedup on a clone); `compact` reuses `compact.rs`'s brief
+/// machinery to summarize the (pre-pruned) parent context into a single
+/// dense message, with a prune-only fallback on model failure. Runs on the
+/// background shrink task, off the parent's frame.
+async fn run_shrink(
+    strategy: crate::config::providers::ShrinkStrategy,
+    parent_full: &[Message],
+    agent: Arc<Agent>,
+    cancel: tokio_util::sync::CancellationToken,
+) -> Vec<Message> {
+    use crate::config::providers::ShrinkStrategy;
+    use crate::engine::deleg_shrink;
+    match strategy {
+        ShrinkStrategy::Prune => deleg_shrink::prune_shrink(parent_full),
+        ShrinkStrategy::Compact => {
+            let drafter = deleg_shrink::ModelBriefDrafter { agent, cancel };
+            deleg_shrink::compact_shrink(parent_full, &drafter).await
+        }
+    }
 }
 
 fn collect_final_text(history: &[Message]) -> String {
@@ -1866,5 +2085,128 @@ mod tests {
             }))
             .unwrap();
         assert!(out.contains("no live background"), "got {out}");
+    }
+
+    /// Config resolution: with no `config.json` on disk, the
+    /// delegation-shrink strategy defaults to `prune` (lowest quality
+    /// loss, priority #1) and a 30s margin.
+    #[test]
+    fn resolve_shrink_config_defaults_to_prune() {
+        use crate::config::providers::ShrinkStrategy;
+        let (driver, _tmp) = test_driver(8);
+        let shrink = driver.resolve_shrink_config();
+        assert_eq!(shrink.strategy, ShrinkStrategy::Prune);
+        assert_eq!(shrink.margin_secs, 30);
+    }
+
+    /// `finish_delegation_shrink`: a COLD-at-return parent (no-cache
+    /// provider → always cold) with a computed prune-shrink resumes on the
+    /// SHRUNK context — the driver swaps the foreground frame's history.
+    #[tokio::test]
+    async fn finish_delegation_shrink_cold_swaps_parent_history() {
+        use crate::config::providers::{CacheConfig, CacheMode, ShrinkConfig};
+        use crate::engine::deleg_shrink::DelegationShrink;
+
+        let (mut driver, _tmp) = test_driver(8);
+        let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
+
+        // Parent (foreground) frame carries elidable duplicate reads.
+        driver.stack[0].history = dup_read_history();
+        assert!(
+            !prune::dedup_plan(&driver.stack[0].history).is_empty(),
+            "parent has something prunable"
+        );
+
+        // A tracker on a no-cache provider is always cold; pre-compute the
+        // prune-shrink as the parallel task would have.
+        let none = CacheConfig {
+            mode: CacheMode::None,
+            ttl_secs: 300,
+        };
+        let mut tracker = DelegationShrink::new(none, &ShrinkConfig::default());
+        let shrunk = crate::engine::deleg_shrink::prune_shrink(&driver.stack[0].history);
+        tracker.set_shrunk(shrunk);
+
+        driver.finish_delegation_shrink(tracker, None, &tx).await;
+        drop(tx);
+        while rx.recv().await.is_some() {}
+
+        // Cold → resumed on the shrunk context: the foreground history is
+        // now fully pruned (nothing left elidable).
+        assert!(
+            prune::dedup_plan(&driver.stack[0].history).is_empty(),
+            "cold parent resumed on the shrunk (pruned) context"
+        );
+    }
+
+    /// `finish_delegation_shrink`: a HOT-at-return parent (cache-capable,
+    /// within TTL) keeps its FULL context even when a shrink was computed —
+    /// no quality loss, the cache is paid for.
+    #[tokio::test]
+    async fn finish_delegation_shrink_hot_keeps_full() {
+        use crate::config::providers::{CacheConfig, CacheMode, ShrinkConfig};
+        use crate::engine::deleg_shrink::DelegationShrink;
+
+        let (mut driver, _tmp) = test_driver(8);
+        let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
+
+        driver.stack[0].history = dup_read_history();
+
+        // Ephemeral cache, generous TTL, tracker started "now" → hot.
+        let ephemeral = CacheConfig {
+            mode: CacheMode::Ephemeral,
+            ttl_secs: 3600,
+        };
+        let mut tracker = DelegationShrink::new(ephemeral, &ShrinkConfig::default());
+        tracker.set_shrunk(vec![Message::user("shrunk")]);
+
+        driver.finish_delegation_shrink(tracker, None, &tx).await;
+        drop(tx);
+        while rx.recv().await.is_some() {}
+
+        // Hot → full context retained: still has the elidable duplicate.
+        assert!(
+            !prune::dedup_plan(&driver.stack[0].history).is_empty(),
+            "hot parent kept its full (un-shrunk) context"
+        );
+    }
+
+    /// `begin_delegation_shrink` on a no-cache provider spawns an EAGER
+    /// shrink task that finishes promptly (ZERO delay); the prune-shrink
+    /// result is adopted on `finish`. Exercises the full begin→finish path.
+    #[tokio::test]
+    async fn begin_delegation_shrink_eager_on_no_cache() {
+        let (mut driver, _tmp) = test_driver(8);
+        let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
+
+        // Default test driver uses provider `lmstudio` with no cache config
+        // → CacheMode::None → eager.
+        driver.stack[0].history = dup_read_history();
+        let parent_full = driver.stack[0].history.clone();
+        let (tracker, handle) = driver.begin_delegation_shrink(parent_full);
+        assert!(handle.is_some(), "a shrink task was spawned");
+
+        // Let the eager task run to completion.
+        let handle = handle.unwrap();
+        let shrunk = handle.await.unwrap();
+        assert!(
+            prune::dedup_plan(&shrunk).is_empty(),
+            "eager prune-shrink produced a pruned history"
+        );
+
+        // Re-run begin to get a fresh tracker + handle to finish with the
+        // already-computed result (the prior handle was consumed above).
+        let (mut tracker2, h) = driver.begin_delegation_shrink(driver.stack[0].history.clone());
+        if let Some(h) = h {
+            h.abort();
+        }
+        tracker2.set_shrunk(shrunk);
+        let _ = tracker; // first tracker not needed further
+        driver.finish_delegation_shrink(tracker2, None, &tx).await;
+        drop(tx);
+        while rx.recv().await.is_some() {}
+
+        // No-cache provider is always cold → swapped to the shrunk context.
+        assert!(prune::dedup_plan(&driver.stack[0].history).is_empty());
     }
 }

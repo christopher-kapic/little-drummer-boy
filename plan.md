@@ -601,6 +601,49 @@ followed it. The transcript holds the originals for audit,
 debugging, and TUI rendering. The wire is the only place
 thinking shrinks, and only after it's stopped being load-bearing.
 
+#### T6.g — Compact-after-delegation (parent-context shrink; GOALS §10/§23)
+
+**Done.** When the main agent delegates (`task`), the wait can outlast
+the provider's prompt-cache TTL so the *parent* prefix goes cold. The
+driver prepares a smaller version of the parent context and, on the
+sub-agent's return, resumes from the cheapest correct context — **cache
+hot → full**, **cache cold → shrunk**. Spec:
+`prompts/compact-after-delegation.md`.
+
+**Eager vs lazy.** No-cache provider (`cache.mode = none`) shrinks
+*eagerly* at delegation start (no cache to protect; latency hides under
+the delegation). Cache-capable provider shrinks *lazily* — the parallel
+shrink task only fires if the sub-agent is still running at
+`ttl_secs - margin_secs`; a fast delegation that returns first aborts the
+still-sleeping task, so nothing is wasted.
+
+**Strategy (per-model `shrink` config, alongside `cache`).** `prune`
+(default — the T6.b snapshot-dedup, run on a clone; lossless, cheap,
+sync) or `compact` (LLM summarization reusing the T6.e brief machinery to
+collapse the parent context into one dense message; heavier, lossier,
+saves more, with a prune-only fallback on model failure). The `compact`
+strategy's model call is behind a `BriefDrafter` trait so the
+decision logic is unit-testable without a network call.
+
+**Cache-cold decision.** Reuses the single `prune::cache_state` predicate
+(T6.f) — no second heuristic. **Critical:** staleness is measured from an
+`Instant` captured at *delegation start* (the parent's last inference),
+NOT `Session::seconds_since_last_send` — the shared sub-agent stamps a
+fresh send each turn, which would mask the parent's cold prefix.
+
+**Wire-only fidelity (GOALS §14).** Like prune, the shrink touches the
+model-bound `Vec<Message>` only; the on-disk transcript + TUI scrollback
+stay full-fidelity.
+
+**Scope.** Both interactive (`SpawnSubagent`, push/pop) and
+noninteractive (`SpawnNoninteractive`, synchronous inline) delegation
+paths are wired (`src/engine/{deleg_shrink.rs,driver.rs}`).
+Background-fork delegations (T22/§22) reuse `begin/finish_delegation_
+shrink` as a documented seam — not yet wired (no fork-delegation path
+exercises it yet; wiring now would expand scope into the fork lifecycle).
+**Future:** per-model context-usage thresholds land additively in the
+same `shrink` config block (GOALS §23).
+
 GOALS §8 sketches `cockpit connect` but defers the design. This plan
 commits to the **architectural shape** that makes the future build
 cheap (§7), without shipping any of the daemon/relay code in v1.

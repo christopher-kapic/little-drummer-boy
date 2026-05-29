@@ -1594,6 +1594,38 @@ that touches every subsystem.
   pruning before compaction means the compaction summarizer sees a
   smaller, denser input and produces a tighter handoff. The order is
   fixed in the engine — there is no `--no-prune` flag.
+- **Compact-after-delegation (parent-context shrink across a sub-agent
+  run).** When the main agent delegates (`task`), the wait can outlast
+  the provider's prompt-cache TTL, so the *parent* prefix goes cold. The
+  driver prepares a smaller version of the parent context and, on the
+  sub-agent's return, resumes from the cheapest correct context — **cache
+  still hot → full** (no quality loss; the cache is paid for); **cache
+  cold → shrunk** (the cold re-read is of a smaller prefix). Timing
+  follows the cache: a **no-cache provider** shrinks *eagerly* at
+  delegation start (no cache to protect; the shrink latency hides under
+  the delegation); a **cache-capable provider** shrinks *lazily* — the
+  parallel shrink is kicked off only if the sub-agent is still running at
+  `ttl_secs - margin_secs`, so a fast delegation that returns first
+  wastes no shrink. The shrink **strategy** is per-model configurable:
+  **`prune`** (default — the lossless snapshot-dedup action; cheap,
+  synchronous, lowest quality loss, priority #1) or **`compact`** (LLM
+  summarization that reuses the `/compact` brief machinery to collapse
+  the parent context into one dense message; heavier, lossier, saves
+  more). The cache-cold decision **reuses the single cache-cold
+  predicate** (the same "expected cache-hit = 0" rule auto-prune uses) —
+  no second heuristic. *Correctness invariant:* the parent's staleness
+  is measured from the moment delegation started (the parent's last
+  inference — the turn that emitted the `task` call), **not** the
+  session-global "seconds since last send"; the sub-agent shares the
+  parent's session and stamps a fresh send on every one of its turns,
+  which would otherwise make the parent's cold prefix look hot (the
+  parent and child hold distinct provider-side cache entries, so the
+  child's sends never warm the parent's prefix). Config lives in the
+  per-model layer (`shrink` alongside `cache`, reusing `cache.ttl_secs`)
+  so a future per-model context-usage threshold is an additive field.
+  Both interactive (`SpawnSubagent`) and noninteractive
+  (`SpawnNoninteractive`) delegation paths apply it; background-fork
+  delegations (§22) are a documented seam (not yet wired — see §22).
 - **Seed-tool handoff** (`plan.md` T6.e, §3d). When the parent
   invokes a subagent (`task`) or fires `/compact`, it may attach a
   list of `seed_tools: [{name, args}, ...]` that are dispatched
@@ -3263,10 +3295,12 @@ inline completion events, a `/jobs` list-and-cancel command, and
 ## 23. Compact-after-delegation
 
 When the main agent delegates to a sub-agent, the wait can outlast the
-provider's prompt-cache TTL, so the main context's cache goes cold.
-This hides the cost by preparing a smaller main context to resume from
+provider's prompt-cache TTL, so the *parent* context's cache goes cold.
+This hides the cost by preparing a smaller parent context to resume from
 when the cache is lost. Build spec in
-`prompts/compact-after-delegation.md`.
+`prompts/compact-after-delegation.md`; cross-referenced from the pruning
+policy (§10). **Implemented** in `src/engine/deleg_shrink.rs` + the
+driver's two delegation paths.
 
 - **Cache-capable provider — lazy.** Don't shrink at delegation start;
   only if the sub-agent is still running at TTL-minus-margin, shrink
@@ -3275,19 +3309,47 @@ when the cache is lost. Build spec in
   to protect; latency hides under the delegation).
 - **On return:** cache hot → resume on the full context (no quality
   loss); cache cold → resume on the shrunk context (smaller cold read).
-- **Shrink strategy is a setting:** `prune` (default — matches the
-  existing "auto-prune when expected cache-hit = 0" policy, §10 /
-  `plan.md` T6.f; lower quality loss) or `compact` (the §T6.e
-  fresh-thread handoff; heavier, more savings).
-- **Cache-cold check reuses the existing auto-prune predicate** (§10)
-  — no second cache-state heuristic.
-- Runs daemon-side (the daemon owns session/inference state). The same
-  logic applies to background delegations (§22).
+- **Shrink strategy is a per-model setting:** `prune` (default — the
+  lossless snapshot-dedup action, §10 / `plan.md` T6.b/f; cheap, sync,
+  lowest quality loss) or `compact` (LLM summarization reusing the
+  `/compact` brief machinery, §T6.e, to collapse the parent context into
+  one dense message; heavier, more savings). Config in the per-model
+  layer (`shrink` alongside `cache`, reusing `cache.ttl_secs` for the
+  TTL).
+- **Cache-cold check reuses the existing auto-prune predicate**
+  (`prune::cache_state`, §10) — no second cache-state heuristic.
+- **Correctness invariant (the staleness trap).** The parent's cache
+  staleness is measured from an instant captured at *delegation start*
+  (the parent's last inference — the turn that emitted the `task` call),
+  **never** the session-global "seconds since last send." The sub-agent
+  shares the parent's session and stamps a fresh send on every one of
+  its turns (`note_send`); measuring from the session-global timer would
+  make the parent's cold prefix look hot. Parent and child hold distinct
+  provider-side cache entries, so the child's sends never warm the
+  parent's prefix.
+- Runs daemon-side (the daemon owns session/inference state). Both the
+  interactive (`SpawnSubagent`) and noninteractive
+  (`SpawnNoninteractive`) delegation paths apply it; the parallel shrink
+  for a synchronous noninteractive child runs on a background task off a
+  clone of the parent history.
+
+**Background-fork delegations (§22) — documented seam, not yet wired.**
+A sub-agent invoked from a background async-jobs fork hits the same TTL
+problem, but the fork's context lifecycle differs from a foreground
+delegation: forks are anti-runaway-gated (they *request*, main decides)
+and their completion injects as a late-arriving turn rather than a
+stack push/pop. The clean seam is `Driver::begin_delegation_shrink` /
+`finish_delegation_shrink` — when the background-fork delegation path is
+built out, it captures a tracker at fork-spawn and resolves it at the
+fork-completion turn boundary, reusing the same primitives. Wiring it
+now would expand scope into the fork lifecycle without a fork path that
+exercises it, so it's left as a seam (no dead half-path).
 
 **Future (hook now, UI later).** Per-provider/model context-usage
 thresholds for autocache/autoprune live in the per-model config layer
 (§4; the three-knob cap per `design-need-to-discuss-or-test.md` D8),
-so adding the threshold UI later is additive.
+so adding the threshold UI later is additive — the `shrink` config block
+is where the threshold field lands.
 
 ---
 

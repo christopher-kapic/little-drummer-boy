@@ -104,6 +104,15 @@ pub struct ProviderEntry {
     #[serde(default)]
     pub cache: CacheConfig,
 
+    /// Delegation-shrink behavior for this provider (GOALS §10 /
+    /// `prompts/compact-after-delegation.md`). Drives the parent-context
+    /// shrink that hides cache-cold cost across a sub-agent delegation. A
+    /// per-model `shrink` overrides this. Lives in the same per-model
+    /// layer as `cache` so a future per-model context-usage threshold is
+    /// an additive field, not a refactor.
+    #[serde(default)]
+    pub shrink: ShrinkConfig,
+
     /// Cached model list. Populated by `/fetch-models` (or the wizard).
     #[serde(default)]
     pub models: Vec<ModelEntry>,
@@ -135,6 +144,56 @@ impl Default for CacheConfig {
 
 fn default_cache_ttl_secs() -> u64 {
     300
+}
+
+/// Delegation-shrink configuration. Set per-provider on [`ProviderEntry`]
+/// and optionally overridden per-model on [`ModelEntry`]. Controls how the
+/// parent context is shrunk while a sub-agent runs so the parent resumes
+/// from the cheapest correct context when the cache went cold
+/// (`prompts/compact-after-delegation.md`). The TTL itself is reused from
+/// [`CacheConfig::ttl_secs`] — this layer adds only the *strategy* and the
+/// *margin* (lead time to finish the shrink before the cache would
+/// expire).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ShrinkConfig {
+    /// Which shrink to run on a cold-at-return delegation. Default
+    /// `prune` (lossless, cheap, sync); `compact` opts into LLM
+    /// summarization (heavier, lossier, saves more).
+    #[serde(default)]
+    pub strategy: ShrinkStrategy,
+    /// Seconds of lead time before the cache TTL elapses at which the
+    /// lazy (cache-capable) shrink is kicked off, so it finishes before
+    /// the prefix would expire. The lazy trigger fires at
+    /// `ttl_secs - margin_secs`. Ignored for no-cache providers (they
+    /// shrink eagerly at delegation start). Default 30s.
+    #[serde(default = "default_shrink_margin_secs")]
+    pub margin_secs: u64,
+}
+
+impl Default for ShrinkConfig {
+    fn default() -> Self {
+        Self {
+            strategy: ShrinkStrategy::default(),
+            margin_secs: default_shrink_margin_secs(),
+        }
+    }
+}
+
+fn default_shrink_margin_secs() -> u64 {
+    30
+}
+
+/// The parent-context shrink strategy used across a sub-agent delegation.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ShrinkStrategy {
+    /// Lossless snapshot-dedup via the existing prune action. Cheap,
+    /// synchronous, low quality loss — the default (priority #1).
+    #[default]
+    Prune,
+    /// LLM summarization of the parent context (reuses the `/compact`
+    /// brief machinery). Heavier and lossier, saves more tokens.
+    Compact,
 }
 
 /// How a provider caches the prompt prefix. `None` (the default) means
@@ -194,6 +253,11 @@ pub struct ModelEntry {
     /// predicate (GOALS §10).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache: Option<CacheConfig>,
+    /// Per-model delegation-shrink override. When set, takes precedence
+    /// over the provider-level [`ProviderEntry::shrink`]
+    /// (`prompts/compact-after-delegation.md`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shrink: Option<ShrinkConfig>,
     /// Free-form metadata the `/models` endpoint returned but we don't
     /// model explicitly. Preserved verbatim so re-saving doesn't drop
     /// fields the user (or provider) cares about.
@@ -254,6 +318,23 @@ impl ProvidersConfig {
             .find(|m| m.id == model)
             .and_then(|m| m.cache.clone())
             .unwrap_or_else(|| entry.cache.clone())
+    }
+
+    /// Resolve the effective delegation-shrink config for
+    /// `(provider, model)`: the model-level override if present, else the
+    /// provider-level config, else the default (`prune`, 30s margin).
+    /// Used by the delegation-shrink decision
+    /// (`prompts/compact-after-delegation.md`).
+    pub fn resolve_shrink(&self, provider: &str, model: &str) -> ShrinkConfig {
+        let Some(entry) = self.providers.get(provider) else {
+            return ShrinkConfig::default();
+        };
+        entry
+            .models
+            .iter()
+            .find(|m| m.id == model)
+            .and_then(|m| m.shrink.clone())
+            .unwrap_or_else(|| entry.shrink.clone())
     }
 }
 
@@ -385,6 +466,7 @@ mod tests {
                 credential_ref: None,
                 auth: Some(AuthKind::ApiKey),
                 cache: CacheConfig::default(),
+                shrink: ShrinkConfig::default(),
                 models: vec![ModelEntry {
                     id: "claude-opus-4-7".into(),
                     name: Some("Claude Opus 4.7".into()),
@@ -392,6 +474,7 @@ mod tests {
                     context_length: None,
                     favorite: false,
                     cache: None,
+                    shrink: None,
                     inputs: Some(Inputs {
                         images: Some(true),
                         video: None,
@@ -485,6 +568,7 @@ mod tests {
                 mode: CacheMode::None,
                 ttl_secs: 300,
             }),
+            shrink: None,
             inputs: None,
             extra: Default::default(),
         });

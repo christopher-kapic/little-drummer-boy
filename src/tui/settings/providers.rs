@@ -462,6 +462,7 @@ impl SettingsDialog {
                     credential_ref: Some("codex".to_string()),
                     auth: Some(crate::config::providers::AuthKind::DeviceFlow),
                     cache: Default::default(),
+                    shrink: Default::default(),
                     models: Vec::new(),
                 };
                 self.config.providers.insert(id.clone(), entry);
@@ -794,6 +795,7 @@ impl SettingsDialog {
                     credential_ref: None,
                     auth: Some(template.auth),
                     cache: Default::default(),
+                    shrink: Default::default(),
                     models: vec![],
                 };
                 self.save_and_fetch_provider(s, id, entry, template);
@@ -815,6 +817,7 @@ impl SettingsDialog {
                             credential_ref: None,
                             auth: Some(template.auth),
                             cache: Default::default(),
+                            shrink: Default::default(),
                             models: vec![],
                         };
                         self.save_and_fetch_provider(s, id, entry, template);
@@ -844,6 +847,7 @@ impl SettingsDialog {
                             credential_ref: None,
                             auth: Some(template.auth),
                             cache: Default::default(),
+                            shrink: Default::default(),
                             models: vec![],
                         };
                         self.save_and_fetch_provider(s, id, entry, template);
@@ -865,6 +869,7 @@ impl SettingsDialog {
                         credential_ref: None,
                         auth: Some(template.auth),
                         cache: Default::default(),
+                        shrink: Default::default(),
                         models: vec![],
                     };
                     self.save_and_fetch_provider(s, id, entry, template);
