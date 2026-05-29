@@ -324,6 +324,14 @@ impl DialogState {
         self.page_states[page].custom.cursor_col()
     }
 
+    /// Display-column of the caret within the custom/free-text field on
+    /// `page` (rendered width in terminal cells, not chars/bytes). Used to
+    /// park the real terminal cursor so it lines up with multi-byte / wide
+    /// input.
+    pub fn custom_cursor_display_col(&self, page: usize) -> usize {
+        self.page_states[page].custom.cursor_display_col()
+    }
+
     /// First visible row index for the current page's option list. The
     /// renderer skips rows before this when the list is taller than the
     /// viewport.
@@ -385,9 +393,17 @@ impl DialogState {
         if self.locked() {
             return DialogOutcome::Continue;
         }
-        // Esc always dismisses the whole dialog (even mid-typing — the
-        // user wants out).
+        // Uniform Esc escalation: a first Esc while typing leaves typing
+        // mode (keeping the dialog open and the typed text intact); a
+        // subsequent Esc — once typing is off — cancels. On a freetext
+        // page this defocuses the field (the next text-affecting key
+        // resumes editing, per `handle_page_key`); on a select/multiselect
+        // custom field it returns focus to the option list.
         if matches!(key.code, KeyCode::Esc) {
+            if self.typing {
+                self.typing = false;
+                return DialogOutcome::Continue;
+            }
             return DialogOutcome::Cancel;
         }
         if self.typing {
@@ -966,11 +982,51 @@ mod tests {
     }
 
     #[test]
-    fn esc_cancels_even_while_typing() {
+    fn esc_exits_typing_before_cancelling_freetext() {
+        // Supersedes the old `esc_cancels_even_while_typing`: Esc now
+        // escalates. A freetext page opens directly in typing mode.
         let mut d = unlocked(vec![Page::text("q")]);
-        // A freetext page opens directly in typing mode.
         assert!(d.is_typing());
         d.handle_key(press(KeyCode::Char('x'))); // mid-typing
+        // First Esc leaves typing mode but keeps the dialog open and the
+        // typed text intact.
+        let out = d.handle_key(press(KeyCode::Esc));
+        assert_eq!(out, DialogOutcome::Continue);
+        assert!(!d.is_typing(), "first Esc defocuses the field");
+        assert_eq!(d.custom_text(0), "x", "Esc preserves typed text");
+        // A text-affecting key resumes editing (the existing resume path).
+        d.handle_key(press(KeyCode::Char('y')));
+        assert!(d.is_typing(), "next key resumes editing");
+        assert_eq!(d.custom_text(0), "xy");
+        // Defocus again, then a second Esc (typing off) cancels.
+        let out = d.handle_key(press(KeyCode::Esc));
+        assert_eq!(out, DialogOutcome::Continue);
+        assert!(!d.is_typing());
+        let out = d.handle_key(press(KeyCode::Esc));
+        assert_eq!(out, DialogOutcome::Cancel);
+    }
+
+    #[test]
+    fn esc_exits_typing_before_cancelling_select_custom() {
+        // On a select custom field: first Esc returns focus to the option
+        // list (typing off, text preserved), second Esc cancels.
+        let mut d = unlocked(vec![Page::select("?", vec![opt("a")])]);
+        // Move to the custom affordance and begin typing.
+        d.handle_key(press(KeyCode::Char('j')));
+        assert_eq!(d.cursor(), 1);
+        d.handle_key(press(KeyCode::Enter)); // begin typing (empty)
+        assert!(d.is_typing());
+        d.handle_key(press(KeyCode::Char('h')));
+        d.handle_key(press(KeyCode::Char('i')));
+        assert_eq!(d.custom_text(0), "hi");
+        // First Esc: defocus the field, dialog stays open, text intact.
+        let out = d.handle_key(press(KeyCode::Esc));
+        assert_eq!(out, DialogOutcome::Continue);
+        assert!(!d.is_typing(), "first Esc returns to option navigation");
+        assert_eq!(d.custom_text(0), "hi", "Esc preserves typed text");
+        // The cursor is still on the custom affordance (navigation mode).
+        assert_eq!(d.cursor(), 1);
+        // Second Esc (not typing) cancels.
         let out = d.handle_key(press(KeyCode::Esc));
         assert_eq!(out, DialogOutcome::Cancel);
     }

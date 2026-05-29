@@ -7,6 +7,7 @@
 //! by byte position; the cursor moves by char boundary.
 
 use crossterm::event::{KeyCode, KeyEvent};
+use unicode_width::UnicodeWidthStr;
 
 #[derive(Debug, Clone, Default)]
 pub struct TextField {
@@ -94,6 +95,14 @@ impl TextField {
     /// Char column (not byte). For cursor placement only.
     pub fn cursor_col(&self) -> usize {
         self.buffer[..self.cursor].chars().count()
+    }
+
+    /// Display-column of the caret: the rendered width (in terminal cells)
+    /// of the text before the cursor. Accounts for wide (CJK) and
+    /// multi-byte glyphs so a parked terminal cursor lines up with the
+    /// character the user is about to edit.
+    pub fn cursor_display_col(&self) -> usize {
+        self.buffer[..self.cursor].width()
     }
 }
 

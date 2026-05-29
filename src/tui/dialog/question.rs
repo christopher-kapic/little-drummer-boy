@@ -18,6 +18,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
+use unicode_width::UnicodeWidthStr;
 use uuid::Uuid;
 
 use crate::daemon::proto::{
@@ -37,6 +38,16 @@ const MAX_DIALOG_HEIGHT: u16 = 16;
 
 const CUSTOM_LABEL: &str = "Type your own answer";
 const NEXT_LABEL: &str = "Next";
+
+/// Leading hover/cursor glyph on every option row: "▸ " when focused,
+/// two spaces otherwise. Both render two cells wide, so the column a row's
+/// content starts at is fixed regardless of focus.
+const OPTION_CURSOR_HOVERED: &str = "▸ ";
+const OPTION_CURSOR_PLAIN: &str = "  ";
+/// Rendered width (terminal cells) of the leading cursor glyph. Used to
+/// park the real terminal cursor by display column rather than byte length
+/// (the hover glyph is multi-byte UTF-8).
+const OPTION_CURSOR_WIDTH: usize = 2;
 
 /// What the host should do once the dialog closes.
 #[derive(Debug, Clone)]
@@ -347,8 +358,10 @@ impl QuestionDialog {
                     Span::raw("▌ "),
                     Span::styled(typed.to_string(), style),
                 ]));
-                // Cursor sits after the "▌ " prefix + the typed char col.
-                let col = 2 + self.state.custom_cursor_col(page_idx) as u16;
+                // Cursor sits after the "▌ " prefix (2 cells) + the caret's
+                // display column within the typed text (so multi-byte / wide
+                // input stays aligned).
+                let col = 2 + self.state.custom_cursor_display_col(page_idx) as u16;
                 cursor = Some((area.x + col, area.y + row));
             }
             PageKind::Select | PageKind::Multiselect => {
@@ -390,10 +403,14 @@ impl QuestionDialog {
                         }
                     } else if row_idx == custom_idx {
                         let typed = self.state.custom_text(page_idx);
+                        // Placeholder and typed text are mutually exclusive:
+                        // an empty field shows the `Type your own answer`
+                        // placeholder; once the user types, the row shows
+                        // only what they typed (with the edit marker).
                         let label = if typed.is_empty() {
                             CUSTOM_LABEL.to_string()
                         } else {
-                            format!("{CUSTOM_LABEL}: {typed}")
+                            typed.to_string()
                         };
                         let marker = if self.state.is_typing() && hovered {
                             "✎ "
@@ -402,10 +419,18 @@ impl QuestionDialog {
                         };
                         lines.push(self.option_line("", marker, &label, hovered));
                         if self.state.is_typing() && hovered {
-                            // Cursor after cursor-glyph(2) + marker + label
-                            // prefix + the typed-char column.
-                            let prefix = 2 + marker.len() + CUSTOM_LABEL.len() + ": ".len();
-                            let col = prefix as u16 + self.state.custom_cursor_col(page_idx) as u16;
+                            // Park the cursor at the caret's display column.
+                            // The rendered prefix on this row is the
+                            // hover/cursor glyph ("▸ ") then the marker
+                            // ("✎ ") — both multi-byte, so measure them by
+                            // RENDERED WIDTH, not `.len()`. Since fix #1
+                            // dropped the label prefix while typing, the
+                            // only text before the caret is those two glyphs
+                            // plus the typed string up to the caret.
+                            let prefix = OPTION_CURSOR_WIDTH
+                                + UnicodeWidthStr::width(marker)
+                                + self.state.custom_cursor_display_col(page_idx);
+                            let col = prefix as u16;
                             let row = (lines.len() - 1) as u16;
                             cursor = Some((area.x + col, area.y + row));
                         }
@@ -424,7 +449,11 @@ impl QuestionDialog {
     }
 
     fn option_line(&self, num: &str, marker: &str, label: &str, hovered: bool) -> Line<'static> {
-        let cursor = if hovered { "▸ " } else { "  " };
+        let cursor = if hovered {
+            OPTION_CURSOR_HOVERED
+        } else {
+            OPTION_CURSOR_PLAIN
+        };
         let style = if hovered {
             Style::default()
                 .fg(Color::Indexed(ACCENT_BLUE_INDEX))
@@ -771,6 +800,148 @@ mod tests {
         );
         assert!(text.contains("Relational engine"), "option description");
         assert!(text.contains("Postgres"), "option label");
+    }
+
+    /// Flatten a page's rendered body into one string per line.
+    fn render_lines(d: &QuestionDialog, area: Rect) -> Vec<String> {
+        let (lines, _) = d.render_page(area);
+        lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn cursor_glyph_width_matches_constant() {
+        // The parked-cursor math assumes both hover glyphs are
+        // OPTION_CURSOR_WIDTH cells; assert that so it can't drift.
+        assert_eq!(
+            UnicodeWidthStr::width(OPTION_CURSOR_HOVERED),
+            OPTION_CURSOR_WIDTH
+        );
+        assert_eq!(
+            UnicodeWidthStr::width(OPTION_CURSOR_PLAIN),
+            OPTION_CURSOR_WIDTH
+        );
+    }
+
+    #[test]
+    fn typed_custom_replaces_placeholder_label() {
+        let mut d = dialog(single_q());
+        let area = Rect::new(0, 0, 60, 12);
+        // Empty field: the placeholder shows.
+        let before = render_lines(&d, area).join("\n");
+        assert!(
+            before.contains(CUSTOM_LABEL),
+            "empty field shows the placeholder"
+        );
+        // Move to the custom affordance, begin typing, type "hello".
+        d.handle_key(press(KeyCode::Down)); // option 2
+        d.handle_key(press(KeyCode::Down)); // custom affordance
+        d.handle_key(press(KeyCode::Enter)); // begin typing (empty)
+        assert!(d.state.is_typing());
+        for c in "hello".chars() {
+            d.handle_key(press(KeyCode::Char(c)));
+        }
+        let (lines, cursor) = d.render_page(area);
+        let text: Vec<String> = lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        let joined = text.join("\n");
+        // The custom row reads only "hello" with the edit marker — never
+        // the "Type your own answer:" prefix.
+        assert!(
+            text.iter().any(|l| l.contains("✎ hello")),
+            "custom row shows the edit marker + typed text: {text:?}"
+        );
+        assert!(
+            !joined.contains(&format!("{CUSTOM_LABEL}: ")),
+            "placeholder prefix must not coexist with typed text"
+        );
+        assert!(
+            !joined.contains(&format!("{CUSTOM_LABEL}\nhello"))
+                && !text
+                    .iter()
+                    .any(|l| l.contains(CUSTOM_LABEL) && l.contains("hello")),
+            "placeholder and typed text are mutually exclusive"
+        );
+        // The parked cursor sits immediately after "hello": hover glyph (2)
+        // + marker "✎ " (2) + 5 chars = column 9.
+        let (cx, _) = cursor.expect("typing parks a cursor");
+        let expected = OPTION_CURSOR_WIDTH as u16
+            + UnicodeWidthStr::width("✎ ") as u16
+            + "hello".chars().count() as u16;
+        assert_eq!(cx, area.x + expected, "cursor lands right after `hello`");
+    }
+
+    #[test]
+    fn clearing_custom_reverts_to_placeholder() {
+        let mut d = dialog(single_q());
+        let area = Rect::new(0, 0, 60, 12);
+        d.handle_key(press(KeyCode::Down));
+        d.handle_key(press(KeyCode::Down)); // custom affordance
+        d.handle_key(press(KeyCode::Enter)); // begin typing
+        d.handle_key(press(KeyCode::Char('x')));
+        assert!(render_lines(&d, area).iter().any(|l| l.contains("✎ x")));
+        // Delete the only char: row reverts to the placeholder.
+        d.handle_key(press(KeyCode::Backspace));
+        let joined = render_lines(&d, area).join("\n");
+        assert!(
+            joined.contains(CUSTOM_LABEL),
+            "empty field reverts to the placeholder: {joined}"
+        );
+    }
+
+    #[test]
+    fn cursor_display_col_tracks_multibyte_caret() {
+        // A wide/multi-byte char before the caret must shift the parked
+        // cursor by its DISPLAY width, not its byte length.
+        let mut d = dialog(single_q());
+        let area = Rect::new(0, 0, 60, 12);
+        d.handle_key(press(KeyCode::Down));
+        d.handle_key(press(KeyCode::Down)); // custom affordance
+        d.handle_key(press(KeyCode::Enter)); // begin typing
+        // "世" is a 3-byte, 2-cell-wide CJK glyph.
+        d.handle_key(press(KeyCode::Char('世')));
+        d.handle_key(press(KeyCode::Char('a')));
+        let (_, cursor) = d.render_page(area);
+        let (cx, _) = cursor.expect("typing parks a cursor");
+        // hover(2) + marker(2) + width("世a") = 2 + 2 + (2 + 1) = 7.
+        let expected = OPTION_CURSOR_WIDTH as u16 + 2 + 3;
+        assert_eq!(cx, area.x + expected, "caret tracks display width");
+    }
+
+    #[test]
+    fn esc_round_trip_preserves_typed_custom_text() {
+        let mut d = dialog(single_q());
+        let area = Rect::new(0, 0, 60, 12);
+        d.handle_key(press(KeyCode::Down));
+        d.handle_key(press(KeyCode::Down)); // custom affordance
+        d.handle_key(press(KeyCode::Enter)); // begin typing
+        for c in "abc".chars() {
+            d.handle_key(press(KeyCode::Char(c)));
+        }
+        // First Esc defocuses; dialog stays open; text intact.
+        assert!(!d.handle_key(press(KeyCode::Esc)), "Esc must not close");
+        assert!(!d.state.is_typing());
+        let joined = render_lines(&d, area).join("\n");
+        assert!(joined.contains("abc"), "typed text survives Esc: {joined}");
+        // Re-enter typing (Enter on the custom affordance with text present
+        // commits on single-select; Space re-enters). Use Space to resume.
+        d.handle_key(press(KeyCode::Char(' ')));
+        assert!(d.state.is_typing(), "resumes typing");
+        assert_eq!(d.state.custom_text(0), "abc", "resumes from same text");
     }
 
     #[test]
