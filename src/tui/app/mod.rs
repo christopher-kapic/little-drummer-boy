@@ -1003,10 +1003,15 @@ impl App {
         // Print the last opened session id — but only when it was actually
         // persisted (session-id-display-and-lazy-persist). An opened-but-
         // unused session left no DB row, so we print nothing about it.
-        if self.current_session_persisted
-            && let Some(session_id) = self.launch.session_id
-        {
-            println!("session {session_id}");
+        // Print the 6-char short id so the exit line matches the welcome
+        // box; fall back to the full UUID only if the short id is somehow
+        // absent (defensive — it should always be set once attached).
+        if self.current_session_persisted {
+            if let Some(short_id) = self.launch.session_short_id.as_deref() {
+                println!("session {short_id}");
+            } else if let Some(session_id) = self.launch.session_id {
+                println!("session {session_id}");
+            }
         }
         result
     }
