@@ -474,6 +474,13 @@ fn turn_event_to_proto(event: TurnEvent, session_id: Uuid) -> Vec<proto::Event> 
         TurnEvent::ThinkingStarted { agent } => {
             vec![proto::Event::ThinkingStarted { session_id, agent }]
         }
+        TurnEvent::Reconnecting { agent, attempt } => {
+            vec![proto::Event::Reconnecting {
+                session_id,
+                agent,
+                attempt,
+            }]
+        }
         TurnEvent::AssistantTextDelta { agent, delta } => {
             vec![proto::Event::AssistantTextDelta {
                 session_id,

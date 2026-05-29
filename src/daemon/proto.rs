@@ -482,6 +482,16 @@ pub enum Event {
     /// `AssistantTextDelta` arrives.
     ThinkingStarted { session_id: Uuid, agent: String },
 
+    /// An inference call hit a network/transient failure and is being
+    /// auto-retried. TUI shows a non-blocking `reconnecting… attempt N`
+    /// status (daemon owns inference state — this is forwarded, not
+    /// computed client-side). `attempt` is the 1-based retry number.
+    Reconnecting {
+        session_id: Uuid,
+        agent: String,
+        attempt: u32,
+    },
+
     /// One streaming chunk of assistant text.
     AssistantTextDelta {
         session_id: Uuid,
@@ -1185,8 +1195,7 @@ mod tests {
                 message: "caffeinate on — note: lid-close not guaranteed".into(),
             },
         );
-        let back: Envelope =
-            serde_json::from_str(&serde_json::to_string(&res).unwrap()).unwrap();
+        let back: Envelope = serde_json::from_str(&serde_json::to_string(&res).unwrap()).unwrap();
         match back.body {
             Body::Response {
                 response:
@@ -1211,11 +1220,13 @@ mod tests {
             lid_close_guaranteed: false,
             message: None,
         });
-        let back: Envelope =
-            serde_json::from_str(&serde_json::to_string(&evt).unwrap()).unwrap();
+        let back: Envelope = serde_json::from_str(&serde_json::to_string(&evt).unwrap()).unwrap();
         match back.body {
             Body::Event {
-                event: Event::CaffeinateState { active, message, .. },
+                event:
+                    Event::CaffeinateState {
+                        active, message, ..
+                    },
             } => {
                 assert!(!active);
                 assert!(message.is_none());

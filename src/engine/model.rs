@@ -35,6 +35,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::engine::agent::TurnEvent;
+use crate::engine::retry;
 
 // `openai::Client` is rig's *Responses API* client (POSTs `/responses`).
 // Every OpenAI-compatible provider in `src/providers/mod.rs` (z.ai,
@@ -83,6 +84,36 @@ pub struct InferenceCancelled;
 /// sentinel — i.e. the turn was aborted by the user, not a real failure.
 pub fn is_cancelled(err: &anyhow::Error) -> bool {
     err.downcast_ref::<InferenceCancelled>().is_some()
+}
+
+/// Sentinel embedded in a [`rig::completion::CompletionError`] when a
+/// retry *attempt* is aborted by ctrl+c (as opposed to a transport
+/// failure). It is wrapped in `RequestError`, which the retry taxonomy
+/// classifies fail-fast, so [`retry::with_retry`] returns at once
+/// instead of retrying; `complete_captured` then maps it to
+/// [`InferenceCancelled`].
+#[derive(Debug, thiserror::Error)]
+#[error("inference attempt cancelled by user")]
+struct AttemptCancelled;
+
+/// Build the cancellation sentinel as a `CompletionError`.
+fn attempt_cancelled() -> rig::completion::CompletionError {
+    rig::completion::CompletionError::RequestError(Box::new(AttemptCancelled))
+}
+
+/// Detect the [`AttemptCancelled`] sentinel in a `CompletionError`.
+fn is_attempt_cancelled(err: &rig::completion::CompletionError) -> bool {
+    if let rig::completion::CompletionError::RequestError(inner) = err {
+        // Walk the boxed error chain for the marker.
+        let mut current: Option<&(dyn std::error::Error + 'static)> = Some(inner.as_ref());
+        while let Some(e) = current {
+            if e.downcast_ref::<AttemptCancelled>().is_some() {
+                return true;
+            }
+            current = e.source();
+        }
+    }
+    false
 }
 
 /// One concrete provider-flavor of completion model. Add variants here
@@ -227,86 +258,128 @@ impl Model {
             return Err(anyhow::Error::new(InferenceCancelled));
         }
 
-        let out: Result<CompleteOut> = match self {
-            Model::OpenAi { client, model_id } => {
-                let agent = build_agent(client, model_id, system, tools, &params);
+        // Build a connectivity probe from the provider base URL so a
+        // backoff wait short-circuits the moment the link returns. `None`
+        // (unparseable URL) falls back to plain backoff — never fatal.
+        let probe = match self {
+            Model::OpenAi { client, .. } => retry::TcpProbe::from_base_url(client.base_url()),
+        };
 
-                let mut req = agent.completion(prompt, history).await?;
-                if params.tools_required && !tools.is_empty() {
-                    req = req.tool_choice(ToolChoice::Required);
-                }
-                // Build the stream, racing the build against cancellation so
-                // a ctrl+c during the initial round-trip aborts promptly.
-                let mut stream = tokio::select! {
-                    biased;
-                    _ = cancel.cancelled() => return Err(anyhow::Error::new(InferenceCancelled)),
-                    built = req.stream() => built?,
-                };
-                loop {
-                    // Race each chunk against cancellation: a ctrl+c aborts
-                    // the in-flight stream instead of waiting for the model
-                    // to finish. Dropping `stream` on the cancel arm closes
-                    // the underlying HTTP body.
-                    let item = tokio::select! {
+        // Each attempt builds + drains a *fresh* stream: a failed
+        // attempt's partial is discarded, never resumed (prompt edge
+        // case). `with_retry` re-invokes this closure on a network/
+        // transient failure with jittered, capped backoff; a non-
+        // transient error fails fast. Persistence in `agent::turn` runs
+        // once, after this whole retry unit settles — so a retried call
+        // logs exactly one inference outcome.
+        //
+        // Cancellation: the select arms below short-circuit a ctrl+c
+        // *during an attempt* via [`AttemptCancelled`] (classified
+        // fail-fast, so `with_retry` returns at once); cancellation
+        // *during a backoff wait* is interrupted immediately by
+        // `with_retry`'s own select against `cancel`. Either way we map
+        // the final state to the `InferenceCancelled` sentinel below.
+        let attempt = || async {
+            match self {
+                Model::OpenAi { client, model_id } => {
+                    let agent = build_agent(client, model_id, system, tools, &params);
+
+                    let mut req = agent.completion(prompt.clone(), history.clone()).await?;
+                    if params.tools_required && !tools.is_empty() {
+                        req = req.tool_choice(ToolChoice::Required);
+                    }
+                    // Build the stream, racing the build against
+                    // cancellation so a ctrl+c during the initial round-
+                    // trip aborts promptly.
+                    let mut stream = tokio::select! {
                         biased;
-                        _ = cancel.cancelled() => {
-                            return Err(anyhow::Error::new(InferenceCancelled));
-                        }
-                        next = stream.next() => match next {
-                            Some(item) => item,
-                            None => break,
-                        },
+                        _ = cancel.cancelled() => return Err(attempt_cancelled()),
+                        built = req.stream() => built?,
                     };
-                    match item? {
-                        StreamedAssistantContent::Text(text) if !text.text.is_empty() => {
-                            let _ = event_tx
-                                .send(TurnEvent::AssistantTextDelta {
-                                    agent: agent_name.to_string(),
-                                    delta: text.text,
-                                })
-                                .await;
-                        }
-                        StreamedAssistantContent::ReasoningDelta { reasoning, .. } => {
-                            // Capture for the "expand thinking block"
-                            // feature; the TUI hides this by default.
-                            let _ = event_tx
-                                .send(TurnEvent::ReasoningDelta {
-                                    agent: agent_name.to_string(),
-                                    delta: reasoning,
-                                })
-                                .await;
-                        }
-                        StreamedAssistantContent::Reasoning(r) => {
-                            let combined = collect_reasoning_text(&r);
-                            if !combined.is_empty() {
+                    loop {
+                        // Race each chunk against cancellation: a ctrl+c
+                        // aborts the in-flight stream instead of waiting
+                        // for the model to finish. Dropping `stream` on
+                        // the cancel arm closes the underlying HTTP body.
+                        let item = tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => return Err(attempt_cancelled()),
+                            next = stream.next() => match next {
+                                Some(item) => item,
+                                None => break,
+                            },
+                        };
+                        match item? {
+                            StreamedAssistantContent::Text(text) if !text.text.is_empty() => {
                                 let _ = event_tx
-                                    .send(TurnEvent::ReasoningDelta {
+                                    .send(TurnEvent::AssistantTextDelta {
                                         agent: agent_name.to_string(),
-                                        delta: combined,
+                                        delta: text.text,
                                     })
                                     .await;
                             }
+                            StreamedAssistantContent::ReasoningDelta { reasoning, .. } => {
+                                // Capture for the "expand thinking block"
+                                // feature; the TUI hides this by default.
+                                let _ = event_tx
+                                    .send(TurnEvent::ReasoningDelta {
+                                        agent: agent_name.to_string(),
+                                        delta: reasoning,
+                                    })
+                                    .await;
+                            }
+                            StreamedAssistantContent::Reasoning(r) => {
+                                let combined = collect_reasoning_text(&r);
+                                if !combined.is_empty() {
+                                    let _ = event_tx
+                                        .send(TurnEvent::ReasoningDelta {
+                                            agent: agent_name.to_string(),
+                                            delta: combined,
+                                        })
+                                        .await;
+                                }
+                            }
+                            // ToolCallDelta / ToolCall / Final are
+                            // aggregated into `stream.choice` /
+                            // `stream.message_id` internally; the
+                            // post-loop reads pick them up.
+                            _ => {}
                         }
-                        // ToolCallDelta / ToolCall / Final are
-                        // aggregated into `stream.choice` /
-                        // `stream.message_id` internally; the
-                        // post-loop reads pick them up.
-                        _ => {}
                     }
+                    // rig requests `stream_options.include_usage = true`
+                    // on every OpenAI-compat stream; the final usage chunk
+                    // lands on `stream.response` (Option, because some
+                    // providers omit it).
+                    let usage = stream
+                        .response
+                        .token_usage()
+                        .map(TokenUsage::from)
+                        .filter(|u| !u.is_empty());
+                    Ok::<CompleteOut, rig::completion::CompletionError>((
+                        stream.message_id.clone(),
+                        stream.choice.clone(),
+                        usage,
+                    ))
                 }
-                // rig requests `stream_options.include_usage = true`
-                // on every OpenAI-compat stream; the final usage chunk
-                // lands on `stream.response` (Option, because some
-                // providers omit it).
-                let usage = stream
-                    .response
-                    .token_usage()
-                    .map(TokenUsage::from)
-                    .filter(|u| !u.is_empty());
-                Ok((stream.message_id.clone(), stream.choice.clone(), usage))
             }
         };
-        Ok((out?, captured))
+
+        let out = retry::with_retry(agent_name, event_tx, cancel, probe.as_ref(), attempt).await;
+
+        match out {
+            Ok(value) => Ok((value, captured)),
+            Err(err) => {
+                // A ctrl+c (either during an attempt via the
+                // `AttemptCancelled` sentinel, or because the token fired
+                // during a backoff wait) unwinds the turn cleanly rather
+                // than logging a real failure.
+                if cancel.is_cancelled() || is_attempt_cancelled(&err) {
+                    Err(anyhow::Error::new(InferenceCancelled))
+                } else {
+                    Err(anyhow::Error::new(err))
+                }
+            }
+        }
     }
 
     fn model_id(&self) -> &str {

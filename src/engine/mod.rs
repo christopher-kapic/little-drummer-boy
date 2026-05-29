@@ -32,6 +32,7 @@ pub mod message;
 pub mod model;
 pub mod prune;
 pub mod repair;
+pub mod retry;
 pub mod tool;
 
 pub use agent::TurnEvent;

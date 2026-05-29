@@ -358,6 +358,12 @@ pub struct App {
     /// pick. Initialized one-past-the-end so the first roll may land on
     /// any message (including index 0).
     pub(super) working_msg_idx: usize,
+    /// Set to the 1-based retry number while an inference call is mid
+    /// network-retry (`Reconnecting` event); the working indicator shows
+    /// `reconnecting… attempt N` instead of the usual working line.
+    /// Cleared on the next `ThinkingStarted` / `AssistantTextDelta` /
+    /// `AgentIdle` (the call resumed, produced output, or the turn ended).
+    pub(super) reconnect_attempt: Option<u32>,
     /// Live git status; updated by a background tokio task spawned in
     /// `run`. The event loop syncs this into `launch.repo_status` once
     /// per tick.
@@ -780,6 +786,7 @@ impl App {
             busy: false,
             span_started_at: None,
             working_msg_idx: WORKING_MESSAGES.len(),
+            reconnect_attempt: None,
             repo_status,
             dialog: Dialog::None,
             model_picker: None,
@@ -1913,7 +1920,20 @@ impl App {
 
     pub(super) fn apply_event(&mut self, event: TurnEvent) {
         match event {
+            TurnEvent::Reconnecting { agent: _, attempt } => {
+                // A network/transient failure is being auto-retried.
+                // Surface a non-blocking status; ensure the working span
+                // is live so the indicator row is shown even if we
+                // attached mid-retry.
+                if !self.busy {
+                    self.begin_working_span();
+                }
+                self.reconnect_attempt = Some(attempt);
+            }
             TurnEvent::ThinkingStarted { agent } => {
+                // A (re)started round-trip clears any reconnect status —
+                // the call is live again.
+                self.reconnect_attempt = None;
                 // Rising-edge fallback: a fresh submit normally starts
                 // the span, but if we missed that (e.g. attached to an
                 // already-running session) begin one here so the
@@ -1943,6 +1963,8 @@ impl App {
                 self.pending = Some(new_pending(agent));
             }
             TurnEvent::AssistantTextDelta { agent, delta } => {
+                // Output is flowing — the retry (if any) reconnected.
+                self.reconnect_attempt = None;
                 let p = self.pending.get_or_insert_with(|| new_pending(agent));
                 let wrote = route_text_delta(
                     &delta,
@@ -2104,6 +2126,7 @@ impl App {
                 self.estimate_at_last_usage = self.estimate_context_tokens();
             }
             TurnEvent::AgentIdle => {
+                self.reconnect_attempt = None;
                 self.finalize_pending();
                 self.end_working_span();
             }

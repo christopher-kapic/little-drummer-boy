@@ -344,6 +344,7 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
     use proto::Event::*;
     Some(match event {
         ThinkingStarted { session_id, .. }
+        | Reconnecting { session_id, .. }
         | AssistantTextDelta { session_id, .. }
         | ReasoningDelta { session_id, .. }
         | AssistantText { session_id, .. }
@@ -375,6 +376,7 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
     use proto::Event::*;
     Some(match event {
         ThinkingStarted { agent, .. } => TurnEvent::ThinkingStarted { agent },
+        Reconnecting { agent, attempt, .. } => TurnEvent::Reconnecting { agent, attempt },
         AssistantTextDelta { agent, delta, .. } => TurnEvent::AssistantTextDelta { agent, delta },
         ReasoningDelta { agent, delta, .. } => TurnEvent::ReasoningDelta { agent, delta },
         AssistantText { agent, text, .. } => TurnEvent::AssistantText { agent, text },

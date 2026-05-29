@@ -308,9 +308,9 @@ impl Drop for OsInhibitor {
 /// releases sleep suppression.
 struct HeldAssertion {
     /// keepawake's idle+system-sleep assertion (and optionally display).
-    /// `None` only if keepawake itself failed to create — but in that
-    /// case `acquire` returned `Err`, so a `Some` always means an active
-    /// keepawake assertion.
+    /// Always present once acquired — a failed create makes `acquire`
+    /// return `Err` before any `HeldAssertion` is built. Dropping it
+    /// releases the keepawake locks.
     _keepawake: keepawake::KeepAwake,
     /// Linux-only `handle-lid-switch` inhibitor; `None` on other
     /// platforms or when logind couldn't grant it.
@@ -669,13 +669,7 @@ pub mod linux {
         default_path = "/org/freedesktop/login1"
     )]
     trait Manager {
-        fn inhibit(
-            &self,
-            what: &str,
-            who: &str,
-            why: &str,
-            mode: &str,
-        ) -> zbus::Result<OwnedFd>;
+        fn inhibit(&self, what: &str, who: &str, why: &str, mode: &str) -> zbus::Result<OwnedFd>;
     }
 
     /// Holds the `handle-lid-switch` inhibitor fd. Dropping it closes the
@@ -943,7 +937,12 @@ mod tests {
     #[test]
     fn controller_toggle_then_off_releases() {
         let c = CaffeineController::with_inhibitor(FakeInhibitor::new());
-        assert!(c.apply(CaffeinateMode::Toggle, SYSTEM_ONLY).unwrap().state.active);
+        assert!(
+            c.apply(CaffeinateMode::Toggle, SYSTEM_ONLY)
+                .unwrap()
+                .state
+                .active
+        );
         let off = c.apply(CaffeinateMode::Toggle, SYSTEM_ONLY).unwrap();
         assert!(!off.state.active);
         assert_eq!(off.message, "caffeinate off");

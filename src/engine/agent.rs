@@ -54,6 +54,12 @@ pub enum TurnEvent {
     /// mode models start emitting their reasoning chunks (which we
     /// currently drop — see [`crate::engine::model::Model::complete`]).
     ThinkingStarted { agent: String },
+    /// An inference call failed with a network/transient error and is
+    /// being auto-retried (GOALS network-retry). `attempt` is the 1-based
+    /// retry number. The TUI shows a non-blocking `reconnecting… attempt
+    /// N` status (no per-attempt toast spam); cleared by the next
+    /// `ThinkingStarted` / `AssistantTextDelta` / `AgentIdle`.
+    Reconnecting { agent: String, attempt: u32 },
     /// One streaming chunk of the assistant's text response. The TUI
     /// accumulates these in a live-rendered line.
     AssistantTextDelta { agent: String, delta: String },

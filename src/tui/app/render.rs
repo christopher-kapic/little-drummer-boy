@@ -178,6 +178,26 @@ impl App {
         let thinking =
             self.in_thinking_block() && block_elapsed.is_some_and(|e| e >= THINKING_FLIP_AFTER);
 
+        // A mid-retry network reconnect overrides everything else: it's
+        // the most informative state and signals the call isn't hung.
+        if let Some(attempt) = self.reconnect_attempt {
+            let text = format!(
+                "reconnecting{dots} attempt {attempt} {}",
+                format_status_elapsed(span_elapsed)
+            );
+            let line = Line::from(vec![
+                Span::raw(" ".repeat(AGENT_INDENT)),
+                Span::styled(
+                    text,
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::ITALIC),
+                ),
+            ]);
+            frame.render_widget(Paragraph::new(line), area);
+            return;
+        }
+
         let (label, elapsed, color) = if thinking {
             (
                 "Thinking",

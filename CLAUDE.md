@@ -166,7 +166,10 @@ out new deps in PR descriptions.
   `redact::scrub()`. No per-call flag disables it; the only escape
   hatch is `redact.enabled = false` at the config level.
 - **TUI chrome is fixed:** cwd + git branch + context indicator +
-  active agent are always shown (GOALS §1a). Not configurable off.
+  active agent are always shown (GOALS §1a). Not configurable off. The
+  only addition is the `☕` `/caffeinate` glyph, shown *alongside*
+  (never displacing) the fixed slots while sleep suppression is active,
+  driven by daemon-broadcast state.
 - **MCP via lazy discovery** (GOALS §18 — reversed from earlier "no
   MCP" policy). The model sees a catalog of `(server.tool, one-line
   description)` pairs only; full schemas load on the first

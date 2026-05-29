@@ -174,15 +174,10 @@ impl SessionRegistry {
     /// authority for "is an agent running anywhere?". Lock-free reads of
     /// each worker's shared atomics.
     pub fn any_agent_running(&self) -> bool {
-        self.inner
-            .workers
-            .lock()
-            .unwrap()
-            .values()
-            .any(|h| {
-                let (has_jobs, processing) = h.live_status();
-                has_jobs || processing
-            })
+        self.inner.workers.lock().unwrap().values().any(|h| {
+            let (has_jobs, processing) = h.live_status();
+            has_jobs || processing
+        })
     }
 
     /// Live `(has_active_jobs, processing)` status for a session, or

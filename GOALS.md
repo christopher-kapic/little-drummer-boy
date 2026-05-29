@@ -105,6 +105,29 @@ the chrome.
   Required because interactive subagents become the primary while
   they work (§3b) — the user must always know who they're talking
   to. Visually distinct from the cwd / branch slot.
+- caffeination glyph (`☕`): an **additive** indicator shown only while
+  `/caffeinate` is active (sleep suppression on, so agents survive a
+  closed lid). Driven by daemon-broadcast state so the glyph appears
+  (and clears, including on `until-idle` auto-off) on **every**
+  connected client in lockstep. Never displaces the always-on
+  cwd/branch/context/agent slots — it's prepended to the cwd line.
+
+#### `/caffeinate` — keep the machine awake during agent runs
+
+`/caffeinate [toggle|on|off|until-idle]` suppresses system idle sleep
+and lid-close suspend so a user can start agents, close the laptop lid,
+and return to still-running agents (cockpit is daemon-first — only OS
+suspend interrupts an agent). State is **daemon-owned**: the OS sleep
+assertion is held in the daemon process (survives TUI-client exit) via
+the `keepawake` crate, with a Linux-specific logind `handle-lid-switch`
+inhibitor added for lid-close (the plain `sleep` inhibitor is ignored
+under the default `LidSwitchIgnoreInhibited=yes`). Lid-close survival
+**cannot** be guaranteed from userspace on macOS battery (clamshell
+sleep) or Windows (lid-close power-plan action); the confirmation toast
+says so honestly and names the setting to change. `until-idle` is
+auto-disabled by the daemon once no agent is running. Whether the
+display is also kept awake is the `/settings → UI → caffeinate display`
+toggle (default: system only, display free to sleep).
 
 ### 1b. Vim keybinds in the composer
 

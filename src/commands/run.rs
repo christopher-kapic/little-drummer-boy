@@ -343,6 +343,7 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
     use proto::Event::*;
     Some(match event {
         ThinkingStarted { session_id, .. }
+        | Reconnecting { session_id, .. }
         | AssistantTextDelta { session_id, .. }
         | ReasoningDelta { session_id, .. }
         | AssistantText { session_id, .. }
