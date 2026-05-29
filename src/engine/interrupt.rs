@@ -35,7 +35,8 @@
 //! for map insert/remove — never across an `.await`.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use tokio::sync::{broadcast, oneshot};
 use uuid::Uuid;
@@ -53,16 +54,31 @@ pub struct InterruptHub {
     /// no client is listening — raising still works; the event is just
     /// not broadcast. Cloned from the session worker's fan-out sender.
     events: Option<broadcast::Sender<proto::Event>>,
+    /// Count of attached *interactive* clients — ones that can answer an
+    /// interrupt (the TUI; later the remote dashboard). A `cockpit run`
+    /// event pump attaches but cannot answer, so it does not count. The
+    /// server bumps this on interactive attach and decrements on detach
+    /// via the shared `Arc`. Read by the loop guard (GOALS §1/§12) to
+    /// decide headless behavior: 0 means "no human to prompt → don't
+    /// block, auto-reject the repeat."
+    interactive_clients: Arc<AtomicUsize>,
 }
 
 impl InterruptHub {
-    /// Build a hub wired to the worker's client event fan-out. Pass the
-    /// session worker's `broadcast::Sender<proto::Event>` so raised
-    /// interrupts reach every attached client.
-    pub fn new(events: broadcast::Sender<proto::Event>) -> Self {
+    /// Build a hub wired to the worker's client event fan-out, sharing an
+    /// externally-owned interactive-client counter so the daemon's attach
+    /// lifecycle and the hub read the same cell. The session worker owns
+    /// the counter and exposes it on its handle for the server to bump as
+    /// interactive clients attach/detach; the loop guard reads it via
+    /// [`Self::is_interactive_attached`].
+    pub fn new(
+        events: broadcast::Sender<proto::Event>,
+        interactive_clients: Arc<AtomicUsize>,
+    ) -> Self {
         Self {
             waiters: Mutex::new(HashMap::new()),
             events: Some(events),
+            interactive_clients,
         }
     }
 
@@ -73,7 +89,16 @@ impl InterruptHub {
         Self {
             waiters: Mutex::new(HashMap::new()),
             events: None,
+            interactive_clients: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    /// Whether at least one interactive client (one that can answer an
+    /// interrupt) is currently attached. `false` means headless: the loop
+    /// guard must not block on a prompt and instead auto-rejects the
+    /// repeat. A detached hub (tests / standalone shim) is always headless.
+    pub fn is_interactive_attached(&self) -> bool {
+        self.interactive_clients.load(Ordering::SeqCst) > 0
     }
 
     /// Register a wakeup for `interrupt_id` and return the guard the

@@ -1373,15 +1373,15 @@ mod tests {
 
     #[test]
     fn enter_on_instructions_row_in_ui_opens_instructions_page() {
-        // UI page row 11 (instructions file) + Enter should land on the
+        // UI page row 12 (instructions file) + Enter should land on the
         // Instructions page. Rows 0-3 are vim/thinking/markdown, 4-5 are
         // mouse/rich-text-copy (T8.c/T8.g), 6 is emojis, 7 is caffeinate
         // display-awake, 8-9 are name/packages, 10 is utility model, 11 is
-        // instructions.
+        // the loop-guard threshold, 12 is instructions.
         let tmp = TempDir::new().unwrap();
         let mut d = fresh_dialog(&tmp);
         enter_ui_from_root(&mut d);
-        for _ in 0..11 {
+        for _ in 0..12 {
             d.handle_key(press(KeyCode::Char('j')));
         }
         d.handle_key(press(KeyCode::Enter));
@@ -1477,10 +1477,10 @@ mod tests {
     fn fresh_instructions_dialog(tmp: &TempDir) -> SettingsDialog {
         let mut d = fresh_dialog(tmp);
         enter_ui_from_root(&mut d);
-        // Move cursor to the instructions row (idx 11: the caffeinate
-        // display-awake toggle at 7 and `utility model` at 10 push
-        // instructions to the last position) and Enter to nav.
-        for _ in 0..11 {
+        // Move cursor to the instructions row (idx 12: utility model at
+        // 10 and the loop-guard threshold at 11 push instructions to the
+        // last position) and Enter to nav.
+        for _ in 0..12 {
             d.handle_key(press(KeyCode::Char('j')));
         }
         d.handle_key(press(KeyCode::Enter));

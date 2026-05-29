@@ -172,6 +172,11 @@ async fn run_turn(
             session_id: None,
             project_root: Some(project_root),
             no_sandbox,
+            // `cockpit run` streams events but has no UI to answer an
+            // interrupt — a non-interactive attach. The loop guard treats
+            // the session as headless and auto-rejects a back-to-back
+            // repeat (with the guidance error) rather than blocking.
+            interactive: false,
         })
         .await?;
     let session_id = match attached {

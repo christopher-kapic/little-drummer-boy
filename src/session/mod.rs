@@ -101,6 +101,21 @@ pub struct Session {
     /// `(strategy, scale)` for the active `(provider, model)`. Never
     /// persisted in-progress.
     calibrator: Mutex<crate::tokens::Calibrator>,
+    /// Loop-guard state (GOALS §1/§12): the signature of the most recent
+    /// dispatched tool call and how many times *in a row* that exact
+    /// signature has been issued. The dispatcher bumps this per tool call
+    /// via [`Self::bump_consecutive_call`] to detect a back-to-back
+    /// repeat. In-memory only — a fresh attach starts the chain over,
+    /// which is correct (a loop only matters within a live run).
+    last_tool_call: Mutex<Option<LastToolCall>>,
+}
+
+/// The most recent dispatched tool call's loop-guard signature and its
+/// consecutive-repeat count. See [`Session::bump_consecutive_call`].
+#[derive(Debug, Clone)]
+struct LastToolCall {
+    signature: String,
+    consecutive: u32,
 }
 
 impl Session {
@@ -170,6 +185,7 @@ impl Session {
             calibrator: Mutex::new(crate::tokens::Calibrator::new()),
             tmp_dir: Mutex::new(None),
             sandbox_enabled: std::sync::atomic::AtomicBool::new(true),
+            last_tool_call: Mutex::new(None),
         })
     }
 
@@ -534,6 +550,30 @@ impl Session {
             .map(|t| t.elapsed().as_secs())
     }
 
+    /// Record a dispatched tool call's loop-guard `signature` and return
+    /// how many times *in a row* that exact signature has now been issued
+    /// (GOALS §1/§12). A repeat of the immediately-preceding call returns
+    /// an incremented count; any different call resets the count to 1.
+    /// This is the back-to-back detector: only the immediately-preceding
+    /// call is compared, so an intervening different call breaks the
+    /// chain.
+    ///
+    /// Called once per dispatched tool call, *before* the guard decides
+    /// whether to run it. The count it returns is compared against the
+    /// configured threshold (default 2 = fire on the first exact repeat).
+    pub fn bump_consecutive_call(&self, signature: &str) -> u32 {
+        let mut slot = self.last_tool_call.lock().unwrap();
+        let consecutive = match slot.as_ref() {
+            Some(prev) if prev.signature == signature => prev.consecutive.saturating_add(1),
+            _ => 1,
+        };
+        *slot = Some(LastToolCall {
+            signature: signature.to_string(),
+            consecutive,
+        });
+        consecutive
+    }
+
     /// Pin a user message as must-survive (`/pin`). Injected verbatim
     /// into the next `/compact` handoff. No-ops on blank input.
     pub fn pin_message(&self, text: &str) {
@@ -856,6 +896,32 @@ mod tests {
         assert!(!s.toggle_sandbox_enabled());
         assert!(s.toggle_sandbox_enabled());
         assert!(s.sandbox_enabled());
+    }
+
+    #[test]
+    fn bump_consecutive_counts_back_to_back_repeats() {
+        let db = Db::open_in_memory().unwrap();
+        let s = Session::create(db, PathBuf::from("/x"), "coder").unwrap();
+        // First call of a signature → count 1.
+        assert_eq!(s.bump_consecutive_call("sig-a"), 1);
+        // Immediate repeat → count 2 (the first exact repeat).
+        assert_eq!(s.bump_consecutive_call("sig-a"), 2);
+        // And again → 3.
+        assert_eq!(s.bump_consecutive_call("sig-a"), 3);
+    }
+
+    #[test]
+    fn bump_consecutive_resets_on_a_different_call() {
+        let db = Db::open_in_memory().unwrap();
+        let s = Session::create(db, PathBuf::from("/x"), "coder").unwrap();
+        assert_eq!(s.bump_consecutive_call("sig-a"), 1);
+        assert_eq!(s.bump_consecutive_call("sig-a"), 2);
+        // A different call breaks the chain — count resets to 1.
+        assert_eq!(s.bump_consecutive_call("sig-b"), 1);
+        // The original signature repeated *after* an intervening call is
+        // NOT consecutive — it starts a fresh chain at 1, so a
+        // non-consecutive repeat never trips the guard.
+        assert_eq!(s.bump_consecutive_call("sig-a"), 1);
     }
 
     #[test]

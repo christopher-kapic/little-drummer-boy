@@ -80,6 +80,10 @@ pub struct ExtendedConfig {
     #[serde(default)]
     pub jobs: JobsConfig,
 
+    /// Loop-guard knobs: the back-to-back identical tool-call threshold.
+    #[serde(default)]
+    pub loop_guard: LoopGuardConfig,
+
     /// Answering-dialog knobs (GOALS §3b) — shared by the `question`
     /// tool today and tool-approval prompts later.
     #[serde(default)]
@@ -156,6 +160,48 @@ impl Default for JobsConfig {
 
 fn default_max_concurrent_jobs() -> usize {
     crate::engine::jobs::DEFAULT_MAX_CONCURRENT_JOBS
+}
+
+/// Loop-guard config: the approval prompt that fires on back-to-back
+/// identical tool calls. A model that re-issues the *exact same* call
+/// (tool name + canonical `wire_input`) as the immediately-preceding one
+/// is likely stuck in a loop; cockpit pauses for approval rather than
+/// burning the context window re-running it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoopGuardConfig {
+    /// Number of consecutive identical tool calls before the approval
+    /// prompt fires. Counts the run that triggers it: `2` (the default)
+    /// fires on the first exact repeat. A value `< 2` is clamped to `2`
+    /// at read time ([`Self::effective_threshold`]) — the guard is only
+    /// meaningful for a *repeat*.
+    #[serde(default = "default_loop_guard_threshold")]
+    pub repeat_threshold: u32,
+}
+
+impl Default for LoopGuardConfig {
+    fn default() -> Self {
+        Self {
+            repeat_threshold: default_loop_guard_threshold(),
+        }
+    }
+}
+
+impl LoopGuardConfig {
+    /// The threshold actually applied, clamped to a minimum of 2. The
+    /// guard compares against the immediately-preceding call only, so a
+    /// threshold below 2 (which would "fire on the first call ever") is
+    /// nonsensical and floored to 2.
+    pub fn effective_threshold(&self) -> u32 {
+        self.repeat_threshold.max(MIN_LOOP_GUARD_THRESHOLD)
+    }
+}
+
+/// Minimum (and default) consecutive-call count before the loop-guard
+/// prompt fires. `2` = fire on the first exact repeat.
+pub const MIN_LOOP_GUARD_THRESHOLD: u32 = 2;
+
+fn default_loop_guard_threshold() -> u32 {
+    MIN_LOOP_GUARD_THRESHOLD
 }
 
 /// Prompt-injection guard config. The substance is deferred (see
@@ -487,6 +533,7 @@ impl Default for ExtendedConfig {
             prompt_injection_guard: PromptInjectionGuardConfig::default(),
             system_prompt: SystemPromptConfig::default(),
             jobs: JobsConfig::default(),
+            loop_guard: LoopGuardConfig::default(),
             dialog: DialogConfig::default(),
             skills: SkillsConfig::default(),
         }
@@ -664,6 +711,45 @@ mod tests {
         );
         assert_eq!(cfg2.system_prompt.time_injection_interval_minutes, 10);
         assert!(!cfg2.tui.banner.enabled);
+    }
+
+    #[test]
+    fn loop_guard_threshold_defaults_to_two() {
+        let cfg = ExtendedConfig::default();
+        assert_eq!(cfg.loop_guard.repeat_threshold, 2);
+        assert_eq!(cfg.loop_guard.effective_threshold(), 2);
+    }
+
+    #[test]
+    fn loop_guard_threshold_clamps_below_two() {
+        // A nonsensical threshold (< 2 would "fire on the first call
+        // ever") is floored to 2 at read time.
+        let cfg = LoopGuardConfig {
+            repeat_threshold: 0,
+        };
+        assert_eq!(cfg.effective_threshold(), 2);
+        let cfg = LoopGuardConfig {
+            repeat_threshold: 1,
+        };
+        assert_eq!(cfg.effective_threshold(), 2);
+        // A larger value is preserved.
+        let cfg = LoopGuardConfig {
+            repeat_threshold: 5,
+        };
+        assert_eq!(cfg.effective_threshold(), 5);
+    }
+
+    #[test]
+    fn loop_guard_threshold_round_trips_through_extended_doc() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("extended-config.json");
+        std::fs::write(&path, "{}").unwrap();
+        let mut doc = ExtendedConfigDoc::load(&path).unwrap();
+        let mut cfg = doc.config();
+        cfg.loop_guard.repeat_threshold = 4;
+        doc.write(&cfg).unwrap();
+        let doc2 = ExtendedConfigDoc::load(&path).unwrap();
+        assert_eq!(doc2.config().loop_guard.repeat_threshold, 4);
     }
 
     #[test]

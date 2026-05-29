@@ -77,6 +77,12 @@ pub struct SessionWorkerHandle {
     event_tx: broadcast::Sender<proto::Event>,
     /// Live job/turn status for the `/sessions` browser (GOALS §17f).
     live: Arc<LiveState>,
+    /// Count of attached *interactive* clients — ones that can answer an
+    /// interrupt (the loop guard reads this to decide headless behavior,
+    /// GOALS §1/§12). Shared with the worker's [`InterruptHub`]; the
+    /// server bumps/decrements it as interactive clients attach/detach via
+    /// [`Self::register_interactive_client`].
+    interactive_clients: Arc<std::sync::atomic::AtomicUsize>,
     /// Shared session handle (sandboxing part 2): lets the server flip
     /// the per-session sandbox-enabled flag (`/sandbox`) directly and
     /// reply synchronously — the flag is an atomic on the `Arc<Session>`
@@ -100,6 +106,39 @@ impl SessionWorkerHandle {
             enabled: new,
         });
         new
+    }
+
+    /// Register an interactive client (one that can answer interrupts —
+    /// the TUI; later the remote dashboard) for the lifetime of the
+    /// returned guard. The loop guard (GOALS §1/§12) reads the resulting
+    /// count to tell an interactive session from a headless run: while at
+    /// least one guard is alive, a back-to-back repeat prompts; with none,
+    /// it auto-rejects without blocking. Dropping the guard (client
+    /// detach / disconnect) decrements the count.
+    pub fn register_interactive_client(&self) -> InteractiveClientGuard {
+        self.interactive_clients
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        InteractiveClientGuard {
+            counter: self.interactive_clients.clone(),
+        }
+    }
+}
+
+/// RAII guard for an attached interactive client. Decrements the worker's
+/// interactive-client count on drop, so a disconnect (even an abrupt one)
+/// correctly returns the session to headless behavior.
+pub struct InteractiveClientGuard {
+    counter: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Drop for InteractiveClientGuard {
+    fn drop(&mut self) {
+        // Saturating: never underflow even on a double-drop path.
+        let _ = self.counter.fetch_update(
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+            |n| Some(n.saturating_sub(1)),
+        );
     }
 }
 
@@ -182,6 +221,10 @@ pub fn spawn(
     let (work_tx, work_rx) = mpsc::channel::<SessionWork>(WORK_QUEUE_CAPACITY);
     let (event_tx, _initial_rx) = broadcast::channel::<proto::Event>(EVENT_BROADCAST_CAPACITY);
     let live = Arc::new(LiveState::default());
+    // Shared interactive-client counter (GOALS §1/§12). Owned here, handed
+    // to the worker's `InterruptHub` and stored on the handle so attach /
+    // detach and the loop guard read the same cell.
+    let interactive_clients = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
     let handle = SessionWorkerHandle {
         session_id,
@@ -190,6 +233,7 @@ pub fn spawn(
         work_tx,
         event_tx: event_tx.clone(),
         live: live.clone(),
+        interactive_clients: interactive_clients.clone(),
         session: session.clone(),
     };
 
@@ -202,6 +246,7 @@ pub fn spawn(
         work_rx,
         event_tx,
         live,
+        interactive_clients,
     ));
 
     handle
@@ -217,6 +262,7 @@ async fn run_worker(
     mut work_rx: mpsc::Receiver<SessionWork>,
     event_tx: broadcast::Sender<proto::Event>,
     live: Arc<LiveState>,
+    interactive_clients: Arc<std::sync::atomic::AtomicUsize>,
 ) {
     let session_id = session.id;
 
@@ -299,6 +345,7 @@ async fn run_worker(
     // hub must be installed before the driver loop starts.
     let interrupts = Arc::new(crate::engine::interrupt::InterruptHub::new(
         event_tx.clone(),
+        interactive_clients,
     ));
     driver.set_interrupt_hub(interrupts.clone());
 
@@ -324,6 +371,10 @@ async fn run_worker(
         interrupts.clone(),
     ));
     driver.set_approver(approver);
+
+    // Loop-guard threshold (GOALS §1/§12) from the layered config, same
+    // discovery the jobs cap uses. Clamped to ≥ 2 by the setter.
+    driver.set_loop_guard_threshold(loop_guard_threshold_for(&project_root));
 
     // Seed-tool re-execution (`/compact` handoff, T6.e): if this session
     // was created by `/compact`, its derived seed-tool plan was persisted
@@ -724,4 +775,17 @@ fn max_concurrent_jobs_for(project_root: &std::path::Path) -> usize {
         .find_map(|d| ExtendedConfigDoc::load(&d.path.join("extended-config.json")).ok())
         .map(|d| d.config().jobs.max_concurrent)
         .unwrap_or(crate::engine::jobs::DEFAULT_MAX_CONCURRENT_JOBS)
+}
+
+/// Resolve the loop-guard threshold (GOALS §1/§12) from the layered
+/// `extended-config.json` rooted at `project_root`, falling back to the
+/// default (2 = fire on the first exact repeat) when none is configured.
+fn loop_guard_threshold_for(project_root: &std::path::Path) -> u32 {
+    use crate::config::dirs::discover_config_dirs;
+    use crate::config::extended::ExtendedConfigDoc;
+    discover_config_dirs(project_root)
+        .into_iter()
+        .find_map(|d| ExtendedConfigDoc::load(&d.path.join("extended-config.json")).ok())
+        .map(|d| d.config().loop_guard.effective_threshold())
+        .unwrap_or(crate::config::extended::MIN_LOOP_GUARD_THRESHOLD)
 }

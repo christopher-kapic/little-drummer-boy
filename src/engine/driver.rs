@@ -117,6 +117,13 @@ pub struct Driver {
     /// `extended.system_prompt.time_injection_interval_minutes`;
     /// defaults to 5 if unset.
     pub time_injection_interval_minutes: u32,
+    /// Back-to-back identical tool-call threshold for the loop guard
+    /// (GOALS §1/§12): the number of consecutive identical calls before
+    /// the approval prompt fires. Loaded from
+    /// `extended.loop_guard.repeat_threshold` (default 2 = fire on the
+    /// first exact repeat); set via [`Self::set_loop_guard_threshold`]
+    /// before the loop starts.
+    pub loop_guard_threshold: u32,
     /// The single async-job authority (GOALS §22). Owns the live-jobs
     /// registry + per-job tasks; the driver is the one place that mutates
     /// it (single-authority rule).
@@ -256,6 +263,7 @@ impl Driver {
                 answering: None,
             }],
             time_injection_interval_minutes: 5,
+            loop_guard_threshold: crate::config::extended::MIN_LOOP_GUARD_THRESHOLD,
             jobs,
             job_event_rx,
             job_cmd_rx,
@@ -288,6 +296,14 @@ impl Driver {
     /// approver captures the same hub).
     pub fn set_approver(&mut self, approver: Arc<crate::approval::Approver>) {
         self.approver = Some(approver);
+    }
+
+    /// Set the loop-guard threshold (GOALS §1/§12) from the layered
+    /// config before the loop starts. Clamped to a minimum of 2 — the
+    /// guard only fires on a *repeat*, so a smaller value is meaningless.
+    pub fn set_loop_guard_threshold(&mut self, threshold: u32) {
+        self.loop_guard_threshold =
+            threshold.max(crate::config::extended::MIN_LOOP_GUARD_THRESHOLD);
     }
 
     /// Wrap `user_text` with the `[time: ...]` prelude when the
@@ -1286,6 +1302,7 @@ impl Driver {
                     self.interrupts.clone(),
                     cancel.clone(),
                     self.approver.clone(),
+                    self.loop_guard_threshold,
                     tx,
                 )
                 .await
@@ -1524,6 +1541,7 @@ impl Driver {
                             self.interrupts.clone(),
                             cancel.clone(),
                             self.approver.clone(),
+                            self.loop_guard_threshold,
                         )
                         .await
                         {
@@ -1732,6 +1750,7 @@ pub(crate) async fn run_noninteractive(
     interrupts: Arc<crate::engine::interrupt::InterruptHub>,
     cancel: tokio_util::sync::CancellationToken,
     approver: Option<Arc<crate::approval::Approver>>,
+    loop_guard_threshold: u32,
 ) -> Result<String> {
     use crate::engine::agent::turn;
 
@@ -1755,6 +1774,7 @@ pub(crate) async fn run_noninteractive(
             interrupts.clone(),
             cancel.clone(),
             approver.clone(),
+            loop_guard_threshold,
             &sink_tx,
         )
         .await?;

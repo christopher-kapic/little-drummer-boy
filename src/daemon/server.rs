@@ -189,6 +189,12 @@ struct ClientState {
 struct AttachedSession {
     handle: SessionWorkerHandle,
     event_rx: broadcast::Receiver<proto::Event>,
+    /// Held for the lifetime of the attachment when this client is
+    /// interactive (can answer interrupts). Dropping it on detach /
+    /// re-attach / disconnect decrements the worker's interactive-client
+    /// count so the loop guard reverts to headless behavior. `None` for a
+    /// non-interactive attach (e.g. `cockpit run`'s event pump).
+    _interactive_guard: Option<crate::daemon::session_worker::InteractiveClientGuard>,
 }
 
 async fn handle_client(stream: UnixStream, ctx: Arc<DaemonContext>) -> Result<()> {
@@ -363,7 +369,15 @@ async fn handle_request(
             session_id,
             project_root,
             no_sandbox,
-        } => attach(state, ctx, session_id, project_root, no_sandbox),
+            interactive,
+        } => attach(
+            state,
+            ctx,
+            session_id,
+            project_root,
+            no_sandbox,
+            interactive,
+        ),
 
         Request::SendUserMessage { text, images } => {
             let att = require_attached(state)?;
@@ -734,6 +748,7 @@ fn attach(
     session_id: Option<Uuid>,
     project_root: Option<String>,
     no_sandbox: bool,
+    interactive: bool,
 ) -> std::result::Result<Response, ErrorPayload> {
     // The client's `--no-sandbox` only governs sessions it *creates*
     // (sandboxing part 2). On resume of an existing session id the session
@@ -775,8 +790,18 @@ fn attach(
         )
         .map_err(internal)?;
 
-    // Replace any prior attachment.
+    // Replace any prior attachment. Register this client with the worker's
+    // interactive-client counter when it can answer interrupts (the loop
+    // guard reads that count for headless detection). Building the guard
+    // before the old `state.attached` is replaced means a re-attach by the
+    // same client transiently holds two guards, never zero — the count
+    // can't briefly read headless mid-swap.
     let event_rx = handle.subscribe();
+    let interactive_guard = if interactive {
+        Some(handle.register_interactive_client())
+    } else {
+        None
+    };
     let session_id = handle.session_id;
 
     // Read/unread marker (GOALS §17f): the session just became active for
@@ -789,7 +814,11 @@ fn attach(
     let project_root = handle.project_root.to_string_lossy().into_owned();
     let active_agent = handle.active_agent_name.clone();
 
-    state.attached = Some(AttachedSession { handle, event_rx });
+    state.attached = Some(AttachedSession {
+        handle,
+        event_rx,
+        _interactive_guard: interactive_guard,
+    });
 
     // History snapshot of past tool calls / assistant turns for the
     // attached session, projected into the wire `HistoryEntry` shape.

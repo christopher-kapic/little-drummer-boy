@@ -114,6 +114,10 @@ fn try_spawn_inner(
                     session_id,
                     project_root: Some(project_root),
                     no_sandbox,
+                    // The TUI can answer interrupts (approval / loop-guard /
+                    // `question` prompts) — mark this attach interactive so
+                    // the loop guard prompts here instead of auto-rejecting.
+                    interactive: true,
                 })
                 .await
                 .map_err(|e| format!("attach: {e}"))?;

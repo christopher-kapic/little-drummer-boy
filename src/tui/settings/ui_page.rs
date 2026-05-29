@@ -43,6 +43,7 @@ pub(super) enum UiField {
     Name,
     PackagesDir,
     UtilityModel,
+    LoopGuardThreshold,
 }
 
 /// `/settings → UI → Instructions File` state. Edits the
@@ -73,8 +74,9 @@ pub(super) struct GrabState {
 
 /// Rows on the UI page (vim mode, thinking, render-agent-markdown,
 /// render-user-markdown, mouse, rich-text-copy, emojis, caffeinate
-/// display-awake, name, packages dir, utility model, instructions file).
-pub(super) const UI_ROWS: usize = 12;
+/// display-awake, name, packages dir, utility model, loop-guard
+/// threshold, instructions file).
+pub(super) const UI_ROWS: usize = 13;
 
 pub(super) fn bool_label(on: bool, on_label: &str, off_label: &str) -> String {
     if on {
@@ -168,6 +170,18 @@ impl SettingsDialog {
                             self.extended.utility_model =
                                 if new.is_empty() { None } else { Some(new) };
                         }
+                        UiField::LoopGuardThreshold => {
+                            // Parse a positive integer; clamp to the
+                            // minimum (2). A blank or unparseable value
+                            // resets to the default rather than erroring —
+                            // the field can't hold a nonsense threshold.
+                            let parsed = new
+                                .parse::<u32>()
+                                .ok()
+                                .map(|v| v.max(crate::config::extended::MIN_LOOP_GUARD_THRESHOLD))
+                                .unwrap_or(crate::config::extended::MIN_LOOP_GUARD_THRESHOLD);
+                            self.extended.loop_guard.repeat_threshold = parsed;
+                        }
                     }
                     p.editing = None;
                     p.status = match self.save_extended() {
@@ -256,6 +270,11 @@ impl SettingsDialog {
                     p.editing = Some(UiField::UtilityModel);
                 }
                 11 => {
+                    p.buf =
+                        TextField::new(self.extended.loop_guard.effective_threshold().to_string());
+                    p.editing = Some(UiField::LoopGuardThreshold);
+                }
+                12 => {
                     return Nav::Replace(Page::Instructions(InstructionsPage {
                         cursor: 0,
                         grabbed: None,
@@ -280,7 +299,7 @@ impl SettingsDialog {
         )));
         lines.push(Line::default());
 
-        let rows: [(&str, String); 12] = [
+        let rows: [(&str, String); 13] = [
             (
                 "vim mode",
                 vim_label(self.extended.tui.vim_mode).to_string(),
@@ -362,6 +381,13 @@ impl SettingsDialog {
                     .unwrap_or_else(|| "(unset — provider:model-id)".to_string()),
             ),
             (
+                "loop-guard threshold",
+                format!(
+                    "{} (consecutive identical tool calls before approval prompt; 2 = first repeat)",
+                    self.extended.loop_guard.effective_threshold()
+                ),
+            ),
+            (
                 "instructions file",
                 if self.extended.agent_guidance_files.is_empty() {
                     "(none)".to_string()
@@ -397,6 +423,7 @@ impl SettingsDialog {
                 UiField::Name => "name: ",
                 UiField::PackagesDir => "packages dir: ",
                 UiField::UtilityModel => "utility model (provider:model-id): ",
+                UiField::LoopGuardThreshold => "loop-guard threshold (>= 2): ",
             };
             lines.push(Line::default());
             lines.push(Line::from(vec![
@@ -484,7 +511,7 @@ impl SettingsDialog {
             KeyCode::Esc | KeyCode::Char('q') => return Nav::Close,
             KeyCode::Left | KeyCode::Backspace | KeyCode::Char('h') => {
                 return Nav::Replace(Page::Ui(UiPage {
-                    cursor: 11,
+                    cursor: 12,
                     editing: None,
                     buf: TextField::default(),
                     status: None,

@@ -287,6 +287,7 @@ pub async fn turn(
     interrupts: Arc<crate::engine::interrupt::InterruptHub>,
     cancel: tokio_util::sync::CancellationToken,
     approver: Option<Arc<crate::approval::Approver>>,
+    loop_guard_threshold: u32,
     tx: &mpsc::Sender<TurnEvent>,
 ) -> Result<TurnOutcome> {
     let tools = agent.tools.definitions();
@@ -553,11 +554,44 @@ pub async fn turn(
             })
             .await;
 
+        // Loop guard (GOALS §1/§12): block a back-to-back identical tool
+        // call (same name + canonical post-repair `wire_input`) pending
+        // approval. Only schema-valid calls are guarded — a malformed call
+        // already short-circuits below, and isn't a "loop" worth
+        // prompting on. The chain is maintained on `session` so it spans
+        // turns; an intervening different call resets the count. When the
+        // guard rejects (one-off, an always-reject rule, or headless), the
+        // call is *not* dispatched and a guidance error stands in as the
+        // tool result so the model changes course. With no approver wired
+        // (seed-tool re-exec, tool tests) the guard is skipped — never
+        // silently denied, matching the command/path approval contract.
+        let loop_guard_reject = if repair_outcome.valid
+            && let Some(approver) = ctx.approver.as_ref()
+        {
+            let signature =
+                crate::approval::store::GrantStore::loop_signature(&tc.function.name, &args);
+            let consecutive = session.bump_consecutive_call(&signature);
+            if consecutive >= loop_guard_threshold.max(1) {
+                let interactive = ctx.interrupts.is_interactive_attached();
+                let decision = approver
+                    .approve_repeat(&tc.function.name, &args, interactive)
+                    .await?;
+                !decision.is_accept()
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
         // Dispatch only when validate-then-repair produced a schema-valid
-        // call. Otherwise skip dispatch and treat the model-readable schema
-        // diagnostic as an invocation failure — same downstream
-        // audit/telemetry/history path a tool's own `invalid_input` takes.
-        let result = if repair_outcome.valid {
+        // call AND the loop guard didn't reject it. Otherwise skip dispatch
+        // and treat the model-readable diagnostic as an invocation failure
+        // — same downstream audit/telemetry/history path a tool's own
+        // `invalid_input` takes.
+        let result = if loop_guard_reject {
+            Err(invalid_input(loop_guard_message(&tc.function.name)))
+        } else if repair_outcome.valid {
             dispatch_one(&agent.tools, &tc.function.name, args.clone(), &ctx).await
         } else {
             let msg = repair_outcome.error.unwrap_or_else(|| {
@@ -693,6 +727,23 @@ pub async fn turn(
     }
 
     Ok(TurnOutcome::Continue)
+}
+
+/// The guidance error returned as a *tool result* when the loop guard
+/// blocks a back-to-back identical call (GOALS §1/§12). It reads as a
+/// normal tool-result error so the model changes course rather than
+/// treating it as a hard abort. Built with [`invalid_input`] so it
+/// classifies as an [`crate::engine::tool::ToolFailKind::Invocation`]
+/// failure (the model's repeat is the cause). The dispatcher prefixes
+/// `Error:` per the wire-vs-user transcript conventions, the same as any
+/// other invocation failure.
+fn loop_guard_message(tool: &str) -> String {
+    format!(
+        "`{tool}` was blocked: it repeats the immediately-preceding tool call exactly \
+         (same arguments), which is a likely loop. Do not re-issue the same call — try a \
+         different approach: change the arguments, use a different tool, or reconsider \
+         whether the previous result already answered the question."
+    )
 }
 
 async fn dispatch_one(

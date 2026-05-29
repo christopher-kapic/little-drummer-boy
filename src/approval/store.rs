@@ -30,6 +30,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 
 use crate::approval::classify::ApprovalKey;
@@ -47,6 +48,24 @@ pub enum Scope {
     Project,
     /// All sessions in all projects (user-level config dir).
     Global,
+}
+
+/// A persisted loop-guard verdict for an exact call signature.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoopVerdict {
+    /// Always run the repeat without prompting.
+    Accept,
+    /// Always block the repeat (guidance error) without prompting.
+    Reject,
+}
+
+impl LoopVerdict {
+    fn as_str(self) -> &'static str {
+        match self {
+            LoopVerdict::Accept => "accept",
+            LoopVerdict::Reject => "reject",
+        }
+    }
 }
 
 /// What kind of thing a grant covers.
@@ -97,6 +116,16 @@ struct ApprovalsFile {
     /// Path grants, as absolute path / prefix strings.
     #[serde(default)]
     paths: BTreeSet<String>,
+    /// Loop-guard always-accept rules, keyed by call signature (a hash of
+    /// tool name + canonical `wire_input`; see [`GrantStore::loop_signature`]).
+    /// A signature here auto-accepts a back-to-back repeat of that exact
+    /// call without re-prompting.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    loop_accept: BTreeSet<String>,
+    /// Loop-guard always-reject rules, keyed by the same call signature.
+    /// A signature here auto-rejects the repeat with the guidance error.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    loop_reject: BTreeSet<String>,
 }
 
 /// The grant store. Holds the session DB handle (for Session scope) and
@@ -182,6 +211,154 @@ impl GrantStore {
             return Err(StoreError::OnceNotPersistable);
         }
         self.record(GrantKind::Path, &normalize_path(path), scope)
+    }
+
+    // ---- loop-guard rules -------------------------------------------------
+
+    /// Stable signature for a loop-guard rule: a hash of the tool name and
+    /// the call's canonical `wire_input`. Two calls share a signature iff
+    /// the tool name and the (serialized) wire input are byte-identical —
+    /// the exact-match semantics the loop guard requires. Hashing bounds
+    /// the storage key regardless of input size.
+    ///
+    /// The `wire_input` is serialized with [`canonical_json`] so that
+    /// object key ordering can't make two semantically-identical inputs
+    /// hash differently (serde_json preserves insertion order; the model
+    /// may emit keys in any order).
+    pub fn loop_signature(tool: &str, wire_input: &serde_json::Value) -> String {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(tool.as_bytes());
+        h.update([0u8]); // separator so `tool` + `input` can't collide across a boundary
+        h.update(canonical_json(wire_input).as_bytes());
+        let out = h.finalize();
+        let mut hex = String::with_capacity(64);
+        for byte in out.iter() {
+            hex.push_str(&format!("{byte:02x}"));
+        }
+        hex
+    }
+
+    /// The recorded verdict for `signature`, or `None` if no rule applies.
+    ///
+    /// ## Precedence (session wins over project/global)
+    ///
+    /// A signature can carry rules at more than one scope (e.g. the user
+    /// chose "always accept for this project" in an earlier session, then
+    /// "always reject for this session" now). The **session** rule wins:
+    /// it is the most recent, most specific expression of intent and is
+    /// the only one the user can have set *in the current session*, so it
+    /// must be able to override a standing project/global rule for the
+    /// life of the session. Project and global are both persistent; among
+    /// them, a project rule (nearer the work) wins over a global one.
+    ///
+    /// Order checked: session → project → global. Within a scope a
+    /// `reject` and an `accept` cannot coexist (recording one clears the
+    /// other), so the first scope with *any* rule decides.
+    pub fn loop_rule(&self, signature: &str) -> Option<LoopVerdict> {
+        if let Some(v) = self.session_loop_rule(signature) {
+            return Some(v);
+        }
+        if let Some(v) = self
+            .project_file()
+            .and_then(|f| file_loop_rule(&f, signature))
+        {
+            return Some(v);
+        }
+        self.global_file()
+            .and_then(|f| file_loop_rule(&f, signature))
+    }
+
+    /// Record a loop-guard rule for `signature` at `scope`. Recording one
+    /// verdict at a scope clears the opposite verdict at the same scope so
+    /// a signature never carries contradictory rules within one scope.
+    /// `Once` is rejected (it is never persisted — the caller acts on a
+    /// one-off decision directly).
+    pub fn record_loop_rule(
+        &self,
+        signature: &str,
+        verdict: LoopVerdict,
+        scope: Scope,
+    ) -> Result<(), StoreError> {
+        match scope {
+            Scope::Once => Err(StoreError::OnceNotPersistable),
+            Scope::Session => self
+                .session_record_loop_rule(signature, verdict)
+                .map_err(StoreError::Io),
+            Scope::Project => {
+                let root = self
+                    .project_root
+                    .as_ref()
+                    .ok_or(StoreError::NoProjectRoot)?;
+                let dir = root.join(".cockpit");
+                self.file_record_loop_rule(&dir, signature, verdict)
+                    .map_err(StoreError::Io)
+            }
+            Scope::Global => {
+                let dir = self
+                    .global_dir
+                    .clone()
+                    .context("no global config dir available")
+                    .map_err(StoreError::Io)?;
+                self.file_record_loop_rule(&dir, signature, verdict)
+                    .map_err(StoreError::Io)
+            }
+        }
+    }
+
+    fn session_loop_rule(&self, signature: &str) -> Option<LoopVerdict> {
+        self.db
+            .with_conn(|conn| {
+                let verdict: Option<String> = conn
+                    .query_row(
+                        "SELECT rule_verdict FROM loop_guard_rules \
+                         WHERE session_id = ?1 AND signature = ?2",
+                        rusqlite::params![self.session_id.to_string(), signature],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                Ok(verdict)
+            })
+            .ok()
+            .flatten()
+            .and_then(|s| parse_verdict(&s))
+    }
+
+    fn session_record_loop_rule(&self, signature: &str, verdict: LoopVerdict) -> Result<()> {
+        self.db.with_conn(|conn| {
+            // `INSERT OR REPLACE` on the (session_id, signature) primary
+            // key flips an existing opposite verdict in place — no
+            // contradictory pair can persist.
+            conn.execute(
+                "INSERT OR REPLACE INTO loop_guard_rules (session_id, signature, rule_verdict) \
+                 VALUES (?1, ?2, ?3)",
+                rusqlite::params![self.session_id.to_string(), signature, verdict.as_str()],
+            )
+            .context("inserting loop_guard_rule")?;
+            Ok(())
+        })
+    }
+
+    fn file_record_loop_rule(
+        &self,
+        dir: &Path,
+        signature: &str,
+        verdict: LoopVerdict,
+    ) -> Result<()> {
+        let mut file = load_approvals(dir).unwrap_or_default();
+        // Clear the opposite verdict so the file never carries a
+        // contradictory pair for one signature.
+        match verdict {
+            LoopVerdict::Accept => {
+                file.loop_reject.remove(signature);
+                file.loop_accept.insert(signature.to_string());
+            }
+            LoopVerdict::Reject => {
+                file.loop_accept.remove(signature);
+                file.loop_reject.insert(signature.to_string());
+            }
+        }
+        store_approvals(dir, &file)
     }
 
     // ---- internals --------------------------------------------------------
@@ -356,6 +533,68 @@ fn path_covers(stored: &str, candidate: &str) -> bool {
     candidate == stored || candidate.starts_with(stored)
 }
 
+/// Parse a stored verdict string. An unrecognized value (corrupt row /
+/// hand-edited file) reads as `None` — no rule applies, so the guard
+/// falls back to prompting, the safe default.
+fn parse_verdict(s: &str) -> Option<LoopVerdict> {
+    match s {
+        "accept" => Some(LoopVerdict::Accept),
+        "reject" => Some(LoopVerdict::Reject),
+        _ => None,
+    }
+}
+
+/// Loop-guard verdict for `signature` from a loaded approvals file.
+/// `reject` is checked first so a hand-edited file that somehow lists a
+/// signature in both sets resolves to the safe (blocking) verdict.
+fn file_loop_rule(file: &ApprovalsFile, signature: &str) -> Option<LoopVerdict> {
+    if file.loop_reject.contains(signature) {
+        Some(LoopVerdict::Reject)
+    } else if file.loop_accept.contains(signature) {
+        Some(LoopVerdict::Accept)
+    } else {
+        None
+    }
+}
+
+/// Serialize a JSON value with object keys sorted recursively, so two
+/// semantically-identical inputs that differ only in key order produce
+/// the same string (and thus the same loop signature).
+fn canonical_json(value: &serde_json::Value) -> String {
+    use serde_json::Value;
+    match value {
+        Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            let mut out = String::from("{");
+            for (i, k) in keys.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                // The key itself is JSON-escaped via serde so embedded
+                // quotes/control chars can't break the framing.
+                out.push_str(&Value::String((*k).clone()).to_string());
+                out.push(':');
+                out.push_str(&canonical_json(&map[*k]));
+            }
+            out.push('}');
+            out
+        }
+        Value::Array(items) => {
+            let mut out = String::from("[");
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push_str(&canonical_json(item));
+            }
+            out.push(']');
+            out
+        }
+        other => other.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -516,5 +755,133 @@ mod tests {
             subcommand: None,
         };
         assert!(!store.is_command_granted(&unknown));
+    }
+
+    // ---- loop-guard rules ------------------------------------------------
+
+    #[test]
+    fn loop_signature_keys_on_tool_and_wire_input() {
+        use serde_json::json;
+        // Same tool + identical input → identical signature.
+        let a = GrantStore::loop_signature("read", &json!({"path": "src/main.rs"}));
+        let b = GrantStore::loop_signature("read", &json!({"path": "src/main.rs"}));
+        assert_eq!(a, b);
+        // A different tool with the same input → different signature.
+        let c = GrantStore::loop_signature("bash", &json!({"path": "src/main.rs"}));
+        assert_ne!(a, c);
+        // A different input under the same tool → different signature.
+        let d = GrantStore::loop_signature("read", &json!({"path": "src/lib.rs"}));
+        assert_ne!(a, d);
+    }
+
+    #[test]
+    fn loop_signature_is_object_key_order_independent() {
+        use serde_json::json;
+        // The model may emit object keys in any order; semantically
+        // identical inputs must share a signature.
+        let a = GrantStore::loop_signature("edit", &json!({"path": "a", "old": "x", "new": "y"}));
+        let b = GrantStore::loop_signature("edit", &json!({"new": "y", "path": "a", "old": "x"}));
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn loop_rule_session_record_and_read_round_trip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tempfile::tempdir().unwrap();
+        let (store, _) = test_store(tmp.path(), global.path().to_path_buf());
+        let sig = GrantStore::loop_signature("read", &serde_json::json!({"path": "x"}));
+        assert!(store.loop_rule(&sig).is_none());
+        store
+            .record_loop_rule(&sig, LoopVerdict::Reject, Scope::Session)
+            .unwrap();
+        assert_eq!(store.loop_rule(&sig), Some(LoopVerdict::Reject));
+        // Recording the opposite verdict at the same scope flips it (no
+        // contradictory pair persists).
+        store
+            .record_loop_rule(&sig, LoopVerdict::Accept, Scope::Session)
+            .unwrap();
+        assert_eq!(store.loop_rule(&sig), Some(LoopVerdict::Accept));
+    }
+
+    #[test]
+    fn loop_rule_project_persists_across_sessions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tempfile::tempdir().unwrap();
+        let (store, sid) = test_store(tmp.path(), global.path().to_path_buf());
+        let sig = GrantStore::loop_signature("bash", &serde_json::json!({"command": "ls"}));
+        store
+            .record_loop_rule(&sig, LoopVerdict::Accept, Scope::Project)
+            .unwrap();
+        // A fresh store over the same project dir (a later session) reads
+        // the persisted project rule back.
+        let db2 = store.db.clone();
+        let mut reloaded = GrantStore::new(db2, sid, tmp.path().to_path_buf());
+        reloaded.project_root = Some(tmp.path().to_path_buf());
+        reloaded.global_dir = Some(global.path().to_path_buf());
+        assert_eq!(reloaded.loop_rule(&sig), Some(LoopVerdict::Accept));
+    }
+
+    #[test]
+    fn loop_rule_session_takes_precedence_over_project() {
+        // A session rule and a project rule for the SAME signature resolve
+        // to the session verdict (documented precedence: session > project
+        // > global).
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tempfile::tempdir().unwrap();
+        let (store, _) = test_store(tmp.path(), global.path().to_path_buf());
+        let sig = GrantStore::loop_signature("read", &serde_json::json!({"path": "z"}));
+        store
+            .record_loop_rule(&sig, LoopVerdict::Accept, Scope::Project)
+            .unwrap();
+        store
+            .record_loop_rule(&sig, LoopVerdict::Reject, Scope::Session)
+            .unwrap();
+        // Session (reject) wins over project (accept).
+        assert_eq!(store.loop_rule(&sig), Some(LoopVerdict::Reject));
+    }
+
+    #[test]
+    fn loop_rule_project_takes_precedence_over_global() {
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tempfile::tempdir().unwrap();
+        let (store, _) = test_store(tmp.path(), global.path().to_path_buf());
+        let sig = GrantStore::loop_signature("read", &serde_json::json!({"path": "q"}));
+        store
+            .record_loop_rule(&sig, LoopVerdict::Reject, Scope::Global)
+            .unwrap();
+        store
+            .record_loop_rule(&sig, LoopVerdict::Accept, Scope::Project)
+            .unwrap();
+        // Project (accept) wins over global (reject).
+        assert_eq!(store.loop_rule(&sig), Some(LoopVerdict::Accept));
+    }
+
+    #[test]
+    fn loop_rule_once_scope_is_never_persisted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tempfile::tempdir().unwrap();
+        let (store, _) = test_store(tmp.path(), global.path().to_path_buf());
+        let sig = GrantStore::loop_signature("read", &serde_json::json!({"path": "x"}));
+        assert!(matches!(
+            store.record_loop_rule(&sig, LoopVerdict::Accept, Scope::Once),
+            Err(StoreError::OnceNotPersistable)
+        ));
+        assert!(store.loop_rule(&sig).is_none());
+    }
+
+    #[test]
+    fn loop_rule_keys_on_exact_signature_not_tool_name() {
+        // A rule for one call must NOT cover a different call of the same
+        // tool with different args.
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tempfile::tempdir().unwrap();
+        let (store, _) = test_store(tmp.path(), global.path().to_path_buf());
+        let sig_a = GrantStore::loop_signature("read", &serde_json::json!({"path": "a"}));
+        let sig_b = GrantStore::loop_signature("read", &serde_json::json!({"path": "b"}));
+        store
+            .record_loop_rule(&sig_a, LoopVerdict::Accept, Scope::Session)
+            .unwrap();
+        assert_eq!(store.loop_rule(&sig_a), Some(LoopVerdict::Accept));
+        assert!(store.loop_rule(&sig_b).is_none());
     }
 }

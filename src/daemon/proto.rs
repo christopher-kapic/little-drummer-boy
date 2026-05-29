@@ -142,6 +142,16 @@ pub enum Request {
         /// `false` so older clients attach sandboxed.
         #[serde(default)]
         no_sandbox: bool,
+        /// Whether this client can *answer* interrupts (approval / loop-
+        /// guard / `question` prompts). The TUI sets `true`; a `cockpit
+        /// run` event pump sets `false` (it streams events but has no UI
+        /// to answer with). The daemon tracks the interactive-client count
+        /// per session so the loop guard knows when a run is headless and
+        /// must auto-reject a repeat rather than block. Defaults to
+        /// `false` so an older client (and any non-answering attach) is
+        /// treated as headless — the safe, non-blocking default.
+        #[serde(default)]
+        interactive: bool,
     },
 
     /// Send a user message into the currently attached session. The

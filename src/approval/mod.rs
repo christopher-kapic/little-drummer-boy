@@ -45,12 +45,16 @@ use std::sync::Arc;
 use anyhow::Result;
 
 use crate::approval::classify::{Classification, SimpleCommandInfo};
-use crate::approval::store::{GrantStore, Scope};
+use crate::approval::store::{GrantStore, LoopVerdict, Scope};
 use crate::daemon::proto::{
     InterruptOption, InterruptQuestion, InterruptQuestionSet, ResolveResponse,
 };
 use crate::engine::interrupt::InterruptHub;
-use crate::tui::dialog::approval::{ID_GLOBAL, ID_ONCE, ID_PROJECT, ID_SESSION};
+use crate::tui::dialog::approval::{
+    ID_GLOBAL, ID_LOOP_ACCEPT_ONCE, ID_LOOP_ACCEPT_PROJECT, ID_LOOP_ACCEPT_SESSION,
+    ID_LOOP_REJECT_ONCE, ID_LOOP_REJECT_PROJECT, ID_LOOP_REJECT_SESSION, ID_ONCE, ID_PROJECT,
+    ID_SESSION,
+};
 
 /// The decision a prompt (or an already-granted query) produced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,6 +70,22 @@ pub enum Decision {
 impl Decision {
     pub fn is_allowed(&self) -> bool {
         matches!(self, Decision::Allow { .. })
+    }
+}
+
+/// The loop-guard's verdict on a back-to-back identical tool call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepeatDecision {
+    /// Run the repeated call (one-off accept or an always-accept rule).
+    Accept,
+    /// Block the repeated call; the dispatcher returns the guidance error
+    /// as the tool result so the model changes course.
+    Reject,
+}
+
+impl RepeatDecision {
+    pub fn is_accept(&self) -> bool {
+        matches!(self, RepeatDecision::Accept)
     }
 }
 
@@ -184,6 +204,98 @@ impl Approver {
         }
     }
 
+    /// Decide a back-to-back identical tool call (the loop guard, GOALS
+    /// §1/§12). The dispatcher calls this only once the same `(tool,
+    /// wire_input)` signature has repeated to the configured threshold.
+    ///
+    /// Resolution order:
+    /// 1. An always-* rule for this exact signature (session > project >
+    ///    global, per [`GrantStore::loop_rule`]) is honored without
+    ///    prompting.
+    /// 2. Headless (no interactive client that can answer): **reject** —
+    ///    never block waiting for input, and never silently re-run a
+    ///    likely loop.
+    /// 3. Otherwise raise the six-option approval prompt (reusing the
+    ///    `question`-tool interrupt path) and act on the answer, recording
+    ///    a session/project rule when the user chose an "always" option.
+    ///
+    /// `tool` + `wire_input` are the canonical post-repair call; the
+    /// signature is derived from them so a rule keys on the exact call,
+    /// never the tool name alone.
+    pub async fn approve_repeat(
+        &self,
+        tool: &str,
+        wire_input: &serde_json::Value,
+        interactive: bool,
+    ) -> Result<RepeatDecision> {
+        let signature = GrantStore::loop_signature(tool, wire_input);
+
+        // 1. Standing rule wins, at any scope.
+        if let Some(verdict) = self.store.loop_rule(&signature) {
+            return Ok(match verdict {
+                LoopVerdict::Accept => RepeatDecision::Accept,
+                LoopVerdict::Reject => RepeatDecision::Reject,
+            });
+        }
+
+        // 2. No human to ask → reject the repeat (the guidance error lets
+        //    the model change course; re-running would bleed the window).
+        if !interactive {
+            return Ok(RepeatDecision::Reject);
+        }
+
+        // 3. Prompt with the six choices and act on the answer.
+        let choice = self.prompt_repeat(tool).await?;
+        match choice {
+            RepeatChoice::AcceptOnce => Ok(RepeatDecision::Accept),
+            RepeatChoice::RejectOnce => Ok(RepeatDecision::Reject),
+            RepeatChoice::Always { verdict, scope } => {
+                // Record BEFORE returning, mirroring the command/path
+                // approval contract. A record failure (e.g. Project scope
+                // with no git root) must not strand the call: fall back to
+                // applying the verdict this once and surface the error in
+                // the log rather than aborting the turn.
+                if let Err(e) = self.store.record_loop_rule(&signature, verdict, scope) {
+                    tracing::warn!(error = %e, tool, ?scope, "recording loop-guard rule failed; applying once");
+                }
+                Ok(match verdict {
+                    LoopVerdict::Accept => RepeatDecision::Accept,
+                    LoopVerdict::Reject => RepeatDecision::Reject,
+                })
+            }
+        }
+    }
+
+    /// Raise the loop-guard approval prompt (six options) and block until
+    /// the user answers, reusing the `question`-tool interrupt path
+    /// verbatim. A dismissal (Esc/cancel) reads as reject-once — the safe
+    /// default for a likely loop.
+    async fn prompt_repeat(&self, tool: &str) -> Result<RepeatChoice> {
+        let question = repeat_question(tool);
+        let set = InterruptQuestionSet {
+            questions: vec![question],
+        };
+        let description = format!("Repeated `{tool}` call — likely a loop. Allow it?");
+
+        let interrupt_id = self.db.raise_interrupt_questions(
+            self.session_id,
+            &self.agent_id,
+            &description,
+            &set,
+        )?;
+        let pending = self.interrupts.register(interrupt_id);
+        self.interrupts.emit_raised(
+            self.session_id,
+            interrupt_id,
+            &self.agent_id,
+            &description,
+            set,
+        );
+
+        let response = pending.wait().await;
+        Ok(response_to_repeat_choice(&response))
+    }
+
     /// Raise an approval interrupt and block until the user answers,
     /// reusing the `question`-tool interrupt path verbatim. Returns the
     /// chosen scope, or `Deny` on dismissal.
@@ -224,6 +336,69 @@ impl Approver {
 enum ApprovalChoice {
     Approve(Scope),
     Deny,
+}
+
+/// The user's choice on a loop-guard prompt. `Always` carries the verdict
+/// and the scope to persist it at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RepeatChoice {
+    AcceptOnce,
+    RejectOnce,
+    Always { verdict: LoopVerdict, scope: Scope },
+}
+
+/// Build the six-option loop-guard question. The options ride through the
+/// generic interrupt; the answering dialog renders them with no
+/// special-casing, exactly like a `question`-tool prompt.
+fn repeat_question(tool: &str) -> InterruptQuestion {
+    InterruptQuestion::Single {
+        prompt: format!("`{tool}` repeated the previous call exactly — likely a loop. Run it?"),
+        options: vec![
+            opt(ID_LOOP_ACCEPT_ONCE, "Accept (once)"),
+            opt(ID_LOOP_REJECT_ONCE, "Reject (once)"),
+            opt(ID_LOOP_ACCEPT_SESSION, "Always accept for this session"),
+            opt(ID_LOOP_REJECT_SESSION, "Always reject for this session"),
+            opt(ID_LOOP_ACCEPT_PROJECT, "Always accept for this project"),
+            opt(ID_LOOP_REJECT_PROJECT, "Always reject for this project"),
+        ],
+        // Fixed choices; no free-text.
+        allow_freetext: false,
+    }
+}
+
+/// Map a resolved interrupt response back to a loop-guard choice. An
+/// unknown id, a non-`Single` response, or a `Cancel` reads as
+/// reject-once — the safe default for a likely loop.
+fn response_to_repeat_choice(response: &ResolveResponse) -> RepeatChoice {
+    let id = match response {
+        ResolveResponse::Single { selected_id } => selected_id.as_str(),
+        ResolveResponse::Batch { responses } => match responses.first() {
+            Some(ResolveResponse::Single { selected_id }) => selected_id.as_str(),
+            _ => return RepeatChoice::RejectOnce,
+        },
+        _ => return RepeatChoice::RejectOnce,
+    };
+    match id {
+        ID_LOOP_ACCEPT_ONCE => RepeatChoice::AcceptOnce,
+        ID_LOOP_REJECT_ONCE => RepeatChoice::RejectOnce,
+        ID_LOOP_ACCEPT_SESSION => RepeatChoice::Always {
+            verdict: LoopVerdict::Accept,
+            scope: Scope::Session,
+        },
+        ID_LOOP_REJECT_SESSION => RepeatChoice::Always {
+            verdict: LoopVerdict::Reject,
+            scope: Scope::Session,
+        },
+        ID_LOOP_ACCEPT_PROJECT => RepeatChoice::Always {
+            verdict: LoopVerdict::Accept,
+            scope: Scope::Project,
+        },
+        ID_LOOP_REJECT_PROJECT => RepeatChoice::Always {
+            verdict: LoopVerdict::Reject,
+            scope: Scope::Project,
+        },
+        _ => RepeatChoice::RejectOnce,
+    }
 }
 
 /// Build the single scope-select question. Full variant offers all four
@@ -475,5 +650,176 @@ mod tests {
             response_to_choice(&ResolveResponse::Cancel),
             ApprovalChoice::Deny
         );
+    }
+
+    // ---- loop guard ------------------------------------------------------
+
+    #[test]
+    fn repeat_response_mapping_round_trips() {
+        use crate::tui::dialog::approval::{
+            ID_LOOP_ACCEPT_ONCE, ID_LOOP_ACCEPT_PROJECT, ID_LOOP_ACCEPT_SESSION,
+            ID_LOOP_REJECT_ONCE, ID_LOOP_REJECT_PROJECT, ID_LOOP_REJECT_SESSION,
+        };
+        let single = |id: &str| ResolveResponse::Single {
+            selected_id: id.into(),
+        };
+        assert_eq!(
+            response_to_repeat_choice(&single(ID_LOOP_ACCEPT_ONCE)),
+            RepeatChoice::AcceptOnce
+        );
+        assert_eq!(
+            response_to_repeat_choice(&single(ID_LOOP_REJECT_ONCE)),
+            RepeatChoice::RejectOnce
+        );
+        assert_eq!(
+            response_to_repeat_choice(&single(ID_LOOP_ACCEPT_SESSION)),
+            RepeatChoice::Always {
+                verdict: LoopVerdict::Accept,
+                scope: Scope::Session
+            }
+        );
+        assert_eq!(
+            response_to_repeat_choice(&single(ID_LOOP_REJECT_SESSION)),
+            RepeatChoice::Always {
+                verdict: LoopVerdict::Reject,
+                scope: Scope::Session
+            }
+        );
+        assert_eq!(
+            response_to_repeat_choice(&single(ID_LOOP_ACCEPT_PROJECT)),
+            RepeatChoice::Always {
+                verdict: LoopVerdict::Accept,
+                scope: Scope::Project
+            }
+        );
+        assert_eq!(
+            response_to_repeat_choice(&single(ID_LOOP_REJECT_PROJECT)),
+            RepeatChoice::Always {
+                verdict: LoopVerdict::Reject,
+                scope: Scope::Project
+            }
+        );
+        // A dismissal reads as reject-once (safe default for a loop).
+        assert_eq!(
+            response_to_repeat_choice(&ResolveResponse::Cancel),
+            RepeatChoice::RejectOnce
+        );
+    }
+
+    #[tokio::test]
+    async fn headless_repeat_with_no_rule_auto_rejects() {
+        // No interactive client + no standing rule → reject without ever
+        // raising a prompt (a detached hub would block forever if it did).
+        let tmp = tempfile::tempdir().unwrap();
+        let (approver, _) = approver(tmp.path());
+        let decision = approver
+            .approve_repeat("read", &serde_json::json!({"path": "x"}), false)
+            .await
+            .unwrap();
+        assert_eq!(decision, RepeatDecision::Reject);
+    }
+
+    #[tokio::test]
+    async fn headless_repeat_honors_always_accept_rule() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (approver, _) = approver(tmp.path());
+        let input = serde_json::json!({"path": "x"});
+        let sig = GrantStore::loop_signature("read", &input);
+        approver
+            .store
+            .record_loop_rule(&sig, LoopVerdict::Accept, Scope::Session)
+            .unwrap();
+        // Headless, but a session always-accept rule applies → accept.
+        let decision = approver
+            .approve_repeat("read", &input, false)
+            .await
+            .unwrap();
+        assert_eq!(decision, RepeatDecision::Accept);
+    }
+
+    #[tokio::test]
+    async fn headless_repeat_honors_always_reject_rule() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (approver, _) = approver(tmp.path());
+        let input = serde_json::json!({"path": "y"});
+        let sig = GrantStore::loop_signature("bash", &input);
+        approver
+            .store
+            .record_loop_rule(&sig, LoopVerdict::Reject, Scope::Session)
+            .unwrap();
+        let decision = approver
+            .approve_repeat("bash", &input, false)
+            .await
+            .unwrap();
+        assert_eq!(decision, RepeatDecision::Reject);
+    }
+
+    #[tokio::test]
+    async fn interactive_repeat_accept_once_runs_but_records_no_rule() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (approver, _) = approver(tmp.path());
+        let db = approver.db.clone();
+        let session_id = approver.session_id;
+        let hub = approver.interrupts.clone();
+        let resolver = tokio::spawn(async move {
+            let iid = loop {
+                let open = db.list_open_interrupts(session_id).unwrap();
+                if let Some(row) = open.first() {
+                    break row.interrupt_id;
+                }
+                tokio::task::yield_now().await;
+            };
+            assert!(hub.resolve(
+                iid,
+                ResolveResponse::Single {
+                    selected_id: crate::tui::dialog::approval::ID_LOOP_ACCEPT_ONCE.into(),
+                }
+            ));
+        });
+        let input = serde_json::json!({"path": "z"});
+        let decision = approver.approve_repeat("read", &input, true).await.unwrap();
+        resolver.await.unwrap();
+        assert_eq!(decision, RepeatDecision::Accept);
+        // Accept-once records no rule: a fresh query still has none.
+        let sig = GrantStore::loop_signature("read", &input);
+        assert!(approver.store.loop_rule(&sig).is_none());
+    }
+
+    #[tokio::test]
+    async fn interactive_repeat_always_reject_session_records_rule() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (approver, _) = approver(tmp.path());
+        let db = approver.db.clone();
+        let session_id = approver.session_id;
+        let hub = approver.interrupts.clone();
+        let resolver = tokio::spawn(async move {
+            let iid = loop {
+                let open = db.list_open_interrupts(session_id).unwrap();
+                if let Some(row) = open.first() {
+                    break row.interrupt_id;
+                }
+                tokio::task::yield_now().await;
+            };
+            assert!(hub.resolve(
+                iid,
+                ResolveResponse::Single {
+                    selected_id: crate::tui::dialog::approval::ID_LOOP_REJECT_SESSION.into(),
+                }
+            ));
+        });
+        let input = serde_json::json!({"command": "spin"});
+        let decision = approver.approve_repeat("bash", &input, true).await.unwrap();
+        resolver.await.unwrap();
+        assert_eq!(decision, RepeatDecision::Reject);
+        // The always-reject-session rule was persisted, so a later
+        // (even headless) repeat of the exact signature auto-rejects with
+        // no prompt.
+        let sig = GrantStore::loop_signature("bash", &input);
+        assert_eq!(approver.store.loop_rule(&sig), Some(LoopVerdict::Reject));
+        let again = approver
+            .approve_repeat("bash", &input, false)
+            .await
+            .unwrap();
+        assert_eq!(again, RepeatDecision::Reject);
     }
 }

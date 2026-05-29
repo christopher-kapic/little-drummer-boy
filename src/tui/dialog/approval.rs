@@ -23,6 +23,18 @@ pub const ID_SESSION: &str = "session";
 pub const ID_PROJECT: &str = "project";
 pub const ID_GLOBAL: &str = "global";
 
+/// Stable option ids for the loop-guard approval prompt (back-to-back
+/// identical tool call). These ride through the generic interrupt the
+/// same way the scope-select ids do; the loop guard maps the selected id
+/// back to an accept/reject verdict + scope. No TUI special-casing is
+/// needed — the answering dialog renders any option set generically.
+pub const ID_LOOP_ACCEPT_ONCE: &str = "loop_accept_once";
+pub const ID_LOOP_REJECT_ONCE: &str = "loop_reject_once";
+pub const ID_LOOP_ACCEPT_SESSION: &str = "loop_accept_session";
+pub const ID_LOOP_REJECT_SESSION: &str = "loop_reject_session";
+pub const ID_LOOP_ACCEPT_PROJECT: &str = "loop_accept_project";
+pub const ID_LOOP_REJECT_PROJECT: &str = "loop_reject_project";
+
 /// The user's choice on an approval prompt. `Deny` is the dismissal
 /// path (Esc / cancel); everything else approves at the named scope.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -195,8 +195,10 @@ async fn run_iteration(
             // reason it gets a detached interrupt hub). No approver →
             // native tools skip the boundary prompt (never deny) and the
             // sandboxed shell can't escalate. The fork still runs
-            // confined when sandboxing is on.
+            // confined when sandboxing is on. The loop guard is gated on
+            // an approver, so it's inert here; the threshold is irrelevant.
             None,
+            crate::config::extended::MIN_LOOP_GUARD_THRESHOLD,
             turn_tx,
         )
         .await?;
