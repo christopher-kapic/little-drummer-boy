@@ -84,6 +84,17 @@ fn compose_system_prompt(role_prompt: &str, session_short_id: &str, cwd: &Path) 
     out
 }
 
+/// The full composed system prompt for the user-facing chat agent
+/// (`orchestrator-build`) at `cwd`: role prompt + OS line + (optional)
+/// session line + injected guidance body. Used by the fresh-chat context
+/// indicator to size the actual baseline sent to the model, in both
+/// daemon (calibrated) and daemonless (raw cl100k) modes. Pass the empty
+/// string for `session_short_id` when no session exists yet — it simply
+/// omits the `Session:` line, matching what the engine sends.
+pub(crate) fn default_chat_system_prompt(cwd: &Path, session_short_id: &str) -> String {
+    compose_system_prompt(ORCHESTRATOR_BUILD_PROMPT, session_short_id, cwd)
+}
+
 /// Locate the first existing project-guidance file by name, searching
 /// `cwd` then its ancestors up to (and including) the git worktree root
 /// when there is one — otherwise stop at the filesystem root. Returns

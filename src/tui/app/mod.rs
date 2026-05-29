@@ -535,11 +535,13 @@ pub struct App {
     /// The attached session's project id — the scope for `tag` records.
     /// `None` until the first attach.
     pub(super) project_id: Option<String>,
-    /// Daemon-computed `(guidance filename, token estimate)` for this
-    /// project, fetched at launch. Drives the fresh-chat context
-    /// indicator (`X tokens in <file>`). `None` when the daemon wasn't
-    /// running at launch or the project has no guidance file.
-    pub(super) guidance_estimate: Option<(String, u64)>,
+    /// Fresh-chat sizing for this project, resolved at launch: the
+    /// guidance-file basename + body tokens (the `X tokens in <file>`
+    /// label) and the full composed system prompt tokens (the baseline
+    /// the running context estimate folds in). Calibrated when a daemon
+    /// is running, raw cl100k otherwise. `None` only before the launch
+    /// fetch has run.
+    pub(super) guidance_estimate: Option<agent_runner::GuidanceEstimate>,
     /// Wire tokens `/prune` would drop from the foreground agent right
     /// now (GOALS §1a). Pushed by the daemon's `ContextProjection` event
     /// — the authoritative figure from the same `dedup_plan` `/prune`
@@ -904,17 +906,17 @@ impl App {
         // so we no longer dump it to stdout before entering the alt
         // screen — that only ever showed up in scrollback after exit.
 
-        // Pre-flight: ask the daemon (if already running) for the
-        // instruction-file token estimate so the fresh-chat context
-        // indicator can show `X tokens in <file>`. Best-effort and
-        // non-blocking on failure — the indicator just falls back to its
-        // normal form when this is `None`.
+        // Pre-flight: size the instruction file + full system prompt for
+        // the fresh-chat context indicator (`X tokens in <file>` plus the
+        // baseline the running estimate folds in). Prefers a running
+        // daemon's calibrated count, falls back to a local raw-cl100k
+        // computation. Best-effort and non-blocking for launch.
         let (provider, model) = match &self.launch.active_model {
             Some((p, m)) => (Some(p.clone()), Some(m.clone())),
             None => (None, None),
         };
         self.guidance_estimate =
-            agent_runner::fetch_guidance_estimate(&self.launch.cwd, provider, model).await;
+            Some(agent_runner::fetch_guidance_estimate(&self.launch.cwd, provider, model).await);
 
         // `try_init` enters the alternate screen and uses a full-
         // terminal viewport by default. GOALS §1d: alt screen during

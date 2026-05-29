@@ -231,17 +231,45 @@ fn try_spawn_inner(
     })
 }
 
-/// Fetch the daemon-computed guidance-file token estimate for `cwd` and
-/// the active model (Feature 1, fresh-chat context indicator). Connects
-/// to an already-running daemon only — no attach, no spawn — so calling
-/// it at launch never creates a session. Returns `None` when the daemon
-/// isn't running or the project has no guidance file. The estimate must
-/// come from the daemon: the TUI can't see the guidance file.
+/// Pre-flight sizing for the fresh-chat context indicator (Feature 1).
+/// `file` is the basename of the matched guidance file (`None` when the
+/// project has none); `guidance_tokens` is its body size (the `… in
+/// <file>` label); `system_tokens` is the full composed system prompt
+/// (role prompt + OS + session + guidance body), the baseline the
+/// running context estimate folds in.
+#[derive(Debug, Clone)]
+pub struct GuidanceEstimate {
+    pub file: Option<String>,
+    pub guidance_tokens: u64,
+    pub system_tokens: u64,
+}
+
+/// Resolve the fresh-chat sizing for `cwd` and the active model. Prefers
+/// an already-running daemon's calibrated estimate (no attach, no spawn —
+/// calling it at launch never creates a session); on any miss (no daemon,
+/// connect/request error, or the daemon couldn't answer) it falls back to
+/// a local raw-cl100k computation via [`crate::engine::builtin`]. The two
+/// modes may differ by the calibration factor; each is the best available
+/// for its mode. Best-effort and non-blocking for launch.
 pub async fn fetch_guidance_estimate(
     cwd: &Path,
     provider: Option<String>,
     model: Option<String>,
-) -> Option<(String, u64)> {
+) -> GuidanceEstimate {
+    if let Some(est) = daemon_guidance_estimate(cwd, provider, model).await {
+        return est;
+    }
+    local_guidance_estimate(cwd)
+}
+
+/// Ask an already-running daemon for the calibrated estimate. Returns
+/// `None` on any failure (no daemon, transport error, or a malformed
+/// response) so the caller can fall back to the local computation.
+async fn daemon_guidance_estimate(
+    cwd: &Path,
+    provider: Option<String>,
+    model: Option<String>,
+) -> Option<GuidanceEstimate> {
     use crate::daemon::{DaemonPaths, DaemonStatus, probe};
     let paths = DaemonPaths::resolve().ok()?;
     if !matches!(probe(&paths).await, DaemonStatus::Running) {
@@ -260,10 +288,45 @@ pub async fn fetch_guidance_estimate(
         .ok()?;
     match resp {
         Response::GuidanceEstimate {
-            file: Some(file),
+            file,
             tokens,
-        } => Some((file, tokens)),
+            system_tokens,
+        } => Some(GuidanceEstimate {
+            file,
+            guidance_tokens: tokens,
+            system_tokens,
+        }),
         _ => None,
+    }
+}
+
+/// Daemonless fallback: size the guidance file body and the full composed
+/// system prompt in-process with raw cl100k (`crate::tokens::count`).
+/// Cheap and synchronous — `load_agent_guidance` only stats/reads one
+/// small file along the cwd→git-root walk — so it never blocks launch.
+fn local_guidance_estimate(cwd: &Path) -> GuidanceEstimate {
+    let file = crate::engine::builtin::load_agent_guidance(cwd).map(|(path, body)| {
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        (name, crate::tokens::count(&body) as u64)
+    });
+    // No session exists yet at the fresh-chat indicator, so the system
+    // prompt omits the `Session:` line — matching what the engine sends.
+    let system_prompt = crate::engine::builtin::default_chat_system_prompt(cwd, "");
+    let system_tokens = crate::tokens::count(&system_prompt) as u64;
+    match file {
+        Some((name, guidance_tokens)) => GuidanceEstimate {
+            file: Some(name),
+            guidance_tokens,
+            system_tokens,
+        },
+        None => GuidanceEstimate {
+            file: None,
+            guidance_tokens: 0,
+            system_tokens,
+        },
     }
 }
 

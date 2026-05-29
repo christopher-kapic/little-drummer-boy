@@ -320,12 +320,13 @@ pub enum Request {
         project_id: Option<String>,
     },
 
-    /// Pre-flight estimate of the project's single instruction/guidance
-    /// file size, for the fresh-chat context indicator. The daemon
-    /// resolves the guidance file for `project_root` and estimates its
-    /// body with the tokenizer calibrated for `(provider, model)`. The
-    /// TUI can't see the guidance file (it's engine-side), so this must
-    /// be computed daemon-side.
+    /// Pre-flight sizing of the project's instruction/guidance file and
+    /// full system prompt, for the fresh-chat context indicator. The
+    /// daemon resolves the guidance file for `project_root` and estimates
+    /// both its body and the full composed system prompt with the
+    /// tokenizer calibrated for `(provider, model)`. The daemon's count is
+    /// calibrated; the TUI computes the same locally (raw cl100k) when no
+    /// daemon is running.
     GuidanceEstimate {
         project_root: String,
         #[serde(default)]
@@ -437,14 +438,19 @@ pub enum Response {
         tags: HashMap<String, u64>,
     },
 
-    /// Estimated token size of the project's guidance file. `file` is the
-    /// basename of the matched guidance file, or `None` when none was
-    /// found (the TUI then falls back to its normal context display).
+    /// Pre-flight sizing for the fresh-chat context indicator. `file` is
+    /// the basename of the matched guidance file, or `None` when none was
+    /// found. `tokens` is the guidance-file **body** size (the `… in
+    /// <file>` label); `system_tokens` is the **full** composed system
+    /// prompt (role prompt + OS + session + guidance body), the baseline
+    /// the running context estimate folds in. Both are estimated with the
+    /// tokenizer calibrated for the request's `(provider, model)`.
     /// Answer to [`Request::GuidanceEstimate`].
     GuidanceEstimate {
         #[serde(default)]
         file: Option<String>,
         tokens: u64,
+        system_tokens: u64,
     },
 
     /// The resulting sandbox-enabled state after a [`Request::SetSandbox`]

@@ -872,7 +872,13 @@ impl App {
         if let Some(label) = fresh_chat_guidance_label(
             self.history.is_empty(),
             self.last_usage.is_some(),
-            self.guidance_estimate.as_ref(),
+            self.guidance_estimate
+                .as_ref()
+                .and_then(|e| e.file.as_deref()),
+            self.guidance_estimate
+                .as_ref()
+                .map(|e| e.guidance_tokens)
+                .unwrap_or(0),
         ) {
             return label;
         }
@@ -923,15 +929,28 @@ impl App {
         }
     }
 
-    /// cl100k_base token count over visible chat content. Tools and
-    /// system prompts aren't included — they live on the engine side.
-    /// Provider-native counts will replace this where available
-    /// (GOALS §10 / plan §3h); cl100k_base is the documented fallback.
-    /// The finalized-history portion is memoized (see
-    /// `history_estimate_tokens`) so the per-frame live counter only
+    /// cl100k_base token count over the context sent to the model: the
+    /// composed system prompt baseline (role prompt + OS + session +
+    /// guidance body, resolved at launch into `guidance_estimate`) plus
+    /// visible chat content. Including the system prompt keeps the fresh-
+    /// chat baseline honest rather than reporting ~0 (the provider's
+    /// authoritative usage still re-anchors the count after the first
+    /// round-trip). Provider-native counts will replace the local
+    /// component where available (GOALS §10 / plan §3h); cl100k_base is
+    /// the documented fallback. The finalized-history portion is memoized
+    /// (see `history_estimate_tokens`) so the per-frame live counter only
     /// re-tokenizes the small, growing `pending` buffer.
     pub(super) fn estimate_context_tokens(&self) -> u32 {
-        let mut tokens = self.history_estimate_tokens() as usize;
+        // The full composed system prompt is a fixed baseline for the
+        // session (computed once at launch); it's present on every turn,
+        // so fold it into every estimate, not just the fresh one.
+        let mut tokens = self
+            .guidance_estimate
+            .as_ref()
+            .map(|e| e.system_tokens)
+            .unwrap_or(0)
+            .min(u32::MAX as u64) as usize;
+        tokens += self.history_estimate_tokens() as usize;
         if let Some(p) = &self.pending {
             tokens += crate::tokens::count(&p.text) + crate::tokens::count(&p.reasoning);
         }
@@ -1455,18 +1474,21 @@ fn format_token_count(n: u32) -> String {
 /// The fresh-chat context-indicator label (`X tokens in <file>`), or
 /// `None` to fall back to the normal context display. Shown only on a
 /// truly fresh chat — no history and no provider usage yet — and only
-/// when the daemon found a guidance file. Pure so the trigger/revert
-/// logic is unit-testable without standing up an `App`.
+/// when a guidance file was found (`file` is `Some`). `guidance_tokens`
+/// is the guidance-file *body* size; the fallback context display
+/// reflects the full system prompt separately. Pure so the
+/// trigger/revert logic is unit-testable without standing up an `App`.
 fn fresh_chat_guidance_label(
     history_empty: bool,
     has_usage: bool,
-    estimate: Option<&(String, u64)>,
+    file: Option<&str>,
+    guidance_tokens: u64,
 ) -> Option<String> {
     if !history_empty || has_usage {
         return None;
     }
-    let (file, tokens) = estimate?;
-    let n = (*tokens).min(u32::MAX as u64) as u32;
+    let file = file?;
+    let n = guidance_tokens.min(u32::MAX as u64) as u32;
     Some(format!("{} tokens in {file}", format_token_count(n)))
 }
 
@@ -1685,23 +1707,35 @@ mod guidance_label_tests {
 
     #[test]
     fn shows_on_fresh_chat_with_estimate() {
-        let est = ("AGENTS.md".to_string(), 1234u64);
-        let label = fresh_chat_guidance_label(true, false, Some(&est));
+        // Daemon-estimate-present path: a guidance file was resolved, so
+        // the label renders its body size with the filename.
+        let label = fresh_chat_guidance_label(true, false, Some("AGENTS.md"), 1234);
         assert_eq!(label.as_deref(), Some("1.2k tokens in AGENTS.md"));
     }
 
     #[test]
+    fn shows_body_tokens_under_one_k() {
+        // Local-fallback path mirrors the daemon path here — the label is
+        // a pure function of `(file, guidance_tokens)`, so a small raw
+        // cl100k count renders without the `k` suffix.
+        let label = fresh_chat_guidance_label(true, false, Some("CLAUDE.md"), 820);
+        assert_eq!(label.as_deref(), Some("820 tokens in CLAUDE.md"));
+    }
+
+    #[test]
     fn reverts_once_history_or_usage_exists() {
-        let est = ("AGENTS.md".to_string(), 1234u64);
         // History present → revert.
-        assert!(fresh_chat_guidance_label(false, false, Some(&est)).is_none());
+        assert!(fresh_chat_guidance_label(false, false, Some("AGENTS.md"), 1234).is_none());
         // Usage reported → revert.
-        assert!(fresh_chat_guidance_label(true, true, Some(&est)).is_none());
+        assert!(fresh_chat_guidance_label(true, true, Some("AGENTS.md"), 1234).is_none());
     }
 
     #[test]
     fn no_guidance_file_falls_back() {
-        assert!(fresh_chat_guidance_label(true, false, None).is_none());
+        // No-guidance-file path: even on a fresh chat, with no resolved
+        // file the label declines so the indicator shows its normal
+        // (now full-system-prompt-inclusive) context form.
+        assert!(fresh_chat_guidance_label(true, false, None, 0).is_none());
     }
 }
 

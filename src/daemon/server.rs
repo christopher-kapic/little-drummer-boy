@@ -587,22 +587,35 @@ async fn handle_request(
             provider,
             model,
         } => {
-            // Resolve the single guidance file the engine would load, and
-            // estimate its body with the calibrated tokenizer for the
-            // active model (cl100k fallback when uncalibrated).
-            match crate::engine::builtin::load_agent_guidance(Path::new(&project_root)) {
+            // Resolve the single guidance file the engine would load and
+            // estimate, with the calibrated tokenizer for the active model
+            // (cl100k fallback when uncalibrated), two figures: the
+            // guidance-file body (the `… in <file>` label) and the full
+            // composed system prompt (the fresh-context baseline the
+            // running estimate folds in). No session exists yet at the
+            // fresh-chat indicator, so the system prompt omits the
+            // `Session:` line — matching what the engine then sends.
+            let cwd = Path::new(&project_root);
+            let (strategy, scale) = ctx.db.resolve_tokenizer(
+                provider.as_deref().unwrap_or(""),
+                model.as_deref().unwrap_or(""),
+            );
+            let system_prompt = crate::engine::builtin::default_chat_system_prompt(cwd, "");
+            let system_tokens = crate::tokens::scaled_estimate(&system_prompt, strategy, scale);
+            match crate::engine::builtin::load_agent_guidance(cwd) {
                 Some((path, body)) => {
-                    let (strategy, scale) = ctx.db.resolve_tokenizer(
-                        provider.as_deref().unwrap_or(""),
-                        model.as_deref().unwrap_or(""),
-                    );
                     let tokens = crate::tokens::scaled_estimate(&body, strategy, scale);
                     let file = path.file_name().map(|n| n.to_string_lossy().into_owned());
-                    Ok(Response::GuidanceEstimate { file, tokens })
+                    Ok(Response::GuidanceEstimate {
+                        file,
+                        tokens,
+                        system_tokens,
+                    })
                 }
                 None => Ok(Response::GuidanceEstimate {
                     file: None,
                     tokens: 0,
+                    system_tokens,
                 }),
             }
         }
