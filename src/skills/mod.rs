@@ -8,12 +8,16 @@
 //! (manual path).
 //!
 //! Scan directories come from [`crate::config::extended::SkillsConfig`].
-//! When unset, the defaults are `~/.agents/skills` plus the project-local
-//! `./.agents/skills` (resolved against cwd, walked up to the git
-//! worktree root). Configured entries support `~` home expansion, `$VAR`
-//! references (via [`crate::envref`]), and relative paths resolved against
-//! cwd. Non-existent directories are silently ignored; a malformed
-//! `SKILL.md` is skipped with a logged warning and never aborts the scan.
+//! The list ships pre-seeded on a fresh install
+//! ([`crate::config::extended::SEEDED_SCAN_DIRS`]: `~/.agents/skills` +
+//! `./.agents/skills`) but is otherwise authoritative — an empty list
+//! scans nothing (no implicit fallback). Entries support `~` home
+//! expansion, `$VAR` references (via [`crate::envref`]), and relative
+//! paths resolved against cwd; with `SkillsConfig::ancestor_walk` enabled
+//! each relative entry also expands to every ancestor up to the git
+//! worktree root. Non-existent directories are silently ignored; a
+//! malformed `SKILL.md` is skipped with a logged warning and never aborts
+//! the scan.
 //!
 //! ## `!`-command processing (Claude vs Codex mode)
 //!
@@ -177,66 +181,65 @@ fn split_frontmatter(raw: &str) -> Option<(&str, &str)> {
     None
 }
 
-/// Resolve the ordered list of scan directories for `cwd`. Configured
-/// entries (when present) win; otherwise the defaults
-/// (`~/.agents/skills` + every `./.agents/skills` from cwd up to the git
-/// worktree root) apply. Returned paths are absolute and may not exist —
-/// [`discover`] tolerates missing dirs.
+/// Resolve the ordered list of scan directories for `cwd`. The configured
+/// `scan_dirs` are authoritative: an empty list yields **zero** directories
+/// (no implicit fallback). With `cfg.ancestor_walk` on, each *relative*
+/// entry expands to cwd plus every ancestor up to the git worktree root.
+/// Returned paths are absolute and may not exist — [`discover`] tolerates
+/// missing dirs.
 pub fn resolve_scan_dirs(cwd: &Path, cfg: &SkillsConfig) -> Vec<PathBuf> {
-    if cfg.scan_dirs.is_empty() {
-        return default_scan_dirs(cwd);
+    let mut out: Vec<PathBuf> = Vec::new();
+    for entry in &cfg.scan_dirs {
+        resolve_dir_entry(entry, cwd, cfg.ancestor_walk, &mut out);
     }
-    cfg.scan_dirs
-        .iter()
-        .filter_map(|entry| resolve_dir_entry(entry, cwd))
-        .collect()
+    out
 }
 
-/// Default scan dirs: `~/.agents/skills` plus the project-local
-/// `.agents/skills` at cwd and each ancestor up to (and including) the
-/// git worktree root. Ancestors are walked so a skill checked into a
-/// repo root is found from any subdirectory.
-fn default_scan_dirs(cwd: &Path) -> Vec<PathBuf> {
-    let mut out: Vec<PathBuf> = Vec::new();
-    if let Some(home) = dirs::home_dir() {
-        out.push(home.join(".agents").join("skills"));
+/// Resolve a single configured scan-dir entry, pushing the resulting
+/// path(s) onto `out`. Supports `~` home expansion, `$VAR` references (via
+/// [`crate::envref`]), and relative paths resolved against `cwd`. A blank
+/// or home-unexpandable `~` entry pushes nothing.
+///
+/// When `ancestor_walk` is set and the entry resolves to a *relative*
+/// path, it expands to that path under `cwd` and under every ancestor up
+/// to (and including) the git worktree root — so a repo-root skills dir is
+/// found from any subdirectory. Absolute / `~` / `$VAR`-rooted entries are
+/// unaffected by the toggle.
+fn resolve_dir_entry(entry: &str, cwd: &Path, ancestor_walk: bool, out: &mut Vec<PathBuf>) {
+    // `$VAR` expansion first, so a value like `$PROJECTS/skills` becomes
+    // a concrete path before tilde / relative handling.
+    let expanded = crate::envref::resolve(entry).value;
+    let expanded = expanded.trim();
+    if expanded.is_empty() {
+        return;
     }
 
+    // `~` / `~/...` home expansion.
+    let tilde = shellexpand::tilde(expanded).into_owned();
+    let rel = PathBuf::from(tilde);
+
+    if rel.is_absolute() {
+        out.push(rel);
+        return;
+    }
+
+    if !ancestor_walk {
+        out.push(cwd.join(&rel));
+        return;
+    }
+
+    // Ancestor walk: join the relative tail under cwd and each ancestor up
+    // to (and including) the git worktree root.
     let stop_at = crate::git::find_worktree_root(cwd);
     let mut dir: Option<&Path> = Some(cwd);
     while let Some(d) = dir {
-        out.push(d.join(".agents").join("skills"));
+        out.push(d.join(&rel));
         if let Some(root) = &stop_at
             && d == root.as_path()
         {
             break;
         }
         dir = d.parent();
-    }
-    out
-}
-
-/// Resolve a single configured scan-dir entry. Supports `~` home
-/// expansion, `$VAR` references (via [`crate::envref`]), and relative
-/// paths resolved against `cwd`. Returns `None` only when `~` can't be
-/// expanded (no home dir) — every other shape yields a path.
-fn resolve_dir_entry(entry: &str, cwd: &Path) -> Option<PathBuf> {
-    // `$VAR` expansion first, so a value like `$PROJECTS/skills` becomes
-    // a concrete path before tilde / relative handling.
-    let expanded = crate::envref::resolve(entry).value;
-    let expanded = expanded.trim();
-    if expanded.is_empty() {
-        return None;
-    }
-
-    // `~` / `~/...` home expansion.
-    let tilde = shellexpand::tilde(expanded).into_owned();
-    let path = PathBuf::from(tilde);
-
-    if path.is_absolute() {
-        Some(path)
-    } else {
-        Some(cwd.join(path))
     }
 }
 
@@ -429,46 +432,100 @@ mod tests {
         let cfg = SkillsConfig {
             scan_dirs: vec![scan.to_string_lossy().into_owned()],
             auto_bang_commands: false,
+            ancestor_walk: false,
         };
         let found = discover(tmp.path(), &cfg).unwrap();
         let names: Vec<&str> = found.iter().map(|s| s.frontmatter.name.as_str()).collect();
         assert_eq!(names, vec!["ok"], "only the well-formed skill survives");
     }
 
-    #[test]
-    fn resolve_dir_entry_expands_env_and_relative() {
-        let cwd = Path::new("/tmp/project");
-        // Relative resolves against cwd.
-        let rel = resolve_dir_entry("skills/dir", cwd).unwrap();
-        assert_eq!(rel, PathBuf::from("/tmp/project/skills/dir"));
-        // Absolute stays absolute.
-        let abs = resolve_dir_entry("/abs/skills", cwd).unwrap();
-        assert_eq!(abs, PathBuf::from("/abs/skills"));
+    fn skills_cfg(scan_dirs: Vec<&str>, ancestor_walk: bool) -> SkillsConfig {
+        SkillsConfig {
+            scan_dirs: scan_dirs.into_iter().map(str::to_string).collect(),
+            auto_bang_commands: false,
+            ancestor_walk,
+        }
     }
 
     #[test]
-    fn resolve_dir_entry_expands_dollar_var() {
+    fn resolve_scan_dirs_expands_env_and_relative() {
+        let cwd = Path::new("/tmp/project");
+        // Relative resolves against cwd; absolute stays absolute.
+        let cfg = skills_cfg(vec!["skills/dir", "/abs/skills"], false);
+        let dirs = resolve_scan_dirs(cwd, &cfg);
+        assert_eq!(
+            dirs,
+            vec![
+                PathBuf::from("/tmp/project/skills/dir"),
+                PathBuf::from("/abs/skills"),
+            ]
+        );
+    }
+
+    #[test]
+    fn resolve_scan_dirs_expands_dollar_var() {
         // SAFETY: single-threaded test; we set then read a unique var.
         unsafe {
             std::env::set_var("COCKPIT_TEST_SKILLS_ROOT", "/var/skills");
         }
-        let got = resolve_dir_entry("$COCKPIT_TEST_SKILLS_ROOT/sub", Path::new("/cwd")).unwrap();
-        assert_eq!(got, PathBuf::from("/var/skills/sub"));
+        let cfg = skills_cfg(vec!["$COCKPIT_TEST_SKILLS_ROOT/sub"], false);
+        let dirs = resolve_scan_dirs(Path::new("/cwd"), &cfg);
+        assert_eq!(dirs, vec![PathBuf::from("/var/skills/sub")]);
         unsafe {
             std::env::remove_var("COCKPIT_TEST_SKILLS_ROOT");
         }
     }
 
     #[test]
-    fn default_scan_dirs_includes_home_and_project_local() {
+    fn resolve_scan_dirs_empty_yields_no_dirs() {
+        // No implicit fallback: an empty list scans nothing.
+        let cfg = skills_cfg(vec![], false);
+        assert!(resolve_scan_dirs(Path::new("/tmp/project"), &cfg).is_empty());
+    }
+
+    #[test]
+    fn resolve_scan_dirs_relative_respects_ancestor_walk_toggle() {
+        // A real git worktree so `find_worktree_root` returns a stop point.
         let tmp = tempfile::tempdir().unwrap();
-        let dirs = default_scan_dirs(tmp.path());
-        // The cwd-local `.agents/skills` is always present.
-        assert!(
-            dirs.iter()
-                .any(|d| d.ends_with(PathBuf::from(".agents").join("skills"))),
-            "expected a project-local `.agents/skills` entry, got {dirs:?}"
-        );
+        let root = tmp.path().canonicalize().unwrap();
+        let git_init = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&root)
+            .status();
+        // Skip on hosts without git rather than fail spuriously.
+        if !matches!(git_init, Ok(s) if s.success()) {
+            return;
+        }
+        // Confirm git agrees on the worktree root (some CI sandboxes refuse
+        // to treat a tmp dir as a repo); bail cleanly if it doesn't.
+        if crate::git::find_worktree_root(&root).as_deref() != Some(root.as_path()) {
+            return;
+        }
+        let nested = root.join("a").join("b");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        // Ancestor walk OFF: the relative entry resolves against cwd only.
+        let off = skills_cfg(vec![".agents/skills"], false);
+        let dirs_off = resolve_scan_dirs(&nested, &off);
+        assert_eq!(dirs_off, vec![nested.join(".agents").join("skills")]);
+
+        // Ancestor walk ON: cwd plus every ancestor up to and including
+        // the worktree root.
+        let on = skills_cfg(vec![".agents/skills"], true);
+        let dirs_on = resolve_scan_dirs(&nested, &on);
+        let expected = vec![
+            nested.join(".agents").join("skills"),
+            root.join("a").join(".agents").join("skills"),
+            root.join(".agents").join("skills"),
+        ];
+        assert_eq!(dirs_on, expected);
+    }
+
+    #[test]
+    fn resolve_scan_dirs_absolute_entry_ignores_ancestor_walk() {
+        let cfg = skills_cfg(vec!["/abs/skills"], true);
+        let dirs = resolve_scan_dirs(Path::new("/tmp/a/b"), &cfg);
+        assert_eq!(dirs, vec![PathBuf::from("/abs/skills")]);
     }
 
     #[test]

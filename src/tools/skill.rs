@@ -12,8 +12,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
 
-use crate::config::dirs::discover_config_dirs;
-use crate::config::extended::{ExtendedConfig, ExtendedConfigDoc};
+use crate::config::extended::ExtendedConfig;
 use crate::engine::tool::{Tool, ToolCtx, ToolOutput, invalid_input};
 
 pub struct SkillTool;
@@ -84,15 +83,11 @@ fn load_skill_into_output(
     Ok(ToolOutput::text(format!("Skill `{name}`:\n\n{rendered}")))
 }
 
-/// Load the first `extended-config.json` on the layered-config path from
-/// `cwd`. Defaults on any miss — discovery degrades to the default scan
-/// dirs and Codex mode.
+/// Load the effective `extended-config.json` for `cwd` (first existing on
+/// the layered-config path; seeded skills defaults on a fresh install with
+/// none on disk). See [`crate::config::extended::load_for_cwd`].
 fn load_extended(cwd: &std::path::Path) -> ExtendedConfig {
-    discover_config_dirs(cwd)
-        .into_iter()
-        .find_map(|d| ExtendedConfigDoc::load(&d.path.join("extended-config.json")).ok())
-        .map(|d| d.config())
-        .unwrap_or_default()
+    crate::config::extended::load_for_cwd(cwd)
 }
 
 #[cfg(test)]
@@ -119,6 +114,7 @@ mod tests {
         e.skills = SkillsConfig {
             scan_dirs: vec![scan.to_string_lossy().into_owned()],
             auto_bang_commands: auto_bang,
+            ancestor_walk: false,
         };
         e
     }

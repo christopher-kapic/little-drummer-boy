@@ -106,14 +106,27 @@ fn default_plan_branch_root() -> String {
     "cockpit-plan".to_string()
 }
 
+/// The two scan-dir entries a brand-new install ships pre-seeded with
+/// (the "fresh install" defaults). These are materialized as ordinary,
+/// editable/removable rows the first time skills config is loaded with no
+/// `extended-config.json` anywhere on disk — they are **not** an
+/// implicit resolve-time fallback. An empty `scan_dirs` always resolves
+/// to zero directories. The relative `./.agents/skills` entry resolves
+/// against cwd (and, with [`SkillsConfig::ancestor_walk`] on, every
+/// ancestor up to the git worktree root).
+pub const SEEDED_SCAN_DIRS: [&str; 2] = ["~/.agents/skills", "./.agents/skills"];
+
 /// Skills subsystem config (GOALS §5).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SkillsConfig {
     /// Directories scanned for `<name>/SKILL.md`. Each entry supports `~`
     /// home expansion, `$VAR` references, and relative paths resolved
-    /// against cwd. When empty, the defaults apply: `~/.agents/skills`
-    /// plus the project-local `./.agents/skills` (cwd up to the git
-    /// worktree root).
+    /// against cwd. The list ships pre-seeded on a fresh install with
+    /// [`SEEDED_SCAN_DIRS`] (`~/.agents/skills` + `./.agents/skills`) as
+    /// ordinary editable rows; an empty list scans **nothing** — there
+    /// is no implicit "empty = defaults" fallback. Relative entries
+    /// resolve against cwd, or against cwd plus every ancestor up to the
+    /// git worktree root when [`Self::ancestor_walk`] is enabled.
     #[serde(default)]
     pub scan_dirs: Vec<String>,
 
@@ -125,6 +138,15 @@ pub struct SkillsConfig {
     /// footgun; correctness/safety over convenience.
     #[serde(default)]
     pub auto_bang_commands: bool,
+
+    /// Ancestor-walk toggle for **relative** scan-dir entries. `false`
+    /// (default): a relative entry resolves against cwd only. `true`:
+    /// each relative entry expands at resolve time to cwd **plus** every
+    /// ancestor directory up to and including the git worktree root, so a
+    /// repo-root `./.agents/skills` is found from any subdirectory.
+    /// Absolute / `~` / `$VAR`-rooted entries are unaffected.
+    #[serde(default)]
+    pub ancestor_walk: bool,
 }
 
 /// Answering-dialog config (GOALS §3b). Governs the reusable selectable-
@@ -576,6 +598,36 @@ fn default_agent_guidance_files() -> Vec<String> {
     vec!["AGENTS.md".into()]
 }
 
+/// Load the effective [`ExtendedConfig`] for `cwd`: the first parseable
+/// `extended-config.json` on the layered-config walk, or — when **none**
+/// exists anywhere (a genuinely *fresh install*) — `Default` with the
+/// skills scan-dir list seeded to [`SEEDED_SCAN_DIRS`]. Best-effort:
+/// unparseable layers are skipped.
+///
+/// The fresh-install distinction is made here, at the *file-existence*
+/// level: an absent file and an existing empty `{}` both parse to an
+/// empty `scan_dirs`, so they can't be told apart after parse. The
+/// seeding is materialization-only — it never happens for an existing
+/// on-disk config whose `scan_dirs` is absent/empty (clean break: scan
+/// nothing).
+pub fn load_for_cwd(cwd: &Path) -> ExtendedConfig {
+    use crate::config::dirs::discover_config_dirs;
+    for dir in discover_config_dirs(cwd) {
+        let path = dir.path.join("extended-config.json");
+        if path.exists()
+            && let Ok(doc) = ExtendedConfigDoc::load(&path)
+        {
+            return doc.config();
+        }
+    }
+    // Fresh install: no extended-config on disk. Materialize the seeded
+    // skills scan-dirs so new users discover (and see in `/settings`) the
+    // default skill directories.
+    let mut cfg = ExtendedConfig::default();
+    cfg.skills.scan_dirs = SEEDED_SCAN_DIRS.iter().map(|s| s.to_string()).collect();
+    cfg
+}
+
 /// Round-trip loader/saver for `extended-config.json` that preserves
 /// unknown fields. Same pattern as [`crate::config::providers::ConfigDoc`]:
 /// the raw `Value` is held alongside the typed view so writes don't
@@ -817,11 +869,40 @@ mod tests {
     #[test]
     fn skills_config_default_is_codex_mode_and_no_dirs() {
         let cfg = ExtendedConfig::default();
-        assert!(cfg.skills.scan_dirs.is_empty());
+        assert!(
+            cfg.skills.scan_dirs.is_empty(),
+            "the struct default scans nothing; seeding is materialized only on a fresh install"
+        );
         assert!(
             !cfg.skills.auto_bang_commands,
             "auto-`!` must default to disabled (Codex mode)"
         );
+        assert!(
+            !cfg.skills.ancestor_walk,
+            "ancestor walk must default to off"
+        );
+    }
+
+    #[test]
+    fn skills_absent_scan_dirs_parses_empty_not_seeded() {
+        // An existing config that omits `scan_dirs` parses to an empty
+        // list (clean break — no implicit re-seed at parse time).
+        let cfg: ExtendedConfig = serde_json::from_str("{}").unwrap();
+        assert!(cfg.skills.scan_dirs.is_empty());
+        assert!(!cfg.skills.ancestor_walk);
+    }
+
+    #[test]
+    fn ancestor_walk_round_trips_through_extended_doc() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("extended-config.json");
+        std::fs::write(&path, "{}").unwrap();
+        let mut doc = ExtendedConfigDoc::load(&path).unwrap();
+        let mut cfg = doc.config();
+        cfg.skills.ancestor_walk = true;
+        doc.write(&cfg).unwrap();
+        let doc2 = ExtendedConfigDoc::load(&path).unwrap();
+        assert!(doc2.config().skills.ancestor_walk);
     }
 
     #[test]

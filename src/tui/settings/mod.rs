@@ -408,9 +408,19 @@ impl SettingsDialog {
             .parent()
             .map(|p| p.join("extended-config.json"))
             .unwrap_or_else(|| PathBuf::from("extended-config.json"));
-        let extended = ExtendedConfigDoc::load(&extended_path)
+        let mut extended = ExtendedConfigDoc::load(&extended_path)
             .map(|d| d.config())
             .unwrap_or_default();
+        // Fresh install (no extended-config at this location yet): seed the
+        // skills scan-dir list with the defaults so they show as ordinary
+        // editable rows. Materialization-only — an existing config whose
+        // `scan_dirs` is absent/empty stays empty (clean break).
+        if !extended_path.exists() {
+            extended.skills.scan_dirs = crate::config::extended::SEEDED_SCAN_DIRS
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+        }
         Self {
             config_path,
             extended_path,

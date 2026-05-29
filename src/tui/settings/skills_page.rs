@@ -8,9 +8,10 @@
 //!     entries with the same grab/reorder editor the Instructions page
 //!     uses. Each entry supports `~`, `$VAR`, and relative paths.
 //!
-//! Layout: row 0 is the toggle; rows 1..=N are the scan-dir entries; the
-//! last row is the synthetic `[+ add directory]`. Toggling and list
-//! edits both persist via `save_extended()`.
+//! Layout: rows 0..[`TOGGLE_ROWS`] are the two toggles (auto-`!`, then
+//! ancestor-walk); rows `TOGGLE_ROWS..=TOGGLE_ROWS+N-1` are the scan-dir
+//! entries; the last row is the synthetic `[+ add directory]`. Toggling
+//! and list edits both persist via `save_extended()`.
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
@@ -23,6 +24,10 @@ use crate::tui::textfield::TextField;
 use crate::tui::theme::MUTED_COLOR_INDEX;
 
 use super::{Nav, Page, SettingsDialog, save_status};
+
+/// Number of leading toggle rows before the scan-dir list: row 0 is the
+/// auto-`!`-command toggle, row 1 is the ancestor-walk toggle.
+const TOGGLE_ROWS: usize = 2;
 
 /// `/settings → Skills` state. The grab editor mirrors the Instructions
 /// page: while a scan-dir row is grabbed, typing edits it and Enter
@@ -66,8 +71,9 @@ impl SettingsDialog {
         }
     }
 
-    /// The toggle occupies cursor 0; scan-dir rows occupy 1..=len; the
-    /// `[+ add]` synthetic row is at `len + 1`.
+    /// Toggles occupy cursors `0..TOGGLE_ROWS`; scan-dir rows occupy
+    /// `TOGGLE_ROWS..TOGGLE_ROWS+len`; the `[+ add]` synthetic row is at
+    /// `TOGGLE_ROWS + len`.
     fn handle_skills_page_key(&mut self, key: KeyEvent, p: &mut SkillsPage) -> Nav {
         // ── Grab mode: editing a scan-dir entry's text ──────────────
         if p.grabbed.is_some() {
@@ -84,10 +90,11 @@ impl SettingsDialog {
         }
 
         let dir_count = self.extended.skills.scan_dirs.len();
-        // Rows: 0 = toggle, 1..=dir_count = entries, dir_count+1 = add
-        // (the last navigable index); `nav_len` is the row count.
-        let max_cursor = dir_count + 1;
-        let nav_len = max_cursor + 1;
+        // Rows: 0,1 = toggles, TOGGLE_ROWS..TOGGLE_ROWS+dir_count =
+        // entries, then the `[+ add]` synthetic row (the last navigable
+        // index); `nav_len` is the row count.
+        let add_cursor = TOGGLE_ROWS + dir_count;
+        let nav_len = add_cursor + 1;
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => return Nav::Close,
             KeyCode::Left | KeyCode::Backspace | KeyCode::Char('h') => {
@@ -109,7 +116,7 @@ impl SettingsDialog {
                     self.extended.skills.scan_dirs.remove(idx);
                     // Keep the cursor on a valid row.
                     let new_count = self.extended.skills.scan_dirs.len();
-                    p.cursor = p.cursor.min(new_count + 1);
+                    p.cursor = p.cursor.min(TOGGLE_ROWS + new_count);
                     p.status = save_status(self.save_extended());
                 }
             }
@@ -119,6 +126,10 @@ impl SettingsDialog {
                     self.extended.skills.auto_bang_commands =
                         !self.extended.skills.auto_bang_commands;
                     p.status = save_status(self.save_extended());
+                } else if p.cursor == 1 {
+                    // Toggle ancestor walk.
+                    self.extended.skills.ancestor_walk = !self.extended.skills.ancestor_walk;
+                    p.status = save_status(self.save_extended());
                 } else if let Some(idx) = dir_index(p.cursor, dir_count) {
                     let cur = self.extended.skills.scan_dirs[idx].clone();
                     p.grabbed = Some(GrabState {
@@ -126,7 +137,7 @@ impl SettingsDialog {
                         original: Some(cur),
                     });
                     p.status = None;
-                } else if p.cursor == max_cursor {
+                } else if p.cursor == add_cursor {
                     self.start_skills_grab_on_new(p);
                 }
             }
@@ -139,7 +150,7 @@ impl SettingsDialog {
     fn start_skills_grab_on_new(&mut self, p: &mut SkillsPage) {
         self.extended.skills.scan_dirs.push(String::new());
         let idx = self.extended.skills.scan_dirs.len() - 1;
-        p.cursor = idx + 1; // +1 for the leading toggle row
+        p.cursor = idx + TOGGLE_ROWS; // skip the leading toggle rows
         p.grabbed = Some(GrabState {
             buf: TextField::default(),
             original: None,
@@ -163,7 +174,7 @@ impl SettingsDialog {
             *slot = trimmed;
         }
         let new_count = self.extended.skills.scan_dirs.len();
-        p.cursor = p.cursor.min(new_count + 1);
+        p.cursor = p.cursor.min(TOGGLE_ROWS + new_count);
         p.status = save_status(self.save_extended());
     }
 
@@ -188,7 +199,7 @@ impl SettingsDialog {
             }
         }
         let new_count = self.extended.skills.scan_dirs.len();
-        p.cursor = p.cursor.min(new_count + 1);
+        p.cursor = p.cursor.min(TOGGLE_ROWS + new_count);
         p.status = None;
     }
 
@@ -204,8 +215,10 @@ impl SettingsDialog {
             Line::default(),
             Line::from(Span::styled(
                 "Scan dirs hold `<name>/SKILL.md` skills. Entries support \
-                 `~`, `$VAR`, and relative paths. Empty list = defaults \
-                 (~/.agents/skills + ./.agents/skills)."
+                 `~`, `$VAR`, and relative paths. The list ships pre-seeded \
+                 (~/.agents/skills + ./.agents/skills); an empty list scans \
+                 nothing. Ancestor walk extends relative entries to every \
+                 dir up to the git root."
                     .to_string(),
                 muted,
             )),
@@ -230,6 +243,26 @@ impl SettingsDialog {
             Span::styled("auto-! commands  ", toggle_label_style),
             Span::styled(toggle_value.to_string(), muted),
         ]));
+
+        // Row 1: ancestor-walk toggle.
+        let walk_on_cursor = p.cursor == 1;
+        let walk_marker = if walk_on_cursor { "▸ " } else { "  " };
+        let walk_label_style = if walk_on_cursor {
+            yellow.add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        let walk_value = if self.extended.skills.ancestor_walk {
+            "on (relative entries also scan ancestors up to the git root)"
+        } else {
+            "off (default — relative entries resolve against cwd only)"
+        };
+        lines.push(Line::from(vec![
+            Span::raw(walk_marker),
+            Span::styled("ancestor walk    ", walk_label_style),
+            Span::styled(walk_value.to_string(), muted),
+        ]));
+
         lines.push(Line::default());
         lines.push(Line::from(Span::styled(
             "scan directories".to_string(),
@@ -237,7 +270,7 @@ impl SettingsDialog {
         )));
 
         for (i, dir) in self.extended.skills.scan_dirs.iter().enumerate() {
-            let row_cursor = i + 1; // +1 for the toggle row
+            let row_cursor = i + TOGGLE_ROWS; // skip the leading toggle rows
             let is_grabbed = p.grabbed.is_some() && row_cursor == p.cursor;
             let on_cursor = row_cursor == p.cursor;
             let marker = if is_grabbed {
@@ -271,7 +304,7 @@ impl SettingsDialog {
 
         // `[+ add directory]` row — hidden while a row is grabbed.
         if p.grabbed.is_none() {
-            let add_idx = self.extended.skills.scan_dirs.len() + 1;
+            let add_idx = TOGGLE_ROWS + self.extended.skills.scan_dirs.len();
             let add_selected = p.cursor == add_idx;
             let marker = if add_selected { "▸ " } else { "  " };
             let style = if add_selected {
@@ -294,13 +327,11 @@ impl SettingsDialog {
     }
 }
 
-/// Map a page cursor to a `scan_dirs` index. Cursor 0 is the toggle; the
-/// `[+ add]` synthetic row is past the end. Returns `None` for both.
+/// Map a page cursor to a `scan_dirs` index. Cursors `0..TOGGLE_ROWS` are
+/// the toggles; the `[+ add]` synthetic row is past the end. Returns
+/// `None` for all of those.
 fn dir_index(cursor: usize, dir_count: usize) -> Option<usize> {
-    if cursor == 0 {
-        return None;
-    }
-    let idx = cursor - 1;
+    let idx = cursor.checked_sub(TOGGLE_ROWS)?;
     if idx < dir_count { Some(idx) } else { None }
 }
 
@@ -320,6 +351,9 @@ mod tests {
         }
     }
 
+    /// A genuinely fresh install: only `config.json` exists, no
+    /// `extended-config.json` — so [`SettingsDialog::open`] seeds the two
+    /// default scan-dir entries. Tests that want an empty list clear it.
     fn fresh_skills_dialog(tmp: &TempDir) -> SettingsDialog {
         let path = tmp.path().join("config.json");
         std::fs::write(&path, "{}").unwrap();
@@ -332,6 +366,49 @@ mod tests {
         d
     }
 
+    /// An existing on-disk config whose `extended-config.json` is present
+    /// but has no `scan_dirs` — must NOT be re-seeded (clean break).
+    fn existing_empty_skills_dialog(tmp: &TempDir) -> SettingsDialog {
+        let path = tmp.path().join("config.json");
+        std::fs::write(&path, "{}").unwrap();
+        std::fs::write(tmp.path().join("extended-config.json"), "{}").unwrap();
+        let mut d = SettingsDialog::open(path);
+        d.page = Page::Skills(SkillsPage {
+            cursor: 0,
+            grabbed: None,
+            status: None,
+        });
+        d
+    }
+
+    #[test]
+    fn fresh_install_seeds_two_entries() {
+        let tmp = TempDir::new().unwrap();
+        let d = fresh_skills_dialog(&tmp);
+        assert_eq!(
+            d.extended.skills.scan_dirs,
+            vec![
+                "~/.agents/skills".to_string(),
+                "./.agents/skills".to_string()
+            ],
+            "a fresh install seeds the two default scan dirs"
+        );
+        assert!(
+            !d.extended.skills.ancestor_walk,
+            "ancestor walk defaults off"
+        );
+    }
+
+    #[test]
+    fn existing_empty_config_stays_empty() {
+        let tmp = TempDir::new().unwrap();
+        let d = existing_empty_skills_dialog(&tmp);
+        assert!(
+            d.extended.skills.scan_dirs.is_empty(),
+            "an existing config with absent scan_dirs is not re-seeded"
+        );
+    }
+
     #[test]
     fn toggling_auto_bang_persists() {
         let tmp = TempDir::new().unwrap();
@@ -340,7 +417,7 @@ mod tests {
             !d.extended.skills.auto_bang_commands,
             "default is Codex mode"
         );
-        // Cursor is at 0 (toggle). Enter flips it.
+        // Cursor is at 0 (auto-! toggle). Enter flips it.
         d.handle_key(press(KeyCode::Enter));
         assert!(d.extended.skills.auto_bang_commands);
         let reloaded = ExtendedConfigDoc::load(&d.extended_path).unwrap().config();
@@ -351,11 +428,27 @@ mod tests {
     }
 
     #[test]
+    fn toggling_ancestor_walk_persists() {
+        let tmp = TempDir::new().unwrap();
+        let mut d = fresh_skills_dialog(&tmp);
+        assert!(!d.extended.skills.ancestor_walk, "default off");
+        // Move to row 1 (ancestor-walk toggle) and flip it.
+        d.handle_key(press(KeyCode::Down));
+        d.handle_key(press(KeyCode::Enter));
+        assert!(d.extended.skills.ancestor_walk);
+        let reloaded = ExtendedConfigDoc::load(&d.extended_path).unwrap().config();
+        assert!(
+            reloaded.skills.ancestor_walk,
+            "ancestor-walk toggle must persist to disk"
+        );
+    }
+
+    #[test]
     fn add_edit_and_remove_scan_dir() {
         let tmp = TempDir::new().unwrap();
         let mut d = fresh_skills_dialog(&tmp);
-        // Move to the `[+ add directory]` row (cursor = dir_count + 1 = 1
-        // when empty) and grab a new row.
+        // Start from an empty list to exercise add/remove cleanly.
+        d.extended.skills.scan_dirs.clear();
         d.handle_key(press(KeyCode::Char('a')));
         match &d.page {
             Page::Skills(p) => assert!(p.grabbed.is_some(), "expected a grabbed new row"),
@@ -374,9 +467,9 @@ mod tests {
         let reloaded = ExtendedConfigDoc::load(&d.extended_path).unwrap().config();
         assert_eq!(reloaded.skills.scan_dirs, vec!["~/skills".to_string()]);
 
-        // Delete it: cursor is on the entry (row 1).
+        // Delete it: cursor is on the entry (first dir row = TOGGLE_ROWS).
         d.page = Page::Skills(SkillsPage {
-            cursor: 1,
+            cursor: TOGGLE_ROWS,
             grabbed: None,
             status: None,
         });
@@ -390,6 +483,7 @@ mod tests {
     fn esc_on_fresh_row_removes_it() {
         let tmp = TempDir::new().unwrap();
         let mut d = fresh_skills_dialog(&tmp);
+        d.extended.skills.scan_dirs.clear();
         d.handle_key(press(KeyCode::Char('a')));
         d.handle_key(press(KeyCode::Esc));
         match &d.page {
@@ -408,7 +502,7 @@ mod tests {
         let mut d = fresh_skills_dialog(&tmp);
         d.extended.skills.scan_dirs = vec!["orig".into()];
         d.page = Page::Skills(SkillsPage {
-            cursor: 1,
+            cursor: TOGGLE_ROWS, // first dir row
             grabbed: None,
             status: None,
         });
@@ -431,12 +525,13 @@ mod tests {
 
     #[test]
     fn dir_index_maps_correctly() {
-        // Cursor 0 = toggle, no dir.
+        // Cursors 0,1 = toggles, no dir.
         assert_eq!(dir_index(0, 2), None);
-        // Cursor 1 = first dir.
-        assert_eq!(dir_index(1, 2), Some(0));
-        assert_eq!(dir_index(2, 2), Some(1));
-        // Cursor 3 = `[+ add]` synthetic row.
-        assert_eq!(dir_index(3, 2), None);
+        assert_eq!(dir_index(1, 2), None);
+        // Cursor TOGGLE_ROWS = first dir.
+        assert_eq!(dir_index(TOGGLE_ROWS, 2), Some(0));
+        assert_eq!(dir_index(TOGGLE_ROWS + 1, 2), Some(1));
+        // Cursor TOGGLE_ROWS + 2 = `[+ add]` synthetic row.
+        assert_eq!(dir_index(TOGGLE_ROWS + 2, 2), None);
     }
 }
