@@ -1543,6 +1543,7 @@ impl Driver {
                             cancel.clone(),
                             self.approver.clone(),
                             self.loop_guard_threshold,
+                            EXPLORE_MAX_TURNS,
                         )
                         .await
                         {
@@ -1740,13 +1741,19 @@ fn wire_token_total(history: &[Message]) -> u64 {
         .sum()
 }
 
+/// Turn cap for the explore subagent's noninteractive loop. Real
+/// exploration work needs headroom; 64 turns bounds runaway loops
+/// without cutting legitimate work short.
+pub(crate) const EXPLORE_MAX_TURNS: usize = 64;
+
 /// Run a child agent's loop to completion synchronously. Used for
 /// noninteractive subagents — explore primarily. Drops the child's
 /// per-turn events on the floor (the parent's history already has a
 /// ToolStart/End representing this call); only the final text comes
-/// back. Limited to `MAX_NONINTERACTIVE_TURNS` to bound runaway loops.
-pub(crate) const MAX_NONINTERACTIVE_TURNS: usize = 12;
-
+/// back. The loop is bounded by the `max_turns` parameter (each role
+/// passes its own named constant — explore/docs-answerer 64, docs
+/// resolver 24) to bound runaway loops; the over-limit error reports
+/// that limit.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_noninteractive(
     child: Agent,
@@ -1759,6 +1766,7 @@ pub(crate) async fn run_noninteractive(
     cancel: tokio_util::sync::CancellationToken,
     approver: Option<Arc<crate::approval::Approver>>,
     loop_guard_threshold: u32,
+    max_turns: usize,
 ) -> Result<String> {
     use crate::engine::agent::turn;
 
@@ -1770,7 +1778,7 @@ pub(crate) async fn run_noninteractive(
     let mut history: Vec<Message> = Vec::new();
     let mut next_prompt = Message::user(brief);
 
-    for _ in 0..MAX_NONINTERACTIVE_TURNS {
+    for _ in 0..max_turns {
         let outcome = turn(
             &agent,
             &mut history,
@@ -1816,7 +1824,7 @@ pub(crate) async fn run_noninteractive(
     drop(sink_tx);
     let _ = drain.await;
     anyhow::bail!(
-        "noninteractive agent `{}` exceeded {MAX_NONINTERACTIVE_TURNS} turns",
+        "noninteractive agent `{}` exceeded {max_turns} turns",
         agent.name
     )
 }

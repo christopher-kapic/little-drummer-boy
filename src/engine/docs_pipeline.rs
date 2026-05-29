@@ -33,6 +33,16 @@ use crate::redact::RedactionTable;
 use crate::session::Session;
 use crate::tools::docs::DocsResolution;
 
+/// Turn cap for the docs resolver (Docs.1). Resolution is narrow work —
+/// locate and register the package — so a tighter bound than the
+/// answerer's suffices.
+const DOCS_RESOLVER_MAX_TURNS: usize = 24;
+
+/// Turn cap for the docs answerer (Docs.2). Answering may require deep
+/// read-only exploration of a cloned dependency, so it gets the same
+/// headroom as explore.
+const DOCS_ANSWERER_MAX_TURNS: usize = 64;
+
 /// The caller → docs structured input. Rides through the existing `task`
 /// mechanism as the `prompt` string (JSON). A bare (non-JSON) prompt is
 /// tolerated: it's treated as the whole brief, with the first line as the
@@ -84,6 +94,7 @@ pub async fn run(
         // approver, is inert here; the threshold value is irrelevant).
         None,
         crate::config::extended::MIN_LOOP_GUARD_THRESHOLD,
+        DOCS_RESOLVER_MAX_TURNS,
     )
     .await?;
 
@@ -124,6 +135,7 @@ pub async fn run(
         // inert (no approver); the threshold value is irrelevant.
         None,
         crate::config::extended::MIN_LOOP_GUARD_THRESHOLD,
+        DOCS_ANSWERER_MAX_TURNS,
     )
     .await?;
     Ok(answer)

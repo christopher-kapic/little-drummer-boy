@@ -46,7 +46,8 @@ pub struct LoopRunCtx {
 }
 
 /// Max turns one fork iteration may take before we cut it off (bounds a
-/// runaway iteration; same spirit as `MAX_NONINTERACTIVE_TURNS`).
+/// runaway iteration; same spirit as the noninteractive per-role turn
+/// caps in `run_noninteractive`).
 const MAX_ITERATION_TURNS: usize = 8;
 
 /// Drive an ephemeral-fork loop to termination. Always sends exactly one
