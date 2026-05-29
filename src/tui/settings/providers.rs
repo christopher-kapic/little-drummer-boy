@@ -25,7 +25,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
 
 use crate::auth::copilot_setup::{self, Shell as CopilotShell};
-use crate::config::providers::{HeaderSpec, OnUnlistedModelsFetch, ProviderEntry};
+use crate::config::providers::{HeaderSpec, ModelEntry, OnUnlistedModelsFetch, ProviderEntry};
 use crate::envref;
 use crate::providers::models_fetch::{self, FetchOutcome};
 use crate::providers::{self as templates, ProviderTemplate};
@@ -36,8 +36,9 @@ use super::auth::{CodexLoginProgress, CodexLoginState, FetchHandle};
 use super::{Nav, Page, SettingsDialog};
 
 /// Number of selectable rows in the Edit-provider action menu.
-/// Index map: 0=URL · 1=Headers · 2=Favorite · 3=Refetch · 4=Delete · 5=Back.
-const EDIT_MENU_LEN: usize = 6;
+/// Index map: 0=URL · 1=Headers · 2=Models · 3=Favorite · 4=Refetch ·
+/// 5=Delete · 6=Back.
+const EDIT_MENU_LEN: usize = 7;
 
 #[allow(private_interfaces)]
 pub(super) enum ProvidersPage {
@@ -61,6 +62,15 @@ pub(super) enum ProvidersPage {
     /// `editor.rows`.
     Headers {
         editor: HeaderEditor,
+        parent: Box<EditState>,
+    },
+    /// Manage the model list for the provider whose Edit state is in
+    /// `parent`. Reached by Enter on the "Models" row of the Edit page.
+    /// Browse rows; add a manual entry; edit a manual entry; delete any
+    /// entry. Back navigation returns to `Edit(parent)` with
+    /// `parent.entry.models` set from `editor.rows`.
+    Models {
+        editor: ModelEditor,
         parent: Box<EditState>,
     },
     /// Triggered by /fetch-models — prompts on unlisted models.
@@ -386,6 +396,290 @@ impl HeaderEditor {
     }
 }
 
+/// Multi-row model list manager for the provider Edit page. Browsing the
+/// rows is inline; adding or editing a *manual* entry opens an
+/// id/name/context popup (see [`render_model_edit_popup`]).
+///
+/// Layout (visible "rows" the cursor can land on):
+///   - 0..n   actual model rows (fetched + manual, in list order)
+///   - n      `[+ add model]`
+///
+/// Only manual entries can be edited (id / name / context). Any entry —
+/// fetched or manual — can be deleted; a deleted fetched entry reappears
+/// on the next `/models` refetch.
+pub(super) struct ModelEditor {
+    pub(super) rows: Vec<ModelEntry>,
+    pub(super) cursor: usize,
+    pub(super) mode: ModelMode,
+    pub(super) id_buf: TextField,
+    pub(super) name_buf: TextField,
+    pub(super) context_buf: TextField,
+    /// Row the popup is editing; `None` while adding a brand-new entry.
+    pub(super) edit_target: Option<usize>,
+    /// Field the popup is focused on while editing.
+    pub(super) focus: ModelField,
+    /// Transient validation/status message shown under the editor.
+    pub(super) status: Option<String>,
+}
+
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub(super) enum ModelField {
+    Id,
+    Name,
+    Context,
+}
+
+pub(super) enum ModelMode {
+    Browse,
+    /// id/name/context popup open (add or edit).
+    Edit,
+}
+
+pub(super) enum ModelResult {
+    Stay,
+    Back,
+}
+
+impl ModelEditor {
+    pub(super) fn new(rows: Vec<ModelEntry>) -> Self {
+        Self {
+            rows,
+            cursor: 0,
+            mode: ModelMode::Browse,
+            id_buf: TextField::default(),
+            name_buf: TextField::default(),
+            context_buf: TextField::default(),
+            edit_target: None,
+            focus: ModelField::Id,
+            status: None,
+        }
+    }
+
+    fn n_rows(&self) -> usize {
+        self.rows.len()
+    }
+
+    fn add_row_idx(&self) -> usize {
+        self.n_rows()
+    }
+
+    fn max_cursor(&self) -> usize {
+        self.add_row_idx()
+    }
+
+    /// Open the popup to add a brand-new manual entry. The row is
+    /// committed to `rows` only on a valid save.
+    fn begin_add(&mut self) {
+        self.edit_target = None;
+        self.id_buf = TextField::default();
+        self.name_buf = TextField::default();
+        self.context_buf = TextField::default();
+        self.focus = ModelField::Id;
+        self.status = None;
+        self.mode = ModelMode::Edit;
+    }
+
+    /// Open the popup to edit an existing manual entry. Fetched entries
+    /// are not editable; the caller gates on `rows[i].manual`.
+    fn begin_edit(&mut self, i: usize) {
+        if let Some(row) = self.rows.get(i) {
+            self.edit_target = Some(i);
+            self.id_buf = TextField::new(row.id.clone());
+            self.name_buf = TextField::new(row.name.clone().unwrap_or_default());
+            self.context_buf = TextField::new(
+                row.context_length
+                    .map(|c| c.to_string())
+                    .unwrap_or_default(),
+            );
+            self.focus = ModelField::Id;
+            self.status = None;
+            self.mode = ModelMode::Edit;
+        }
+    }
+
+    /// Validate the popup buffers and, if valid, commit them to `rows`.
+    /// Returns `Err(message)` on validation failure (kept open) and
+    /// `Ok(())` on a successful commit (popup closed).
+    fn commit_edit(&mut self) -> Result<(), String> {
+        let id = self.id_buf.text().trim().to_string();
+        if id.is_empty() {
+            return Err("model id cannot be empty".to_string());
+        }
+        // Reject a duplicate id within this provider, ignoring the row
+        // being edited so a no-op id keeps validating.
+        let dup = self
+            .rows
+            .iter()
+            .enumerate()
+            .any(|(i, m)| m.id == id && Some(i) != self.edit_target);
+        if dup {
+            return Err(format!("a model with id `{id}` already exists"));
+        }
+        let name_raw = self.name_buf.text().trim();
+        let name = if name_raw.is_empty() {
+            None
+        } else {
+            Some(name_raw.to_string())
+        };
+        let context_raw = self.context_buf.text().trim();
+        let context_length = if context_raw.is_empty() {
+            None
+        } else {
+            match context_raw.parse::<u32>() {
+                Ok(n) => Some(n),
+                Err(_) => return Err("context length must be a number".to_string()),
+            }
+        };
+
+        match self.edit_target {
+            Some(i) => {
+                if let Some(row) = self.rows.get_mut(i) {
+                    row.id = id;
+                    row.name = name;
+                    row.context_length = context_length;
+                    self.cursor = i;
+                }
+            }
+            None => {
+                self.rows.push(ModelEntry {
+                    id,
+                    name,
+                    thinking_modes: Vec::new(),
+                    inputs: None,
+                    context_length,
+                    favorite: false,
+                    manual: true,
+                    cache: None,
+                    shrink: None,
+                    extra: Default::default(),
+                });
+                self.cursor = self.rows.len() - 1;
+            }
+        }
+        self.edit_target = None;
+        self.status = None;
+        self.mode = ModelMode::Browse;
+        Ok(())
+    }
+
+    /// Close the popup without saving.
+    fn cancel_edit(&mut self) {
+        self.edit_target = None;
+        self.status = None;
+        self.mode = ModelMode::Browse;
+    }
+
+    pub(super) fn handle_key(&mut self, key: KeyEvent) -> ModelResult {
+        match self.mode {
+            ModelMode::Browse => self.handle_browse_key(key),
+            ModelMode::Edit => self.handle_edit_key(key),
+        }
+    }
+
+    fn handle_browse_key(&mut self, key: KeyEvent) -> ModelResult {
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => {
+                self.cursor = crate::tui::nav::wrap_prev(self.cursor, self.max_cursor() + 1);
+                self.status = None;
+                ModelResult::Stay
+            }
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
+                self.cursor = crate::tui::nav::wrap_next(self.cursor, self.max_cursor() + 1);
+                self.status = None;
+                ModelResult::Stay
+            }
+            KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') | KeyCode::Backspace => {
+                ModelResult::Back
+            }
+            KeyCode::Char('a') => {
+                self.begin_add();
+                ModelResult::Stay
+            }
+            KeyCode::Char('d') | KeyCode::Delete => {
+                if self.cursor < self.rows.len() {
+                    self.rows.remove(self.cursor);
+                    if self.cursor > 0 && self.cursor >= self.rows.len() {
+                        self.cursor -= 1;
+                    }
+                    self.status = None;
+                }
+                ModelResult::Stay
+            }
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                if self.cursor < self.rows.len() {
+                    if self.rows[self.cursor].manual {
+                        self.begin_edit(self.cursor);
+                    } else {
+                        self.status =
+                            Some("fetched models can't be edited (delete with d)".to_string());
+                    }
+                    ModelResult::Stay
+                } else if self.cursor == self.add_row_idx() {
+                    self.begin_add();
+                    ModelResult::Stay
+                } else {
+                    ModelResult::Stay
+                }
+            }
+            _ => ModelResult::Stay,
+        }
+    }
+
+    fn handle_edit_key(&mut self, key: KeyEvent) -> ModelResult {
+        match key.code {
+            KeyCode::Esc => {
+                self.cancel_edit();
+                ModelResult::Stay
+            }
+            KeyCode::Enter => {
+                if let Err(msg) = self.commit_edit() {
+                    self.status = Some(msg);
+                }
+                ModelResult::Stay
+            }
+            // Three fields cycled by Tab / Shift+Tab.
+            KeyCode::Tab => {
+                self.focus = match self.focus {
+                    ModelField::Id => ModelField::Name,
+                    ModelField::Name => ModelField::Context,
+                    ModelField::Context => ModelField::Id,
+                };
+                ModelResult::Stay
+            }
+            KeyCode::BackTab => {
+                self.focus = match self.focus {
+                    ModelField::Id => ModelField::Context,
+                    ModelField::Name => ModelField::Id,
+                    ModelField::Context => ModelField::Name,
+                };
+                ModelResult::Stay
+            }
+            _ => {
+                match self.focus {
+                    ModelField::Id => {
+                        self.id_buf.handle_key(key);
+                    }
+                    ModelField::Name => {
+                        self.name_buf.handle_key(key);
+                    }
+                    ModelField::Context => {
+                        self.context_buf.handle_key(key);
+                    }
+                }
+                ModelResult::Stay
+            }
+        }
+    }
+
+    pub(super) fn rows(&self) -> &[ModelEntry] {
+        &self.rows
+    }
+
+    pub(super) fn is_editing(&self) -> bool {
+        matches!(self.mode, ModelMode::Edit)
+    }
+}
+
 pub(super) struct FetchAllState {
     pub(super) providers: Vec<String>,
     pub(super) in_flight: Vec<FetchHandle>,
@@ -537,7 +831,8 @@ impl SettingsDialog {
         if let Some(entry) = self.config.providers.get_mut(provider_id) {
             match result {
                 Ok(FetchOutcome::Models(models)) => {
-                    entry.models = models;
+                    entry.models =
+                        crate::config::providers::merge_fetched_models(&entry.models, models);
                     entry.models_fetched_at = Some(Utc::now());
                     message = format!("fetched {} model(s) from /models", entry.models.len());
                 }
@@ -574,6 +869,14 @@ impl SettingsDialog {
                     parent.entry.models = entry.models.clone();
                     parent.entry.models_fetched_at = entry.models_fetched_at;
                 }
+            }
+            Page::Providers(ProvidersPage::Models { parent, .. }) => {
+                // A refetch finished while the user is managing the model
+                // list. The model editor owns the live (unsaved) rows, so
+                // we don't touch them here — just record the outcome on
+                // the parent so it surfaces when they return to Edit.
+                parent.status = Some(message);
+                parent.fetch = None;
             }
             _ => {}
         }
@@ -618,7 +921,8 @@ impl SettingsDialog {
             if let Ok(FetchOutcome::Models(models)) = &summary.outcome
                 && let Some(entry) = self.config.providers.get_mut(&summary.provider_id)
             {
-                entry.models = models.clone();
+                entry.models =
+                    crate::config::providers::merge_fetched_models(&entry.models, models.clone());
                 entry.models_fetched_at = Some(Utc::now());
             }
         }
@@ -764,6 +1068,7 @@ impl SettingsDialog {
             ProvidersPage::Headers { editor, parent } => {
                 self.handle_headers_key(key, editor, parent)
             }
+            ProvidersPage::Models { editor, parent } => self.handle_models_key(key, editor, parent),
             ProvidersPage::FetchAll(state) => self.handle_fetch_all_key(key, state),
             ProvidersPage::CopilotSetup(state) => self.handle_copilot_setup_key(key, state),
         }
@@ -1149,6 +1454,20 @@ impl SettingsDialog {
                         }));
                     }
                     2 => {
+                        // Hand off to the Models sub-page, moving the
+                        // EditState out so the sub-page can return it
+                        // intact on back (mirrors the Headers row).
+                        let editor = ModelEditor::new(s.entry.models.clone());
+                        let owned = std::mem::replace(
+                            s,
+                            EditState::new(String::new(), ProviderEntry::default()),
+                        );
+                        return Nav::Replace(Page::Providers(ProvidersPage::Models {
+                            editor,
+                            parent: Box::new(owned),
+                        }));
+                    }
+                    3 => {
                         let new = !s.entry.favorite.unwrap_or(false);
                         s.entry.favorite = if new { Some(true) } else { None };
                         s.status = Some(if new {
@@ -1157,7 +1476,7 @@ impl SettingsDialog {
                             "removed favorite".into()
                         });
                     }
-                    3 => {
+                    4 => {
                         // Same as 'r'
                         match models_fetch::resolve_provider_request(&s.provider_id, &s.entry) {
                             Err(e) => {
@@ -1172,7 +1491,7 @@ impl SettingsDialog {
                             }
                         }
                     }
-                    4 => {
+                    5 => {
                         if s.delete_pending {
                             self.config.providers.remove(&s.provider_id);
                             let saved = self.save_config();
@@ -1190,7 +1509,7 @@ impl SettingsDialog {
                             s.status = Some("press Enter again to confirm delete".into());
                         }
                     }
-                    5 => {
+                    6 => {
                         return Nav::Replace(Page::Providers(ProvidersPage::List {
                             cursor: 0,
                             status: s.status.clone(),
@@ -1233,6 +1552,36 @@ impl SettingsDialog {
                 // user there are unsaved changes to commit with `s`.
                 owned.cursor = 1;
                 owned.status = Some("headers updated; press s to save".into());
+                Nav::Replace(Page::Providers(ProvidersPage::Edit(owned)))
+            }
+        }
+    }
+
+    /// Handle keys on the Models sub-page. All keys go to the
+    /// [`ModelEditor`] until it signals `Back`; on back, copy the
+    /// editor's rows into `parent.entry.models` and return to the Edit
+    /// page with the parent intact (so its cursor, status, and any
+    /// unsaved entry-level edits survive the round trip). The user still
+    /// commits to disk with `s` on the Edit page, like every other edit.
+    fn handle_models_key(
+        &mut self,
+        key: KeyEvent,
+        editor: &mut ModelEditor,
+        parent: &mut Box<EditState>,
+    ) -> Nav {
+        match editor.handle_key(key) {
+            ModelResult::Stay => Nav::Stay,
+            ModelResult::Back => {
+                let rows = std::mem::take(&mut editor.rows);
+                let mut owned = std::mem::replace(
+                    parent.as_mut(),
+                    EditState::new(String::new(), ProviderEntry::default()),
+                );
+                owned.entry.models = rows;
+                // Put the cursor back on the Models row and prompt the
+                // user to persist with `s`.
+                owned.cursor = 2;
+                owned.status = Some("models updated; press s to save".into());
                 Nav::Replace(Page::Providers(ProvidersPage::Edit(owned)))
             }
         }
@@ -1423,6 +1772,9 @@ impl SettingsDialog {
             ProvidersPage::Edit(s) => self.render_edit(frame, area, s),
             ProvidersPage::Headers { editor, parent } => {
                 self.render_headers_page(frame, area, editor, parent.as_ref())
+            }
+            ProvidersPage::Models { editor, parent } => {
+                self.render_models_page(frame, area, editor, parent.as_ref())
             }
             ProvidersPage::FetchAll(s) => self.render_fetch_all(frame, area, s),
             ProvidersPage::CopilotSetup(s) => self.render_copilot_setup(frame, area, s),
@@ -1757,9 +2109,20 @@ impl SettingsDialog {
                     .join(", ")
             )
         };
+        let manual_count = s.entry.models.iter().filter(|m| m.manual).count();
+        let models_summary = if manual_count > 0 {
+            format!(
+                "{} model(s) ({} manual)",
+                s.entry.models.len(),
+                manual_count
+            )
+        } else {
+            format!("{} model(s)", s.entry.models.len())
+        };
         let rows = [
             ("URL", s.entry.url.clone()),
             ("Headers", headers_summary),
+            ("Models", models_summary),
             (
                 "Favorite",
                 if s.entry.favorite.unwrap_or(false) {
@@ -1858,6 +2221,46 @@ impl SettingsDialog {
         frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
         if editor.is_editing() {
             render_header_edit_popup(frame, area, editor);
+        }
+    }
+
+    /// Full-pane render for the Models sub-page. Lists every model row
+    /// (fetched + manual) plus the `[+ add model]` affordance; the parent
+    /// Edit state is recalled on back.
+    fn render_models_page(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        editor: &ModelEditor,
+        parent: &EditState,
+    ) {
+        let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+        let mut lines: Vec<Line<'static>> = vec![
+            Line::from(vec![
+                Span::styled("Provider: ", muted),
+                Span::styled(
+                    parent.provider_id.clone(),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::default(),
+        ];
+        render_model_editor(&mut lines, editor);
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled(
+            "a: add manual model   enter: edit manual   d: delete   esc: back".to_string(),
+            muted,
+        )));
+        if let Some(status) = &editor.status {
+            lines.push(Line::default());
+            lines.push(Line::from(Span::styled(
+                status.clone(),
+                Style::default().fg(Color::Yellow),
+            )));
+        }
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+        if editor.is_editing() {
+            render_model_edit_popup(frame, area, editor);
         }
     }
 
@@ -2210,6 +2613,124 @@ fn render_header_edit_popup(frame: &mut Frame, area: Rect, h: &HeaderEditor) {
     frame.render_widget(Paragraph::new(body).wrap(Wrap { trim: false }), inner);
 }
 
+/// Render a [`ModelEditor`] as rows + `[+ add model]`. Each row shows the
+/// model id, an `M` tag for manual entries, the display name, and the
+/// context length when set. The active cursor row is highlighted.
+fn render_model_editor(lines: &mut Vec<Line<'static>>, m: &ModelEditor) {
+    let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+    let yellow = Style::default().fg(Color::Yellow);
+    let green = Style::default().fg(Color::Green);
+    lines.push(Line::from(Span::styled(
+        "Models:".to_string(),
+        Style::default().add_modifier(Modifier::BOLD),
+    )));
+
+    if m.rows().is_empty() {
+        lines.push(Line::from(Span::styled(
+            "    (no models — add one by hand or refetch /models)".to_string(),
+            muted,
+        )));
+    } else {
+        let id_w = m
+            .rows()
+            .iter()
+            .map(|r| r.id.chars().count())
+            .max()
+            .unwrap_or(0);
+        for (i, row) in m.rows().iter().enumerate() {
+            let cursor_here = m.cursor == i;
+            let marker = if cursor_here { "  ▸ " } else { "    " };
+            let id_style = if cursor_here {
+                yellow.add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            let tag = if row.manual { "M" } else { " " };
+            let mut detail = row.name.clone().unwrap_or_default();
+            if let Some(ctx) = row.context_length {
+                if !detail.is_empty() {
+                    detail.push_str("  ");
+                }
+                detail.push_str(&format!("ctx {ctx}"));
+            }
+            lines.push(Line::from(vec![
+                Span::raw(marker.to_string()),
+                Span::styled(format!("{tag} "), green),
+                Span::styled(format!("{:<width$}", row.id, width = id_w), id_style),
+                Span::raw("  "),
+                Span::styled(detail, muted),
+            ]));
+        }
+    }
+
+    let add_idx = m.rows().len();
+    let add_cursor = m.cursor == add_idx;
+    let add_marker = if add_cursor { "  ▸ " } else { "    " };
+    let add_style = if add_cursor {
+        yellow.add_modifier(Modifier::BOLD)
+    } else {
+        muted
+    };
+    lines.push(Line::from(vec![
+        Span::raw(add_marker.to_string()),
+        Span::styled("[+ add model]".to_string(), add_style),
+    ]));
+}
+
+/// Centered id/name/context popup for adding or editing a manual model.
+/// Drawn on top of the model list while the editor is in `Edit` mode.
+fn render_model_edit_popup(frame: &mut Frame, area: Rect, m: &ModelEditor) {
+    let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+    let yellow = Style::default().fg(Color::Yellow);
+    let red = Style::default().fg(Color::Red);
+
+    let mut body: Vec<Line<'static>> = Vec::new();
+    render_field_row(&mut body, "Id     ", &m.id_buf, m.focus == ModelField::Id);
+    render_field_row(
+        &mut body,
+        "Name   ",
+        &m.name_buf,
+        m.focus == ModelField::Name,
+    );
+    render_field_row(
+        &mut body,
+        "Context",
+        &m.context_buf,
+        m.focus == ModelField::Context,
+    );
+    body.push(Line::default());
+    if let Some(status) = &m.status {
+        body.push(Line::from(Span::styled(format!("  {status}"), red)));
+    } else {
+        body.push(Line::from(Span::styled(
+            "  id required · name falls back to id · context optional (number)".to_string(),
+            muted,
+        )));
+    }
+    body.push(Line::from(Span::styled(
+        "  Tab: switch field   enter: save   esc: cancel".to_string(),
+        muted,
+    )));
+
+    let title = if m.edit_target.is_some() {
+        " Edit model "
+    } else {
+        " Add model "
+    };
+    let width = area.width.saturating_sub(6).clamp(24, 70);
+    let height = (body.len() as u16) + 2; // +2 for the top/bottom border
+    let rect = centered_rect(area, width, height);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(yellow)
+        .title(title);
+    let inner = block.inner(rect);
+    frame.render_widget(Clear, rect);
+    frame.render_widget(block, rect);
+    frame.render_widget(Paragraph::new(body).wrap(Wrap { trim: false }), inner);
+}
+
 /// A `width`×`height` rect centered within `area`, clamped to fit.
 fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
     let width = width.min(area.width);
@@ -2320,7 +2841,9 @@ fn compute_unlisted(dialog: &SettingsDialog) -> Vec<(String, String)> {
             && let Some(entry) = dialog.config.providers.get(&summary.provider_id)
         {
             for m in &entry.models {
-                if !remote.iter().any(|r| r.id == m.id) {
+                // Manual entries are intentionally absent from upstream —
+                // they're retained by the merge, not "drifted out".
+                if !m.manual && !remote.iter().any(|r| r.id == m.id) {
                     unlisted.push((summary.provider_id.clone(), m.id.clone()));
                 }
             }

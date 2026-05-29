@@ -248,6 +248,13 @@ pub struct ModelEntry {
     /// the top of the list.
     #[serde(default, skip_serializing_if = "is_false")]
     pub favorite: bool,
+    /// True for entries added by hand on the provider Edit page (for
+    /// providers without a `/models` endpoint). Manual entries survive a
+    /// `/models` refetch via [`merge_fetched_models`] and win on an id
+    /// collision. Defaults to `false`, so configs written before this
+    /// field existed load as non-manual (fetched).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub manual: bool,
     /// Per-model prompt-cache override. When set, takes precedence over
     /// the provider-level [`ProviderEntry::cache`] for the cache-cold
     /// predicate (GOALS §10).
@@ -267,6 +274,34 @@ pub struct ModelEntry {
 
 fn is_false(b: &bool) -> bool {
     !*b
+}
+
+/// Merge a freshly-fetched `/models` list into an existing model list,
+/// preserving manually-added entries.
+///
+/// The fetched list replaces the previously-fetched portion (non-manual
+/// entries) wholesale, while every manual entry is retained. Dedupe is by
+/// `id`: a manual entry is authoritative, so if a fetch returns an id that
+/// matches a manual entry the manual one is kept and the fetched duplicate
+/// is dropped (no double row). Manual entries are listed first so they
+/// stay stable across refetches; the fetched entries follow in upstream
+/// order.
+///
+/// Used by both the per-provider refetch and the all-providers fetch so
+/// the merge logic lives in exactly one place.
+pub fn merge_fetched_models(existing: &[ModelEntry], fetched: Vec<ModelEntry>) -> Vec<ModelEntry> {
+    let manual: Vec<ModelEntry> = existing.iter().filter(|m| m.manual).cloned().collect();
+    let mut merged = manual;
+    for mut m in fetched {
+        if merged.iter().any(|e| e.id == m.id) {
+            // Manual entry wins on id collision — drop the fetched dup.
+            continue;
+        }
+        // Defensive: a fetched entry is never manual.
+        m.manual = false;
+        merged.push(m);
+    }
+    merged
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -473,6 +508,7 @@ mod tests {
                     thinking_modes: vec![ThinkingMode::Off, ThinkingMode::High],
                     context_length: None,
                     favorite: false,
+                    manual: false,
                     cache: None,
                     shrink: None,
                     inputs: Some(Inputs {
@@ -564,6 +600,7 @@ mod tests {
             thinking_modes: vec![],
             context_length: None,
             favorite: false,
+            manual: false,
             cache: Some(CacheConfig {
                 mode: CacheMode::None,
                 ttl_secs: 300,
@@ -583,5 +620,67 @@ mod tests {
         assert_eq!(p.ttl_secs, 600);
         // Unknown provider → default (none).
         assert_eq!(cfg.resolve_cache("nope", "x").mode, CacheMode::None);
+    }
+
+    /// Minimal `ModelEntry` for the merge tests.
+    fn model(id: &str, manual: bool) -> ModelEntry {
+        ModelEntry {
+            id: id.to_string(),
+            name: None,
+            thinking_modes: vec![],
+            inputs: None,
+            context_length: None,
+            favorite: false,
+            manual,
+            cache: None,
+            shrink: None,
+            extra: Default::default(),
+        }
+    }
+
+    #[test]
+    fn manual_field_defaults_false_when_absent() {
+        // A model row written before the `manual` field existed must
+        // load as non-manual.
+        let m: ModelEntry = serde_json::from_str(r#"{"id":"legacy"}"#).unwrap();
+        assert!(!m.manual);
+        // And the field is skipped when serializing a non-manual entry.
+        let json = serde_json::to_string(&model("x", false)).unwrap();
+        assert!(!json.contains("manual"));
+        let json = serde_json::to_string(&model("x", true)).unwrap();
+        assert!(json.contains("\"manual\":true"));
+    }
+
+    #[test]
+    fn merge_retains_manual_entry_across_refetch() {
+        let existing = vec![model("fetched-old", false), model("hand-added", true)];
+        // A refetch returns a fresh fetched list that no longer includes
+        // the old fetched id and never knew about the manual one.
+        let fetched = vec![model("fetched-new", false)];
+        let merged = merge_fetched_models(&existing, fetched);
+
+        let ids: Vec<&str> = merged.iter().map(|m| m.id.as_str()).collect();
+        // Manual entry survives; stale fetched entry is gone; new fetched
+        // entry is present.
+        assert!(ids.contains(&"hand-added"));
+        assert!(ids.contains(&"fetched-new"));
+        assert!(!ids.contains(&"fetched-old"));
+        // The manual entry keeps its manual flag.
+        assert!(merged.iter().find(|m| m.id == "hand-added").unwrap().manual);
+    }
+
+    #[test]
+    fn merge_manual_wins_on_id_collision_no_duplicate() {
+        let existing = vec![model("shared", true)];
+        // The refetch returns an id that collides with the manual entry.
+        let fetched = vec![model("shared", false), model("other", false)];
+        let merged = merge_fetched_models(&existing, fetched);
+
+        // Exactly one `shared` row, and it's the manual one.
+        let shared: Vec<&ModelEntry> = merged.iter().filter(|m| m.id == "shared").collect();
+        assert_eq!(shared.len(), 1, "manual entry must dedupe the fetched dup");
+        assert!(shared[0].manual);
+        // The non-colliding fetched entry is still added.
+        assert!(merged.iter().any(|m| m.id == "other" && !m.manual));
     }
 }

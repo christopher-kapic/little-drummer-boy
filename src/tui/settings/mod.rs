@@ -486,6 +486,7 @@ impl SettingsDialog {
             Page::Providers(ProvidersPage::Add(s)) => s.fetch.clone(),
             Page::Providers(ProvidersPage::Edit(s)) => s.fetch.clone(),
             Page::Providers(ProvidersPage::Headers { parent, .. }) => parent.fetch.clone(),
+            Page::Providers(ProvidersPage::Models { parent, .. }) => parent.fetch.clone(),
             _ => None,
         };
         if let Some(handle) = pending
@@ -506,12 +507,14 @@ impl SettingsDialog {
         self.advance_codex_login();
     }
 
-    /// True while a header add/edit popup or its browsing list is on
-    /// screen — the header editor owns `Tab`/`Shift+Tab` itself, so the
-    /// field-nav rewrite in [`Self::handle_key`] must leave them alone.
+    /// True while a header or model add/edit popup or its browsing list
+    /// is on screen — those editors own `Tab`/`Shift+Tab` themselves (the
+    /// popup switches between fields; the browse list treats Tab as ↓), so
+    /// the field-nav rewrite in [`Self::handle_key`] must leave them alone.
     fn in_header_editor(&self) -> bool {
         match &self.page {
             Page::Providers(ProvidersPage::Headers { .. }) => true,
+            Page::Providers(ProvidersPage::Models { .. }) => true,
             Page::Providers(ProvidersPage::Add(s)) => matches!(s.step, AddStep::EditHeaders),
             _ => false,
         }
@@ -667,6 +670,9 @@ impl SettingsDialog {
             Page::Providers(ProvidersPage::Headers { parent, .. }) => {
                 format!(" › Providers › {} › Headers", parent.provider_id)
             }
+            Page::Providers(ProvidersPage::Models { parent, .. }) => {
+                format!(" › Providers › {} › Models", parent.provider_id)
+            }
             Page::Providers(ProvidersPage::FetchAll(_)) => " › Providers › refetch all".into(),
             Page::Providers(ProvidersPage::CopilotSetup(_)) => {
                 " › Providers › Copilot setup".into()
@@ -745,6 +751,13 @@ impl SettingsDialog {
                     "type to edit  Tab: switch field  enter: save  esc: cancel"
                 } else {
                     "↑/↓  a: add  enter: edit  d: delete  h: back"
+                }
+            }
+            Page::Providers(ProvidersPage::Models { editor, .. }) => {
+                if editor.is_editing() {
+                    "type to edit  Tab: switch field  enter: save  esc: cancel"
+                } else {
+                    "↑/↓  a: add manual  enter: edit manual  d: delete  h: back"
                 }
             }
             Page::Providers(ProvidersPage::FetchAll(s)) => {
@@ -996,7 +1009,9 @@ pub fn fetch_all_unlisted_dialog(
             && let Some(entry) = config.providers.get(pid)
         {
             for m in &entry.models {
-                if !remote.iter().any(|r| r.id == m.id) {
+                // Manual entries are intentionally absent from upstream —
+                // they're retained by the merge, not "drifted out".
+                if !m.manual && !remote.iter().any(|r| r.id == m.id) {
                     unlisted.push((pid.clone(), m.id.clone()));
                 }
             }
@@ -1028,6 +1043,7 @@ mod tests {
                     inputs: None,
                     context_length: None,
                     favorite: false,
+                    manual: false,
                     cache: None,
                     shrink: None,
                     extra: Default::default(),
@@ -1090,6 +1106,7 @@ mod tests {
                 inputs: None,
                 context_length: None,
                 favorite: false,
+                manual: false,
                 cache: None,
                 shrink: None,
                 extra: Default::default(),
@@ -1101,6 +1118,7 @@ mod tests {
                 inputs: None,
                 context_length: None,
                 favorite: false,
+                manual: false,
                 cache: None,
                 shrink: None,
                 extra: Default::default(),
@@ -1818,6 +1836,111 @@ mod tests {
                 assert_eq!(row.value, "v");
             }
             other => panic!("expected Headers sub-page, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn enter_on_models_row_navigates_to_models_subpage() {
+        // Provider Edit page → cursor on row 2 (Models) → Enter lands on
+        // the dedicated Models sub-page.
+        let tmp = TempDir::new().unwrap();
+        let mut d = dialog_with_one_provider(&tmp);
+        d.handle_key(press(KeyCode::Down)); // skip the refetch-all button
+        d.handle_key(press(KeyCode::Enter)); // List → Edit(vendor)
+        d.handle_key(press(KeyCode::Char('j'))); // → row 1 (Headers)
+        d.handle_key(press(KeyCode::Char('j'))); // → row 2 (Models)
+        d.handle_key(press(KeyCode::Enter));
+        match &d.page {
+            Page::Providers(ProvidersPage::Models { parent, .. }) => {
+                assert_eq!(parent.provider_id, "vendor");
+            }
+            other => panic!("expected Models sub-page, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn add_manual_model_then_back_lands_on_edit_with_manual_entry() {
+        let tmp = TempDir::new().unwrap();
+        let mut d = dialog_with_one_provider(&tmp);
+        d.handle_key(press(KeyCode::Down));
+        d.handle_key(press(KeyCode::Enter)); // → Edit
+        d.handle_key(press(KeyCode::Char('j'))); // → Headers
+        d.handle_key(press(KeyCode::Char('j'))); // → Models
+        d.handle_key(press(KeyCode::Enter)); // → Models sub-page
+        // Add a manual entry: `a` opens the popup focused on the id field.
+        d.handle_key(press(KeyCode::Char('a')));
+        for ch in "gpt-x".chars() {
+            d.handle_key(press(KeyCode::Char(ch)));
+        }
+        d.handle_key(press(KeyCode::Enter)); // commit
+        // Back to Edit.
+        d.handle_key(press(KeyCode::Char('h')));
+        match &d.page {
+            Page::Providers(ProvidersPage::Edit(s)) => {
+                assert_eq!(s.cursor, 2, "cursor returns to the Models row");
+                assert_eq!(s.entry.models.len(), 1);
+                assert_eq!(s.entry.models[0].id, "gpt-x");
+                assert!(s.entry.models[0].manual, "added entry is flagged manual");
+            }
+            other => panic!("expected Edit after back, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn add_model_empty_id_is_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let mut d = dialog_with_one_provider(&tmp);
+        d.handle_key(press(KeyCode::Down));
+        d.handle_key(press(KeyCode::Enter)); // → Edit
+        d.handle_key(press(KeyCode::Char('j'))); // → Headers
+        d.handle_key(press(KeyCode::Char('j'))); // → Models
+        d.handle_key(press(KeyCode::Enter)); // → Models sub-page
+        d.handle_key(press(KeyCode::Char('a'))); // open popup
+        d.handle_key(press(KeyCode::Enter)); // commit with empty id
+        match &d.page {
+            Page::Providers(ProvidersPage::Models { editor, .. }) => {
+                assert!(editor.is_editing(), "popup stays open on empty id");
+                assert!(editor.rows().is_empty(), "no row added");
+                assert!(editor.status.as_deref().unwrap_or("").contains("empty"));
+            }
+            other => panic!("expected Models sub-page, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn add_model_duplicate_id_is_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let mut d = dialog_with_one_provider(&tmp);
+        d.handle_key(press(KeyCode::Down));
+        d.handle_key(press(KeyCode::Enter)); // → Edit
+        d.handle_key(press(KeyCode::Char('j'))); // → Headers
+        d.handle_key(press(KeyCode::Char('j'))); // → Models
+        d.handle_key(press(KeyCode::Enter)); // → Models sub-page
+        // Add `dup` once.
+        d.handle_key(press(KeyCode::Char('a')));
+        for ch in "dup".chars() {
+            d.handle_key(press(KeyCode::Char(ch)));
+        }
+        d.handle_key(press(KeyCode::Enter));
+        // Try to add `dup` again.
+        d.handle_key(press(KeyCode::Char('a')));
+        for ch in "dup".chars() {
+            d.handle_key(press(KeyCode::Char(ch)));
+        }
+        d.handle_key(press(KeyCode::Enter));
+        match &d.page {
+            Page::Providers(ProvidersPage::Models { editor, .. }) => {
+                assert!(editor.is_editing(), "popup stays open on duplicate id");
+                assert_eq!(editor.rows().len(), 1, "no duplicate row added");
+                assert!(
+                    editor
+                        .status
+                        .as_deref()
+                        .unwrap_or("")
+                        .contains("already exists")
+                );
+            }
+            other => panic!("expected Models sub-page, got {other:?}"),
         }
     }
 
