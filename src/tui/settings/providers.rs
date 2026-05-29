@@ -397,6 +397,46 @@ pub(super) struct FetchAllState {
     pub(super) unlisted: Vec<(String, String)>,
 }
 
+impl FetchAllState {
+    /// Kick off one background `/models` fetch per configured provider,
+    /// reusing the same [`FetchHandle`] machinery the Add/Edit pages use.
+    /// Providers whose request can't even be resolved (missing
+    /// env/credentials) land directly in `finished` as an error so one
+    /// bad provider never blocks the rest — `tick` drains the live
+    /// handles as they complete.
+    pub(super) fn spawn(providers: &crate::config::providers::ProvidersConfig) -> Self {
+        let mut ids: Vec<String> = providers.providers.keys().cloned().collect();
+        ids.sort();
+        let mut in_flight = Vec::new();
+        let mut finished = Vec::new();
+        for id in &ids {
+            let Some(entry) = providers.providers.get(id) else {
+                continue;
+            };
+            match models_fetch::resolve_provider_request(id, entry) {
+                Err(e) => finished.push(FetchedSummary {
+                    provider_id: id.clone(),
+                    outcome: Err(e.to_string()),
+                }),
+                Ok(_) => in_flight.push(FetchHandle::spawn(id.clone(), entry.clone())),
+            }
+        }
+        Self {
+            providers: ids,
+            in_flight,
+            finished,
+            cursor: 0,
+            dont_ask_again: false,
+            unlisted: Vec::new(),
+        }
+    }
+
+    /// True while at least one per-provider fetch is still running.
+    pub(super) fn is_fetching(&self) -> bool {
+        !self.in_flight.is_empty()
+    }
+}
+
 pub(super) struct FetchedSummary {
     pub(super) provider_id: String,
     pub(super) outcome: Result<FetchOutcome, String>,
@@ -539,6 +579,71 @@ impl SettingsDialog {
         }
     }
 
+    /// Poll the in-flight handles of an active all-providers refetch.
+    /// Each finished handle is removed from `in_flight`, its models are
+    /// persisted into config (mirroring [`Self::apply_fetch_result`]'s
+    /// `Models` arm), and its outcome is recorded in `finished`. When
+    /// `in_flight` empties, the aggregated unlisted-models set is built
+    /// so [`Self::render_fetch_all`] can show the Keep/Remove prompt.
+    /// A per-provider failure is just an `Err` summary — it never aborts
+    /// the others.
+    pub(super) fn drain_fetch_all(&mut self) {
+        let Page::Providers(ProvidersPage::FetchAll(s)) = &mut self.page else {
+            return;
+        };
+        if s.in_flight.is_empty() {
+            return;
+        }
+
+        // Collect the results of any handles that have completed, leaving
+        // the still-running ones in place.
+        let mut newly_done: Vec<FetchedSummary> = Vec::new();
+        s.in_flight.retain(|handle| match handle.take() {
+            Some(outcome) => {
+                newly_done.push(FetchedSummary {
+                    provider_id: handle.provider_id.clone(),
+                    outcome,
+                });
+                false
+            }
+            None => true,
+        });
+        if newly_done.is_empty() {
+            return;
+        }
+
+        // Persist successful fetches into config exactly as the
+        // single-provider path does, then record every outcome.
+        for summary in &newly_done {
+            if let Ok(FetchOutcome::Models(models)) = &summary.outcome
+                && let Some(entry) = self.config.providers.get_mut(&summary.provider_id)
+            {
+                entry.models = models.clone();
+                entry.models_fetched_at = Some(Utc::now());
+            }
+        }
+        let _ = self.save_config();
+
+        let all_done = {
+            let Page::Providers(ProvidersPage::FetchAll(s)) = &mut self.page else {
+                return;
+            };
+            s.finished.extend(newly_done);
+            s.in_flight.is_empty()
+        };
+
+        // Once every provider has reported, aggregate the set of
+        // configured-but-unlisted models for the Keep/Remove prompt.
+        // Done as a free function so it doesn't hold `self.page` and
+        // `self.config` borrowed at once.
+        if all_done {
+            let unlisted = compute_unlisted(self);
+            if let Page::Providers(ProvidersPage::FetchAll(s)) = &mut self.page {
+                s.unlisted = unlisted;
+            }
+        }
+    }
+
     pub(super) fn handle_providers_key(&mut self, key: KeyEvent) -> bool {
         // Detach the providers page so its `&mut SubState` doesn't alias
         // `&mut self`. Inner handlers communicate navigation via the
@@ -573,7 +678,11 @@ impl SettingsDialog {
                 status,
                 delete_pending,
             } => {
+                // Row 0 is the synthetic `[refetch all models]` button;
+                // provider rows are offset by one (1..=ids.len()).
                 let ids: Vec<String> = self.config.providers.keys().cloned().collect();
+                let row_count = ids.len() + 1;
+                let provider_idx = cursor.checked_sub(1);
                 let pressed_d = matches!(key.code, KeyCode::Char('d'));
                 match key.code {
                     KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') | KeyCode::Backspace => {
@@ -583,16 +692,25 @@ impl SettingsDialog {
                     }
                     KeyCode::Char('q') => return Nav::Close,
                     KeyCode::Up | KeyCode::Char('k') => {
-                        *cursor = crate::tui::nav::wrap_prev(*cursor, ids.len());
+                        *cursor = crate::tui::nav::wrap_prev(*cursor, row_count);
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
-                        *cursor = crate::tui::nav::wrap_next(*cursor, ids.len());
+                        *cursor = crate::tui::nav::wrap_next(*cursor, row_count);
                     }
                     KeyCode::Char('a') => {
                         return Nav::Replace(Page::Providers(ProvidersPage::Add(AddState::new())));
                     }
+                    // `R` triggers the all-providers refetch from anywhere
+                    // on the list; Enter on the button row does the same.
+                    KeyCode::Char('R') => {
+                        return self.start_fetch_all();
+                    }
                     KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
-                        if let Some(id) = ids.get(*cursor).cloned()
+                        if *cursor == 0 {
+                            return self.start_fetch_all();
+                        }
+                        if let Some(idx) = provider_idx
+                            && let Some(id) = ids.get(idx).cloned()
                             && let Some(entry) = self.config.providers.get(&id)
                         {
                             return Nav::Replace(Page::Providers(ProvidersPage::Edit(
@@ -602,19 +720,21 @@ impl SettingsDialog {
                     }
                     KeyCode::Char('d') => {
                         // Only arm/confirm when the cursor is on a
-                        // provider row (not the synthetic Copilot button).
-                        let on_provider_row = *cursor < ids.len();
+                        // provider row (not the refetch-all button).
+                        let on_provider_row = provider_idx.is_some_and(|i| i < ids.len());
                         if !on_provider_row {
                             // Drop through to the post-match cleanup.
                         } else if *delete_pending {
-                            let id = ids[*cursor].clone();
+                            let id = ids[provider_idx.unwrap()].clone();
                             self.config.providers.remove(&id);
                             let msg = match self.save_config() {
                                 Ok(()) => format!("deleted `{id}`"),
                                 Err(e) => format!("delete failed: {e}"),
                             };
                             let new_len = self.config.providers.len();
-                            let new_cursor = (*cursor).min(new_len.saturating_sub(1));
+                            // Keep the cursor on a valid provider row (or
+                            // the button if none remain).
+                            let new_cursor = (*cursor).min(new_len);
                             return Nav::Replace(Page::Providers(ProvidersPage::List {
                                 cursor: new_cursor,
                                 status: Some(msg),
@@ -622,7 +742,10 @@ impl SettingsDialog {
                             }));
                         } else {
                             *delete_pending = true;
-                            *status = Some(format!("press d again to delete `{}`", ids[*cursor]));
+                            *status = Some(format!(
+                                "press d again to delete `{}`",
+                                ids[provider_idx.unwrap()]
+                            ));
                             return Nav::Stay;
                         }
                     }
@@ -1115,12 +1238,55 @@ impl SettingsDialog {
         }
     }
 
+    /// Enter the all-providers refetch flow, reusing the existing
+    /// [`FetchAll`](ProvidersPage::FetchAll) page and its per-provider
+    /// [`FetchHandle`] machinery. No-op (with a status) when no providers
+    /// are configured; never stacks a second concurrent run because the
+    /// only entry point is the List page and entering replaces it.
+    fn start_fetch_all(&mut self) -> Nav {
+        if self.config.providers.is_empty() {
+            return Nav::Replace(Page::Providers(ProvidersPage::List {
+                cursor: 0,
+                status: Some("no providers configured".into()),
+                delete_pending: false,
+            }));
+        }
+        let state = FetchAllState::spawn(&self.config);
+        Nav::Replace(Page::Providers(ProvidersPage::FetchAll(state)))
+    }
+
     fn handle_fetch_all_key(&mut self, key: KeyEvent, s: &mut FetchAllState) -> Nav {
+        // While the per-provider fetches are still running, the only
+        // accepted key is Esc (cancel + return). The prompt rows aren't
+        // live yet — `tick`/`drain_fetch_all` populates them once every
+        // handle has reported.
+        if s.is_fetching() {
+            if matches!(key.code, KeyCode::Esc) {
+                return Nav::Replace(Page::Providers(ProvidersPage::List {
+                    cursor: 0,
+                    status: Some("refetch-all cancelled".into()),
+                    delete_pending: false,
+                }));
+            }
+            return Nav::Stay;
+        }
+
+        // If the fetch finished but no model drifted out of the upstream
+        // list, there's nothing to rule on — any key returns to the list
+        // with a per-provider summary.
+        if s.unlisted.is_empty() {
+            return Nav::Replace(Page::Providers(ProvidersPage::List {
+                cursor: 0,
+                status: Some(fetch_all_summary(s)),
+                delete_pending: false,
+            }));
+        }
+
         match key.code {
             KeyCode::Esc => {
                 return Nav::Replace(Page::Providers(ProvidersPage::List {
                     cursor: 0,
-                    status: Some("/fetch-models cancelled".into()),
+                    status: Some("refetch-all cancelled".into()),
                     delete_pending: false,
                 }));
             }
@@ -1163,10 +1329,11 @@ impl SettingsDialog {
                 if s.dont_ask_again {
                     self.config.on_unlisted_models_fetch = Some(pick);
                 }
+                let summary = fetch_all_summary(s);
                 let _ = self.save_config();
                 return Nav::Replace(Page::Providers(ProvidersPage::List {
                     cursor: 0,
-                    status: Some("/fetch-models applied".into()),
+                    status: Some(summary),
                     delete_pending: false,
                 }));
             }
@@ -1274,6 +1441,23 @@ impl SettingsDialog {
         let red = Style::default().fg(Color::Red);
         let mut lines: Vec<Line<'static>> = Vec::new();
         let ids: Vec<&String> = self.config.providers.keys().collect();
+
+        // Row 0: the `[refetch all models]` button. Provider rows follow
+        // at cursor indices 1..=ids.len().
+        let button_selected = cursor == 0;
+        let button_style = if button_selected {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            muted
+        };
+        lines.push(Line::from(vec![
+            Span::raw(if button_selected { "▸ " } else { "  " }),
+            Span::styled("[refetch all models]".to_string(), button_style),
+        ]));
+        lines.push(Line::default());
+
         if ids.is_empty() {
             lines.push(Line::from(Span::styled(
                 "  (no providers configured)".to_string(),
@@ -1282,17 +1466,18 @@ impl SettingsDialog {
         } else {
             let id_w = ids.iter().map(|s| s.chars().count()).max().unwrap_or(0);
             for (i, id) in ids.iter().enumerate() {
+                let row = i + 1;
                 let entry = self.config.providers.get(*id).unwrap();
-                let marker = if i == cursor { "▸ " } else { "  " };
+                let marker = if row == cursor { "▸ " } else { "  " };
                 let label = format!("{:<width$}", id, width = id_w);
                 let star = if entry.favorite.unwrap_or(false) {
                     " ★"
                 } else {
                     "  "
                 };
-                let style = if i == cursor && delete_pending {
+                let style = if row == cursor && delete_pending {
                     red.add_modifier(Modifier::BOLD)
-                } else if i == cursor {
+                } else if row == cursor {
                     Style::default()
                         .fg(Color::Yellow)
                         .add_modifier(Modifier::BOLD)
@@ -1679,7 +1864,45 @@ impl SettingsDialog {
     fn render_fetch_all(&self, frame: &mut Frame, area: Rect, s: &FetchAllState) {
         let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
         let yellow = Style::default().fg(Color::Yellow);
+        let green = Style::default().fg(Color::Green);
+        let red = Style::default().fg(Color::Red);
         let mut lines: Vec<Line<'static>> = Vec::new();
+
+        // Progress view while fetches are in flight, plus the running
+        // per-provider results so the user sees outcomes land one by one.
+        if s.is_fetching() {
+            let done = s.finished.len();
+            let total = done + s.in_flight.len();
+            lines.push(Line::from(Span::styled(
+                format!("Refetching /models for all providers… ({done}/{total})"),
+                Style::default().add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::default());
+            render_fetch_all_results(&mut lines, s, muted, green, red);
+            lines.push(Line::default());
+            lines.push(Line::from(Span::styled("esc: cancel".to_string(), muted)));
+            frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+            return;
+        }
+
+        // Fetch complete with no drifted models: show the per-provider
+        // summary and wait for a keypress to return.
+        if s.unlisted.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "Refetch complete.".to_string(),
+                Style::default().add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::default());
+            render_fetch_all_results(&mut lines, s, muted, green, red);
+            lines.push(Line::default());
+            lines.push(Line::from(Span::styled(
+                "Press any key to return.".to_string(),
+                muted,
+            )));
+            frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+            return;
+        }
+
         lines.push(Line::from(Span::styled(
             "Some configured models are not in the upstream /models list:".to_string(),
             Style::default().add_modifier(Modifier::BOLD),
@@ -2028,6 +2251,82 @@ fn render_field_row(lines: &mut Vec<Line<'static>>, label: &str, field: &TextFie
             Span::raw("")
         },
     ]));
+}
+
+/// Render the per-provider outcome rows of an all-providers refetch:
+/// `✓ provider — N model(s)`, `· provider — no /models endpoint`, or
+/// `✗ provider — <error>`. Shared by the in-flight and completed views.
+fn render_fetch_all_results(
+    lines: &mut Vec<Line<'static>>,
+    s: &FetchAllState,
+    muted: Style,
+    green: Style,
+    red: Style,
+) {
+    for f in &s.finished {
+        let (glyph, text, style) = match &f.outcome {
+            Ok(FetchOutcome::Models(models)) => (
+                "✓",
+                format!("{} — {} model(s)", f.provider_id, models.len()),
+                green,
+            ),
+            Ok(FetchOutcome::Unsupported) => (
+                "·",
+                format!("{} — no /models endpoint (skipped)", f.provider_id),
+                muted,
+            ),
+            Err(e) => ("✗", format!("{} — {e}", f.provider_id), red),
+        };
+        lines.push(Line::from(vec![
+            Span::raw(format!("  {glyph} ")),
+            Span::styled(text, style),
+        ]));
+    }
+}
+
+/// One-line per-provider summary of a finished all-providers refetch:
+/// how many succeeded, how many failed, and (when any did) the first
+/// failing provider so the user has a thread to pull on.
+fn fetch_all_summary(s: &FetchAllState) -> String {
+    let total = s.finished.len();
+    let failed: Vec<&FetchedSummary> = s.finished.iter().filter(|f| f.outcome.is_err()).collect();
+    let ok = total - failed.len();
+    if failed.is_empty() {
+        format!("refetched /models for {ok}/{total} provider(s)")
+    } else {
+        let first = &failed[0];
+        let reason = match &first.outcome {
+            Err(e) => e.as_str(),
+            Ok(_) => "",
+        };
+        format!(
+            "refetched {ok}/{total} provider(s); {} failed (e.g. `{}`: {reason})",
+            failed.len(),
+            first.provider_id,
+        )
+    }
+}
+
+/// Build the (provider_id, model_id) set of configured models that are
+/// absent from the freshly-fetched upstream list, across every provider
+/// that reported a successful `Models` outcome in the active FetchAll.
+fn compute_unlisted(dialog: &SettingsDialog) -> Vec<(String, String)> {
+    let Page::Providers(ProvidersPage::FetchAll(s)) = &dialog.page else {
+        return Vec::new();
+    };
+    let mut unlisted: Vec<(String, String)> = Vec::new();
+    for summary in &s.finished {
+        if let Ok(FetchOutcome::Models(remote)) = &summary.outcome
+            && let Some(entry) = dialog.config.providers.get(&summary.provider_id)
+        {
+            for m in &entry.models {
+                if !remote.iter().any(|r| r.id == m.id) {
+                    unlisted.push((summary.provider_id.clone(), m.id.clone()));
+                }
+            }
+        }
+    }
+    unlisted
 }
 
 pub(super) fn valid_url(s: &str) -> bool {

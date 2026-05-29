@@ -484,6 +484,13 @@ impl SettingsDialog {
             self.apply_fetch_result(&handle.provider_id, result);
         }
 
+        // Drain the all-providers refetch: move any handle that has
+        // finished out of `in_flight`, persist its models into config,
+        // and record its outcome for the per-provider summary. When the
+        // last one lands, compute the aggregated unlisted-models set so
+        // the Keep/Remove prompt can render.
+        self.drain_fetch_all();
+
         // Advance the codex device-flow when the background task
         // signals Success — write the ProviderEntry and move to Done.
         self.advance_codex_login();
@@ -650,7 +657,7 @@ impl SettingsDialog {
             Page::Providers(ProvidersPage::Headers { parent, .. }) => {
                 format!(" › Providers › {} › Headers", parent.provider_id)
             }
-            Page::Providers(ProvidersPage::FetchAll(_)) => " › Providers › /fetch-models".into(),
+            Page::Providers(ProvidersPage::FetchAll(_)) => " › Providers › refetch all".into(),
             Page::Providers(ProvidersPage::CopilotSetup(_)) => {
                 " › Providers › Copilot setup".into()
             }
@@ -697,7 +704,7 @@ impl SettingsDialog {
                 }
             }
             Page::Providers(ProvidersPage::List { .. }) => {
-                "↑/↓  enter: edit  a: add  d: delete (×2 to confirm)  h: back  esc: close"
+                "↑/↓  enter: edit/refetch-all  R: refetch all  a: add  d: delete (×2)  h: back  esc: close"
             }
             Page::Providers(ProvidersPage::Add(s)) => match s.step {
                 AddStep::PickTemplate { .. } => "↑/↓  enter: choose  esc: cancel",
@@ -730,8 +737,14 @@ impl SettingsDialog {
                     "↑/↓  a: add  enter: edit  d: delete  h: back"
                 }
             }
-            Page::Providers(ProvidersPage::FetchAll(_)) => {
-                "↑/↓  space: toggle don't-ask  enter: apply  esc: cancel"
+            Page::Providers(ProvidersPage::FetchAll(s)) => {
+                if s.is_fetching() {
+                    "fetching all providers…  esc: cancel"
+                } else if s.unlisted.is_empty() {
+                    "press any key to return"
+                } else {
+                    "↑/↓  space: toggle don't-ask  enter: apply  esc: cancel"
+                }
             }
             Page::Providers(ProvidersPage::CopilotSetup(_)) => "enter: apply  esc: cancel",
         }
@@ -991,7 +1004,7 @@ pub fn fetch_all_unlisted_dialog(
 mod tests {
     use super::*;
     use crate::config::providers::{ModelEntry, ProviderEntry};
-    use providers::valid_url;
+    use providers::{FetchAllState, valid_url};
 
     fn entry(id_models: &[&str]) -> ProviderEntry {
         ProviderEntry {
@@ -1188,6 +1201,9 @@ mod tests {
     fn pressing_d_once_arms_delete_and_keeps_provider() {
         let tmp = TempDir::new().unwrap();
         let mut d = dialog_with_one_provider(&tmp);
+        // Row 0 is the `[refetch all models]` button; move down onto the
+        // provider row before arming the delete.
+        d.handle_key(press(KeyCode::Down));
         d.handle_key(press(KeyCode::Char('d')));
         assert!(
             d.config.providers.contains_key("vendor"),
@@ -1213,6 +1229,8 @@ mod tests {
     fn pressing_d_twice_deletes_the_provider() {
         let tmp = TempDir::new().unwrap();
         let mut d = dialog_with_one_provider(&tmp);
+        // Move past the refetch-all button onto the provider row first.
+        d.handle_key(press(KeyCode::Down));
         d.handle_key(press(KeyCode::Char('d')));
         d.handle_key(press(KeyCode::Char('d')));
         assert!(
@@ -1232,14 +1250,103 @@ mod tests {
         // delete so the second press doesn't nuke a different row.
         let tmp = TempDir::new().unwrap();
         let mut d = dialog_with_one_provider(&tmp);
-        d.handle_key(press(KeyCode::Char('d')));
+        // Onto the provider row, arm the delete, then move — the move
+        // must disarm it.
         d.handle_key(press(KeyCode::Down));
+        d.handle_key(press(KeyCode::Char('d')));
+        d.handle_key(press(KeyCode::Up));
         match &d.page {
             Page::Providers(ProvidersPage::List { delete_pending, .. }) => {
                 assert!(!*delete_pending, "arrow key should clear pending-delete");
             }
             other => panic!("expected List, got {other:?}"),
         }
+    }
+
+    fn on_fetch_all_page(d: &SettingsDialog) -> bool {
+        matches!(&d.page, Page::Providers(ProvidersPage::FetchAll(_)))
+    }
+
+    #[tokio::test]
+    async fn refetch_all_button_enters_fetch_all_with_providers() {
+        // Row 0 is the `[refetch all models]` button. Enter on it (with
+        // providers configured) spawns the per-provider FetchHandle flow
+        // and lands on the FetchAll page.
+        let tmp = TempDir::new().unwrap();
+        let mut d = dialog_with_one_provider(&tmp);
+        // Cursor starts on the button row (0).
+        d.handle_key(press(KeyCode::Enter));
+        assert!(
+            on_fetch_all_page(&d),
+            "Enter on the refetch-all button should enter FetchAll, got {:?}",
+            d.page
+        );
+        if let Page::Providers(ProvidersPage::FetchAll(s)) = &d.page {
+            assert_eq!(
+                s.in_flight.len() + s.finished.len(),
+                1,
+                "exactly one provider should be accounted for"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn refetch_all_via_capital_r_enters_fetch_all() {
+        // `R` triggers the same flow from any row on the list.
+        let tmp = TempDir::new().unwrap();
+        let mut d = dialog_with_one_provider(&tmp);
+        d.handle_key(press(KeyCode::Char('R')));
+        assert!(
+            on_fetch_all_page(&d),
+            "`R` on the list should enter FetchAll, got {:?}",
+            d.page
+        );
+    }
+
+    #[test]
+    fn refetch_all_with_no_providers_is_a_noop_with_status() {
+        // No providers: the button is reachable but activating it must
+        // not error or navigate — just set a status on the List page.
+        let tmp = TempDir::new().unwrap();
+        let mut d = fresh_dialog(&tmp);
+        d.enter_providers();
+        assert!(d.config.providers.is_empty());
+        d.handle_key(press(KeyCode::Enter));
+        match &d.page {
+            Page::Providers(ProvidersPage::List { status, .. }) => {
+                assert_eq!(
+                    status.as_deref(),
+                    Some("no providers configured"),
+                    "expected the no-op status, got {status:?}"
+                );
+            }
+            other => panic!("expected to stay on List, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_all_in_flight_ignores_keys_except_esc() {
+        // While the per-provider fetches are running, a stray Enter must
+        // not navigate away (which is how a second concurrent all-fetch
+        // would otherwise be stacked). Only Esc cancels.
+        let tmp = TempDir::new().unwrap();
+        let mut d = dialog_with_one_provider(&tmp);
+        // Force a state with a live in-flight handle, independent of how
+        // fast the spawned task completes (we never tick, so in_flight
+        // stays populated).
+        let state = ProvidersPage::FetchAll(FetchAllState::spawn(&d.config));
+        d.page = Page::Providers(state);
+        if let Page::Providers(ProvidersPage::FetchAll(s)) = &d.page {
+            assert!(s.is_fetching(), "expected an in-flight fetch");
+        }
+        // A non-Esc key is ignored — we stay on FetchAll.
+        let closed = d.handle_key(press(KeyCode::Enter));
+        assert!(!closed);
+        assert!(
+            on_fetch_all_page(&d),
+            "Enter during an in-flight fetch must not navigate, got {:?}",
+            d.page
+        );
     }
 
     #[test]
@@ -1605,6 +1712,7 @@ mod tests {
         // overlay on the Edit page.
         let tmp = TempDir::new().unwrap();
         let mut d = dialog_with_one_provider(&tmp);
+        d.handle_key(press(KeyCode::Down)); // skip the refetch-all button
         d.handle_key(press(KeyCode::Enter)); // List → Edit(vendor)
         match &d.page {
             Page::Providers(ProvidersPage::Edit(_)) => {}
@@ -1625,6 +1733,7 @@ mod tests {
     fn back_from_headers_returns_to_edit_with_updated_headers() {
         let tmp = TempDir::new().unwrap();
         let mut d = dialog_with_one_provider(&tmp);
+        d.handle_key(press(KeyCode::Down)); // skip the refetch-all button
         d.handle_key(press(KeyCode::Enter)); // → Edit
         d.handle_key(press(KeyCode::Char('j'))); // cursor → row 1 (Headers)
         d.handle_key(press(KeyCode::Enter)); // → Headers sub-page
@@ -1657,6 +1766,7 @@ mod tests {
         // row behind — the row is only committed on Enter.
         let tmp = TempDir::new().unwrap();
         let mut d = dialog_with_one_provider(&tmp);
+        d.handle_key(press(KeyCode::Down)); // skip the refetch-all button
         d.handle_key(press(KeyCode::Enter)); // → Edit
         d.handle_key(press(KeyCode::Char('j'))); // cursor → Headers row
         d.handle_key(press(KeyCode::Enter)); // → Headers sub-page
@@ -1682,6 +1792,7 @@ mod tests {
         // so subsequent keystrokes land in the value field.
         let tmp = TempDir::new().unwrap();
         let mut d = dialog_with_one_provider(&tmp);
+        d.handle_key(press(KeyCode::Down)); // skip the refetch-all button
         d.handle_key(press(KeyCode::Enter)); // → Edit
         d.handle_key(press(KeyCode::Char('j'))); // cursor → Headers row
         d.handle_key(press(KeyCode::Enter)); // → Headers sub-page
@@ -1706,6 +1817,7 @@ mod tests {
         // (now-removed) inline header editor.
         let tmp = TempDir::new().unwrap();
         let mut d = dialog_with_one_provider(&tmp);
+        d.handle_key(press(KeyCode::Down)); // skip the refetch-all button
         d.handle_key(press(KeyCode::Enter)); // → Edit
         d.handle_key(press(KeyCode::Char('h')));
         match &d.page {
