@@ -168,6 +168,10 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "Keep the machine awake so agents survive a closed lid (arg: on/off/until-idle)",
     },
     SlashCommand {
+        name: "clear",
+        description: "Clear the chat and start a fresh session (alias of /new)",
+    },
+    SlashCommand {
         name: "compact",
         description: "Compress the conversation to save context",
     },
@@ -3207,7 +3211,7 @@ impl App {
                 }
                 return false;
             }
-            "new" => {
+            "new" | "clear" => {
                 self.pending_new_session = true;
                 return false;
             }
@@ -3972,6 +3976,20 @@ mod slash_rank_tests {
         assert!(
             SLASH_COMMANDS.iter().any(|c| c.name == "sandbox"),
             "/sandbox must be a registered slash command"
+        );
+    }
+
+    #[test]
+    fn new_and_clear_are_both_registered_aliases() {
+        // `/new` and `/clear` are both menu entries routing to the one
+        // fresh-session handler (`"new" | "clear"` dispatch arm).
+        assert!(
+            SLASH_COMMANDS.iter().any(|c| c.name == "new"),
+            "/new must be a registered slash command"
+        );
+        assert!(
+            SLASH_COMMANDS.iter().any(|c| c.name == "clear"),
+            "/clear must be a registered slash command"
         );
     }
 }
