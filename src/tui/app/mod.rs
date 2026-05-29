@@ -1727,6 +1727,7 @@ impl App {
                 // Fresh thread → no wire-side elisions carry over.
                 self.elided_event_ids.clear();
                 self.launch.session_id = Some(runner.session_id);
+                self.launch.session_short_id = Some(runner.short_id.clone());
                 // The compaction successor session already has a DB row
                 // (session-id-display-and-lazy-persist).
                 self.current_session_persisted = true;
@@ -1780,6 +1781,7 @@ impl App {
                 let short_id = runner.short_id.clone();
                 self.project_id = Some(runner.project_id.clone());
                 self.launch.session_id = Some(runner.session_id);
+                self.launch.session_short_id = Some(runner.short_id.clone());
                 // A resumed session already has a DB row
                 // (session-id-display-and-lazy-persist).
                 self.current_session_persisted = true;
@@ -1903,6 +1905,7 @@ impl App {
             // shows it and `/new` re-renders with the fresh one
             // (session-id-display-and-lazy-persist).
             self.launch.session_id = Some(r.session_id);
+            self.launch.session_short_id = Some(r.short_id.clone());
             // Seed the in-memory tally from the daemon's authoritative
             // counts. Additive: any optimistic increments made before
             // attach (held in the maps) stay on top of the historical

@@ -87,13 +87,14 @@ fn content_lines(info: &LaunchInfo) -> Vec<Line<'static>> {
         Span::raw(" "),
         Span::styled(format!("v{}", info.version), Style::default().fg(GREY)),
     ];
-    // Current session id, right after the version in the same grey
-    // (session-id-display-and-lazy-persist). The id is assigned by the
-    // daemon at attach, so it's absent until the TUI has connected.
-    if let Some(session_id) = info.session_id {
+    // Current session's short id, right after the version in the same grey
+    // (session-id-short-display). The short id is assigned by the daemon at
+    // attach, so it's absent until the TUI has connected; never fall back to
+    // the full UUID.
+    if let Some(short_id) = info.session_short_id.as_deref() {
         title.push(Span::raw("  "));
         title.push(Span::styled(
-            session_id.to_string(),
+            short_id.to_string(),
             Style::default().fg(GREY),
         ));
     }
@@ -148,6 +149,7 @@ mod tests {
         LaunchInfo {
             version: "9.9.9",
             session_id: None,
+            session_short_id: None,
             provider_line: "anthropic / claude".to_string(),
             active_model: None,
             active_model_is_favorite: false,
@@ -201,30 +203,29 @@ mod tests {
 
     #[test]
     fn session_id_shows_after_version_when_set() {
-        // No id set → the title line carries the version but no uuid.
+        // No short id set → the title line carries the version but no id.
         let none = build_box(&sample(true, None), 200, 50).unwrap();
         let joined_none: String = none.iter().map(joined).collect::<Vec<_>>().join("\n");
         assert!(joined_none.contains("v9.9.9"));
 
-        // Id set → it appears, right after the version, on the title row.
-        let id = uuid::Uuid::new_v4();
+        // Short id set → it appears, right after the version, on the title row.
+        let short_id = "k3m7qz";
         let mut info = sample(true, None);
-        info.session_id = Some(id);
+        info.session_short_id = Some(short_id.to_string());
         let with = build_box(&info, 200, 50).unwrap();
         let title_row = with
             .iter()
             .map(joined)
             .find(|l| l.contains("v9.9.9"))
             .expect("title row");
-        let id_str = id.to_string();
         assert!(
-            title_row.contains(&id_str),
-            "id missing from title: {title_row:?}"
+            title_row.contains(short_id),
+            "short id missing from title: {title_row:?}"
         );
-        // Ordering: version precedes the id on the same line.
+        // Ordering: version precedes the short id on the same line.
         let vpos = title_row.find("v9.9.9").unwrap();
-        let ipos = title_row.find(&id_str).unwrap();
-        assert!(vpos < ipos, "version should precede the session id");
+        let ipos = title_row.find(short_id).unwrap();
+        assert!(vpos < ipos, "version should precede the session short id");
     }
 
     #[test]
