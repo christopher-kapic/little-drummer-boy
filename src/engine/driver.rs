@@ -18,7 +18,7 @@ use tokio::sync::mpsc;
 
 use crate::engine::agent::{Agent, TurnEvent, TurnOutcome, turn};
 use crate::engine::jobs::{JobAuthority, JobCommand, JobEvent};
-use crate::engine::message::Message;
+use crate::engine::message::{Message, UserSubmission};
 use crate::engine::prune;
 use crate::redact::RedactionTable;
 use crate::session::Session;
@@ -368,7 +368,7 @@ impl Driver {
     /// behavior.
     pub async fn run_main_loop(
         &mut self,
-        mut input_rx: mpsc::Receiver<String>,
+        mut input_rx: mpsc::Receiver<UserSubmission>,
         mut control_rx: mpsc::Receiver<DriverControl>,
         tx: &mpsc::Sender<TurnEvent>,
     ) -> Result<()> {
@@ -386,13 +386,21 @@ impl Driver {
             // right here.
             tokio::select! {
                 msg = input_rx.recv() => {
-                    let Some(text) = msg else { break };
+                    let Some(first) = msg else { break };
                     // Fold anything else that's already queued behind the
                     // first message (rare but harmless).
-                    let mut batch = vec![text];
+                    let mut batch = vec![first];
                     drain_queue(&mut input_rx, &mut batch);
-                    let folded = self.redact.scrub(&fold_messages(batch));
-                    self.run_user_input(folded, &mut input_rx, tx).await?;
+                    // Fold texts (scrubbed) and collect image parts in
+                    // order. Image bytes bypass redaction — they're raw
+                    // PNG, not env-scannable text — so only the text side
+                    // goes through `scrub`.
+                    let folded = fold_submissions(batch);
+                    let submission = UserSubmission {
+                        text: self.redact.scrub(&folded.text),
+                        images: folded.images,
+                    };
+                    self.run_user_input(submission, &mut input_rx, tx).await?;
                 }
                 ctl = control_rx.recv() => {
                     match ctl {
@@ -860,14 +868,18 @@ impl Driver {
     async fn run_job_event(
         &mut self,
         event: JobEvent,
-        input_rx: &mut mpsc::Receiver<String>,
+        input_rx: &mut mpsc::Receiver<UserSubmission>,
         tx: &mpsc::Sender<TurnEvent>,
     ) -> Result<()> {
         match event {
             JobEvent::LoopIterationDue { job_id, prompt } => {
                 let framed = format!("[loop {job_id}] {prompt}");
-                self.run_user_input(self.redact.scrub(&framed), input_rx, tx)
-                    .await?;
+                self.run_user_input(
+                    UserSubmission::text(self.redact.scrub(&framed)),
+                    input_rx,
+                    tx,
+                )
+                .await?;
                 // The iteration's turn finished — advance the schedule.
                 self.jobs.iteration_finished(&job_id);
             }
@@ -914,8 +926,12 @@ impl Driver {
                         injected.push_str(&format!("\n- {}", req.summary()));
                     }
                 }
-                self.run_user_input(self.redact.scrub(&injected), input_rx, tx)
-                    .await?;
+                self.run_user_input(
+                    UserSubmission::text(self.redact.scrub(&injected)),
+                    input_rx,
+                    tx,
+                )
+                .await?;
             }
         }
         Ok(())
@@ -1020,10 +1036,17 @@ impl Driver {
     /// [`Self::run_main_loop`] for the contract.
     pub async fn run_user_input(
         &mut self,
-        user_text: String,
-        input_rx: &mut mpsc::Receiver<String>,
+        submission: UserSubmission,
+        input_rx: &mut mpsc::Receiver<UserSubmission>,
         tx: &mpsc::Sender<TurnEvent>,
     ) -> Result<()> {
+        // Pasted image parts (vision models only) ride alongside the text
+        // through every text-only step below (titling, skills, seed,
+        // time prelude) and are reattached when the prompt `Message` is
+        // built. Non-vision callers already folded images into `text` and
+        // pass none here (composer-paste-handling).
+        let images = submission.images;
+        let user_text = submission.text;
         // Install a fresh cancellation token for this run so a user ctrl+c
         // (`SessionWork::Cancel` → `CancelHandle::cancel`) can abort the
         // in-flight inference and kill any running `bash` subprocess. The
@@ -1087,7 +1110,10 @@ impl Driver {
         // main model.
         let user_text = self.maybe_inject_skill(&user_text).await;
 
-        let mut next_prompt = Message::user(self.with_time_prelude(user_text));
+        let mut next_prompt = crate::engine::message::build_user_message(UserSubmission {
+            text: self.with_time_prelude(user_text),
+            images,
+        });
 
         loop {
             // Cache-aware auto-prune (GOALS §10): before talking to the
@@ -1146,14 +1172,17 @@ impl Driver {
                     // inference. The tool result still has to be
                     // delivered, so push it back onto history and use
                     // the queued user content as the next prompt.
-                    let mut queued: Vec<String> = Vec::new();
+                    let mut queued: Vec<UserSubmission> = Vec::new();
                     drain_queue(input_rx, &mut queued);
                     if queued.is_empty() {
                         next_prompt = last_tool_result;
                     } else {
                         top.history.push(last_tool_result);
-                        let folded = self.redact.scrub(&fold_messages(queued));
-                        next_prompt = Message::user(self.with_time_prelude(folded));
+                        let folded = fold_submissions(queued);
+                        next_prompt = crate::engine::message::build_user_message(UserSubmission {
+                            text: self.with_time_prelude(self.redact.scrub(&folded.text)),
+                            images: folded.images,
+                        });
                     }
                     continue;
                 }
@@ -1211,10 +1240,14 @@ impl Driver {
                     // we wait for the next user input, check if more
                     // landed in the queue while we were busy — fold
                     // them and start a new run with the combined text.
-                    let mut queued: Vec<String> = Vec::new();
+                    let mut queued: Vec<UserSubmission> = Vec::new();
                     drain_queue(input_rx, &mut queued);
                     if !queued.is_empty() {
-                        next_prompt = Message::user(self.redact.scrub(&fold_messages(queued)));
+                        let folded = fold_submissions(queued);
+                        next_prompt = crate::engine::message::build_user_message(UserSubmission {
+                            text: self.redact.scrub(&folded.text),
+                            images: folded.images,
+                        });
                         continue;
                     }
                     return Ok(());
@@ -1440,9 +1473,9 @@ impl Driver {
     }
 }
 
-/// Drain queued user messages from the channel without blocking. Stops
-/// at the [`MAX_FOLD`] cap; anything beyond stays for a later fold.
-fn drain_queue(rx: &mut mpsc::Receiver<String>, into: &mut Vec<String>) {
+/// Drain queued user submissions from the channel without blocking.
+/// Stops at the [`MAX_FOLD`] cap; anything beyond stays for a later fold.
+fn drain_queue(rx: &mut mpsc::Receiver<UserSubmission>, into: &mut Vec<UserSubmission>) {
     while into.len() < MAX_FOLD {
         match rx.try_recv() {
             Ok(s) => into.push(s),
@@ -1451,12 +1484,23 @@ fn drain_queue(rx: &mut mpsc::Receiver<String>, into: &mut Vec<String>) {
     }
 }
 
-/// Concatenate multiple user messages into a single inference payload
-/// per GOALS §1c: blank-line separator, no special framing or
-/// numbering. The user composed them as separate thoughts; the model
-/// sees one coherent message.
-fn fold_messages(messages: Vec<String>) -> String {
-    messages.join("\n\n")
+/// Fold multiple user submissions into one inference payload per GOALS
+/// §1c: blank-line text separator, no special framing or numbering, and
+/// all image parts concatenated in order. The user composed them as
+/// separate thoughts; the model sees one coherent message. The folded
+/// `text` preserves each submission's `IMAGE_PART_SENTINEL` markers in
+/// place, so the marker order still lines up with `images`.
+fn fold_submissions(submissions: Vec<UserSubmission>) -> UserSubmission {
+    let mut texts = Vec::with_capacity(submissions.len());
+    let mut images = Vec::new();
+    for s in submissions {
+        texts.push(s.text);
+        images.extend(s.images);
+    }
+    UserSubmission {
+        text: texts.join("\n\n"),
+        images,
+    }
 }
 
 /// Estimate the wire-side token total of a message history via the

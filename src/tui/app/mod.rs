@@ -164,6 +164,10 @@ pub(super) struct PendingCompact {
 
 const SLASH_COMMANDS: &[SlashCommand] = &[
     SlashCommand {
+        name: "caffeinate",
+        description: "Keep the machine awake so agents survive a closed lid (arg: on/off/until-idle)",
+    },
+    SlashCommand {
         name: "compact",
         description: "Compress the conversation to save context",
     },
@@ -226,6 +230,10 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
     SlashCommand {
         name: "session",
         description: "Session subcommands (e.g. /session rename <title>)",
+    },
+    SlashCommand {
+        name: "sandbox",
+        description: "Toggle filesystem sandboxing (arg: on/off)",
     },
     SlashCommand {
         name: "sessions",
@@ -464,6 +472,12 @@ pub struct App {
     /// editing elsewhere in the buffer can't desync it; cleared on
     /// submit and on `/new`.
     pub(super) accepted_tags: Vec<String>,
+    /// Registry of condensed-text / image paste blocks currently in the
+    /// composer buffer (composer-paste-handling). Kept byte-range-synced
+    /// with [`Self::composer`] across every edit; consumed at submit to
+    /// inline text + emit real image parts (vision) or text notes
+    /// (non-vision). Cleared on submit and `/new`.
+    pub(super) paste_registry: crate::tui::paste::PasteRegistry,
     /// `@`-tag expansions from messages submitted while the agent was
     /// busy. Flushed into history as tool-call entries right after the
     /// folded user message appears (on the next `ThinkingStarted`), so
@@ -614,6 +628,16 @@ pub struct App {
     /// when the window has lapsed (the next press is a fresh first press).
     /// Uses `Instant` (monotonic) so a wall-clock jump can't mis-trigger.
     pub(super) ctrl_c_armed_at: Option<Instant>,
+    /// The client's `--no-sandbox` flag (sandboxing part 2). Passed to
+    /// the daemon at attach so sessions this TUI creates start with
+    /// filesystem sandboxing OFF (unless the daemon itself was launched
+    /// `--no-sandbox`, which wins). A `/sandbox` flip still overrides.
+    pub(super) no_sandbox: bool,
+    /// Daemon-broadcast caffeination state (`/caffeinate`). Drives the `☕`
+    /// chrome glyph; set/cleared from the daemon-global `CaffeinateState`
+    /// event so it stays in sync across all clients (incl. until-idle
+    /// auto-off). Not client-owned: the assertion lives in the daemon.
+    pub(super) caffeinate_active: bool,
 }
 
 /// A live async job tracked by the TUI for the jobs strip / `/jobs`.
@@ -699,7 +723,7 @@ enum CursorShape {
 
 #[allow(private_interfaces)]
 impl App {
-    pub fn new(project: Option<&Path>) -> Self {
+    pub fn new(project: Option<&Path>, no_sandbox: bool) -> Self {
         let launch = welcome::load(project);
         let tui_cfg = load_tui_config(&launch.cwd);
         let vim_setting = tui_cfg.vim_mode;
@@ -781,6 +805,7 @@ impl App {
             at_scroll: 0,
             at_cache: std::cell::RefCell::new(None),
             accepted_tags: Vec::new(),
+            paste_registry: crate::tui::paste::PasteRegistry::new(),
             queued_tag_calls: Vec::new(),
             at_dismissed: false,
             slash_selected: 0,
@@ -817,6 +842,8 @@ impl App {
             pending_git_blocks: Vec::new(),
             active_jobs: std::collections::BTreeMap::new(),
             ctrl_c_armed_at: None,
+            no_sandbox,
+            caffeinate_active: false,
         };
         // First-run convenience: if the daemon prompt doesn't gate
         // startup, open the Add-Provider wizard immediately when no
@@ -897,6 +924,14 @@ impl App {
         )
         .is_ok();
 
+        // Bracketed paste (composer-paste-handling): the terminal wraps a
+        // genuine paste in escape sequences crossterm surfaces as one
+        // `Event::Paste(String)`, distinguishing it from char-by-char
+        // typing (which keeps arriving as individual `KeyEvent`s). Without
+        // this, large pastes would stream in as a flood of key events and
+        // never trigger block behavior.
+        let _ = crossterm::execute!(stdout(), crossterm::event::EnableBracketedPaste);
+
         // Mouse capture is configurable (tui.mouse_capture, GOALS §1
         // T8.c). On: click-to-position in composer, clickable chips,
         // drag-select in chat. Off: native terminal select + copy +
@@ -921,6 +956,7 @@ impl App {
         if self.mouse_capture {
             let _ = crossterm::execute!(stdout(), DisableMouseCapture);
         }
+        let _ = crossterm::execute!(stdout(), crossterm::event::DisableBracketedPaste);
         if kbd_enhanced {
             let _ = crossterm::execute!(stdout(), PopKeyboardEnhancementFlags);
         }
@@ -1005,6 +1041,9 @@ impl App {
             if event::poll(EVENT_TICK)? {
                 match event::read()? {
                     Event::Key(key) if accepts_key(&key) && self.handle_key(key) => break,
+                    Event::Paste(data) => {
+                        self.handle_paste(data);
+                    }
                     Event::Mouse(mouse) => {
                         self.handle_mouse(mouse);
                     }
@@ -1305,6 +1344,10 @@ impl App {
                     // write one even when the user didn't add one.
                     let text = text.strip_suffix('\n').unwrap_or(&text).to_string();
                     self.composer.set(text);
+                    // The editor returns plain text; any prior paste
+                    // blocks were flattened to their placeholder text when
+                    // we wrote the temp file, so drop the registry.
+                    self.paste_registry.clear();
                 }
                 Err(e) => {
                     self.history.push(HistoryEntry::Plain {
@@ -1629,8 +1672,13 @@ impl App {
             return false;
         };
         self.composer.clear();
+        self.paste_registry.clear();
         // Switch the runner onto the fresh session.
-        match agent_runner::attach_to_session(&self.launch.cwd, pending.new_session_id) {
+        match agent_runner::attach_to_session(
+            &self.launch.cwd,
+            pending.new_session_id,
+            self.no_sandbox,
+        ) {
             Ok(runner) => {
                 // Fresh thread: clear the transcript view + queue + pending.
                 self.history.clear();
@@ -1663,7 +1711,9 @@ impl App {
                 });
                 self.begin_working_span();
                 if let Some(Ok(runner)) = self.agent_runner.as_ref() {
-                    let _ = runner.input_tx.try_send(handoff);
+                    let _ = runner
+                        .input_tx
+                        .try_send(crate::engine::message::UserSubmission::text(handoff));
                 }
             }
             Err(e) => {
@@ -1682,7 +1732,7 @@ impl App {
     /// attach (clearing its unread state). Mirrors `commit_compact`'s
     /// transcript reset; new agent output streams in live.
     pub(super) fn resume_session(&mut self, session_id: uuid::Uuid) {
-        match agent_runner::attach_to_session(&self.launch.cwd, session_id) {
+        match agent_runner::attach_to_session(&self.launch.cwd, session_id, self.no_sandbox) {
             Ok(runner) => {
                 let short_id = runner.short_id.clone();
                 self.project_id = Some(runner.project_id.clone());
@@ -1715,6 +1765,51 @@ impl App {
 
     /// `/pin <text>`: mark a message as must-survive for the next
     /// `/compact` (injected verbatim, never summarized).
+    /// `/sandbox` (sandboxing part 2): no arg toggles, `on`/`off` set
+    /// explicitly. Sends `SetSandbox` to the daemon for the attached
+    /// session; the resulting state is surfaced via the `SandboxState`
+    /// event → toast. Effective immediately for subsequent tool calls.
+    pub(super) fn handle_sandbox_command(&mut self, args: &str) {
+        let enabled = match parse_sandbox_arg(args) {
+            Ok(e) => e,
+            Err(other) => {
+                self.history.push(HistoryEntry::Plain {
+                    line: format!("/sandbox: unknown arg `{other}` — use `on` or `off`"),
+                });
+                return;
+            }
+        };
+        if !self.send_daemon_request(crate::daemon::proto::Request::SetSandbox { enabled }) {
+            self.history.push(HistoryEntry::Plain {
+                line: "/sandbox: no daemon connection".to_string(),
+            });
+        }
+    }
+
+    /// `/caffeinate [toggle|on|off|until-idle]`: suppress system sleep +
+    /// lid-close so agents survive a closed lid. Daemon-owned state — this
+    /// just sends the request; the daemon acquires/releases the OS
+    /// assertion and broadcasts a `CaffeinateState` event back (→ toast +
+    /// ☕ glyph). Bare command toggles.
+    pub(super) fn handle_caffeinate_command(&mut self, args: &str) {
+        let mode = match crate::daemon::caffeinate::CaffeinateMode::parse(args) {
+            Ok(m) => m,
+            Err(other) => {
+                self.history.push(HistoryEntry::Plain {
+                    line: format!(
+                        "/caffeinate: unknown arg `{other}` — use `on`, `off`, `until-idle`, or no arg to toggle"
+                    ),
+                });
+                return;
+            }
+        };
+        if !self.send_daemon_request(crate::daemon::proto::Request::SetCaffeinate { mode }) {
+            self.history.push(HistoryEntry::Plain {
+                line: "/caffeinate: no daemon connection".to_string(),
+            });
+        }
+    }
+
     pub(super) fn handle_pin_command(&mut self, args: &str) {
         let text = args.trim();
         if text.is_empty() {
@@ -1741,7 +1836,7 @@ impl App {
         if self.agent_runner.is_some() {
             return;
         }
-        let runner = agent_runner::try_spawn(&self.launch.cwd);
+        let runner = agent_runner::try_spawn(&self.launch.cwd, self.no_sandbox);
         if let Ok(r) = &runner {
             // Seed the in-memory tally from the daemon's authoritative
             // counts. Additive: any optimistic increments made before
@@ -2123,6 +2218,7 @@ impl App {
                 // sends the (edited) handoff as the first message; the
                 // new session re-executes its seed tools first.
                 self.composer.set(handoff);
+                self.paste_registry.clear();
                 // Capture the predecessor (current) session's short id now,
                 // before the commit re-attaches onto the fresh session and
                 // the runner's short id changes.
@@ -2141,6 +2237,34 @@ impl App {
                         "/compact: handoff ready for review in the composer — {seed_tool_count} seed tool(s), ~{seed_tool_tokens} tokens will re-run in the fresh session. Edit and submit to commit; the old session stays recoverable.",
                     ),
                 });
+            }
+            TurnEvent::SandboxState { enabled } => {
+                // `/sandbox` result (sandboxing part 2): surface the
+                // resulting on/off state as a toast.
+                self.show_toast(
+                    if enabled { "sandbox on" } else { "sandbox off" },
+                    ToastKind::Info,
+                );
+            }
+            TurnEvent::CaffeinateState {
+                active,
+                lid_close_guaranteed,
+                message,
+            } => {
+                // Daemon-global: always update the ☕ glyph state so every
+                // client stays in sync (incl. until-idle auto-off). Only
+                // the originating client gets a `message` → toast; a
+                // not-guaranteed lid-close (or missing mechanism) makes the
+                // toast a warning so the honest note reads as a caveat.
+                self.caffeinate_active = active;
+                if let Some(message) = message {
+                    let kind = if active && !lid_close_guaranteed {
+                        ToastKind::Error
+                    } else {
+                        ToastKind::Info
+                    };
+                    self.show_toast(message, kind);
+                }
             }
         }
     }
@@ -2927,6 +3051,7 @@ impl App {
         // commands (`/git`, `/editor`) can read their arguments.
         let raw = self.composer.text().to_string();
         self.composer.clear();
+        self.paste_registry.clear();
         // The slash line is gone; reset the menu cursor so the next `/`
         // session opens on the top match.
         self.reset_slash_window();
@@ -3003,6 +3128,10 @@ impl App {
                 self.handle_jobs_command(&slash_args(&raw));
                 return false;
             }
+            "caffeinate" => {
+                self.handle_caffeinate_command(&slash_args(&raw));
+                return false;
+            }
             "compact" => {
                 self.start_compact();
                 return false;
@@ -3013,6 +3142,10 @@ impl App {
             }
             "pin" => {
                 self.handle_pin_command(&slash_args(&raw));
+                return false;
+            }
+            "sandbox" => {
+                self.handle_sandbox_command(&slash_args(&raw));
                 return false;
             }
             "stats" => {
@@ -3339,6 +3472,18 @@ pub(super) fn parse_pane_side(arg: &str) -> PaneSide {
         "top" | "up" => PaneSide::Top,
         "bottom" | "down" => PaneSide::Bottom,
         _ => PaneSide::Full,
+    }
+}
+
+/// Parse a `/sandbox` argument (sandboxing part 2) into the
+/// `SetSandbox.enabled` value: `""` (no arg) toggles (`None`), `on` /
+/// `off` set explicitly. `Err(arg)` for anything else.
+fn parse_sandbox_arg(args: &str) -> Result<Option<bool>, String> {
+    match args.trim().to_ascii_lowercase().as_str() {
+        "" => Ok(None),
+        "on" => Ok(Some(true)),
+        "off" => Ok(Some(false)),
+        other => Err(other.to_string()),
     }
 }
 
@@ -3729,6 +3874,15 @@ mod slash_rank_tests {
             .collect();
         assert_eq!(names, declared);
     }
+
+    #[test]
+    fn sandbox_command_is_registered() {
+        // `/sandbox` (sandboxing part 2) must be dispatchable.
+        assert!(
+            SLASH_COMMANDS.iter().any(|c| c.name == "sandbox"),
+            "/sandbox must be a registered slash command"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -3762,8 +3916,8 @@ mod working_msg_tests {
 #[cfg(test)]
 mod local_cmd_tests {
     use super::{
-        GIT_AGENT_TOKEN_CAP, PaneSide, cap_tokens, parse_pane_side, slash_args, strip_ansi,
-        xml_escape,
+        GIT_AGENT_TOKEN_CAP, PaneSide, cap_tokens, parse_pane_side, parse_sandbox_arg, slash_args,
+        strip_ansi, xml_escape,
     };
 
     #[test]
@@ -3792,6 +3946,19 @@ mod local_cmd_tests {
         assert_eq!(parse_pane_side("LEFT"), PaneSide::Left);
         assert_eq!(parse_pane_side(""), PaneSide::Full);
         assert_eq!(parse_pane_side("garbage"), PaneSide::Full);
+    }
+
+    #[test]
+    fn parse_sandbox_arg_maps_to_enabled() {
+        // `/sandbox` (no arg) toggles; `on`/`off` set explicitly
+        // (sandboxing part 2). Case- and whitespace-insensitive.
+        assert_eq!(parse_sandbox_arg(""), Ok(None));
+        assert_eq!(parse_sandbox_arg("  "), Ok(None));
+        assert_eq!(parse_sandbox_arg("on"), Ok(Some(true)));
+        assert_eq!(parse_sandbox_arg(" ON "), Ok(Some(true)));
+        assert_eq!(parse_sandbox_arg("off"), Ok(Some(false)));
+        assert_eq!(parse_sandbox_arg("Off"), Ok(Some(false)));
+        assert_eq!(parse_sandbox_arg("maybe"), Err("maybe".to_string()));
     }
 
     #[test]

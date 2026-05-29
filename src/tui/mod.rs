@@ -28,6 +28,7 @@ pub mod history;
 pub mod markdown;
 pub mod model_picker;
 pub mod nav;
+pub mod paste;
 pub mod pty;
 pub mod sessions_pane;
 pub mod settings;

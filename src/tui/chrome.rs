@@ -103,6 +103,24 @@ pub fn jobs_strip_spans(jobs: &[(String, String, u64)]) -> Vec<Span<'static>> {
     spans
 }
 
+/// Persistent caffeination indicator (`/caffeinate`, GOALS §1a). Rendered
+/// **only** while caffeination is active — additive to the fixed chrome,
+/// never a permanent slot. Driven by the daemon-broadcast state so the
+/// glyph appears (and clears) on every connected client in lockstep.
+/// Returns the spans to prepend to the right-hand status line (`☕` plus a
+/// trailing space separating it from the cwd), or an empty vec when off.
+pub fn caffeinate_glyph_spans(active: bool) -> Vec<Span<'static>> {
+    if !active {
+        return Vec::new();
+    }
+    // Cyan reads as "kept awake" without competing with the yellow branch
+    // badge; the trailing space keeps it off the cwd text.
+    vec![Span::styled(
+        "☕ ".to_string(),
+        Style::default().fg(Color::Cyan),
+    )]
+}
+
 pub fn repo_counts(repo: &RepoStatus) -> String {
     let mut parts = Vec::new();
     if repo.staged > 0 {

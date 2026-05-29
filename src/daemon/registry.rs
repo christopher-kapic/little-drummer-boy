@@ -62,6 +62,7 @@ impl SessionRegistry {
         project_root: Option<PathBuf>,
         providers_cfg: &ProvidersConfig,
         extended_cfg: &ExtendedConfig,
+        client_no_sandbox: bool,
     ) -> Result<SessionWorkerHandle> {
         // Resume path.
         if let Some(id) = session_id {
@@ -71,7 +72,7 @@ impl SessionRegistry {
             let session = Session::resume(self.inner.db.clone(), id)
                 .context("resuming session")?
                 .ok_or_else(|| anyhow::anyhow!("unknown session {id}"))?;
-            return self.start_worker(session, providers_cfg, extended_cfg);
+            return self.start_worker(session, providers_cfg, extended_cfg, client_no_sandbox);
         }
 
         // Create path.
@@ -89,7 +90,7 @@ impl SessionRegistry {
                 .set_active_model(&active.provider, &active.model)
                 .context("setting active model on new session")?;
         }
-        self.start_worker(session, providers_cfg, extended_cfg)
+        self.start_worker(session, providers_cfg, extended_cfg, client_no_sandbox)
     }
 
     fn lookup(&self, session_id: Uuid) -> Option<SessionWorkerHandle> {
@@ -101,6 +102,7 @@ impl SessionRegistry {
         session: Session,
         providers_cfg: &ProvidersConfig,
         extended_cfg: &ExtendedConfig,
+        client_no_sandbox: bool,
     ) -> Result<SessionWorkerHandle> {
         let session_id = session.id;
         let project_root = session.project_root.clone();
@@ -122,6 +124,7 @@ impl SessionRegistry {
             redact,
             model,
             project_root,
+            client_no_sandbox,
         );
 
         self.inner
@@ -162,6 +165,24 @@ impl SessionRegistry {
     /// daemon status` and the `list_sessions` request.
     pub fn active_session_ids(&self) -> Vec<Uuid> {
         self.inner.workers.lock().unwrap().keys().copied().collect()
+    }
+
+    /// Whether *any* live session worker is currently doing agent work —
+    /// either mid-turn (`processing`) or holding an async job
+    /// (loop/timer/background). Drives `/caffeinate until-idle` auto-off:
+    /// the daemon owns the session workers / `JobAuthority`, so it is the
+    /// authority for "is an agent running anywhere?". Lock-free reads of
+    /// each worker's shared atomics.
+    pub fn any_agent_running(&self) -> bool {
+        self.inner
+            .workers
+            .lock()
+            .unwrap()
+            .values()
+            .any(|h| {
+                let (has_jobs, processing) = h.live_status();
+                has_jobs || processing
+            })
     }
 
     /// Live `(has_active_jobs, processing)` status for a session, or

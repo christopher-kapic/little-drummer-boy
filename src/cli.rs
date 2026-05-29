@@ -46,6 +46,14 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub debug_last_message: bool,
 
+    /// Disable filesystem sandboxing for sessions this invocation
+    /// creates (sandboxing part 2). The shell runs unconfined and native
+    /// tools skip the cwd-boundary prompt. A per-session `/sandbox` flip
+    /// still overrides. The daemon's own `--no-sandbox` (set at
+    /// `cockpit daemon start`) outranks this for all sessions.
+    #[arg(long, global = true)]
+    pub no_sandbox: bool,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 }
@@ -236,6 +244,12 @@ pub enum DaemonCommand {
         /// Spawn a detached background daemon and exit immediately.
         #[arg(long)]
         detach: bool,
+        /// Disable filesystem sandboxing for ALL sessions this daemon
+        /// hosts (sandboxing part 2) — the highest-precedence default.
+        /// Outranks any client `--no-sandbox`. A per-session `/sandbox on`
+        /// still re-enables confinement for that session.
+        #[arg(long)]
+        no_sandbox: bool,
     },
     /// Stop the running daemon.
     Stop,

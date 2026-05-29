@@ -43,6 +43,12 @@ pub struct LaunchInfo {
     /// config carries it. Drives the `(max Nk)` part of the chrome's
     /// context indicator.
     pub active_model_max_context: Option<u32>,
+    /// True when the active model declares `inputs.images: true` in
+    /// config (vision-capable). Drives the composer image-paste send-time
+    /// decision: bytes vs. text note. Recomputed on every
+    /// `reload_launch_info` so a `/model` switch round-trips images
+    /// without a re-paste (composer-paste-handling).
+    pub active_model_supports_images: bool,
     pub cwd: PathBuf,
     pub cwd_display: String,
     pub repo_status: Option<RepoStatus>,
@@ -72,6 +78,10 @@ pub fn load(project: Option<&Path>) -> LaunchInfo {
     let active_model_max_context = active_model
         .as_ref()
         .and_then(|(p, m)| lookup_model_context(&cwd, p, m));
+    let active_model_supports_images = active_model
+        .as_ref()
+        .map(|(p, m)| model_supports_images(&cwd, p, m))
+        .unwrap_or(false);
     let repo_status = git::repo_status(&cwd).ok().flatten();
     let user_name = load_user_name(&cwd);
     let banner_enabled = load_banner_enabled(&cwd);
@@ -82,6 +92,7 @@ pub fn load(project: Option<&Path>) -> LaunchInfo {
         active_model,
         active_model_is_favorite,
         active_model_max_context,
+        active_model_supports_images,
         cwd_display: display_path(&cwd),
         cwd,
         repo_status,
@@ -147,6 +158,33 @@ fn lookup_model_context(cwd: &Path, provider_id: &str, model_id: &str) -> Option
         }
     }
     None
+}
+
+/// Whether the active `<provider>/<model>` declares `inputs.images:
+/// true` in config — i.e. it can accept real image message parts. Used
+/// by the composer's image-paste send-time gate
+/// (composer-paste-handling). Returns false when unset (the safe
+/// default: send images as a text note rather than risk a 400).
+fn model_supports_images(cwd: &Path, provider_id: &str, model_id: &str) -> bool {
+    use crate::config::dirs::discover_config_dirs;
+    use crate::config::providers::ConfigDoc;
+    for dir in discover_config_dirs(cwd) {
+        let path = dir.path.join("config.json");
+        let Ok(doc) = ConfigDoc::load(&path) else {
+            continue;
+        };
+        let cfg = doc.providers();
+        if let Some(entry) = cfg.providers.get(provider_id)
+            && let Some(model) = entry.models.iter().find(|m| m.id == model_id)
+        {
+            return model
+                .inputs
+                .as_ref()
+                .and_then(|i| i.images)
+                .unwrap_or(false);
+        }
+    }
+    false
 }
 
 /// Look up `<provider>/<model>` in the first config.json on the

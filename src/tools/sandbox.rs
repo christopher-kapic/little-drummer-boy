@@ -212,4 +212,157 @@ mod tests {
         let cr = canonical_root(root).unwrap();
         assert!(within_root(&cr, &root.join("a.txt")));
     }
+
+    // ---- native-tool confinement (sandboxing part 2) ----------------------
+
+    use std::sync::Arc;
+
+    use crate::approval::Approver;
+    use crate::approval::store::GrantStore;
+    use crate::daemon::proto::ResolveResponse;
+    use crate::engine::interrupt::InterruptHub;
+    use crate::engine::tool::ToolCtx;
+    use crate::tui::dialog::approval::ID_SESSION;
+
+    /// Build a `ToolCtx` rooted at `cwd` with sandboxing ON and an
+    /// approver wired to a detached interrupt hub, so a prompt can be
+    /// resolved from a sibling task.
+    fn sandboxed_ctx(cwd: &std::path::Path) -> ToolCtx {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session =
+            crate::session::Session::create(db.clone(), cwd.to_path_buf(), "coder").unwrap();
+        session.set_sandbox_enabled(true);
+        let sid = session.id;
+        let locks = Arc::new(crate::locks::LockManager::from_db(db.clone()).unwrap());
+        let cfg = crate::config::extended::RedactConfig::default();
+        let redact = Arc::new(crate::redact::RedactionTable::build(&cfg, cwd).unwrap());
+        let hub = Arc::new(InterruptHub::detached());
+        let store = GrantStore::new(db.clone(), sid, cwd.to_path_buf());
+        let approver = Arc::new(Approver::new(store, db, sid, "coder", hub.clone()));
+        ToolCtx {
+            agent_id: "coder".to_string(),
+            locks,
+            session: Arc::new(session),
+            cwd: cwd.to_path_buf(),
+            redact,
+            interrupts: hub,
+            cancel: tokio_util::sync::CancellationToken::new(),
+            approver: Some(approver),
+        }
+    }
+
+    #[tokio::test]
+    async fn native_inside_cwd_allowed_without_prompt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = sandboxed_ctx(tmp.path());
+        // A path under cwd is allowed silently — no client attached, so a
+        // prompt would block forever; this returns immediately.
+        let inside = tmp.path().join("src/main.rs");
+        check_native_access(&ctx, &inside).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn native_inside_session_tmp_allowed_without_prompt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = sandboxed_ctx(tmp.path());
+        // The per-session tmp dir counts as inside the boundary.
+        let tmp_dir = ctx.session.tmp_dir().expect("session tmp dir");
+        let scratch = tmp_dir.join("scratch.txt");
+        check_native_access(&ctx, &scratch).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn native_parent_traversal_stays_inside() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = sandboxed_ctx(tmp.path());
+        // `cwd/sub/../keep.txt` normalizes back inside cwd — no prompt.
+        let traversed = tmp.path().join("sub/../keep.txt");
+        check_native_access(&ctx, &traversed).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn native_disabled_skips_check() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = sandboxed_ctx(tmp.path());
+        ctx.session.set_sandbox_enabled(false);
+        // Sandbox off → every path allowed, even far outside, no prompt.
+        check_native_access(&ctx, std::path::Path::new("/etc/shadow"))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn native_outside_granted_allows_and_persists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let ctx = sandboxed_ctx(tmp.path());
+        let target = outside.path().join("notes.txt");
+
+        // Resolve the raised prompt with a Session-scope grant.
+        let db = ctx.session.db.clone();
+        let sid = ctx.session.id;
+        let hub = ctx.interrupts.clone();
+        let resolver = tokio::spawn(async move {
+            let iid = loop {
+                if let Some(row) = db.list_open_interrupts(sid).unwrap().first() {
+                    break row.interrupt_id;
+                }
+                tokio::task::yield_now().await;
+            };
+            assert!(hub.resolve(
+                iid,
+                ResolveResponse::Single {
+                    selected_id: ID_SESSION.into(),
+                }
+            ));
+        });
+        // First access prompts → granted → allowed.
+        check_native_access(&ctx, &target).await.unwrap();
+        resolver.await.unwrap();
+
+        // A second access to the same path is now granted with no prompt
+        // (would block forever otherwise — no client attached).
+        check_native_access(&ctx, &target).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn native_outside_denied_refuses() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let ctx = sandboxed_ctx(tmp.path());
+        let target = outside.path().join("secret.txt");
+
+        let db = ctx.session.db.clone();
+        let sid = ctx.session.id;
+        let hub = ctx.interrupts.clone();
+        let resolver = tokio::spawn(async move {
+            let iid = loop {
+                if let Some(row) = db.list_open_interrupts(sid).unwrap().first() {
+                    break row.interrupt_id;
+                }
+                tokio::task::yield_now().await;
+            };
+            assert!(hub.resolve(iid, ResolveResponse::Cancel));
+        });
+        let err = check_native_access(&ctx, &target).await.unwrap_err();
+        resolver.await.unwrap();
+        assert!(
+            err.to_string().contains("outside the session boundary"),
+            "got: {err}"
+        );
+        // The exact path is named in the error.
+        assert!(err.to_string().contains("secret.txt"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn native_no_approver_never_denies() {
+        // No approver wired (seed-tool / loop-fork path): an outside path
+        // must NOT be denied — it skips the prompt and is allowed.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ctx = sandboxed_ctx(tmp.path());
+        ctx.approver = None;
+        check_native_access(&ctx, std::path::Path::new("/var/lib/x"))
+            .await
+            .unwrap();
+    }
 }

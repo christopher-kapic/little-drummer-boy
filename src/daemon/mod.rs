@@ -22,6 +22,7 @@
 //!   to the freshly spawned daemon. `cockpit daemon {start, stop,
 //!   status}` lets the user manage the lifecycle explicitly.
 
+pub mod caffeinate;
 pub mod client;
 pub mod proto;
 pub mod registry;
@@ -229,9 +230,11 @@ pub fn probe_blocking(paths: &DaemonPaths) -> DaemonStatus {
 
 /// Spawn a detached *canonical* daemon process. Returns the child PID.
 /// The current process should *not* wait on the child — it's intended
-/// to outlive us.
-pub fn spawn_detached() -> Result<u32> {
-    spawn_detached_inner(None)
+/// to outlive us. `no_sandbox` forwards the daemon-level `--no-sandbox`
+/// (sandboxing part 2): the child disables filesystem sandboxing for all
+/// its sessions.
+pub fn spawn_detached(no_sandbox: bool) -> Result<u32> {
+    spawn_detached_inner(None, no_sandbox)
 }
 
 /// Spawn a detached *ephemeral* daemon bound to `paths` (a unique
@@ -239,11 +242,15 @@ pub fn spawn_detached() -> Result<u32> {
 /// The child binds the exact path the parent chose by reading the
 /// internal env vars (Layer B); never via the user-facing CLI surface.
 /// Returns the child PID.
+///
+/// An auto-promoted ephemeral daemon is never launched `--no-sandbox`:
+/// the client's `--no-sandbox` is a *per-session* default passed at
+/// attach time, not a daemon-level one (sandboxing part 2 precedence).
 pub fn spawn_detached_ephemeral(paths: &DaemonPaths) -> Result<u32> {
-    spawn_detached_inner(Some(paths))
+    spawn_detached_inner(Some(paths), false)
 }
 
-fn spawn_detached_inner(ephemeral: Option<&DaemonPaths>) -> Result<u32> {
+fn spawn_detached_inner(ephemeral: Option<&DaemonPaths>, no_sandbox: bool) -> Result<u32> {
     use std::process::{Command, Stdio};
     let exe = std::env::current_exe().context("locating own binary")?;
     let mut command = Command::new(exe);
@@ -254,6 +261,9 @@ fn spawn_detached_inner(ephemeral: Option<&DaemonPaths>) -> Result<u32> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    if no_sandbox {
+        command.arg("--no-sandbox");
+    }
     if let Some(paths) = ephemeral {
         command
             .env(EPHEMERAL_SOCKET_ENV, &paths.socket)

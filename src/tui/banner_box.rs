@@ -141,6 +141,7 @@ mod tests {
             active_model: None,
             active_model_is_favorite: false,
             active_model_max_context: None,
+            active_model_supports_images: false,
             cwd: PathBuf::from("/tmp/project"),
             cwd_display: "~/project".to_string(),
             repo_status: None,

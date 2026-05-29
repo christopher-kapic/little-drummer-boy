@@ -168,8 +168,12 @@ impl App {
             let choice = prompt.take_choice();
             match choice {
                 Some(crate::tui::daemon_prompt::DaemonChoice::StartAndConnect) => {
+                    // The TUI promotes a *persistent* daemon here; the
+                    // client's `--no-sandbox` is a per-session default
+                    // applied at attach, not a daemon-level launch flag
+                    // (sandboxing part 2 precedence).
                     match crate::daemon::DaemonPaths::resolve()
-                        .and_then(|_| crate::daemon::spawn_detached())
+                        .and_then(|_| crate::daemon::spawn_detached(false))
                     {
                         Ok(pid) => {
                             self.history.push(HistoryEntry::Plain {
@@ -464,6 +468,7 @@ impl App {
                 // exit path; `/exit`, Ctrl+C, Ctrl+D cover that).
                 if self.slash_query().is_some() {
                     self.composer.clear();
+                    self.paste_registry.clear();
                     self.reset_slash_window();
                 } else if self.composer.vim_enabled() {
                     self.composer.set_vim_mode(VimMode::Normal);
@@ -475,7 +480,7 @@ impl App {
                 if key.modifiers.contains(KeyModifiers::SHIFT)
                     || key.modifiers.contains(KeyModifiers::ALT)
                 {
-                    self.composer.insert_char('\n');
+                    self.composer_insert_char('\n');
                     self.refresh_at_dismiss();
                     self.reset_slash_window();
                     false
@@ -490,11 +495,20 @@ impl App {
             // canonical LF on every Unix terminal and survives every
             // multiplexer hop.
             KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.composer.insert_char('\n');
+                self.composer_insert_char('\n');
                 self.reset_slash_window();
                 false
             }
             KeyCode::Backspace => {
+                // Whole-block delete (paste blocks): cursor immediately
+                // right of `]` removes the entire block. Checked before
+                // the `@`-tag path since blocks are explicit + atomic.
+                if let Some((s, e)) = self.paste_block_left() {
+                    self.delete_paste_block(s, e);
+                    self.refresh_at_dismiss();
+                    self.reset_at_window();
+                    return false;
+                }
                 // Whole-tag delete: when not actively composing a tag
                 // (popup closed) and the cursor sits at a completed
                 // tag's right edge, one Backspace removes the whole tag.
@@ -506,7 +520,7 @@ impl App {
                     self.reset_at_window();
                     return false;
                 }
-                self.composer.delete_left();
+                self.composer_delete_left();
                 // Two-keystroke trailing space: if we just removed a
                 // space that sat right after a completed tag, keep the
                 // popup suppressed so the *next* Backspace deletes the
@@ -521,6 +535,14 @@ impl App {
                 false
             }
             KeyCode::Delete => {
+                // Whole-block forward delete: cursor immediately left of
+                // `[` removes the entire block.
+                if let Some((s, e)) = self.paste_block_right() {
+                    self.delete_paste_block(s, e);
+                    self.refresh_at_dismiss();
+                    self.reset_at_window();
+                    return false;
+                }
                 if !self.at_popup_active()
                     && let Some((s, e)) = self.completed_tag_right()
                 {
@@ -529,18 +551,18 @@ impl App {
                     self.reset_at_window();
                     return false;
                 }
-                self.composer.delete_right();
+                self.composer_delete_right();
                 self.refresh_at_dismiss();
                 self.reset_at_window();
                 self.reset_slash_window();
                 false
             }
             KeyCode::Left => {
-                self.composer.move_left();
+                self.composer_move_left();
                 false
             }
             KeyCode::Right => {
-                self.composer.move_right();
+                self.composer_move_right();
                 false
             }
             KeyCode::Up => {
@@ -560,7 +582,7 @@ impl App {
                 false
             }
             KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.composer.insert_char(ch);
+                self.composer_insert_char(ch);
                 // Note: we deliberately do NOT reset
                 // `prompt_history_cursor` here. Edits made while in
                 // recall mode stay in the buffer, but pressing Down
@@ -595,6 +617,7 @@ impl App {
         // existing pop-from-queue affordance the user already had).
         if self.prompt_history_cursor == 0 && self.composer.is_empty() && !self.queue.is_empty() {
             self.composer.set(self.queue.pop().unwrap());
+            self.paste_registry.clear();
             return;
         }
         if self.prompt_history.is_empty() {
@@ -603,16 +626,20 @@ impl App {
         if self.prompt_history_cursor == 0 {
             // Entering history mode — save the live draft so we can
             // restore it on the way back. `None` if the buffer was
-            // empty (nothing meaningful to restore).
+            // empty (nothing meaningful to restore). Paste blocks are
+            // flattened to their placeholder text in the recalled draft;
+            // the registry is dropped (it indexed the live buffer).
             let draft = self.composer.text().to_string();
             self.staged_draft = if draft.is_empty() { None } else { Some(draft) };
             self.prompt_history_cursor = 1;
             let idx = self.prompt_history.len() - 1;
             self.composer.set(self.prompt_history[idx].clone());
+            self.paste_registry.clear();
         } else if self.prompt_history_cursor < self.prompt_history.len() {
             self.prompt_history_cursor += 1;
             let idx = self.prompt_history.len() - self.prompt_history_cursor;
             self.composer.set(self.prompt_history[idx].clone());
+            self.paste_registry.clear();
         }
     }
 
@@ -643,6 +670,9 @@ impl App {
             let idx = self.prompt_history.len() - self.prompt_history_cursor;
             self.composer.set(self.prompt_history[idx].clone());
         }
+        // History navigation always lands on plain recalled text — no
+        // paste blocks survive.
+        self.paste_registry.clear();
     }
 
     /// If the composer no longer has an active `@partial` token, clear
@@ -853,14 +883,14 @@ impl App {
                     return false;
                 }
                 match ch {
-                    'h' => self.composer.move_left(),
-                    'l' => self.composer.move_right(),
+                    'h' => self.composer_move_left(),
+                    'l' => self.composer_move_right(),
                     'k' => self.history_up(),
                     'j' => self.history_down(),
-                    'w' => self.composer.move_word_forward(false),
-                    'W' => self.composer.move_word_forward(true),
-                    'b' => self.composer.move_word_backward(false),
-                    'B' => self.composer.move_word_backward(true),
+                    'w' => self.vim_motion(|c| c.move_word_forward(false), true),
+                    'W' => self.vim_motion(|c| c.move_word_forward(true), true),
+                    'b' => self.vim_motion(|c| c.move_word_backward(false), false),
+                    'B' => self.vim_motion(|c| c.move_word_backward(true), false),
                     '0' => self.composer.move_line_start(),
                     '$' => self.composer.move_line_end(),
                     'G' => self.composer.move_buffer_end(),
@@ -879,17 +909,28 @@ impl App {
                         self.composer.set_vim_mode(VimMode::Insert);
                     }
                     'a' => {
-                        self.composer.move_right();
+                        self.composer_move_right();
                         self.composer.set_vim_mode(VimMode::Insert);
                     }
                     'A' => {
                         self.composer.move_line_end();
                         self.composer.set_vim_mode(VimMode::Insert);
                     }
-                    'x' => self.composer.delete_right(),
-                    'D' => self.composer.delete_to_line_end(),
+                    'x' => {
+                        // Block-aware single forward delete: if the cursor
+                        // sits at a block's opening `[`, remove the whole
+                        // block; else ordinary forward-delete.
+                        if let Some((s, e)) = self.paste_block_right() {
+                            self.delete_paste_block(s, e);
+                        } else {
+                            self.composer_delete_right();
+                        }
+                    }
+                    'D' => {
+                        self.block_aware_delete(|c| c.move_line_end(), |c| c.delete_to_line_end())
+                    }
                     'C' => {
-                        self.composer.delete_to_line_end();
+                        self.block_aware_delete(|c| c.move_line_end(), |c| c.delete_to_line_end());
                         self.composer.set_vim_mode(VimMode::Insert);
                     }
                     'o' => {
@@ -930,7 +971,10 @@ impl App {
         // Pending `g` for `dgg` / `cgg` chord.
         if let KeyCode::Char('g') = key.code {
             if self.composer.pending_g() {
-                self.composer.delete_to_buffer_start();
+                // `dgg` — delete from buffer start to cursor (motion lands
+                // at 0). Block-aware so a block in that range is removed
+                // whole.
+                self.block_aware_delete(|c| c.move_buffer_start(), |c| c.delete_to_buffer_start());
                 self.composer.set_pending_g(false);
                 self.composer.set_vim_mode(if to_insert_on_change {
                     VimMode::Insert
@@ -945,35 +989,49 @@ impl App {
         self.composer.set_pending_g(false);
         let applied = match key.code {
             KeyCode::Char('w') => {
-                self.composer.delete_word_forward(false);
+                self.block_aware_delete(
+                    |c| c.move_word_forward(false),
+                    |c| c.delete_word_forward(false),
+                );
                 true
             }
             KeyCode::Char('W') => {
-                self.composer.delete_word_forward(true);
+                self.block_aware_delete(
+                    |c| c.move_word_forward(true),
+                    |c| c.delete_word_forward(true),
+                );
                 true
             }
             KeyCode::Char('b') => {
-                self.composer.delete_word_backward(false);
+                self.block_aware_delete(
+                    |c| c.move_word_backward(false),
+                    |c| c.delete_word_backward(false),
+                );
                 true
             }
             KeyCode::Char('B') => {
-                self.composer.delete_word_backward(true);
+                self.block_aware_delete(
+                    |c| c.move_word_backward(true),
+                    |c| c.delete_word_backward(true),
+                );
                 true
             }
             KeyCode::Char('$') => {
-                self.composer.delete_to_line_end();
+                self.block_aware_delete(|c| c.move_line_end(), |c| c.delete_to_line_end());
                 true
             }
             KeyCode::Char('0') => {
-                self.composer.delete_to_line_start();
+                self.block_aware_delete(|c| c.move_line_start(), |c| c.delete_to_line_start());
                 true
             }
             KeyCode::Char('G') => {
-                self.composer.delete_to_buffer_end();
+                // `dG` — delete from cursor to end of buffer.
+                let len = self.composer.len();
+                self.block_aware_delete(move |c| c.set_cursor(len), |c| c.delete_to_buffer_end());
                 true
             }
             KeyCode::Char('d') if matches!(op, Operator::Delete) => {
-                self.composer.delete_current_line();
+                self.delete_current_line_block_aware();
                 true
             }
             KeyCode::Char('c') if matches!(op, Operator::Change) => {
@@ -981,7 +1039,7 @@ impl App {
                 // the line's content, leave the line itself, and enter
                 // Insert. vim does the same.
                 self.composer.move_line_start();
-                self.composer.delete_to_line_end();
+                self.block_aware_delete(|c| c.move_line_end(), |c| c.delete_to_line_end());
                 true
             }
             _ => false,
@@ -1005,6 +1063,7 @@ impl App {
         if self.composer.text().starts_with('!') {
             let cmd = self.composer.text()[1..].to_string();
             self.composer.clear();
+            self.paste_registry.clear();
             self.run_shell_command(&cmd);
             self.at_dismissed = false;
             self.at_selected = 0;
@@ -1030,8 +1089,27 @@ impl App {
     }
 
     pub(super) fn submit_input(&mut self) -> bool {
+        // The *displayed* message keeps the composer's exact text,
+        // including paste-block placeholders (wire/user split — the user
+        // sees `[Pasted text #1, …]`, the model gets the expansion).
         let submitted = self.composer.text().trim().to_string();
-        if submitted.is_empty() {
+        if submitted.is_empty() && self.paste_registry.is_empty() {
+            return false;
+        }
+
+        // Build the paste-side wire from the live (untrimmed) buffer +
+        // registry: text blocks inline their full content; image blocks
+        // become real image parts on a vision model, or a terse text note
+        // otherwise. `paste_images` are the ordered PNG payloads; the
+        // sentinel markers in `paste_wire` mark where each lands. Done
+        // first (offsets index the untrimmed buffer) and gated on the
+        // active model's `inputs.images` at *this* send time — a `/model`
+        // switch since paste round-trips the same blocks differently.
+        let vision = self.active_model_supports_images();
+        let (paste_wire, paste_images) =
+            self.paste_registry.build_wire(self.composer.text(), vision);
+        let paste_wire = paste_wire.trim().to_string();
+        if paste_wire.is_empty() && paste_images.is_empty() {
             return false;
         }
 
@@ -1053,7 +1131,9 @@ impl App {
         // the original `@`-form; only the wire payload gets inlined.
         // Autocompleted spaced paths are quoted on this submit copy so
         // the scanner reads them as one token (the composer stays clean).
-        let quoted = crate::tui::file_tag::quote_tracked_tags(&submitted, &self.accepted_tags);
+        // Tag expansion runs over the paste-expanded wire so a tag and a
+        // pasted block can coexist in one message.
+        let quoted = crate::tui::file_tag::quote_tracked_tags(&paste_wire, &self.accepted_tags);
         let expanded = crate::tui::file_tag::expand_tags(&quoted, &self.launch.cwd);
         // Attach any buffered `/git` blocks to this message's wire text
         // (GOALS §1l). The displayed user message keeps the original
@@ -1111,9 +1191,17 @@ impl App {
             true
         };
 
+        // Carry the wire text together with any real image parts (vision
+        // only — non-vision folded the images into `wire` as text notes,
+        // leaving `paste_images` empty).
+        let submission = crate::engine::message::UserSubmission {
+            text: wire,
+            images: paste_images,
+        };
+
         self.ensure_agent_runner();
         let outcome = match self.agent_runner.as_ref() {
-            Some(Ok(runner)) => match runner.input_tx.try_send(wire) {
+            Some(Ok(runner)) => match runner.input_tx.try_send(submission) {
                 Ok(()) => DispatchOutcome::Sent,
                 Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                     self.history.push(HistoryEntry::Plain {
@@ -1146,6 +1234,8 @@ impl App {
             self.end_working_span();
         }
         self.composer.clear();
+        // The buffer is gone — its paste blocks go with it.
+        self.paste_registry.clear();
         self.at_dismissed = false;
         self.at_selected = 0;
         self.at_scroll = 0;
@@ -1160,6 +1250,364 @@ impl App {
 }
 
 impl App {
+    // ---- Paste blocks (composer-paste-handling) -----------------------
+    //
+    // A genuine bracketed paste arrives as one `Event::Paste(String)`.
+    // Images come from the system clipboard read on the same gesture. Both
+    // collapse into atomic placeholder blocks tracked in
+    // `self.paste_registry`, kept byte-range-synced with the composer.
+
+    /// Route a bracketed-paste event. First checks the clipboard for an
+    /// image (a paste gesture over an image puts the bytes there, while
+    /// `data` is typically empty or a filename); if present, inserts an
+    /// image block. Otherwise treats `data` as text: re-paste-to-expand
+    /// if the cursor sits at a matching text block's right edge, else
+    /// condense-or-insert by the threshold rule.
+    pub(super) fn handle_paste(&mut self, data: String) {
+        // Paste only targets the composer. If a modal/pane is up, ignore —
+        // matches how typed keys are consumed by modals before reaching
+        // the composer.
+        if self.pane.is_some()
+            || self.daemon_prompt.is_some()
+            || self.question_dialog.is_some()
+            || self.dialog.is_active()
+            || self.model_picker.is_some()
+            || self.stats_pane.is_some()
+            || self.sessions_pane.is_some()
+            || self.context_menu.is_some()
+        {
+            return;
+        }
+
+        // Image first: a clipboard image on the paste gesture becomes an
+        // image block regardless of `data`. SSH is out of scope — the read
+        // is local-clipboard only and silently yields `None` when there's
+        // no bitmap.
+        match crate::clipboard::read_image_as_png() {
+            Ok(Some(png)) => {
+                self.insert_image_block(png);
+                return;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::debug!(error = %e, "clipboard image read failed; treating paste as text");
+            }
+        }
+
+        if data.is_empty() {
+            return;
+        }
+
+        // Re-paste-to-expand: cursor at a text block's right edge + the
+        // paste equals that block's stored content → expand in place.
+        let cursor = self.composer.cursor();
+        if let Some((start, end, full)) = self.paste_registry.expandable_text_at(cursor, &data) {
+            // Replace the placeholder span with the raw text and drop the
+            // block from the registry.
+            self.composer.delete_range(start, end);
+            self.paste_registry.remove_range(start, end);
+            self.composer.set_cursor(start);
+            self.insert_text_raw(&full);
+            self.refresh_at_dismiss();
+            self.reset_at_window();
+            self.reset_slash_window();
+            return;
+        }
+
+        if crate::tui::paste::should_condense(&data) {
+            self.insert_text_block(data);
+        } else {
+            self.insert_text_raw(&data);
+        }
+        self.refresh_at_dismiss();
+        self.reset_at_window();
+        self.reset_slash_window();
+    }
+
+    /// Insert raw (non-condensed) pasted text at the cursor, snapping the
+    /// insertion point to a block boundary first and shifting the registry
+    /// for the inserted length.
+    fn insert_text_raw(&mut self, text: &str) {
+        let at = self
+            .paste_registry
+            .resolve_insertion(self.composer.cursor());
+        self.composer.set_cursor(at);
+        self.composer.insert_str(text);
+        self.paste_registry.shift_for_edit(at, text.len() as isize);
+    }
+
+    /// Estimate tokens for a condensed text block: the active model's
+    /// calibrated counter when available, else cl100k_base (GOALS §10
+    /// fallback). v1 has no in-TUI calibrated counter wired, so this is
+    /// cl100k today — the seam is here for when one lands.
+    fn estimate_paste_tokens(&self, text: &str) -> usize {
+        crate::tokens::count(text)
+    }
+
+    /// Condense a long text paste into a `[Pasted text #N, X tokens]`
+    /// block. The placeholder occupies the buffer; the full text lives in
+    /// the registry and is inlined at send time.
+    fn insert_text_block(&mut self, full: String) {
+        let at = self
+            .paste_registry
+            .resolve_insertion(self.composer.cursor());
+        self.composer.set_cursor(at);
+        let tokens = self.estimate_paste_tokens(&full);
+        let placeholder = self.paste_registry.register_text(at, full, tokens);
+        self.composer.insert_str(&placeholder);
+        // `register_text` already recorded the block at `[at, at+len)`;
+        // shift only the blocks that were *after* the insertion point.
+        self.shift_other_blocks_after_insert(at, placeholder.len());
+    }
+
+    /// Insert a pasted image as a `[Pasted image #N]` block. On a
+    /// non-vision model, also toast that it'll be sent as a text note —
+    /// the bytes are retained either way and re-evaluated at send time.
+    fn insert_image_block(&mut self, png: Vec<u8>) {
+        let at = self
+            .paste_registry
+            .resolve_insertion(self.composer.cursor());
+        self.composer.set_cursor(at);
+        let placeholder = self.paste_registry.register_image(at, png);
+        self.composer.insert_str(&placeholder);
+        self.shift_other_blocks_after_insert(at, placeholder.len());
+        self.refresh_at_dismiss();
+        self.reset_at_window();
+        self.reset_slash_window();
+        if !self.active_model_supports_images() {
+            self.show_toast(
+                "Current model has no image support — this image will be sent as a text note.",
+                super::ToastKind::Info,
+            );
+        }
+    }
+
+    /// After [`crate::tui::paste::PasteRegistry::register_text`] /
+    /// `register_image` recorded a new block at `[at, at+len)`, shift the
+    /// *other* blocks that started at/after `at` (the new one is exact).
+    /// `register_*` inserts the new block sorted, so we shift every block
+    /// whose start is `> at` (i.e. excluding the one we just added).
+    fn shift_other_blocks_after_insert(&mut self, at: usize, len: usize) {
+        for b in self.paste_registry.blocks_mut() {
+            if b.start > at {
+                b.start += len;
+                b.end += len;
+            }
+        }
+    }
+
+    /// Whether the active model accepts real image parts
+    /// (`inputs.images: true`). Recomputed by `reload_launch_info` after a
+    /// `/model` switch, so images round-trip without a re-paste.
+    pub(super) fn active_model_supports_images(&self) -> bool {
+        self.launch.active_model_supports_images
+    }
+
+    /// `dd` — delete the current line, block-aware. Any paste block on
+    /// that line is removed whole (the whole line goes), and the registry
+    /// is reconciled for the removed byte range. The line's byte range is
+    /// computed up front (start of the line through its trailing `\n`, or
+    /// the preceding `\n` on the last line) so we can shift the registry
+    /// by the exact removed extent before delegating to the composer.
+    fn delete_current_line_block_aware(&mut self) {
+        if self.paste_registry.is_empty() {
+            self.composer.delete_current_line();
+            return;
+        }
+        let before = self.composer.len();
+        let cursor = self.composer.cursor();
+        let text = self.composer.text();
+        let line_start = text[..cursor].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        self.composer.delete_current_line();
+        let removed = before - self.composer.len();
+        if removed > 0 {
+            // `delete_current_line` removes either `[line_start, …]` or,
+            // on the last line, `[line_start-1, …]`. The lower anchor is
+            // the smaller of the original line start and the post-delete
+            // cursor (which lands at the new line's start).
+            let anchor = line_start.min(self.composer.cursor());
+            self.paste_registry
+                .shift_for_edit(anchor, -(removed as isize));
+        }
+    }
+
+    /// Block whose closing `]` is exactly at the cursor (Backspace
+    /// whole-block delete). Mirrors `completed_tag_left` for `@`-tags.
+    fn paste_block_left(&self) -> Option<(usize, usize)> {
+        self.paste_registry
+            .block_ending_at(self.composer.cursor())
+            .map(|b| (b.start, b.end))
+    }
+
+    /// Block whose opening `[` is exactly at the cursor (forward-`Delete`
+    /// whole-block delete). Mirrors `completed_tag_right`.
+    fn paste_block_right(&self) -> Option<(usize, usize)> {
+        self.paste_registry
+            .block_starting_at(self.composer.cursor())
+            .map(|b| (b.start, b.end))
+    }
+
+    /// Delete the block at `[start, end)` from both the buffer and the
+    /// registry, leaving the cursor at `start`.
+    fn delete_paste_block(&mut self, start: usize, end: usize) {
+        self.composer.delete_range(start, end);
+        self.paste_registry.remove_range(start, end);
+    }
+
+    /// Insert one char, block-aware. Fast-paths to the plain composer
+    /// insert when no blocks exist (so ordinary typing is byte-identical
+    /// to today). Otherwise snaps the insertion point out of any block
+    /// interior and shifts trailing block ranges.
+    fn composer_insert_char(&mut self, ch: char) {
+        if self.paste_registry.is_empty() {
+            self.composer.insert_char(ch);
+            return;
+        }
+        let at = self
+            .paste_registry
+            .resolve_insertion(self.composer.cursor());
+        self.composer.set_cursor(at);
+        self.composer.insert_char(ch);
+        self.paste_registry
+            .shift_for_edit(at, ch.len_utf8() as isize);
+    }
+
+    /// Backspace, block-aware. (The whole-block case is handled by the
+    /// caller via `paste_block_left`; this is the ordinary single-char
+    /// path.) Snaps the cursor off a left boundary first so a Backspace
+    /// just *inside* the text after a block can't reach into it, then
+    /// shifts trailing blocks for the removed byte.
+    fn composer_delete_left(&mut self) {
+        if self.paste_registry.is_empty() {
+            self.composer.delete_left();
+            return;
+        }
+        let cursor = self.composer.cursor();
+        // Never delete from inside a block interior — snap to its start.
+        let cursor = self.paste_registry.skip_cursor(cursor, false);
+        self.composer.set_cursor(cursor);
+        let before = self.composer.len();
+        self.composer.delete_left();
+        let removed = before - self.composer.len();
+        if removed > 0 {
+            // delete_left removes the char ending at the old cursor; the
+            // edit anchor is the new cursor position.
+            self.paste_registry
+                .shift_for_edit(self.composer.cursor(), -(removed as isize));
+        }
+    }
+
+    /// Forward-delete (`Delete` / vim `x`), block-aware ordinary-char
+    /// path. The whole-block case is handled by `paste_block_right`.
+    fn composer_delete_right(&mut self) {
+        if self.paste_registry.is_empty() {
+            self.composer.delete_right();
+            return;
+        }
+        let cursor = self.composer.cursor();
+        let cursor = self.paste_registry.skip_cursor(cursor, true);
+        self.composer.set_cursor(cursor);
+        let at = self.composer.cursor();
+        let before = self.composer.len();
+        self.composer.delete_right();
+        let removed = before - self.composer.len();
+        if removed > 0 {
+            self.paste_registry.shift_for_edit(at, -(removed as isize));
+        }
+    }
+
+    /// Run a vim normal-mode motion (`w`/`W`/`b`/`B`) then snap the cursor
+    /// off any block interior to the far boundary in the direction of
+    /// travel (`forward`), so a word motion treats a paste block as one
+    /// unit. Fast-paths when there are no blocks.
+    fn vim_motion<F: FnOnce(&mut crate::tui::composer::Composer)>(
+        &mut self,
+        motion: F,
+        forward: bool,
+    ) {
+        motion(&mut self.composer);
+        if self.paste_registry.is_empty() {
+            return;
+        }
+        let landed = self
+            .paste_registry
+            .skip_cursor(self.composer.cursor(), forward);
+        self.composer.set_cursor(landed);
+    }
+
+    /// Move left one unit, treating a block as a single step: landing on a
+    /// block's right boundary then moving left jumps to its left boundary.
+    fn composer_move_left(&mut self) {
+        if self.paste_registry.is_empty() {
+            self.composer.move_left();
+            return;
+        }
+        let cursor = self.composer.cursor();
+        // If we're exactly at a block's right edge, jump the whole block.
+        if let Some(b) = self.paste_registry.block_ending_at(cursor) {
+            self.composer.set_cursor(b.start);
+            return;
+        }
+        self.composer.move_left();
+        // If the plain move landed inside a block, snap to its start.
+        let landed = self
+            .paste_registry
+            .skip_cursor(self.composer.cursor(), false);
+        self.composer.set_cursor(landed);
+    }
+
+    /// Move right one unit, treating a block as a single step.
+    fn composer_move_right(&mut self) {
+        if self.paste_registry.is_empty() {
+            self.composer.move_right();
+            return;
+        }
+        let cursor = self.composer.cursor();
+        if let Some(b) = self.paste_registry.block_starting_at(cursor) {
+            self.composer.set_cursor(b.end);
+            return;
+        }
+        self.composer.move_right();
+        let landed = self
+            .paste_registry
+            .skip_cursor(self.composer.cursor(), true);
+        self.composer.set_cursor(landed);
+    }
+
+    /// Run a vim motion-delete (`dw`, `db`, `cw`, `d$`, `d0`, `dG`,
+    /// `dgg`, …) block-aware via a motion closure that moves the composer
+    /// cursor to the far end of the operator's range and a matching plain
+    /// `delete` closure for the no-blocks fast path. When blocks exist, we
+    /// delete the byte span between the start and the motion's landing
+    /// point, widened to a block boundary if it crosses any paste block,
+    /// so the block is removed whole. When no blocks exist we just run the
+    /// plain composer delete — vim editing is byte-identical to today.
+    fn block_aware_delete<M, D>(&mut self, motion: M, delete: D)
+    where
+        M: FnOnce(&mut crate::tui::composer::Composer),
+        D: FnOnce(&mut crate::tui::composer::Composer),
+    {
+        if self.paste_registry.is_empty() {
+            delete(&mut self.composer);
+            return;
+        }
+        let from = self.composer.cursor();
+        let to = self.composer.probe_motion(motion);
+        if from == to {
+            return;
+        }
+        let (mut lo, mut hi) = if from <= to { (from, to) } else { (to, from) };
+        // Widen the range to swallow any block it crosses, so a delete
+        // that touches a placeholder removes the whole block.
+        if let Some((bs, be)) = self.paste_registry.block_crossed_by(lo, hi) {
+            lo = lo.min(bs);
+            hi = hi.max(be);
+        }
+        self.composer.delete_range(lo, hi);
+        self.paste_registry
+            .shift_for_edit(lo, -((hi - lo) as isize));
+    }
+
     pub(super) fn is_ctrl_shift_y(&self, key: &KeyEvent) -> bool {
         if !key.modifiers.contains(KeyModifiers::CONTROL) {
             return false;

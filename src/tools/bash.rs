@@ -155,8 +155,8 @@ impl Tool for BashTool {
         //     Global), skip the box and run with broadened access.
         //   - Else run sandboxed (cwd + session tmp rw, PATH exec, deny
         //     outside).
-        let sandbox_on = ctx.session.sandbox_enabled()
-            && crate::tools::shell_sandbox::shell_sandbox_supported();
+        let sandbox_on =
+            ctx.session.sandbox_enabled() && crate::tools::shell_sandbox::shell_sandbox_supported();
 
         // Windows has no zerobox backend: show the one-time per-session
         // notice that the shell runs unconfined. The flag is only ever
@@ -211,41 +211,42 @@ impl Tool for BashTool {
         // part 1 persists the grant, and we re-run with broadened access
         // (which repeats side-effects — noted in the prompt).
         let mut final_outcome = outcome;
-        if confine && !final_outcome.success {
-            if let Some(approver) = ctx.approver.as_ref() {
-                let decision = approver.approve_command(command).await?;
-                if decision.is_allowed() {
-                    let rerun = run_shell(
-                        &prefixed,
-                        &cwd,
-                        false, // broadened — no confinement
-                        tmp_dir.as_deref(),
-                        &scrub,
-                        ctx,
-                        timeout_ms,
-                    )
-                    .await;
-                    match rerun {
-                        RunOutcome::Cancelled => {
-                            return Ok(ToolOutput::truncated_text(
-                                "Error: command cancelled by user (ctrl+c)".to_string(),
-                            ));
-                        }
-                        RunOutcome::TimedOut => {
-                            return Ok(ToolOutput::truncated_text(format!(
-                                "Error: timeout after {timeout_ms} ms"
-                            )));
-                        }
-                        RunOutcome::SpawnError(e) => {
-                            return Ok(ToolOutput::text(format!("Error spawning shell: {e}")));
-                        }
-                        RunOutcome::WaitError(e) => {
-                            return Ok(ToolOutput::text(format!("Error running command: {e}")));
-                        }
-                        RunOutcome::Done(o) => final_outcome = o,
+        if confine
+            && !final_outcome.success
+            && let Some(approver) = ctx.approver.as_ref()
+        {
+            let decision = approver.approve_command(command).await?;
+            // Deny → fall through with the original sandboxed result.
+            if decision.is_allowed() {
+                let rerun = run_shell(
+                    &prefixed,
+                    &cwd,
+                    false, // broadened — no confinement
+                    tmp_dir.as_deref(),
+                    &scrub,
+                    ctx,
+                    timeout_ms,
+                )
+                .await;
+                match rerun {
+                    RunOutcome::Cancelled => {
+                        return Ok(ToolOutput::truncated_text(
+                            "Error: command cancelled by user (ctrl+c)".to_string(),
+                        ));
                     }
+                    RunOutcome::TimedOut => {
+                        return Ok(ToolOutput::truncated_text(format!(
+                            "Error: timeout after {timeout_ms} ms"
+                        )));
+                    }
+                    RunOutcome::SpawnError(e) => {
+                        return Ok(ToolOutput::text(format!("Error spawning shell: {e}")));
+                    }
+                    RunOutcome::WaitError(e) => {
+                        return Ok(ToolOutput::text(format!("Error running command: {e}")));
+                    }
+                    RunOutcome::Done(o) => final_outcome = o,
                 }
-                // Deny → fall through with the original sandboxed result.
             }
         }
 
@@ -272,20 +273,17 @@ async fn command_granted_broad(ctx: &ToolCtx, command: &str) -> bool {
     let Some(approver) = ctx.approver.as_ref() else {
         return false;
     };
-    use crate::approval::classify::{self, Classification};
-    let classification = classify::classify(command);
-    let simple = match classification {
-        Classification::Parsed {
-            simple_commands, ..
-        } => simple_commands,
-        Classification::Empty | Classification::Unparseable(_) => return false,
-    };
-    if simple.is_empty() {
+    let classification = crate::approval::classify::classify(command);
+    let simple = classification.simple_commands();
+    if simple.is_empty() || classification.has_wrapper() {
+        // Empty / unparseable / no simple commands, or any wrapper → run
+        // sandboxed (a wrapper is never persistable, so never "granted
+        // broad").
         return false;
     }
     simple
         .iter()
-        .all(|info| !info.wrapper && approver.store().is_command_granted(&info.key))
+        .all(|info| approver.store().is_command_granted(&info.key))
 }
 
 /// The combined outcome of one shell run.
@@ -569,6 +567,32 @@ fn scrub_overrides() -> Vec<(String, String)> {
     out
 }
 
+/// Windows-only: the shell-sandbox notice fires at most once per process
+/// and only when the session wanted sandboxing on (sandboxing part 2).
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    #[test]
+    fn windows_notice_fires_once_then_silent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = crate::tools::common::test_ctx(tmp.path());
+        // test_ctx defaults sandbox OFF → no notice.
+        assert!(windows_shell_notice(&ctx).is_none());
+        // With sandbox requested ON, the notice fires once, then the
+        // one-shot guard silences it (process-global).
+        ctx.session.set_sandbox_enabled(true);
+        let first = windows_shell_notice(&ctx);
+        let second = windows_shell_notice(&ctx);
+        // Exactly one of the two is `Some` (whichever observed the guard
+        // first); the other is `None`. (Other tests in this binary may
+        // have tripped the guard already, so we assert "at most one.")
+        assert!(first.is_none() || second.is_none());
+        // And shell sandboxing is reported unsupported on Windows.
+        assert!(!crate::tools::shell_sandbox::shell_sandbox_supported());
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -648,4 +672,95 @@ mod tests {
         assert!(out.content.contains("hello"), "got: {}", out.content);
         assert!(out.content.contains("exit: 0"), "got: {}", out.content);
     }
+
+    // ---- run-fail-escalate decision logic (sandboxing part 2) -------------
+
+    use std::sync::Arc;
+
+    use crate::approval::Approver;
+    use crate::approval::classify::SimpleCommandInfo;
+    use crate::approval::store::{GrantStore, Scope};
+
+    /// Build a sandbox-enabled ctx with an approver + grant store.
+    fn ctx_with_store(cwd: &std::path::Path) -> ToolCtx {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session =
+            crate::session::Session::create(db.clone(), cwd.to_path_buf(), "coder").unwrap();
+        session.set_sandbox_enabled(true);
+        let sid = session.id;
+        let locks = Arc::new(crate::locks::LockManager::from_db(db.clone()).unwrap());
+        let cfg = crate::config::extended::RedactConfig::default();
+        let redact = Arc::new(crate::redact::RedactionTable::build(&cfg, cwd).unwrap());
+        let hub = Arc::new(crate::engine::interrupt::InterruptHub::detached());
+        let store = GrantStore::new(db.clone(), sid, cwd.to_path_buf());
+        let approver = Arc::new(Approver::new(store, db, sid, "coder", hub.clone()));
+        ToolCtx {
+            agent_id: "coder".to_string(),
+            locks,
+            session: Arc::new(session),
+            cwd: cwd.to_path_buf(),
+            redact,
+            interrupts: hub,
+            cancel: tokio_util::sync::CancellationToken::new(),
+            approver: Some(approver),
+        }
+    }
+
+    #[tokio::test]
+    async fn granted_broad_skips_the_box() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = ctx_with_store(tmp.path());
+        let approver = ctx.approver.as_ref().unwrap();
+        // Not yet granted → must run sandboxed.
+        assert!(!command_granted_broad(&ctx, "cargo build --release").await);
+        // Grant `cargo build` at Session scope.
+        let info = SimpleCommandInfo {
+            program: "cargo".into(),
+            subcommand: Some("build".into()),
+            key: crate::approval::classify::ApprovalKey {
+                program: "cargo".into(),
+                subcommand: Some("build".into()),
+            },
+            wrapper: false,
+        };
+        approver
+            .store()
+            .record_command(&info, Scope::Session)
+            .unwrap();
+        // Now the same command is granted broad → skip the box.
+        assert!(command_granted_broad(&ctx, "cargo build --release").await);
+        // A different subcommand is still ungranted → run sandboxed.
+        assert!(!command_granted_broad(&ctx, "cargo test").await);
+    }
+
+    #[tokio::test]
+    async fn wrapper_never_skips_the_box() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = ctx_with_store(tmp.path());
+        // A wrapper can't be persisted, so it can never be "granted
+        // broad" → always runs sandboxed (and re-prompts on failure).
+        assert!(!command_granted_broad(&ctx, "bash -c 'echo hi'").await);
+        assert!(!command_granted_broad(&ctx, "sudo rm x").await);
+    }
+
+    #[tokio::test]
+    async fn no_approver_never_skips_the_box() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = crate::tools::common::test_ctx(tmp.path());
+        // No approver → can't know any grant → run sandboxed.
+        assert!(!command_granted_broad(&ctx, "ls").await);
+    }
+
+    // NOTE: an end-to-end "runs confined and EPERMs an outside read" test
+    // is deliberately omitted. On Linux the zerobox path re-execs THIS
+    // test binary as the `zerobox-linux-sandbox` helper, which only works
+    // from a binary whose `main` ran `arg0::dispatch_linux_sandbox_helper`
+    // first — the test harness's `main` does not, so a confined spawn
+    // hangs/errors on helper re-entry. Per the build spec we therefore
+    // cover the Sandbox CONFIGURATION/command-building (see
+    // `shell_sandbox::tests::builds_confined_command`) and the
+    // run-fail-escalate DECISION logic (above) instead of live EPERM
+    // enforcement. The unconfined cancel/timeout/pgid path stays fully
+    // exercised by `cancel_kills_process_group_promptly` /
+    // `normal_command_completes` (test_ctx defaults sandbox OFF).
 }

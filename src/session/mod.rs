@@ -803,6 +803,62 @@ mod tests {
     }
 
     #[test]
+    fn tmp_dir_is_per_session_and_isolated() {
+        // Two sessions get distinct private tmp dirs (sandboxing part 2),
+        // so neither can read the other's scratch.
+        let db = Db::open_in_memory().unwrap();
+        let a = Session::create(db.clone(), PathBuf::from("/x"), "coder").unwrap();
+        let b = Session::create(db, PathBuf::from("/x"), "coder").unwrap();
+        let da = a.tmp_dir().unwrap();
+        let db_ = b.tmp_dir().unwrap();
+        assert_ne!(da, db_, "sessions must not share a tmp dir");
+        assert!(da.exists());
+        assert!(db_.exists());
+        // Idempotent: a second call returns the same dir.
+        assert_eq!(a.tmp_dir().unwrap(), da);
+    }
+
+    #[test]
+    fn tmp_dir_removed_on_end() {
+        let db = Db::open_in_memory().unwrap();
+        let s = Session::create(db, PathBuf::from("/x"), "coder").unwrap();
+        let dir = s.tmp_dir().unwrap();
+        std::fs::write(dir.join("scratch"), "x").unwrap();
+        assert!(dir.exists());
+        s.end().unwrap();
+        assert!(!dir.exists(), "tmp dir must be cleaned up on session end");
+    }
+
+    #[test]
+    fn tmp_dir_removed_on_drop() {
+        let db = Db::open_in_memory().unwrap();
+        let dir = {
+            let s = Session::create(db, PathBuf::from("/x"), "coder").unwrap();
+            let d = s.tmp_dir().unwrap();
+            assert!(d.exists());
+            d
+        };
+        assert!(!dir.exists(), "drop is the cleanup backstop");
+    }
+
+    #[test]
+    fn sandbox_flag_defaults_on_and_toggles() {
+        let db = Db::open_in_memory().unwrap();
+        let s = Session::create(db, PathBuf::from("/x"), "coder").unwrap();
+        // Sandboxing-enabled (sandboxing part 2): defaults ON.
+        assert!(s.sandbox_enabled());
+        // Explicit set.
+        assert!(!s.set_sandbox_enabled(false));
+        assert!(!s.sandbox_enabled());
+        assert!(s.set_sandbox_enabled(true));
+        assert!(s.sandbox_enabled());
+        // Toggle flips and returns the new state.
+        assert!(!s.toggle_sandbox_enabled());
+        assert!(s.toggle_sandbox_enabled());
+        assert!(s.sandbox_enabled());
+    }
+
+    #[test]
     fn record_tool_call_writes_row() {
         let db = Db::open_in_memory().unwrap();
         let s = Session::create(db.clone(), PathBuf::from("/x"), "coder").unwrap();

@@ -320,6 +320,37 @@ pub struct TuiConfig {
     /// user opt in.
     #[serde(default)]
     pub use_emojis: bool,
+    /// `/caffeinate` display scope. When `true`, an active caffeination
+    /// also keeps the display awake; default `false` keeps only the
+    /// machine awake (and prevents lid-close suspend) while letting the
+    /// display turn off — saves screen wear/power on overnight runs.
+    /// System-idle + lid-close prevention are always on while caffeinated
+    /// regardless of this; the setting only governs the display.
+    #[serde(default)]
+    pub caffeinate_display_awake: bool,
+}
+
+/// Sleep scope `/caffeinate` keeps awake — derived from the
+/// `caffeinate_display_awake` UI setting. System-idle + lid-close are
+/// always suppressed while caffeinated; this only governs the display.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SleepScope {
+    /// Keep the machine awake + prevent lid-close suspend; let the display
+    /// turn off (default).
+    SystemOnly,
+    /// Also keep the display on.
+    SystemAndDisplay,
+}
+
+impl TuiConfig {
+    /// The `/caffeinate` sleep scope implied by the display-awake setting.
+    pub fn sleep_scope(&self) -> SleepScope {
+        if self.caffeinate_display_awake {
+            SleepScope::SystemAndDisplay
+        } else {
+            SleepScope::SystemOnly
+        }
+    }
 }
 
 fn default_exit_tail_lines() -> i32 {
@@ -477,6 +508,7 @@ impl Default for TuiConfig {
             rich_text_copy: true,
             exit_tail_lines: default_exit_tail_lines(),
             use_emojis: false,
+            caffeinate_display_awake: false,
         }
     }
 }
@@ -632,6 +664,32 @@ mod tests {
         );
         assert_eq!(cfg2.system_prompt.time_injection_interval_minutes, 10);
         assert!(!cfg2.tui.banner.enabled);
+    }
+
+    #[test]
+    fn caffeinate_display_awake_defaults_off_and_maps_to_system_only_scope() {
+        let cfg = ExtendedConfig::default();
+        assert!(
+            !cfg.tui.caffeinate_display_awake,
+            "default must keep the display free to sleep"
+        );
+        assert_eq!(cfg.tui.sleep_scope(), SleepScope::SystemOnly);
+    }
+
+    #[test]
+    fn caffeinate_display_awake_round_trips_and_maps_to_full_scope() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("extended-config.json");
+        std::fs::write(&path, "{}").unwrap();
+        let mut doc = ExtendedConfigDoc::load(&path).unwrap();
+        let mut cfg = doc.config();
+        cfg.tui.caffeinate_display_awake = true;
+        doc.write(&cfg).unwrap();
+
+        let doc2 = ExtendedConfigDoc::load(&path).unwrap();
+        let cfg2 = doc2.config();
+        assert!(cfg2.tui.caffeinate_display_awake);
+        assert_eq!(cfg2.tui.sleep_scope(), SleepScope::SystemAndDisplay);
     }
 
     #[test]

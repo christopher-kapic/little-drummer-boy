@@ -106,10 +106,8 @@ struct ApprovalsFile {
 pub struct GrantStore {
     db: Db,
     session_id: uuid::Uuid,
-    /// Session working directory — drives project-root resolution.
-    cwd: PathBuf,
-    /// Resolved project root for `cwd`, if any. `Project`-scope reads and
-    /// writes target `<root>/.cockpit/approvals.json`.
+    /// Resolved project root for the session cwd, if any. `Project`-scope
+    /// reads and writes target `<root>/.cockpit/approvals.json`.
     project_root: Option<PathBuf>,
     /// User-level cockpit config dir for `Global`-scope grants. Resolved
     /// once; `None` only if no home/data dir can be located.
@@ -119,14 +117,16 @@ pub struct GrantStore {
 impl GrantStore {
     /// Build a store for a session at `cwd`. Resolves the project root
     /// (via [`crate::git::find_worktree_root`], the same resolution the
-    /// rest of the app uses) and the global config dir up front.
+    /// rest of the app uses) and the global config dir up front. `cwd` is
+    /// consumed for that resolution; the absolutization part 2 needs is
+    /// done against the `ToolCtx` cwd at the call site, so the store
+    /// doesn't retain it.
     pub fn new(db: Db, session_id: uuid::Uuid, cwd: PathBuf) -> Self {
         let project_root = crate::git::find_worktree_root(&cwd);
         let global_dir = global_approvals_dir();
         Self {
             db,
             session_id,
-            cwd,
             project_root,
             global_dir,
         }
@@ -281,18 +281,6 @@ impl GrantStore {
         };
         set.insert(key.to_string());
         store_approvals(dir, &file)
-    }
-
-    /// The resolved project root, if any — exposed so part 2 can report
-    /// which project a grant would land in before prompting.
-    pub fn project_root(&self) -> Option<&Path> {
-        self.project_root.as_deref()
-    }
-
-    /// The session's cwd. Part 2 uses it to absolutize a relative path
-    /// before a path-grant query/record.
-    pub fn cwd(&self) -> &Path {
-        &self.cwd
     }
 }
 

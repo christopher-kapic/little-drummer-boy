@@ -42,8 +42,24 @@ use clap::Parser;
 
 use crate::cli::{Cli, Command};
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    // Sandboxing part 2: dispatch the zerobox Linux sandbox helper and
+    // install the PATH-prepend alias BEFORE the tokio runtime starts —
+    // the dispatch can re-exec this binary as the helper (never
+    // returning) and the PATH mutation is only sound single-threaded.
+    // No-op on non-Linux. Must precede `Cli::parse` so a helper re-entry
+    // doesn't try to parse cockpit's CLI.
+    tools::shell_sandbox::init();
+
+    // Build the multi-thread runtime by hand (the `#[tokio::main]`
+    // equivalent) so the helper dispatch above runs first.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async_main())
+}
+
+async fn async_main() -> Result<()> {
     let cli = Cli::parse();
 
     init_tracing(cli.log_level.as_deref(), cli.print_logs);
@@ -62,10 +78,11 @@ async fn main() -> Result<()> {
 
     match cli.command {
         // Bare `cockpit` (no subcommand) launches the TUI in cwd. Mirrors
-        // opencode's default behavior.
-        None => commands::tui::run(cli.project.as_deref()).await,
+        // opencode's default behavior. `--no-sandbox` (sandboxing part 2)
+        // disables filesystem sandboxing for sessions this client creates.
+        None => commands::tui::run(cli.project.as_deref(), cli.no_sandbox).await,
 
-        Some(Command::Run(args)) => commands::run::run(args).await,
+        Some(Command::Run(args)) => commands::run::run(args, cli.no_sandbox).await,
         Some(Command::Agent(sub)) => commands::agent::run(sub).await,
         Some(Command::Providers(sub)) => commands::providers::run(sub).await,
         Some(Command::Models(args)) => commands::models::run(args).await,

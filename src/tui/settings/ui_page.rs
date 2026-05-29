@@ -72,9 +72,9 @@ pub(super) struct GrabState {
 }
 
 /// Rows on the UI page (vim mode, thinking, render-agent-markdown,
-/// render-user-markdown, mouse, rich-text-copy, emojis, name, packages
-/// dir, utility model, instructions file).
-pub(super) const UI_ROWS: usize = 11;
+/// render-user-markdown, mouse, rich-text-copy, emojis, caffeinate
+/// display-awake, name, packages dir, utility model, instructions file).
+pub(super) const UI_ROWS: usize = 12;
 
 pub(super) fn bool_label(on: bool, on_label: &str, off_label: &str) -> String {
     if on {
@@ -233,10 +233,15 @@ impl SettingsDialog {
                     p.status = save_status(self.save_extended());
                 }
                 7 => {
+                    self.extended.tui.caffeinate_display_awake =
+                        !self.extended.tui.caffeinate_display_awake;
+                    p.status = save_status(self.save_extended());
+                }
+                8 => {
                     p.buf = TextField::new(self.extended.name.clone().unwrap_or_default());
                     p.editing = Some(UiField::Name);
                 }
-                8 => {
+                9 => {
                     let cur = self
                         .extended
                         .packages_directory
@@ -246,11 +251,11 @@ impl SettingsDialog {
                     p.buf = TextField::new(cur);
                     p.editing = Some(UiField::PackagesDir);
                 }
-                9 => {
+                10 => {
                     p.buf = TextField::new(self.extended.utility_model.clone().unwrap_or_default());
                     p.editing = Some(UiField::UtilityModel);
                 }
-                10 => {
+                11 => {
                     return Nav::Replace(Page::Instructions(InstructionsPage {
                         cursor: 0,
                         grabbed: None,
@@ -275,7 +280,7 @@ impl SettingsDialog {
         )));
         lines.push(Line::default());
 
-        let rows: [(&str, String); 11] = [
+        let rows: [(&str, String); 12] = [
             (
                 "vim mode",
                 vim_label(self.extended.tui.vim_mode).to_string(),
@@ -322,6 +327,14 @@ impl SettingsDialog {
                     self.extended.tui.use_emojis,
                     "enabled (emoji glyphs in tool calls + splash)",
                     "disabled (default — text-only; safe for terminals without emoji)",
+                ),
+            ),
+            (
+                "caffeinate display",
+                bool_label(
+                    self.extended.tui.caffeinate_display_awake,
+                    "keep display on too (while /caffeinate is active)",
+                    "system only (default — machine + lid-close, display may sleep)",
                 ),
             ),
             (
@@ -471,7 +484,7 @@ impl SettingsDialog {
             KeyCode::Esc | KeyCode::Char('q') => return Nav::Close,
             KeyCode::Left | KeyCode::Backspace | KeyCode::Char('h') => {
                 return Nav::Replace(Page::Ui(UiPage {
-                    cursor: 10,
+                    cursor: 11,
                     editing: None,
                     buf: TextField::default(),
                     status: None,

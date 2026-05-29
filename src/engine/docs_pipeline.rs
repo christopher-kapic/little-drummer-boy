@@ -77,6 +77,11 @@ pub async fn run(
         spawn_args.cwd.clone(),
         interrupts.clone(),
         cancel.clone(),
+        // The docs pipeline has no human on the other end (detached hub)
+        // and its filesystem reach is the docs hard-deny `confine()` path,
+        // which must NOT gain an escalation prompt (sandboxing part 2).
+        // No approver → no prompt.
+        None,
     )
     .await?;
 
@@ -112,6 +117,9 @@ pub async fn run(
         resolved.path,
         interrupts,
         cancel,
+        // Docs answerer: hard-deny `confine()` path, no human — no
+        // approver / no escalation prompt (sandboxing part 2).
+        None,
     )
     .await?;
     Ok(answer)

@@ -32,10 +32,10 @@ pub struct UsageCounts {
 
 /// Handle the TUI keeps to talk to the engine (now via the daemon).
 pub struct AgentRunner {
-    /// Send user-typed messages here. Each line becomes one
-    /// `SendUserMessage` request; the daemon's queue-folding (GOALS
-    /// §1c) is performed inside the worker, not here.
-    pub input_tx: mpsc::Sender<String>,
+    /// Send user submissions here (text + any pasted image parts). Each
+    /// becomes one `SendUserMessage` request; the daemon's queue-folding
+    /// (GOALS §1c) is performed inside the worker, not here.
+    pub input_tx: mpsc::Sender<crate::engine::message::UserSubmission>,
     /// Fire-and-forget `RecordUsage` requests (autocomplete tally).
     pub record_tx: mpsc::Sender<Request>,
     /// Drained per tick into [`crate::tui::app::App::history`].
@@ -61,19 +61,29 @@ pub struct AgentRunner {
 /// Returns `Err(String)` instead of `anyhow::Error` so `app.rs` can
 /// render the message in its fallback "input captured" stub without
 /// having to format an anyhow chain.
-pub fn try_spawn(cwd: &Path) -> Result<AgentRunner, String> {
-    try_spawn_inner(cwd, None)
+pub fn try_spawn(cwd: &Path, no_sandbox: bool) -> Result<AgentRunner, String> {
+    try_spawn_inner(cwd, None, no_sandbox)
 }
 
 /// Re-attach to an existing session by id (the `/compact` commit path,
 /// T6.e). Same as [`try_spawn`] but resumes `session_id` instead of
 /// creating a fresh one, so the TUI switches its event stream + input
-/// channel onto the new compaction-handoff session.
-pub fn attach_to_session(cwd: &Path, session_id: uuid::Uuid) -> Result<AgentRunner, String> {
-    try_spawn_inner(cwd, Some(session_id))
+/// channel onto the new compaction-handoff session. `no_sandbox` is
+/// ignored by the daemon on resume (the session keeps its own state),
+/// passed only to keep the attach shape uniform.
+pub fn attach_to_session(
+    cwd: &Path,
+    session_id: uuid::Uuid,
+    no_sandbox: bool,
+) -> Result<AgentRunner, String> {
+    try_spawn_inner(cwd, Some(session_id), no_sandbox)
 }
 
-fn try_spawn_inner(cwd: &Path, session_id: Option<uuid::Uuid>) -> Result<AgentRunner, String> {
+fn try_spawn_inner(
+    cwd: &Path,
+    session_id: Option<uuid::Uuid>,
+    no_sandbox: bool,
+) -> Result<AgentRunner, String> {
     let runtime = tokio::runtime::Handle::try_current()
         .map_err(|_| "no tokio runtime — cockpit must be invoked from main".to_string())?;
 
@@ -103,6 +113,7 @@ fn try_spawn_inner(cwd: &Path, session_id: Option<uuid::Uuid>) -> Result<AgentRu
                 .request_ok(Request::Attach {
                     session_id,
                     project_root: Some(project_root),
+                    no_sandbox,
                 })
                 .await
                 .map_err(|e| format!("attach: {e}"))?;
@@ -149,18 +160,24 @@ fn try_spawn_inner(cwd: &Path, session_id: Option<uuid::Uuid>) -> Result<AgentRu
     })?;
     let (client, session_id, short_id, initial_active_agent, project_id, usage) = attached;
 
-    let (input_tx, mut input_rx) = mpsc::channel::<String>(32);
+    let (input_tx, mut input_rx) = mpsc::channel::<crate::engine::message::UserSubmission>(32);
     let (record_tx, mut record_rx) = mpsc::channel::<Request>(32);
     let events = Arc::new(Mutex::new(Vec::new()));
     let active_agent = Arc::new(Mutex::new(initial_active_agent));
 
-    // Outbound: TUI sends a line → forward to daemon as
-    // SendUserMessage.
+    // Outbound: TUI sends a submission (text + any image parts) → forward
+    // to daemon as SendUserMessage.
     {
         let client = client.clone();
         tokio::spawn(async move {
-            while let Some(text) = input_rx.recv().await {
-                if let Err(e) = client.request(Request::SendUserMessage { text }).await {
+            while let Some(sub) = input_rx.recv().await {
+                if let Err(e) = client
+                    .request(Request::SendUserMessage {
+                        text: sub.text,
+                        images: sub.images,
+                    })
+                    .await
+                {
                     tracing::warn!(error = ?e, "send_user_message transport failed");
                     break;
                 }
@@ -188,7 +205,11 @@ fn try_spawn_inner(cwd: &Path, session_id: Option<uuid::Uuid>) -> Result<AgentRu
         let client = client.clone();
         tokio::spawn(async move {
             while let Some(event) = client.next_event().await {
-                if event_session(&event) != Some(session_id) {
+                // Daemon-global events (caffeinate) carry no session_id and
+                // must reach this client regardless of which session it's
+                // attached to — so they bypass the per-session filter.
+                let is_global = matches!(event, proto::Event::CaffeinateState { .. });
+                if !is_global && event_session(&event) != Some(session_id) {
                     continue;
                 }
                 update_active_agent(&event, &active_agent);
@@ -342,7 +363,11 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         | JobCompleted { session_id, .. }
         | ContextProjection { session_id, .. }
         | Pruned { session_id, .. }
-        | CompactReady { session_id, .. } => *session_id,
+        | CompactReady { session_id, .. }
+        | SandboxState { session_id, .. } => *session_id,
+        // Daemon-global events carry no session_id: they reach every
+        // client regardless of attachment.
+        CaffeinateState { .. } => return None,
     })
 }
 
@@ -487,6 +512,16 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
         } => TurnEvent::InterruptRaised {
             interrupt_id,
             questions,
+        },
+        SandboxState { enabled, .. } => TurnEvent::SandboxState { enabled },
+        CaffeinateState {
+            active,
+            lid_close_guaranteed,
+            message,
+        } => TurnEvent::CaffeinateState {
+            active,
+            lid_close_guaranteed,
+            message,
         },
         InterruptRaised { .. } | InterruptResolved { .. } | SessionEnded { .. } => return None,
     })

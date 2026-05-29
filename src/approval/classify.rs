@@ -126,6 +126,8 @@ pub enum Classification {
 
 impl Classification {
     /// The simple commands, or an empty slice for `Empty`/`Unparseable`.
+    /// `bash`'s skip-the-box check (sandboxing part 2) walks these to ask
+    /// the store whether every constituent command is already granted.
     pub fn simple_commands(&self) -> &[SimpleCommandInfo] {
         match self {
             Classification::Parsed {
@@ -136,7 +138,8 @@ impl Classification {
     }
 
     /// Whether any constituent command is a wrapper. A `true` here means
-    /// the whole string can only ever be approved [`Once`], never stored.
+    /// the whole string can only ever be approved [`Once`], never stored,
+    /// so `bash`'s skip-the-box fast path (sandboxing part 2) bails on it.
     ///
     /// [`Once`]: crate::approval::store::Scope::Once
     pub fn has_wrapper(&self) -> bool {

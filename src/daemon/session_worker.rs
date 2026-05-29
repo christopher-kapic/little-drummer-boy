@@ -77,6 +77,30 @@ pub struct SessionWorkerHandle {
     event_tx: broadcast::Sender<proto::Event>,
     /// Live job/turn status for the `/sessions` browser (GOALS §17f).
     live: Arc<LiveState>,
+    /// Shared session handle (sandboxing part 2): lets the server flip
+    /// the per-session sandbox-enabled flag (`/sandbox`) directly and
+    /// reply synchronously — the flag is an atomic on the `Arc<Session>`
+    /// the worker's driver also reads per tool call.
+    session: Arc<Session>,
+}
+
+impl SessionWorkerHandle {
+    /// Set or toggle the session's filesystem-sandbox flag (sandboxing
+    /// part 2). `None` toggles; `Some(b)` sets explicitly. Returns the
+    /// resulting state. Effective immediately for the next tool call (the
+    /// driver reads the same atomic). Broadcasts a `SandboxState` event
+    /// so every attached client stays in sync.
+    pub fn set_sandbox(&self, enabled: Option<bool>) -> bool {
+        let new = match enabled {
+            Some(b) => self.session.set_sandbox_enabled(b),
+            None => self.session.toggle_sandbox_enabled(),
+        };
+        let _ = self.event_tx.send(proto::Event::SandboxState {
+            session_id: self.session_id,
+            enabled: new,
+        });
+        new
+    }
 }
 
 impl SessionWorkerHandle {
@@ -102,7 +126,7 @@ impl SessionWorkerHandle {
 /// Work items a client can ask the worker to perform.
 #[derive(Debug)]
 pub enum SessionWork {
-    UserMessage(String),
+    UserMessage(crate::engine::message::UserSubmission),
     Cancel,
     ResolveInterrupt {
         interrupt_id: Uuid,
@@ -134,14 +158,27 @@ pub enum SessionWork {
 }
 
 /// One-shot constructor: spawn the worker and return its handle.
+///
+/// `client_no_sandbox` is the attaching client's `--no-sandbox` flag
+/// (sandboxing part 2): `Some(true)` means the client asked for new
+/// sessions it creates to be unsandboxed. The session-spawn default is
+/// resolved here by the precedence daemon-flag → client-flag → ON.
 pub fn spawn(
     session: Arc<Session>,
     locks: Arc<LockManager>,
     redact: Arc<RedactionTable>,
     model: Arc<Model>,
     project_root: PathBuf,
+    client_no_sandbox: bool,
 ) -> SessionWorkerHandle {
     let session_id = session.id;
+    // Resolve the new-session sandbox default (highest wins):
+    //   (a) daemon launched `--no-sandbox` → OFF for ALL sessions.
+    //   (b) else this client passed `--no-sandbox` → OFF for the
+    //       sessions it creates.
+    //   (c) else ON.
+    // A later `/sandbox` flip overrides this for the session.
+    session.set_sandbox_enabled(resolve_sandbox_default(client_no_sandbox));
     let (work_tx, work_rx) = mpsc::channel::<SessionWork>(WORK_QUEUE_CAPACITY);
     let (event_tx, _initial_rx) = broadcast::channel::<proto::Event>(EVENT_BROADCAST_CAPACITY);
     let live = Arc::new(LiveState::default());
@@ -153,6 +190,7 @@ pub fn spawn(
         work_tx,
         event_tx: event_tx.clone(),
         live: live.clone(),
+        session: session.clone(),
     };
 
     tokio::spawn(run_worker(
@@ -190,7 +228,8 @@ async fn run_worker(
     };
     let root = Arc::new(builtin::orchestrator_build(&spawn_args));
 
-    let (driver_input_tx, driver_input_rx) = mpsc::channel::<String>(WORK_QUEUE_CAPACITY);
+    let (driver_input_tx, driver_input_rx) =
+        mpsc::channel::<crate::engine::message::UserSubmission>(WORK_QUEUE_CAPACITY);
     let (driver_control_tx, driver_control_rx) =
         mpsc::channel::<crate::engine::driver::DriverControl>(WORK_QUEUE_CAPACITY);
     let (engine_event_tx, mut engine_event_rx) = mpsc::channel::<TurnEvent>(WORK_QUEUE_CAPACITY);
@@ -263,6 +302,29 @@ async fn run_worker(
     ));
     driver.set_interrupt_hub(interrupts.clone());
 
+    // Command/path approval driver (sandboxing part 2). Built on the
+    // session's grant store + the client-wired interrupt hub above, so a
+    // `bash` run-fail-escalate or a native out-of-boundary path access
+    // raises a prompt that fans out to the attached client exactly like a
+    // `question`. The driver threads it into every `ToolCtx`. Installed
+    // after the hub (the approver captures the same `Arc`). The active
+    // agent for the prompt is the foreground orchestrator at spawn time;
+    // a delegated coder shares the same approver via the `ToolCtx`
+    // `Arc`, so grants persist across the delegation tree.
+    let grant_store = crate::approval::store::GrantStore::new(
+        session.db.clone(),
+        session_id,
+        project_root.clone(),
+    );
+    let approver = Arc::new(crate::approval::Approver::new(
+        grant_store,
+        session.db.clone(),
+        session_id,
+        initial_active_agent(),
+        interrupts.clone(),
+    ));
+    driver.set_approver(approver);
+
     // Seed-tool re-execution (`/compact` handoff, T6.e): if this session
     // was created by `/compact`, its derived seed-tool plan was persisted
     // keyed by this session id. Drain it and dispatch the calls (read-only
@@ -289,11 +351,11 @@ async fn run_worker(
     // Main work loop.
     while let Some(work) = work_rx.recv().await {
         match work {
-            SessionWork::UserMessage(text) => {
+            SessionWork::UserMessage(submission) => {
                 if let Err(e) = session.touch() {
                     tracing::warn!(error = %e, "session touch failed");
                 }
-                if driver_input_tx.send(text).await.is_err() {
+                if driver_input_tx.send(submission).await.is_err() {
                     tracing::warn!(session_id = %session_id, "driver input channel closed");
                     break;
                 }
@@ -572,6 +634,20 @@ fn turn_event_to_proto(event: TurnEvent, session_id: Uuid) -> Vec<proto::Event> 
             seed_tool_count,
             seed_tool_tokens,
         }],
+        // The engine never emits `SandboxState` — the daemon's
+        // `SetSandbox` handler broadcasts the wire event directly (it
+        // carries `session_id`). This arm exists only for exhaustiveness.
+        TurnEvent::SandboxState { enabled } => {
+            vec![proto::Event::SandboxState {
+                session_id,
+                enabled,
+            }]
+        }
+        // Caffeination is daemon-global, not a session event: the
+        // `SetCaffeinate` handler / until-idle watcher broadcast
+        // `proto::Event::CaffeinateState` over the global bus directly.
+        // The engine never emits this; the arm is for exhaustiveness.
+        TurnEvent::CaffeinateState { .. } => vec![],
     }
 }
 
@@ -580,6 +656,54 @@ fn turn_event_to_proto(event: TurnEvent, session_id: Uuid) -> Vec<proto::Event> 
 /// constants and event-translation helpers stay in one module.
 pub(crate) fn initial_active_agent() -> &'static str {
     "orchestrator-build"
+}
+
+/// Env var the daemon sets at boot when launched with `--no-sandbox`
+/// (sandboxing part 2). Read per session-spawn to apply the
+/// highest-precedence "OFF for ALL sessions" rule. Set internally only
+/// (Layer B style); never a user-facing surface.
+pub const DAEMON_NO_SANDBOX_ENV: &str = "COCKPIT_DAEMON_NO_SANDBOX";
+
+/// Whether the running daemon was launched with `--no-sandbox`.
+fn daemon_no_sandbox() -> bool {
+    std::env::var_os(DAEMON_NO_SANDBOX_ENV).is_some()
+}
+
+/// Resolve the new-session sandbox default from the live daemon flag.
+fn resolve_sandbox_default(client_no_sandbox: bool) -> bool {
+    resolve_sandbox_default_with(daemon_no_sandbox(), client_no_sandbox)
+}
+
+/// Pure precedence resolver (highest wins): daemon `--no-sandbox` →
+/// client `--no-sandbox` → ON. Returns `true` when sandboxing should
+/// start enabled. Factored out from [`resolve_sandbox_default`] so the
+/// precedence can be unit-tested without touching process env.
+fn resolve_sandbox_default_with(daemon_no_sandbox: bool, client_no_sandbox: bool) -> bool {
+    if daemon_no_sandbox {
+        false
+    } else {
+        !client_no_sandbox
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sandbox_default_precedence_daemon_wins() {
+        // (a) daemon `--no-sandbox` → OFF regardless of the client flag.
+        assert!(!resolve_sandbox_default_with(true, false));
+        assert!(!resolve_sandbox_default_with(true, true));
+    }
+
+    #[test]
+    fn sandbox_default_precedence_client_then_on() {
+        // (b) no daemon flag, client `--no-sandbox` → OFF.
+        assert!(!resolve_sandbox_default_with(false, true));
+        // (c) neither flag → ON.
+        assert!(resolve_sandbox_default_with(false, false));
+    }
 }
 
 /// Resolve the per-session async-jobs concurrency cap (GOALS §22) from the

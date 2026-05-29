@@ -134,12 +134,28 @@ pub enum Request {
         /// it knows for this client connection.
         #[serde(default)]
         project_root: Option<String>,
+        /// The client's `--no-sandbox` flag (sandboxing part 2). When
+        /// `true`, sessions this client *creates* start with filesystem
+        /// sandboxing OFF — unless the daemon itself was launched
+        /// `--no-sandbox` (which wins). Ignored on resume of an existing
+        /// session (the session keeps its own state). Defaults to
+        /// `false` so older clients attach sandboxed.
+        #[serde(default)]
+        no_sandbox: bool,
     },
 
     /// Send a user message into the currently attached session. The
     /// daemon enqueues it on the driver and acks immediately —
-    /// per-turn progress flows over the event stream.
-    SendUserMessage { text: String },
+    /// per-turn progress flows over the event stream. `images` carries
+    /// PNG bytes for any pasted images sent as real image parts
+    /// (vision models only; non-vision clients fold images into `text`
+    /// and leave this empty — composer-paste-handling). The `text` may
+    /// contain `IMAGE_PART_SENTINEL` markers, one per image, in order.
+    SendUserMessage {
+        text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<Vec<u8>>,
+    },
 
     /// Cancel the in-flight model call for the attached session. The
     /// daemon aborts the streaming completion and returns control to
@@ -234,6 +250,27 @@ pub enum Request {
 
     /// Swap which built-in or user agent owns the conversation.
     SetAgent { name: String },
+
+    /// Set (or toggle) filesystem sandboxing for the attached session at
+    /// runtime (`/sandbox`, sandboxing part 2). `enabled = None` toggles
+    /// the current state; `Some(true)`/`Some(false)` set it explicitly.
+    /// Effective immediately for subsequent tool calls. Acked with the
+    /// resulting state via [`Response::SandboxState`].
+    SetSandbox {
+        #[serde(default)]
+        enabled: Option<bool>,
+    },
+
+    /// Set caffeination (`/caffeinate`): suppress system sleep + lid-close
+    /// so agents survive a closed lid. Daemon-global state — the daemon
+    /// holds the OS sleep assertion in its own (long-lived) process and
+    /// broadcasts the resulting [`Event::CaffeinateState`] to **every**
+    /// connected client (not just the attached session). `until_idle`
+    /// auto-off is decided by the daemon once no agent is running. Acked
+    /// with [`Response::CaffeinateState`].
+    SetCaffeinate {
+        mode: crate::daemon::caffeinate::CaffeinateMode,
+    },
 
     /// Cancel a live async job (loop / timer / background, GOALS §22) by
     /// id, on behalf of the human (the `/jobs cancel <id>` affordance).
@@ -409,7 +446,28 @@ pub enum Response {
         file: Option<String>,
         tokens: u64,
     },
+
+    /// The resulting sandbox-enabled state after a [`Request::SetSandbox`]
+    /// (sandboxing part 2). The TUI surfaces it via a toast.
+    SandboxState {
+        enabled: bool,
+    },
+
+    /// The resulting caffeination state after a [`Request::SetCaffeinate`].
+    /// `message` is the honest confirmation text for the toast (names the
+    /// lid-close limitation / missing mechanism where applicable);
+    /// `lid_close_guaranteed` is `true` only when active *and* lid-close
+    /// survival is assured on this platform/config. The matching
+    /// broadcast for other clients is [`Event::CaffeinateState`].
+    CaffeinateState {
+        active: bool,
+        lid_close_guaranteed: bool,
+        message: String,
+    },
 }
+
+// (The wire event variant for the same state change lives on `Event`
+// below, carrying `session_id` so the client can route it.)
 
 // ---- Events ----------------------------------------------------------------
 
@@ -611,6 +669,25 @@ pub enum Event {
         handoff: String,
         seed_tool_count: usize,
         seed_tool_tokens: u64,
+    },
+
+    /// Filesystem sandboxing was set/toggled for the session (`/sandbox`,
+    /// sandboxing part 2). Broadcast to every attached client so they
+    /// surface the resulting state (TUI: a toast).
+    SandboxState { session_id: Uuid, enabled: bool },
+
+    /// Caffeination (`/caffeinate`) turned on or off — including the
+    /// daemon-decided `until-idle` auto-off. **Daemon-global**: carries no
+    /// `session_id` and is broadcast to *every* connected client so the
+    /// `☕` chrome glyph appears (and clears) on all of them in lockstep.
+    /// `message` is `Some` for the originating client's toast; other
+    /// clients use `active` to drive the glyph. `lid_close_guaranteed`
+    /// lets a client word the lid-close caveat if it shows one.
+    CaffeinateState {
+        active: bool,
+        lid_close_guaranteed: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
     },
 }
 
@@ -956,13 +1033,14 @@ mod tests {
             Uuid::new_v4(),
             Request::SendUserMessage {
                 text: "hello".into(),
+                images: Vec::new(),
             },
         );
         let s = serde_json::to_string(&env).unwrap();
         let back: Envelope = serde_json::from_str(&s).unwrap();
         match back.body {
             Body::Request {
-                request: Request::SendUserMessage { text },
+                request: Request::SendUserMessage { text, .. },
                 ..
             } => assert_eq!(text, "hello"),
             other => panic!("expected SendUserMessage, got {other:?}"),
@@ -1063,6 +1141,86 @@ mod tests {
                 assert!(!statuses[0].processing);
             }
             other => panic!("expected SessionLiveStatus response, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_caffeinate_round_trip() {
+        use crate::daemon::caffeinate::CaffeinateMode;
+
+        // Request side: each mode survives the wire.
+        for mode in [
+            CaffeinateMode::Toggle,
+            CaffeinateMode::On,
+            CaffeinateMode::Off,
+            CaffeinateMode::UntilIdle,
+        ] {
+            let env = Envelope::request(Uuid::new_v4(), Request::SetCaffeinate { mode });
+            let s = serde_json::to_string(&env).unwrap();
+            let back: Envelope = serde_json::from_str(&s).unwrap();
+            match back.body {
+                Body::Request {
+                    request: Request::SetCaffeinate { mode: got },
+                    ..
+                } => assert_eq!(got, mode),
+                other => panic!("expected SetCaffeinate, got {other:?}"),
+            }
+        }
+        // `until-idle` serializes as snake_case `until_idle`.
+        let env = Envelope::request(
+            Uuid::new_v4(),
+            Request::SetCaffeinate {
+                mode: CaffeinateMode::UntilIdle,
+            },
+        );
+        let v: Value = serde_json::from_str(&serde_json::to_string(&env).unwrap()).unwrap();
+        assert_eq!(v["params"]["mode"], json!("until_idle"));
+
+        // Response side carries the honest message + lid-close flag.
+        let res = Envelope::response(
+            Uuid::new_v4(),
+            Response::CaffeinateState {
+                active: true,
+                lid_close_guaranteed: false,
+                message: "caffeinate on — note: lid-close not guaranteed".into(),
+            },
+        );
+        let back: Envelope =
+            serde_json::from_str(&serde_json::to_string(&res).unwrap()).unwrap();
+        match back.body {
+            Body::Response {
+                response:
+                    Response::CaffeinateState {
+                        active,
+                        lid_close_guaranteed,
+                        message,
+                    },
+                ..
+            } => {
+                assert!(active);
+                assert!(!lid_close_guaranteed);
+                assert!(message.contains("note:"));
+            }
+            other => panic!("expected CaffeinateState response, got {other:?}"),
+        }
+
+        // Event side is the daemon-global broadcast (no session_id, no
+        // message for non-originating clients).
+        let evt = Envelope::event(Event::CaffeinateState {
+            active: false,
+            lid_close_guaranteed: false,
+            message: None,
+        });
+        let back: Envelope =
+            serde_json::from_str(&serde_json::to_string(&evt).unwrap()).unwrap();
+        match back.body {
+            Body::Event {
+                event: Event::CaffeinateState { active, message, .. },
+            } => {
+                assert!(!active);
+                assert!(message.is_none());
+            }
+            other => panic!("expected CaffeinateState event, got {other:?}"),
         }
     }
 

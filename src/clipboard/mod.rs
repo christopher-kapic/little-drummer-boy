@@ -110,6 +110,43 @@ fn osc52_set_clipboard(text: &str) -> Result<(), CopyError> {
     Ok(())
 }
 
+/// Read an image from the system clipboard and encode it to PNG bytes.
+///
+/// Returns `Ok(Some(png))` when the clipboard holds a bitmap image,
+/// `Ok(None)` when it holds no image (the caller falls back to treating
+/// the paste as text), and `Err` only when the clipboard backend itself
+/// is unavailable. arboard hands us raw RGBA (`width`/`height`/`bytes`);
+/// we wrap it in an `image::RgbaImage` and re-encode as PNG so every
+/// provider gets a normalized, self-describing payload. Mirrors codex's
+/// `clipboard_paste::paste_image_as_png`, minus the file-list fallback
+/// (we only care about a real bitmap on the clipboard, not file paths).
+///
+/// Local clipboard only — SSH image paste is out of scope, and arboard
+/// has no remote pathway anyway.
+pub fn read_image_as_png() -> Result<Option<Vec<u8>>, CopyError> {
+    let mut cb = arboard::Clipboard::new().map_err(|e| CopyError::Backend(e.to_string()))?;
+    let img = match cb.get_image() {
+        Ok(img) => img,
+        // No image on the clipboard is the common case (the user pasted
+        // text); surface it as `None`, not an error.
+        Err(_) => return Ok(None),
+    };
+    let w = img.width as u32;
+    let h = img.height as u32;
+    let Some(rgba) = image::RgbaImage::from_raw(w, h, img.bytes.into_owned()) else {
+        return Err(CopyError::Backend(
+            "clipboard image had an invalid RGBA buffer".to_string(),
+        ));
+    };
+    let dynimg = image::DynamicImage::ImageRgba8(rgba);
+    let mut png = Vec::new();
+    let mut cursor = std::io::Cursor::new(&mut png);
+    dynimg
+        .write_to(&mut cursor, image::ImageFormat::Png)
+        .map_err(|e| CopyError::Backend(format!("PNG encode failed: {e}")))?;
+    Ok(Some(png))
+}
+
 fn arboard_set_text(text: &str) -> Result<(), CopyError> {
     let mut cb = arboard::Clipboard::new().map_err(|e| CopyError::Backend(e.to_string()))?;
     cb.set_text(text.to_string())

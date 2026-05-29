@@ -183,6 +183,11 @@ pub(crate) fn test_ctx(root: &Path) -> ToolCtx {
 
     let db = crate::db::Db::open_in_memory().unwrap();
     let session = crate::session::Session::create(db.clone(), root.to_path_buf(), "coder").unwrap();
+    // Test ctx has no daemon and no zerobox Linux helper installed, so
+    // the shell sandbox can't run here (sandboxing part 2). Default the
+    // session sandbox OFF — tests that exercise sandbox config/decision
+    // logic build their own ctx or flip the flag explicitly.
+    session.set_sandbox_enabled(false);
     let locks = Arc::new(crate::locks::LockManager::from_db(db).unwrap());
     let cfg = crate::config::extended::RedactConfig::default();
     let redact = Arc::new(crate::redact::RedactionTable::build(&cfg, root).unwrap());

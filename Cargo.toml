@@ -40,7 +40,14 @@ pulldown-cmark = { version = "0.13", default-features = false, features = ["html
 # System clipboard for local sessions (plan.md T8.e). Supports
 # multi-format set (plain text + HTML) which OSC52 cannot do, so
 # rich-text copy goes through arboard when not running over SSH.
-arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }
+# `image-data` enables `Clipboard::get_image` for composer image paste
+# (composer-paste-handling); it pulls arboard's own `image` dep.
+arboard = { version = "3", default-features = false, features = ["wayland-data-control", "image-data"] }
+# Decode/normalize/encode pasted clipboard images to PNG before they go
+# to a vision model (composer-paste-handling). PNG-only feature set keeps
+# the build lean; we never decode other formats ourselves (arboard hands
+# us raw RGBA, we only encode).
+image = { version = "0.25", default-features = false, features = ["png"] }
 # Embedded-PTY panes for `/editor` + `/lazygit` (GOALS §1i/§1j, plan
 # T9). `portable-pty` (wezterm's pure-Rust PTY layer) spawns + resizes
 # the child; `vt100` is the terminal-screen state machine fed by the
@@ -139,6 +146,27 @@ dotenvy = "0.15"
 # active provider doesn't expose its own. Singleton-backed; the BPE
 # vocab is built once on first call.
 tiktoken-rs = "0.11"
+
+# Cross-platform sleep-assertion crate for `/caffeinate` (daemon holds
+# the assertion). Pure-Rust: `SetThreadExecutionState` (Windows),
+# `IOPMAssertionCreateWithName` (macOS), logind `idle`/`sleep`
+# inhibitor locks via blocking zbus (Linux). Default features only —
+# the `bin` feature (clap/ctrlc/sysinfo) is opt-in and we never build
+# its CLI. NB: keepawake's logind path inhibits `idle`+`sleep` but NOT
+# `handle-lid-switch`, which `LidSwitchIgnoreInhibited=yes` (the logind
+# default) causes to be ignored on lid close — so on Linux we add our
+# own `handle-lid-switch` inhibitor (see `daemon::caffeinate::linux`)
+# using the same zbus version to keep one zbus in the tree.
+keepawake = "0.6"
+
+# Linux-only: logind `handle-lid-switch` inhibitor lock for
+# `/caffeinate` lid-close survival (the high-level inhibitor logind
+# always honors, unlike the `sleep` lock keepawake takes). Blocking
+# zbus matches keepawake's `zbus = "5"` so the dependency graph has a
+# single zbus. Held on a dedicated thread alongside the keepawake
+# assertion (see `daemon::caffeinate`).
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = "5"
 
 # OAuth device-code flow (Codex login). PKCE = SHA-256 + URL-safe base64
 # (no padding); `urlencoding` is just for the form-encoded body of the

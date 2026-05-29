@@ -1326,8 +1326,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut d = fresh_dialog(&tmp);
         enter_ui_from_root(&mut d);
-        // Row 9 = utility model.
-        for _ in 0..9 {
+        // Row 10 = utility model (row 7 is the caffeinate-display toggle).
+        for _ in 0..10 {
             d.handle_key(press(KeyCode::Char('j')));
         }
         d.handle_key(press(KeyCode::Enter)); // begin editing
@@ -1370,14 +1370,15 @@ mod tests {
 
     #[test]
     fn enter_on_instructions_row_in_ui_opens_instructions_page() {
-        // UI page row 10 (instructions file) + Enter should land on the
+        // UI page row 11 (instructions file) + Enter should land on the
         // Instructions page. Rows 0-3 are vim/thinking/markdown, 4-5 are
-        // mouse/rich-text-copy (T8.c/T8.g), 6 is emojis, 7-8 are
-        // name/packages, 9 is utility model, 10 is instructions.
+        // mouse/rich-text-copy (T8.c/T8.g), 6 is emojis, 7 is caffeinate
+        // display-awake, 8-9 are name/packages, 10 is utility model, 11 is
+        // instructions.
         let tmp = TempDir::new().unwrap();
         let mut d = fresh_dialog(&tmp);
         enter_ui_from_root(&mut d);
-        for _ in 0..10 {
+        for _ in 0..11 {
             d.handle_key(press(KeyCode::Char('j')));
         }
         d.handle_key(press(KeyCode::Enter));
@@ -1473,10 +1474,10 @@ mod tests {
     fn fresh_instructions_dialog(tmp: &TempDir) -> SettingsDialog {
         let mut d = fresh_dialog(tmp);
         enter_ui_from_root(&mut d);
-        // Move cursor to the instructions row (idx 10: the `utility
-        // model` row at 9 pushes instructions to the last position) and
-        // Enter to nav.
-        for _ in 0..10 {
+        // Move cursor to the instructions row (idx 11: the caffeinate
+        // display-awake toggle at 7 and `utility model` at 10 push
+        // instructions to the last position) and Enter to nav.
+        for _ in 0..11 {
             d.handle_key(press(KeyCode::Char('j')));
         }
         d.handle_key(press(KeyCode::Enter));

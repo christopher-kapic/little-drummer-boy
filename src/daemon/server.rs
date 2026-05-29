@@ -28,6 +28,10 @@ use crate::daemon::session_worker::{SessionWork, SessionWorkerHandle};
 use crate::db::Db;
 use crate::locks::LockManager;
 
+/// Daemon-wide broadcast capacity for global (non-session) events such as
+/// [`proto::Event::CaffeinateState`]. Generous — these are rare.
+const GLOBAL_EVENT_CAPACITY: usize = 64;
+
 /// Daemon-wide singletons. Held in an `Arc` so per-client tasks can
 /// share without copying.
 pub struct DaemonContext {
@@ -36,6 +40,15 @@ pub struct DaemonContext {
     pub registry: SessionRegistry,
     pub paths: DaemonPaths,
     pub started_at: Instant,
+    /// Caffeination authority (`/caffeinate`, GOALS §1a chrome glyph).
+    /// Holds the OS sleep assertion **in the daemon process** so it
+    /// survives TUI-client exit, plus the on/off + until-idle state.
+    pub caffeinate: Arc<crate::daemon::caffeinate::CaffeineController>,
+    /// Daemon-global event bus. Unlike the per-session broadcast on each
+    /// worker, every client task subscribes to this regardless of which
+    /// (if any) session it's attached to — so a daemon-global event like
+    /// [`proto::Event::CaffeinateState`] reaches *all* connected clients.
+    global_events: broadcast::Sender<proto::Event>,
     /// Live count of connected clients. Each [`handle_client`] task
     /// increments on accept and decrements on exit. The ephemeral
     /// self-reaping watchdog (Layer C) watches the receiver side for
@@ -47,14 +60,28 @@ impl DaemonContext {
     pub fn new(db: Db, locks: Arc<LockManager>, paths: DaemonPaths) -> Self {
         let registry = SessionRegistry::new(db.clone(), locks.clone());
         let (client_count, _) = tokio::sync::watch::channel(0usize);
+        let (global_events, _) = broadcast::channel(GLOBAL_EVENT_CAPACITY);
         Self {
             db,
             locks,
             registry,
             paths,
             started_at: Instant::now(),
+            caffeinate: Arc::new(crate::daemon::caffeinate::CaffeineController::new()),
+            global_events,
             client_count,
         }
+    }
+
+    /// Subscribe to the daemon-global event bus. Every client task holds
+    /// one of these for its lifetime.
+    pub fn subscribe_global(&self) -> broadcast::Receiver<proto::Event> {
+        self.global_events.subscribe()
+    }
+
+    /// Broadcast a daemon-global event to all connected clients.
+    pub fn broadcast_global(&self, event: proto::Event) {
+        let _ = self.global_events.send(event);
     }
 
     /// Subscribe to the live connected-client count. Used by the
@@ -191,6 +218,25 @@ async fn handle_client(stream: UnixStream, ctx: Arc<DaemonContext>) -> Result<()
 
     let mut state = ClientState { attached: None };
 
+    // Daemon-global events (caffeinate, …) reach every client regardless
+    // of attachment, so this receiver lives for the whole client task.
+    let mut global_rx = ctx.subscribe_global();
+
+    // On connect, sync the client's caffeinate glyph to the daemon's
+    // current state (a TUI that attaches while caffeination is already on
+    // must show ☕ immediately). Fire-and-forget; a send failure just
+    // means the client went away.
+    {
+        let snap = ctx.caffeinate.snapshot();
+        let _ = proto
+            .send(&Envelope::event(proto::Event::CaffeinateState {
+                active: snap.active,
+                lid_close_guaranteed: false,
+                message: None,
+            }))
+            .await;
+    }
+
     loop {
         // The select! pulls from whichever side of the socket has work.
         // We have to expand `recv_event` inline because Future<Output=
@@ -214,6 +260,24 @@ async fn handle_client(stream: UnixStream, ctx: Arc<DaemonContext>) -> Result<()
 
         tokio::select! {
             biased;
+            global = global_rx.recv() => {
+                match global {
+                    Ok(ev) => {
+                        if let Err(e) = proto.send(&Envelope::event(ev)).await {
+                            tracing::debug!(error = ?e, "client disconnected during global event send");
+                            return Ok(());
+                        }
+                    }
+                    // A lagging global bus is non-fatal: caffeinate state
+                    // is re-synced on the next change + at attach time.
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!(missed = n, "client global event stream lagged");
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        // The daemon is tearing down; let the socket close.
+                    }
+                }
+            }
             event = event_branch => {
                 match event {
                     Some(Ok(ev)) => {
@@ -264,7 +328,7 @@ async fn handle_client(stream: UnixStream, ctx: Arc<DaemonContext>) -> Result<()
 async fn handle_envelope(
     env: Envelope,
     state: &mut ClientState,
-    ctx: &DaemonContext,
+    ctx: &Arc<DaemonContext>,
     proto: &mut ProtoStream<UnixStream>,
 ) -> Result<()> {
     match env.body {
@@ -292,18 +356,21 @@ async fn handle_envelope(
 async fn handle_request(
     request: Request,
     state: &mut ClientState,
-    ctx: &DaemonContext,
+    ctx: &Arc<DaemonContext>,
 ) -> std::result::Result<Response, ErrorPayload> {
     match request {
         Request::Attach {
             session_id,
             project_root,
-        } => attach(state, ctx, session_id, project_root),
+            no_sandbox,
+        } => attach(state, ctx, session_id, project_root, no_sandbox),
 
-        Request::SendUserMessage { text } => {
+        Request::SendUserMessage { text, images } => {
             let att = require_attached(state)?;
             att.handle
-                .send_work(SessionWork::UserMessage(text))
+                .send_work(SessionWork::UserMessage(
+                    crate::engine::message::UserSubmission { text, images },
+                ))
                 .await
                 .map_err(internal)?;
             Ok(Response::Ack)
@@ -402,6 +469,8 @@ async fn handle_request(
             Ok(Response::Ack)
         }
 
+        Request::SetCaffeinate { mode } => set_caffeinate(state, ctx, mode),
+
         Request::CancelJob { job_id } => {
             let att = require_attached(state)?;
             att.handle
@@ -409,6 +478,16 @@ async fn handle_request(
                 .await
                 .map_err(internal)?;
             Ok(Response::Ack)
+        }
+
+        Request::SetSandbox { enabled } => {
+            // Sandboxing part 2: flip the session's sandbox flag directly
+            // (it's a shared atomic) and reply with the resulting state.
+            // The handle also broadcasts a `SandboxState` event so every
+            // attached client stays in sync.
+            let att = require_attached(state)?;
+            let new = att.handle.set_sandbox(enabled);
+            Ok(Response::SandboxState { enabled: new })
         }
 
         Request::Prune => {
@@ -545,12 +624,108 @@ async fn handle_request(
 
 // ---- helpers --------------------------------------------------------------
 
+/// Apply a `/caffeinate` request: resolve the display-awake scope from
+/// config, drive the daemon-held [`CaffeineController`], broadcast the
+/// resulting state to **all** clients, and (for `until-idle`) arm the
+/// daemon's auto-off watcher. The OS assertion lives in this process so it
+/// survives the requesting client's exit.
+fn set_caffeinate(
+    state: &ClientState,
+    ctx: &Arc<DaemonContext>,
+    mode: crate::daemon::caffeinate::CaffeinateMode,
+) -> std::result::Result<Response, ErrorPayload> {
+    use crate::daemon::caffeinate::InhibitScope;
+
+    // Display-awake is a config setting; resolve it from the attached
+    // session's project root when available, else the daemon's cwd.
+    let cfg_root = state
+        .attached
+        .as_ref()
+        .map(|att| att.handle.project_root.clone())
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."));
+    let scope: InhibitScope = match load_configs(&cfg_root) {
+        Ok((_, extended)) => extended.tui.sleep_scope().into(),
+        // Config read failure must not block caffeination: fall back to
+        // the safe default (system-only, display free to sleep).
+        Err(_) => InhibitScope {
+            keep_display_on: false,
+        },
+    };
+
+    match ctx.caffeinate.apply(mode, scope) {
+        Ok(applied) => {
+            // Broadcast to every client so the ☕ glyph stays in sync.
+            ctx.broadcast_global(proto::Event::CaffeinateState {
+                active: applied.state.active,
+                lid_close_guaranteed: applied.lid_close_guaranteed,
+                message: None,
+            });
+            // Arm the daemon-owned until-idle watcher: it polls "is any
+            // agent running?" and auto-offs once none are.
+            if applied.state.until_idle {
+                spawn_until_idle_watcher(ctx.clone());
+            }
+            Ok(Response::CaffeinateState {
+                active: applied.state.active,
+                lid_close_guaranteed: applied.lid_close_guaranteed,
+                message: applied.message,
+            })
+        }
+        // Missing-mechanism / acquire failure: report it so the TUI shows
+        // an honest, actionable toast (never silent). State stays off.
+        Err(message) => Ok(Response::CaffeinateState {
+            active: false,
+            lid_close_guaranteed: false,
+            message,
+        }),
+    }
+}
+
+/// Poll interval for the until-idle auto-off watcher. Short enough that
+/// the machine doesn't stay awake long after the last agent finishes,
+/// long enough to be negligible overhead.
+const UNTIL_IDLE_POLL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Spawn the daemon's `until-idle` auto-off watcher. The daemon owns the
+/// session workers / `JobAuthority`, so it is the authority for "is an
+/// agent running anywhere?". The watcher polls that and, once no agent is
+/// running, releases the assertion and broadcasts the off-state to all
+/// clients. It exits if the mode is no longer until-idle (a later
+/// `on`/`off`/`toggle` superseded it) so a fresh `until-idle` can re-arm
+/// without stacking watchers racing each other.
+fn spawn_until_idle_watcher(ctx: Arc<DaemonContext>) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(UNTIL_IDLE_POLL).await;
+            // Superseded (explicit on/off, or already auto-offed): stop.
+            if !ctx.caffeinate.is_until_idle() {
+                return;
+            }
+            let running = ctx.registry.any_agent_running();
+            if let Some(applied) = ctx.caffeinate.idle_check(running) {
+                ctx.broadcast_global(proto::Event::CaffeinateState {
+                    active: applied.state.active,
+                    lid_close_guaranteed: applied.lid_close_guaranteed,
+                    message: None,
+                });
+                return;
+            }
+        }
+    });
+}
+
 fn attach(
     state: &mut ClientState,
     ctx: &DaemonContext,
     session_id: Option<Uuid>,
     project_root: Option<String>,
+    no_sandbox: bool,
 ) -> std::result::Result<Response, ErrorPayload> {
+    // The client's `--no-sandbox` only governs sessions it *creates*
+    // (sandboxing part 2). On resume of an existing session id the session
+    // keeps its own runtime state, so the flag is ignored there.
+    let client_no_sandbox = no_sandbox && session_id.is_none();
     let project_root = project_root.map(PathBuf::from);
 
     let cfg_root = match (session_id, &project_root) {
@@ -578,7 +753,13 @@ fn attach(
 
     let handle = ctx
         .registry
-        .attach(session_id, project_root, &providers_cfg, &extended_cfg)
+        .attach(
+            session_id,
+            project_root,
+            &providers_cfg,
+            &extended_cfg,
+            client_no_sandbox,
+        )
         .map_err(internal)?;
 
     // Replace any prior attachment.

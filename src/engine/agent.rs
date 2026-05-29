@@ -194,6 +194,21 @@ pub enum TurnEvent {
         seed_tool_count: usize,
         seed_tool_tokens: u64,
     },
+
+    /// Filesystem sandboxing was toggled for the session (`/sandbox`,
+    /// sandboxing part 2). UI-only: the TUI surfaces the resulting state
+    /// as a toast. Emitted by the daemon's `SetSandbox` handler.
+    SandboxState { enabled: bool },
+
+    /// Caffeination (`/caffeinate`) state changed — daemon-global,
+    /// broadcast to every client (incl. until-idle auto-off). Drives the
+    /// `☕` chrome glyph on all clients + a toast on the originator.
+    /// `message` is `Some` only for the client that issued the request.
+    CaffeinateState {
+        active: bool,
+        lid_close_guaranteed: bool,
+        message: Option<String>,
+    },
 }
 
 /// Outcome of one [`turn`] call. The driver loops on the result.

@@ -704,8 +704,23 @@ impl App {
         let inner_w = input_inner.width as usize;
         let budget = inner_w.saturating_sub(prefix_width).max(1);
         let mut lines: Vec<Line<'static>> = Vec::new();
+        // Byte offset of the start of the current logical line within the
+        // full buffer — used to map a wrapped chunk back to absolute byte
+        // ranges so paste-block placeholders render with a distinct style
+        // (composer-paste-handling). Lines are split on '\n', so each
+        // separator adds one byte.
+        let mut line_byte_start = 0usize;
         for (li, line) in buf_lines.iter().enumerate() {
             let line_chars: Vec<char> = line.chars().collect();
+            // Char→byte prefix sums for this line, so a chunk's char
+            // range maps to absolute buffer byte offsets.
+            let mut char_byte: Vec<usize> = Vec::with_capacity(line_chars.len() + 1);
+            let mut acc = 0usize;
+            char_byte.push(0);
+            for ch in &line_chars {
+                acc += ch.len_utf8();
+                char_byte.push(acc);
+            }
             let chunks = wrap_logical_line_chunks(line, budget);
             for (ci, (start, end)) in chunks.iter().enumerate() {
                 let chunk_text: String = line_chars[*start..*end].iter().collect();
@@ -714,11 +729,16 @@ impl App {
                 } else {
                     indent.as_str()
                 };
-                lines.push(Line::from(vec![
-                    Span::styled(pre.to_string(), Style::default().fg(Color::White)),
-                    Span::styled(chunk_text, Style::default().fg(Color::White)),
-                ]));
+                let chunk_byte_start = line_byte_start + char_byte[*start];
+                let mut spans = vec![Span::styled(
+                    pre.to_string(),
+                    Style::default().fg(Color::White),
+                )];
+                spans.extend(self.paste_styled_spans(&chunk_text, chunk_byte_start));
+                lines.push(Line::from(spans));
             }
+            // Advance past this line + its '\n' separator.
+            line_byte_start += line.len() + 1;
         }
 
         let (cursor_line, cursor_col) = self.composer.cursor_line_col();
@@ -764,6 +784,54 @@ impl App {
             input_inner.x + cursor_col,
             input_inner.y + cursor_row.saturating_sub(scroll_y),
         )
+    }
+
+    /// Split a rendered composer chunk (`text`, whose first char is at
+    /// absolute buffer byte `chunk_byte_start`) into styled spans, giving
+    /// any bytes covered by a paste-block placeholder a distinct dim-cyan
+    /// style (composer-paste-handling). Non-block text keeps the default
+    /// white. Returns one span when no block overlaps the chunk (the
+    /// common case), so ordinary typing renders exactly as before.
+    fn paste_styled_spans(&self, text: &str, chunk_byte_start: usize) -> Vec<Span<'static>> {
+        let plain = || {
+            vec![Span::styled(
+                text.to_string(),
+                Style::default().fg(Color::White),
+            )]
+        };
+        if self.paste_registry.is_empty() {
+            return plain();
+        }
+        let blocks = self.paste_registry.blocks();
+        let chunk_end = chunk_byte_start + text.len();
+        // Quick reject: no block overlaps this chunk.
+        if !blocks
+            .iter()
+            .any(|b| b.start < chunk_end && b.end > chunk_byte_start)
+        {
+            return plain();
+        }
+        let block_style = Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM);
+        let normal = Style::default().fg(Color::White);
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        let mut cur = String::new();
+        let mut cur_in_block = false;
+        let mut byte = chunk_byte_start;
+        for ch in text.chars() {
+            let in_block = blocks.iter().any(|b| byte >= b.start && byte < b.end);
+            if in_block != cur_in_block && !cur.is_empty() {
+                let style = if cur_in_block { block_style } else { normal };
+                spans.push(Span::styled(std::mem::take(&mut cur), style));
+            }
+            cur_in_block = in_block;
+            cur.push(ch);
+            byte += ch.len_utf8();
+        }
+        if !cur.is_empty() {
+            let style = if cur_in_block { block_style } else { normal };
+            spans.push(Span::styled(cur, style));
+        }
+        spans
     }
 
     /// Build the chrome's context indicator. Format (GOALS §1a):
@@ -1096,7 +1164,11 @@ impl App {
     }
 
     pub(super) fn render_status(&self, frame: &mut ratatui::Frame, area: Rect) {
-        let right = chrome::status_line_spans(&self.launch);
+        // Caffeination glyph (☕) leads the right-hand chrome while active,
+        // driven by the daemon-broadcast state (GOALS §1a). Additive to the
+        // fixed cwd + branch chrome — never displaces it.
+        let mut right = chrome::caffeinate_glyph_spans(self.caffeinate_active);
+        right.extend(chrome::status_line_spans(&self.launch));
         let mut left = chrome::left_status_spans(&self.launch);
         // Transient async-jobs strip (GOALS §22): only when ≥1 job is
         // active, appended to the bottom-left so the fixed chrome

@@ -1,11 +1,3 @@
-#![allow(dead_code)]
-// This is part 1 of 2 (sandboxing). The public API below — the
-// classifier, the grant store, and the `Approver` prompt orchestration —
-// has no in-tree consumer until `prompts/zerobox-filesystem-sandboxing.md`
-// (part 2) wires it to the sandbox. It's built and tested as a
-// self-contained subsystem (see the `#[cfg(test)]` modules), so the
-// "never used" lints are expected here; part 2 removes this allow.
-//
 //! Command-approval & escalation subsystem (sandboxing, part 1 of 2).
 //!
 //! The reusable layer that decides *whether a shell command or path is

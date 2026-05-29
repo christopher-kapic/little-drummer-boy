@@ -144,6 +144,48 @@ impl Composer {
         self.cursor
     }
 
+    /// Buffer length in bytes. Used by the paste-block registry to
+    /// compute the magnitude of an edit (`len_after - len_before`).
+    pub fn len(&self) -> usize {
+        self.buffer.len()
+    }
+
+    /// Set the cursor to an explicit byte offset (clamped to a char
+    /// boundary at or before `pos`). Used to snap the cursor onto a
+    /// paste-block boundary so it never lands in a block interior
+    /// (composer-paste-handling).
+    pub fn set_cursor(&mut self, pos: usize) {
+        let pos = pos.min(self.buffer.len());
+        // Walk back to the nearest char boundary (no-op for ASCII /
+        // boundary positions).
+        let mut p = pos;
+        while p > 0 && !self.buffer.is_char_boundary(p) {
+            p -= 1;
+        }
+        self.cursor = p;
+    }
+
+    /// Insert a whole string at the cursor and advance past it. Used by
+    /// the paste path to drop a placeholder (or raw pasted text) in one
+    /// step so the registry can record the exact byte span.
+    pub fn insert_str(&mut self, s: &str) {
+        self.buffer.insert_str(self.cursor, s);
+        self.cursor += s.len();
+    }
+
+    /// Run a cursor-moving motion closure without keeping its effect:
+    /// returns the byte offset the motion *would* land on and restores the
+    /// original cursor. Used by the paste-block-aware vim operators to
+    /// compute a deletion range before deciding whether it crosses a block
+    /// (composer-paste-handling).
+    pub fn probe_motion<F: FnOnce(&mut Self)>(&mut self, motion: F) -> usize {
+        let saved = self.cursor;
+        motion(self);
+        let landed = self.cursor;
+        self.cursor = saved;
+        landed
+    }
+
     /// Position the cursor at `(line, col)` measured in characters from
     /// the start of each line. Out-of-range coordinates clamp to the
     /// nearest valid position (past-end-of-line lands on the line's

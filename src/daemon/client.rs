@@ -287,7 +287,11 @@ pub async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemon> {
         let pid = spawn_detached_ephemeral(&paths)?;
         (paths, pid)
     } else {
-        let pid = spawn_detached()?;
+        // Auto-promoted persistent daemon: never `--no-sandbox` from a
+        // client flag (that's a per-session default passed at attach;
+        // sandboxing part 2 precedence). Only an explicit
+        // `cockpit daemon start --no-sandbox` sets the daemon-level flag.
+        let pid = spawn_detached(false)?;
         (canonical, pid)
     };
     tracing::info!(pid = pid, ephemeral = ephemeral, "daemon spawned");

@@ -105,7 +105,7 @@ fn stop_daemon_blocking(socket: &Path) {
     }
 }
 
-pub async fn run(args: RunArgs) -> Result<()> {
+pub async fn run(args: RunArgs, no_sandbox: bool) -> Result<()> {
     let prompt = build_prompt(&args)?;
     if prompt.trim().is_empty() {
         anyhow::bail!("no prompt supplied (pass a message or pipe one on stdin)");
@@ -131,7 +131,7 @@ pub async fn run(args: RunArgs) -> Result<()> {
     // socket so it drives the identical synchronous shutdown.
     let signal_task = spawn_signal_shutdown(guard.as_ref());
 
-    let result = run_turn(&client, &args, prompt).await;
+    let result = run_turn(&client, &args, prompt, no_sandbox).await;
 
     // Stop the signal watcher and run the (now happy-path) shutdown
     // before deciding the exit code, so the daemon is gone whether the
@@ -159,15 +159,19 @@ async fn run_turn(
     client: &crate::daemon::client::DaemonClient,
     args: &RunArgs,
     prompt: String,
+    no_sandbox: bool,
 ) -> Result<i32> {
     let cwd = std::env::current_dir().context("resolving cwd")?;
     let project_root = cwd.to_string_lossy().into_owned();
 
-    // Attach a fresh session.
+    // Attach a fresh session. `no_sandbox` (sandboxing part 2) makes this
+    // noninteractive session start unsandboxed unless the daemon was
+    // launched `--no-sandbox` (which wins).
     let attached = client
         .request_ok(Request::Attach {
             session_id: None,
             project_root: Some(project_root),
+            no_sandbox,
         })
         .await?;
     let session_id = match attached {
@@ -177,7 +181,10 @@ async fn run_turn(
 
     // Send the user message.
     client
-        .request_ok(Request::SendUserMessage { text: prompt })
+        .request_ok(Request::SendUserMessage {
+            text: prompt,
+            images: Vec::new(),
+        })
         .await
         .context("sending user message")?;
 
@@ -355,7 +362,11 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         | JobCompleted { session_id, .. }
         | ContextProjection { session_id, .. }
         | Pruned { session_id, .. }
-        | CompactReady { session_id, .. } => *session_id,
+        | CompactReady { session_id, .. }
+        | SandboxState { session_id, .. } => *session_id,
+        // Daemon-global event (no session_id) — irrelevant to a headless
+        // one-shot run, so it's filtered out by the session check.
+        CaffeinateState { .. } => return None,
     })
 }
 

@@ -1465,6 +1465,26 @@ caveats around shell semantics (no POSIX `sh`), path handling, and
 process-group signals. See `miscellaneous.md` for the bundled-gitbash
 discussion and the full Windows compatibility plan.
 
+**Filesystem sandboxing (part 2).** The `bash` tool confines shell
+commands to cwd (rw) + a per-session tmp dir (rw) + PATH execution via
+the `zerobox` crate (Linux/macOS/WSL), denying reads outside that
+boundary. A sandboxed command that exits non-zero offers an honest
+broadened re-run through the part-1 approval prompt (the failure *may*
+need outside access — zerobox is silent, so the prompt can't name the
+path; the re-run repeats side-effects). The native tools (`read`,
+`readlock`, `editunlock`, `writeunlock`, the intel/`search` tools)
+confine **in-process** (all platforms, incl. native Windows): an
+out-of-boundary path consults the part-1 path-grant store and, if not
+granted, prompts naming the **exact** path. The docs-answerer's
+hard-deny `confine()` is unchanged — it never gains an escalation
+prompt. **Windows shells run unconfined** (no zerobox backend) with a
+one-time per-session notice; native confinement still applies there.
+Network is out of scope. Runtime control: `/sandbox` (no arg toggles,
+`on`/`off` set) flips the current session's sandbox state immediately.
+New-session default precedence (highest wins): daemon `cockpit daemon
+start --no-sandbox` (OFF for all sessions) → client `--no-sandbox` (OFF
+for sessions that client creates) → ON.
+
 ---
 
 ## 10. Token economy — keep cockpit's overhead off the model
