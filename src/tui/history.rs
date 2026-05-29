@@ -213,8 +213,8 @@ pub const TIMESTAMP_WIDTH: usize = 5;
 /// stay visually distinct even when their names collide on a prefix.
 pub fn agent_color(name: &str) -> Color {
     match name {
-        "orchestrator-build" => Color::Cyan,
-        "orchestrator-plan" => Color::Magenta,
+        "Build" => Color::Cyan,
+        "Plan" => Color::Magenta,
         "coder" => Color::Green,
         "explore" => Color::Yellow,
         "docs" => Color::Blue,

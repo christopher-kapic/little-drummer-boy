@@ -323,9 +323,7 @@ mod tests {
     #[test]
     fn export_bundles_main_and_subagent_requests() {
         let db = Db::open_in_memory().unwrap();
-        let s = db
-            .create_session("p", "/proj", "orchestrator-build")
-            .unwrap();
+        let s = db.create_session("p", "/proj", "Build").unwrap();
         let sid = s.session_id;
 
         // Main agent inference call + captured request.
@@ -339,7 +337,7 @@ mod tests {
         db.insert_session_event(
             sid,
             SessionEventKind::InferenceRequest,
-            Some("orchestrator-build"),
+            Some("Build"),
             Some(&call_main.to_string()),
             &json!({"usage": {"input_tokens": 10}}),
         )
@@ -348,7 +346,7 @@ mod tests {
         db.insert_session_event(
             sid,
             SessionEventKind::SubagentSpawned,
-            Some("orchestrator-build"),
+            Some("Build"),
             Some("task-1"),
             &json!({"child_agent": "explore"}),
         )

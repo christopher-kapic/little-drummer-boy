@@ -281,12 +281,8 @@ mod tests {
     #[test]
     fn search_ranks_and_scopes_by_project() {
         let db = Db::open_in_memory().unwrap();
-        let a = db
-            .create_session("projA", "/a", "orchestrator-build")
-            .unwrap();
-        let b = db
-            .create_session("projB", "/b", "orchestrator-build")
-            .unwrap();
+        let a = db.create_session("projA", "/a", "Build").unwrap();
+        let b = db.create_session("projB", "/b", "Build").unwrap();
         msg(
             &db,
             a.session_id,
@@ -328,9 +324,9 @@ mod tests {
     #[test]
     fn search_excludes_archived_and_current_session() {
         let db = Db::open_in_memory().unwrap();
-        let live = db.create_session("p", "/x", "orchestrator-build").unwrap();
-        let archived = db.create_session("p", "/x", "orchestrator-build").unwrap();
-        let current = db.create_session("p", "/x", "orchestrator-build").unwrap();
+        let live = db.create_session("p", "/x", "Build").unwrap();
+        let archived = db.create_session("p", "/x", "Build").unwrap();
+        let current = db.create_session("p", "/x", "Build").unwrap();
         for s in [&live, &archived, &current] {
             msg(
                 &db,
@@ -359,7 +355,7 @@ mod tests {
     #[test]
     fn search_indexes_titles() {
         let db = Db::open_in_memory().unwrap();
-        let s = db.create_session("p", "/x", "orchestrator-build").unwrap();
+        let s = db.create_session("p", "/x", "Build").unwrap();
         db.set_auto_title(s.session_id, "refactor the lock manager")
             .unwrap();
         let hits = db
@@ -372,7 +368,7 @@ mod tests {
     #[test]
     fn search_honors_since_filter() {
         let db = Db::open_in_memory().unwrap();
-        let s = db.create_session("p", "/x", "orchestrator-build").unwrap();
+        let s = db.create_session("p", "/x", "Build").unwrap();
         msg(
             &db,
             s.session_id,
@@ -399,7 +395,7 @@ mod tests {
     #[test]
     fn no_match_is_empty_not_error() {
         let db = Db::open_in_memory().unwrap();
-        let s = db.create_session("p", "/x", "orchestrator-build").unwrap();
+        let s = db.create_session("p", "/x", "Build").unwrap();
         msg(
             &db,
             s.session_id,
@@ -425,7 +421,7 @@ mod tests {
         // event row by hand bypassing nothing (triggers fire) — then drop
         // and rebuild the FTS table from the backfill statements.
         let db = Db::open_in_memory().unwrap();
-        let s = db.create_session("p", "/x", "orchestrator-build").unwrap();
+        let s = db.create_session("p", "/x", "Build").unwrap();
         msg(
             &db,
             s.session_id,
@@ -458,7 +454,7 @@ mod tests {
     #[test]
     fn thread_turns_and_match_seqs() {
         let db = Db::open_in_memory().unwrap();
-        let s = db.create_session("p", "/x", "orchestrator-build").unwrap();
+        let s = db.create_session("p", "/x", "Build").unwrap();
         let s1 = msg(
             &db,
             s.session_id,

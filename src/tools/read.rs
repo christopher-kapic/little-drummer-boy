@@ -1,6 +1,6 @@
 //! `read` — snapshot read with no lock.
 //!
-//! Used by `orchestrator-build` for shallow inspection and by `coder`
+//! Used by `Build` for shallow inspection and by `coder`
 //! for read-only context. Lock-acquiring reads go through
 //! [`crate::tools::readlock`]. Both share output format + caps.
 

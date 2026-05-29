@@ -242,7 +242,7 @@ pub fn spawn(
     let handle = SessionWorkerHandle {
         session_id,
         project_root: project_root.clone(),
-        active_agent_name: "orchestrator-build".into(),
+        active_agent_name: "Build".into(),
         work_tx,
         event_tx: event_tx.clone(),
         live: live.clone(),
@@ -288,7 +288,7 @@ async fn run_worker(
         // it gets the cross-session recall tools.
         interactive: true,
     };
-    let root = Arc::new(builtin::orchestrator_build(&spawn_args));
+    let root = Arc::new(builtin::build(&spawn_args));
 
     let (driver_input_tx, driver_input_rx) =
         mpsc::channel::<crate::engine::message::UserSubmission>(WORK_QUEUE_CAPACITY);
@@ -371,7 +371,7 @@ async fn run_worker(
     // raises a prompt that fans out to the attached client exactly like a
     // `question`. The driver threads it into every `ToolCtx`. Installed
     // after the hub (the approver captures the same `Arc`). The active
-    // agent for the prompt is the foreground orchestrator at spawn time;
+    // agent for the prompt is the foreground primary agent at spawn time;
     // a delegated coder shares the same approver via the `ToolCtx`
     // `Arc`, so grants persist across the delegation tree.
     let grant_store = crate::approval::store::GrantStore::new(
@@ -744,7 +744,7 @@ fn turn_event_to_proto(event: TurnEvent, session_id: Uuid) -> Vec<proto::Event> 
 /// row before passing the work off to a worker. Lives here so the
 /// constants and event-translation helpers stay in one module.
 pub(crate) fn initial_active_agent() -> &'static str {
-    "orchestrator-build"
+    "Build"
 }
 
 /// Env var the daemon sets at boot when launched with `--no-sandbox`

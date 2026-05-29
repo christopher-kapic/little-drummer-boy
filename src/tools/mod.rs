@@ -7,7 +7,7 @@
 //! Layout:
 //!
 //! - [`bash`] — process spawn, output capping, env scrub.
-//! - [`read`] — snapshot read (no lock). Used by `orchestrator-build`
+//! - [`read`] — snapshot read (no lock). Used by `Build`
 //!   for shallow inspection and by `coder` for non-mutating context
 //!   reads.
 //! - [`readlock`] — acquire-and-read (plan §4.1).

@@ -116,10 +116,13 @@ out new deps in PR descriptions.
   inference state live in the daemon, not the TUI process. Same wire
   schema will carry the v2 WebSocket relay (GOALS §8d).
 - **Multi-agent file locking, single writer.** The bundled cast is
-  `orchestrator-build`, `orchestrator-plan`, `explore`, `coder`,
+  `Build`, `Plan`, `explore`, `coder`,
   `docs`. Only `coder` holds file locks and writes/edits (GOALS §3a).
   Adding a new write-capable tool requires a design conversation —
   the lock manager assumes one writer per delegation tree.
+- **Agent-name casing convention.** Primary (top-level) agents are
+  Capitalized (`Build`, `Plan`); subagents (`coder`, `explore`, `docs`)
+  are lowercase.
 - **`docs` is a fixed two-stage internal pipeline, not general
   delegation** (GOALS §3a). A caller delegates `task(agent="docs",
   prompt=<JSON {package, question}>)` and it behaves like one leaf
@@ -153,7 +156,7 @@ out new deps in PR descriptions.
   shell access — they are Rust-native (ripgrep libraries + `globset`,
   never shelling to `rg`/`fd`) and hard-confine every path to the
   answerer's package-root cwd (`src/tools/sandbox.rs`). Do **not** add
-  them to explore/coder/orchestrators. Anything outside this set needs a
+  them to explore/coder/Build/Plan. Anything outside this set needs a
   design discussion before it's added (GOALS §10). `mcp_invoke`
   dispatches to MCP servers via lazy discovery
   (catalog of name + one-line description; schema loaded on first

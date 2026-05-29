@@ -883,7 +883,7 @@ pub struct AgentSummary {
     pub description: String,
     pub mode: String,
     pub source: String,
-    /// `true` for the built-in cast (`orchestrator-build`, `coder`,
+    /// `true` for the built-in cast (`Build`, `coder`,
     /// `explore`, …).
     pub builtin: bool,
 }

@@ -189,6 +189,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0012_loop_guard_rules.sql"),
     include_str!("migrations/0013_session_search_fts.sql"),
     include_str!("migrations/0014_plans.sql"),
+    include_str!("migrations/0015_rename_build_agent.sql"),
 ];
 
 fn migrate(conn: &Connection) -> Result<()> {

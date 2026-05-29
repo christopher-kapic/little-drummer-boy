@@ -404,9 +404,9 @@ fn update_active_agent(event: &proto::Event, slot: &Arc<Mutex<String>>) {
         }
         proto::Event::SubagentReport { .. } => {
             // Pop back to the root. v1 supports a depth-1 stack
-            // (orchestrator-build → coder | explore); deeper trees
+            // (`Build` → coder | explore); deeper trees
             // need a proper stack to track properly.
-            *slot.lock().unwrap() = "orchestrator-build".to_string();
+            *slot.lock().unwrap() = "Build".to_string();
         }
         _ => {}
     }

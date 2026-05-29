@@ -156,7 +156,7 @@ mod tests {
             cwd: PathBuf::from("/tmp/project"),
             cwd_display: "~/project".to_string(),
             repo_status: None,
-            agent_name: "orchestrator-build".to_string(),
+            agent_name: "Build".to_string(),
             user_name: name.map(str::to_string),
             banner_enabled: enabled,
         }

@@ -286,7 +286,7 @@ mod tests {
         use crate::engine::tool::ToolBox;
 
         // The tools array a conversation carries (here: just `jobs`; the
-        // real orchestrator adds more, but they're equally immutable).
+        // real primary agent adds more, but they're equally immutable).
         let toolbox = ToolBox::new().with(Arc::new(JobsTool));
         let before = serde_json::to_string(&toolbox.definitions()).unwrap();
 

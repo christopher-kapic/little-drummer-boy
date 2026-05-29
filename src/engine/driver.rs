@@ -1481,7 +1481,7 @@ impl Driver {
                     task_function_call_id,
                 } => {
                     // Emit a single ToolStart/ToolEnd pair so the
-                    // user sees one row in the orchestrator's history
+                    // user sees one row in the primary agent's history
                     // — never a separate agent stream.
                     let args_json = serde_json::json!({
                         "agent": child_agent,
@@ -1871,8 +1871,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().to_path_buf();
         let db = crate::db::Db::open_in_memory().unwrap();
-        let session =
-            Arc::new(Session::create(db.clone(), root.clone(), "orchestrator-build").unwrap());
+        let session = Arc::new(Session::create(db.clone(), root.clone(), "Build").unwrap());
         let locks = Arc::new(crate::locks::LockManager::from_db(db).unwrap());
         let rcfg = crate::config::extended::RedactConfig::default();
         let redact = Arc::new(RedactionTable::build(&rcfg, &root).unwrap());
@@ -1897,7 +1896,7 @@ mod tests {
         };
         let model = Arc::new(crate::engine::model::Model::from_config(&pcfg).unwrap());
         let agent = Arc::new(Agent {
-            name: "orchestrator-build".into(),
+            name: "Build".into(),
             system: String::new(),
             tools: crate::engine::tool::ToolBox::new(),
             model,
@@ -1920,7 +1919,7 @@ mod tests {
             driver.cwd.clone(),
             agent,
         );
-        assert_eq!(d2.active_agent(), "orchestrator-build");
+        assert_eq!(d2.active_agent(), "Build");
         assert!(!d2.jobs.has_loop());
         assert_eq!(
             d2.jobs.max_concurrent,

@@ -1,4 +1,4 @@
-//! Built-in agent definitions: `orchestrator-build`, `coder`.
+//! Built-in agent definitions: `Build`, `coder`.
 //!
 //! The agent prompts live as Markdown documents alongside this file.
 //! `include_str!` bakes them into the binary so a fresh `cargo install
@@ -18,11 +18,11 @@ use crate::engine::model::{Model, ModelParams};
 use crate::engine::tool::ToolBox;
 use crate::tools::custom::CustomBashTool;
 
-/// Embedded prompt for `orchestrator-build`. The frontmatter is
+/// Embedded prompt for `Build`. The frontmatter is
 /// authored opencode-style for forward-compat with [`crate::agents`]
 /// — we still pull the prompt out by hand here because the agent loop
 /// already knows the tool surface.
-const ORCHESTRATOR_BUILD_PROMPT: &str = include_str!("orchestrator_build.md");
+const BUILD_PROMPT: &str = include_str!("build.md");
 const CODER_PROMPT: &str = include_str!("coder.md");
 const EXPLORE_PROMPT: &str = include_str!("explore.md");
 /// Docs pipeline stage prompts (GOALS §3a, prompt `docs-agent.md`).
@@ -137,7 +137,7 @@ fn compose_system_prompt_with(
 }
 
 /// The full composed system prompt for the user-facing chat agent
-/// (`orchestrator-build`) at `cwd`: role prompt + harness/version/URL
+/// (`Build`) at `cwd`: role prompt + harness/version/URL
 /// lines + (optional) user-name line + OS line + (optional) session
 /// line + injected guidance body. Used by the fresh-chat context
 /// indicator to size the actual baseline sent to the model, in both
@@ -145,7 +145,7 @@ fn compose_system_prompt_with(
 /// string for `session_short_id` when no session exists yet — it simply
 /// omits the `Session:` line, matching what the engine sends.
 pub(crate) fn default_chat_system_prompt(cwd: &Path, session_short_id: &str) -> String {
-    compose_system_prompt(ORCHESTRATOR_BUILD_PROMPT, session_short_id, cwd)
+    compose_system_prompt(BUILD_PROMPT, session_short_id, cwd)
 }
 
 /// Locate the first existing project-guidance file by name, searching
@@ -233,7 +233,7 @@ fn with_custom_tools(mut tb: ToolBox, cwd: &Path) -> ToolBox {
 /// silently spawning the wrong one.
 pub fn load(name: &str, args: &SpawnArgs) -> Result<Agent> {
     match name {
-        "orchestrator-build" => Ok(orchestrator_build(args)),
+        "Build" => Ok(build(args)),
         "coder" => Ok(coder(args)),
         "explore" => Ok(explore(args)),
         // `docs` is a fixed two-stage pipeline, not a single agent — the
@@ -250,7 +250,7 @@ pub fn load(name: &str, args: &SpawnArgs) -> Result<Agent> {
 }
 
 /// True if `name` denotes a built-in agent that runs *noninteractively*
-/// — the orchestrator dispatches it like a tool call (synchronously)
+/// — the primary agent dispatches it like a tool call (synchronously)
 /// rather than handing the primary conversation off. The driver uses
 /// this to route `task(agent=…, …)` correctly. `docs` is noninteractive:
 /// the caller sees one leaf invocation even though it's a two-stage
@@ -417,10 +417,10 @@ mod tests {
     }
 }
 
-/// `orchestrator-build` — the user-facing primary agent. Owns the chat
+/// `Build` — the user-facing primary agent. Owns the chat
 /// when the focus is *making the change* (GOALS §3a). Delegates writes
 /// to `coder` via `task`.
-pub fn orchestrator_build(args: &SpawnArgs) -> Agent {
+pub fn build(args: &SpawnArgs) -> Agent {
     let tools = with_recall_tools(
         with_custom_tools(
             ToolBox::new()
@@ -434,7 +434,7 @@ pub fn orchestrator_build(args: &SpawnArgs) -> Agent {
                 // driver-owned async-job authority.
                 .with(Arc::new(crate::tools::jobs::JobsTool))
                 // `question` (GOALS §3b): structural — blocks the turn until
-                // the user answers. Only `orchestrator-build` + `coder` get
+                // the user answers. Only `Build` + `coder` get
                 // it; `explore`/`docs` are leaf-terminated and report up.
                 .with(Arc::new(crate::tools::question::QuestionTool))
                 // `skill` (GOALS §5): manual on-demand skill loading. Both
@@ -449,8 +449,8 @@ pub fn orchestrator_build(args: &SpawnArgs) -> Agent {
     );
 
     Agent {
-        name: "orchestrator-build".to_string(),
-        system: compose_system_prompt(ORCHESTRATOR_BUILD_PROMPT, &args.session_short_id, &args.cwd),
+        name: "Build".to_string(),
+        system: compose_system_prompt(BUILD_PROMPT, &args.session_short_id, &args.cwd),
         tools,
         model: args.model.clone(),
         params: args.params.clone(),
@@ -459,7 +459,7 @@ pub fn orchestrator_build(args: &SpawnArgs) -> Agent {
 
 /// `coder` — the only agent that writes. Holds file locks; runs bash;
 /// applies edits. Caller-determined interactivity: interactive when
-/// spawned from `orchestrator-build` (GOALS §3a/§3b).
+/// spawned from `Build` (GOALS §3a/§3b).
 pub fn coder(args: &SpawnArgs) -> Agent {
     let tools = with_recall_tools(
         ToolBox::new()
@@ -499,10 +499,10 @@ pub fn coder(args: &SpawnArgs) -> Agent {
 
 /// `explore` — read-only investigator. Leaf in the invocation tree
 /// (no `task` of its own). Runs noninteractively from
-/// `orchestrator-build`'s perspective: the orchestrator dispatches it
+/// `Build`'s perspective: the primary agent dispatches it
 /// via `task(agent="explore", …)` and gets a single text report back
 /// as the tool result. The user sees the call rendered like any other
-/// tool in the orchestrator's history.
+/// tool in the primary agent's history.
 pub fn explore(args: &SpawnArgs) -> Agent {
     let tools = with_recall_tools(
         with_custom_tools(

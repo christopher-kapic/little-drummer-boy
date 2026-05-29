@@ -765,7 +765,7 @@ mod tests {
     #[test]
     fn create_and_resume_round_trip() {
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create(db.clone(), PathBuf::from("/x"), "orchestrator-build").unwrap();
+        let s = Session::create(db.clone(), PathBuf::from("/x"), "Build").unwrap();
         let id = s.id;
         let short = s.short_id.clone();
         drop(s);
@@ -780,8 +780,7 @@ mod tests {
     #[test]
     fn fork_inherits_parent_metadata() {
         let db = Db::open_in_memory().unwrap();
-        let parent =
-            Session::create(db.clone(), PathBuf::from("/x"), "orchestrator-build").unwrap();
+        let parent = Session::create(db.clone(), PathBuf::from("/x"), "Build").unwrap();
         parent.set_active_model("anthropic", "opus-4-7").unwrap();
         let fork = Session::create_fork(db.clone(), parent.id, Some("turn-7".into())).unwrap();
         assert_eq!(fork.parent_session_id, Some(parent.id));
@@ -1003,8 +1002,7 @@ mod tests {
         // and short_id in memory but no `sessions` row, and never appears in
         // listings until persisted.
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create_deferred(db.clone(), PathBuf::from("/x"), "orchestrator-build")
-            .unwrap();
+        let s = Session::create_deferred(db.clone(), PathBuf::from("/x"), "Build").unwrap();
         // Id + short_id exist immediately (for the startup graphic).
         assert!(!s.short_id.is_empty());
         assert!(!s.is_persisted());
@@ -1032,8 +1030,7 @@ mod tests {
         // A model picked before the first message survives the deferred
         // write (session-id-display-and-lazy-persist).
         let db = Db::open_in_memory().unwrap();
-        let s = Session::create_deferred(db.clone(), PathBuf::from("/x"), "orchestrator-build")
-            .unwrap();
+        let s = Session::create_deferred(db.clone(), PathBuf::from("/x"), "Build").unwrap();
         // set_active_model's DB UPDATE is a no-op while un-persisted; the
         // value lives in memory and must land in the deferred INSERT.
         s.set_active_model("anthropic", "claude-opus-4-7").unwrap();

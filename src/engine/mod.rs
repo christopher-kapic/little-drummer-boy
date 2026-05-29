@@ -19,7 +19,7 @@
 //! - [`agent`] — [`Agent`](agent::Agent) + [`turn`](agent::turn).
 //! - [`driver`] — multi-agent stack with interactive primary handoff
 //!   (GOALS §3b).
-//! - [`builtin`] — embedded `coder.md` + `orchestrator-build.md`.
+//! - [`builtin`] — embedded `coder.md` + `build.md`.
 
 pub mod agent;
 pub mod builtin;

@@ -95,7 +95,7 @@ pub struct ExtendedConfig {
     pub skills: SkillsConfig,
 
     /// Branch-name prefix for suggested plan branches (`plan.md` §4.1).
-    /// The planning flow (orchestrator-plan) suggests a plan's target
+    /// The planning flow (`Plan`) suggests a plan's target
     /// branch as `${planBranchRoot}/<feature-branch>`. Default
     /// `"cockpit-plan"`.
     #[serde(rename = "planBranchRoot", default = "default_plan_branch_root")]

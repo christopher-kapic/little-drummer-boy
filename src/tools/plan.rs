@@ -11,7 +11,7 @@
 //!
 //! Each tool takes `Args = serde_json::Value` and runs through the §12
 //! repair layer, per the cockpit `Tool` contract. They are not yet
-//! registered onto any agent's toolbox — prompt 2 wires `orchestrator-plan`.
+//! registered onto any agent's toolbox — prompt 2 wires `Plan`.
 
 use anyhow::Result;
 use async_trait::async_trait;

@@ -695,13 +695,11 @@ mod tests {
     #[test]
     fn create_and_get() {
         let db = Db::open_in_memory().unwrap();
-        let s = db
-            .create_session("p1", "/x/y", "orchestrator-build")
-            .unwrap();
+        let s = db.create_session("p1", "/x/y", "Build").unwrap();
         let g = db.get_session(s.session_id).unwrap().unwrap();
         assert_eq!(g.project_id, "p1");
         assert_eq!(g.project_root, "/x/y");
-        assert_eq!(g.active_agent, "orchestrator-build");
+        assert_eq!(g.active_agent, "Build");
         assert!(g.ended_at.is_none());
     }
 
@@ -777,9 +775,7 @@ mod tests {
     #[test]
     fn create_fork_inherits_parent_metadata() {
         let db = Db::open_in_memory().unwrap();
-        let parent = db
-            .create_session("p", "/proj", "orchestrator-build")
-            .unwrap();
+        let parent = db.create_session("p", "/proj", "Build").unwrap();
         db.set_session_model(parent.session_id, "anthropic", "opus-4-7")
             .unwrap();
         let fork = db
@@ -787,7 +783,7 @@ mod tests {
             .unwrap();
         assert_eq!(fork.project_id, "p");
         assert_eq!(fork.project_root, "/proj");
-        assert_eq!(fork.active_agent, "orchestrator-build");
+        assert_eq!(fork.active_agent, "Build");
         assert_eq!(fork.parent_session_id, Some(parent.session_id));
         assert_eq!(fork.fork_point_turn_id.as_deref(), Some("turn-42"));
         assert_eq!(fork.provider.as_deref(), Some("anthropic"));

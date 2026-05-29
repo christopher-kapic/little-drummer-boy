@@ -161,7 +161,7 @@ impl LockManager {
 
     /// Record a successful read by `agent` in `session`. Acquisition
     /// already calls this internally; non-locking reads (the `read`
-    /// tool exposed to orchestrator-build) call it explicitly so a
+    /// tool exposed to `Build`) call it explicitly so a
     /// subsequent `writeunlock` is permitted.
     pub fn note_read(&self, path: &Path, agent: &str, session: Uuid) {
         let canon = canonicalize(path);

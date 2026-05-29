@@ -1,6 +1,6 @@
 //! `skill` — load a named skill's body on demand (manual selection path).
 //!
-//! The main interactive agents (`orchestrator-build`, `coder`) call this
+//! The main interactive agents (`Build`, `coder`) call this
 //! to pull a skill into context by name. The body is read on demand and
 //! run through the same auto-`!`-command processing as the cheap-model
 //! auto-selection path (GOALS §5): Claude mode runs `` !`command` ``

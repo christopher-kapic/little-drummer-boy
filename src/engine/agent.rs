@@ -1,11 +1,11 @@
 //! [`Agent`] — one role-specialized conversational actor.
 //!
 //! An `Agent` bundles:
-//!   - `name`        — `orchestrator-build`, `coder`, etc. Shown in the
+//!   - `name`        — `Build`, `coder`, etc. Shown in the
 //!     TUI active-agent slot (GOALS §1a).
 //!   - `system`      — the role-specific system prompt.
 //!   - `tools`       — a [`ToolBox`] of tools this agent is allowed to
-//!     invoke. The orchestrator and the coder share an engine but have
+//!     invoke. The primary agent and the coder share an engine but have
 //!     completely different tool surfaces.
 //!   - `model`       — provider-side completion model. May be shared
 //!     across agents via `Arc`.
@@ -230,7 +230,7 @@ pub enum TurnOutcome {
     /// turn so the model can react to the results.
     Continue,
     /// Agent invoked `task` for an *interactive* subagent (e.g.
-    /// `coder` from `orchestrator-build`). The driver pushes a fresh
+    /// `coder` from `Build`). The driver pushes a fresh
     /// session onto the stack and the subagent takes over the
     /// conversation until it produces final text.
     SpawnSubagent {
@@ -245,7 +245,7 @@ pub enum TurnOutcome {
         task_function_call_id: Option<String>,
     },
     /// Agent invoked `task` for a *noninteractive* subagent (e.g.
-    /// `explore` from `orchestrator-build`). The driver runs the
+    /// `explore` from `Build`). The driver runs the
     /// child's full conversation loop to completion synchronously
     /// and delivers its final text back as the parent's tool result —
     /// the user sees the spawn rendered like a single tool call,

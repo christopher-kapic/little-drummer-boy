@@ -16,7 +16,7 @@ use crate::tui::chrome::repo_counts;
 use crate::tui::composer::INPUT_PREFIX;
 
 pub const APP_NAME: &str = "Cockpit CLI";
-pub const DEFAULT_AGENT: &str = "orchestrator-build";
+pub const DEFAULT_AGENT: &str = "Build";
 
 const RESET: &str = "\x1b[0m";
 const BOLD: &str = "\x1b[1m";

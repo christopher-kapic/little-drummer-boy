@@ -165,7 +165,7 @@ mod tests {
         let other = ctx
             .session
             .db
-            .create_session(&ctx.session.project_id, "/x", "orchestrator-build")
+            .create_session(&ctx.session.project_id, "/x", "Build")
             .unwrap();
         ctx.session
             .db

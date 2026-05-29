@@ -220,7 +220,7 @@ mod tests {
         let s = ctx
             .session
             .db
-            .create_session(&ctx.session.project_id, "/x", "orchestrator-build")
+            .create_session(&ctx.session.project_id, "/x", "Build")
             .unwrap();
         for (text, is_assistant) in texts {
             let kind = if *is_assistant {
