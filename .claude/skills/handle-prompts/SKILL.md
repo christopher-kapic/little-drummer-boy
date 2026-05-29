@@ -1,6 +1,6 @@
 ---
 name: handle-prompts
-description: Work through the prompt files in prompts/ — implement each dependency-free one via a subagent, verify the gates, commit it with its prompt, delete the prompt, and repeat until none remain, then run the tests. Use when the user wants you to "go through the prompts", "handle the prompts directory", or clear out prompts/.
+description: Work through the prompt files in prompts/ — implement each dependency-free one via a subagent, verify the gates, bump the patch version, commit it with its prompt + Cargo.toml/lock, delete the prompt, and repeat until none remain, then run the tests. Use when the user wants you to "go through the prompts", "handle the prompts directory", or clear out prompts/.
 ---
 
 # Handle the prompts directory
@@ -86,17 +86,25 @@ Repeat until `prompts/` holds no prompt files:
    any non-obvious claim the subagent made (e.g. "the constant cancels
    downstream") against the actual code.
 
-6. **Commit the implementation together with its prompt file.** Stage the
-   changed source files (and any new files) **plus the prompt file
-   itself**, and commit with a descriptive message. Stage paths
-   explicitly — never `git add -A` / `git add .`, because of the
-   untracked sibling directories. Follow the repo's commit conventions
-   (e.g. the `Co-Authored-By` trailer in `CLAUDE.md`).
+6. **Bump the patch version and commit the implementation with its
+   prompt file.** Each landed prompt gets its own version, so a bug can
+   later be traced to the exact build it shipped in:
+   - Bump the **patch** component of `version` in `Cargo.toml` by one
+     (e.g. `0.1.0` → `0.1.1`). One increment per prompt cycle.
+   - Run `cargo check` (`cargo c`) so `Cargo.lock` picks up the new
+     version. This must succeed before you commit.
+   - Stage the changed source files (and any new files), **plus the
+     prompt file itself, plus `Cargo.toml` and `Cargo.lock`**, and commit
+     with a descriptive message that includes the new version number.
+     Stage paths explicitly — never `git add -A` / `git add .`, because
+     of the untracked sibling directories. Follow the repo's commit
+     conventions (e.g. the `Co-Authored-By` trailer in `CLAUDE.md`).
 
-7. **Delete the prompt in a follow-up commit.** `git rm` the prompt file
-   and commit the removal on its own. ("Commit the prompt and the
-   changes, then delete the prompt" — two commits: implement+prompt, then
-   delete.)
+7. **Delete the prompt — but do not commit the deletion.** `rm` the
+   prompt file so it drops out of the next re-list and the loop can
+   terminate. Leave the deletion unstaged; the user commits removals
+   periodically themselves. (The prompt's *content* is already preserved
+   in history by the implement+prompt commit from step 6.)
 
 ## When the directory is empty
 
@@ -106,8 +114,9 @@ Then summarize: one or two lines per prompt — what it did and its commit
 
 ## Rules
 
-- **One prompt per iteration.** Implement, verify, commit, delete, then
-  re-list. Don't batch multiple prompts into one commit.
+- **One prompt per iteration.** Implement, verify, bump the patch
+  version, commit, delete, then re-list. Don't batch multiple prompts
+  into one commit — each prompt ships in its own version.
 - **No tech debt.** The prompts themselves say so; hold the subagent to
   it. No TODOs, no half-finished paths, no shortcuts.
 - **Stage explicitly.** This repo has untracked sibling directories that
