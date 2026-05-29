@@ -134,28 +134,28 @@ impl Db {
         project_root: &str,
         active_agent: &str,
     ) -> Result<SessionRow> {
+        let row = self.new_session_row(project_id, project_root, active_agent)?;
+        self.insert_session_row(&row)?;
+        Ok(row)
+    }
+
+    /// Build a brand-new session row — fresh UUID + project-unique
+    /// short_id — **without** writing it to the DB. Used by the
+    /// lazy-persistence path (session-id-display-and-lazy-persist): the
+    /// daemon holds the row in memory and only [`Self::insert_session_row`]s
+    /// it on the first user message, so an opened-but-unused session leaves
+    /// no DB trace. The short_id is reserved against the live table at build
+    /// time; the eventual INSERT is the collision-of-last-resort guard.
+    pub fn new_session_row(
+        &self,
+        project_id: &str,
+        project_root: &str,
+        active_agent: &str,
+    ) -> Result<SessionRow> {
         let session_id = Uuid::new_v4();
         let now = Utc::now().timestamp();
         let short_id = self.with_conn(|conn| {
-            let short_id = generate_unique_short_id(conn, project_id)
-                .context("generating session short_id")?;
-            conn.execute(
-                "INSERT INTO sessions
-                 (session_id, project_id, project_root, started_at,
-                  last_active_at, active_agent, short_id)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![
-                    session_id.to_string(),
-                    project_id,
-                    project_root,
-                    now,
-                    now,
-                    active_agent,
-                    short_id,
-                ],
-            )
-            .context("inserting session")?;
-            Ok(short_id)
+            generate_unique_short_id(conn, project_id).context("generating session short_id")
         })?;
         Ok(SessionRow {
             session_id,
@@ -174,6 +174,34 @@ impl Db {
             user_renamed: false,
             last_viewed_at: None,
             archived_at: None,
+        })
+    }
+
+    /// Insert a pre-built root session row. Pairs with
+    /// [`Self::new_session_row`] for the deferred-persistence path; also the
+    /// second half of [`Self::create_session`]. Idempotent at the
+    /// application layer is **not** assumed — callers persist exactly once.
+    pub fn insert_session_row(&self, row: &SessionRow) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO sessions
+                 (session_id, project_id, project_root, started_at,
+                  last_active_at, active_agent, short_id, provider, model)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    row.session_id.to_string(),
+                    row.project_id,
+                    row.project_root,
+                    row.started_at,
+                    row.last_active_at,
+                    row.active_agent,
+                    row.short_id,
+                    row.provider,
+                    row.model,
+                ],
+            )
+            .context("inserting session")?;
+            Ok(())
         })
     }
 
@@ -675,6 +703,34 @@ mod tests {
         assert_eq!(g.project_root, "/x/y");
         assert_eq!(g.active_agent, "orchestrator-build");
         assert!(g.ended_at.is_none());
+    }
+
+    #[test]
+    fn new_session_row_defers_the_write() {
+        // session-id-display-and-lazy-persist: building a row reserves an id
+        // + short_id but writes nothing; inserting it makes it queryable.
+        let db = Db::open_in_memory().unwrap();
+        let row = db.new_session_row("p", "/x", "coder").unwrap();
+        assert!(row.short_id.is_some());
+        assert!(db.get_session(row.session_id).unwrap().is_none());
+        assert!(db.list_sessions(false, 100).unwrap().is_empty());
+        db.insert_session_row(&row).unwrap();
+        let got = db.get_session(row.session_id).unwrap().unwrap();
+        assert_eq!(got.project_id, "p");
+        assert_eq!(got.short_id, row.short_id);
+        assert_eq!(db.list_sessions(false, 100).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn insert_session_row_round_trips_provider_model() {
+        let db = Db::open_in_memory().unwrap();
+        let mut row = db.new_session_row("p", "/x", "coder").unwrap();
+        row.provider = Some("anthropic".into());
+        row.model = Some("opus".into());
+        db.insert_session_row(&row).unwrap();
+        let got = db.get_session(row.session_id).unwrap().unwrap();
+        assert_eq!(got.provider.as_deref(), Some("anthropic"));
+        assert_eq!(got.model.as_deref(), Some("opus"));
     }
 
     #[test]

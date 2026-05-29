@@ -535,6 +535,15 @@ pub struct App {
     /// The attached session's project id — the scope for `tag` records.
     /// `None` until the first attach.
     pub(super) project_id: Option<String>,
+    /// Whether the *currently bound* session has been persisted to the DB
+    /// (session-id-display-and-lazy-persist). The daemon writes the
+    /// `sessions` row on the first user message, so this flips `true` the
+    /// instant a submission is accepted by the runner, and resets to `false`
+    /// whenever the runner is rebound (`/new`, `/resume`, `/compact`) since
+    /// those open or switch to a different session. Read on exit to decide
+    /// whether to print the session id; a resumed session is persisted from
+    /// the start, so its rebind sets this `true`.
+    pub(super) current_session_persisted: bool,
     /// Fresh-chat sizing for this project, resolved at launch: the
     /// guidance-file basename + body tokens (the `X tokens in <file>`
     /// label) and the full composed system prompt tokens (the baseline
@@ -827,6 +836,7 @@ impl App {
             usage_slash: HashMap::new(),
             usage_tags: HashMap::new(),
             project_id: None,
+            current_session_persisted: false,
             guidance_estimate: None,
             prunable_tokens: 0,
             cache_cold: true,
@@ -982,6 +992,14 @@ impl App {
         for line in tail {
             println!("{line}");
         }
+        // Print the last opened session id — but only when it was actually
+        // persisted (session-id-display-and-lazy-persist). An opened-but-
+        // unused session left no DB row, so we print nothing about it.
+        if self.current_session_persisted
+            && let Some(session_id) = self.launch.session_id
+        {
+            println!("session {session_id}");
+        }
         result
     }
 
@@ -1027,6 +1045,7 @@ impl App {
 
     pub(super) fn event_loop(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         loop {
+            self.ensure_session_for_display();
             self.sync_repo_status();
             self.drain_fetch_progress();
             self.drain_agent_events();
@@ -1283,6 +1302,9 @@ impl App {
         // Drop the runner so the next submit re-attaches the daemon
         // with `session_id: None`, opening a fresh session.
         self.agent_runner = None;
+        // The fresh session is deferred-persistence until its first message
+        // (session-id-display-and-lazy-persist).
+        self.current_session_persisted = false;
 
         // Reset the autocomplete tally so the next attach re-seeds it
         // fresh (additive merge would otherwise double-count). The
@@ -1696,6 +1718,10 @@ impl App {
                 self.prunable_tokens = 0;
                 // Fresh thread → no wire-side elisions carry over.
                 self.elided_event_ids.clear();
+                self.launch.session_id = Some(runner.session_id);
+                // The compaction successor session already has a DB row
+                // (session-id-display-and-lazy-persist).
+                self.current_session_persisted = true;
                 self.agent_runner = Some(Ok(runner));
                 // Boundary marker at the top of the fresh session's
                 // scrollback (the divider-equivalent for compaction). Only
@@ -1745,6 +1771,10 @@ impl App {
             Ok(runner) => {
                 let short_id = runner.short_id.clone();
                 self.project_id = Some(runner.project_id.clone());
+                self.launch.session_id = Some(runner.session_id);
+                // A resumed session already has a DB row
+                // (session-id-display-and-lazy-persist).
+                self.current_session_persisted = true;
                 // Switch the runner: fresh transcript view bound to the
                 // resumed session.
                 self.history.clear();
@@ -1841,12 +1871,30 @@ impl App {
         }
     }
 
+    /// Attach the session eagerly once the daemon is reachable so the
+    /// startup graphic can show its id (session-id-display-and-lazy-persist).
+    /// The attach creates a deferred (un-persisted) session in the daemon;
+    /// the first user message is what writes the `sessions` row. Runs each
+    /// event-loop tick but is a no-op once a runner exists or while the
+    /// "daemon not running" prompt is still open (we don't want to spawn a
+    /// daemon out from under the user's choice).
+    pub(super) fn ensure_session_for_display(&mut self) {
+        if self.agent_runner.is_some() || self.daemon_prompt.is_some() || !self.daemon_connected {
+            return;
+        }
+        self.ensure_agent_runner();
+    }
+
     pub(super) fn ensure_agent_runner(&mut self) {
         if self.agent_runner.is_some() {
             return;
         }
         let runner = agent_runner::try_spawn(&self.launch.cwd, self.no_sandbox);
         if let Ok(r) = &runner {
+            // Record the daemon-assigned session id so the startup graphic
+            // shows it and `/new` re-renders with the fresh one
+            // (session-id-display-and-lazy-persist).
+            self.launch.session_id = Some(r.session_id);
             // Seed the in-memory tally from the daemon's authoritative
             // counts. Additive: any optimistic increments made before
             // attach (held in the maps) stay on top of the historical

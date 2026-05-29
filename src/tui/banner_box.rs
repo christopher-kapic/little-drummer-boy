@@ -82,11 +82,21 @@ fn build_box(info: &LaunchInfo, pane_w: u16, pane_h: u16) -> Option<Vec<Line<'st
 /// bottom padding.
 fn content_lines(info: &LaunchInfo) -> Vec<Line<'static>> {
     let art = banner::render_styled_lines();
-    let title = vec![
+    let mut title = vec![
         Span::styled(APP_NAME, Style::default().add_modifier(Modifier::BOLD)),
         Span::raw(" "),
         Span::styled(format!("v{}", info.version), Style::default().fg(GREY)),
     ];
+    // Current session id, right after the version in the same grey
+    // (session-id-display-and-lazy-persist). The id is assigned by the
+    // daemon at attach, so it's absent until the TUI has connected.
+    if let Some(session_id) = info.session_id {
+        title.push(Span::raw("  "));
+        title.push(Span::styled(
+            session_id.to_string(),
+            Style::default().fg(GREY),
+        ));
+    }
     let provider = vec![Span::styled(
         info.provider_line.clone(),
         Style::default().fg(GREY),
@@ -137,6 +147,7 @@ mod tests {
     fn sample(enabled: bool, name: Option<&str>) -> LaunchInfo {
         LaunchInfo {
             version: "9.9.9",
+            session_id: None,
             provider_line: "anthropic / claude".to_string(),
             active_model: None,
             active_model_is_favorite: false,
@@ -186,6 +197,34 @@ mod tests {
         let without = build_box(&sample(true, None), 200, 50).unwrap();
         let joined_none: String = without.iter().map(joined).collect::<Vec<_>>().join("\n");
         assert!(!joined_none.contains("Welcome"));
+    }
+
+    #[test]
+    fn session_id_shows_after_version_when_set() {
+        // No id set → the title line carries the version but no uuid.
+        let none = build_box(&sample(true, None), 200, 50).unwrap();
+        let joined_none: String = none.iter().map(joined).collect::<Vec<_>>().join("\n");
+        assert!(joined_none.contains("v9.9.9"));
+
+        // Id set → it appears, right after the version, on the title row.
+        let id = uuid::Uuid::new_v4();
+        let mut info = sample(true, None);
+        info.session_id = Some(id);
+        let with = build_box(&info, 200, 50).unwrap();
+        let title_row = with
+            .iter()
+            .map(joined)
+            .find(|l| l.contains("v9.9.9"))
+            .expect("title row");
+        let id_str = id.to_string();
+        assert!(
+            title_row.contains(&id_str),
+            "id missing from title: {title_row:?}"
+        );
+        // Ordering: version precedes the id on the same line.
+        let vpos = title_row.find("v9.9.9").unwrap();
+        let ipos = title_row.find(&id_str).unwrap();
+        assert!(vpos < ipos, "version should precede the session id");
     }
 
     #[test]

@@ -33,6 +33,12 @@ const BADGE_RIGHT_EDGE: &str = "\x1b[38;5;220m▌\x1b[0m";
 #[derive(Debug, Clone)]
 pub struct LaunchInfo {
     pub version: &'static str,
+    /// Current session id, shown in the TUI startup graphic right after the
+    /// version (session-id-display-and-lazy-persist). `None` at `load` time —
+    /// the daemon assigns it when the TUI attaches, after which the TUI sets
+    /// it and re-renders the banner. TUI-only: the headless `print` /
+    /// `header_lines` splash never shows it.
+    pub session_id: Option<uuid::Uuid>,
     pub provider_line: String,
     /// Currently selected (provider_id, model_id). None when nothing
     /// has been picked yet.
@@ -88,6 +94,7 @@ pub fn load(project: Option<&Path>) -> LaunchInfo {
 
     LaunchInfo {
         version: env!("CARGO_PKG_VERSION"),
+        session_id: None,
         provider_line,
         active_model,
         active_model_is_favorite,

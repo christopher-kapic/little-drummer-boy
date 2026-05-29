@@ -813,6 +813,11 @@ fn attach(
 
     let project_root = handle.project_root.to_string_lossy().into_owned();
     let active_agent = handle.active_agent_name.clone();
+    // Source identity from the live session, not a DB read: a freshly
+    // created session is deferred-persistence (session-id-display-and-lazy-
+    // persist) and has no `sessions` row yet, so `get_session` would miss.
+    let project_id = handle.project_id();
+    let short_id = handle.short_id();
 
     state.attached = Some(AttachedSession {
         handle,
@@ -840,16 +845,6 @@ fn attach(
             .collect(),
         Err(_) => Vec::new(),
     };
-
-    let row = ctx.db.get_session(session_id).ok().flatten();
-    let project_id = row
-        .as_ref()
-        .map(|s| s.project_id.clone())
-        .unwrap_or_default();
-    let short_id = row
-        .as_ref()
-        .and_then(|s| s.short_id.clone())
-        .unwrap_or_default();
 
     Ok(Response::Attached {
         session_id,

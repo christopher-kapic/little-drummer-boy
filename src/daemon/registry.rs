@@ -79,7 +79,10 @@ impl SessionRegistry {
         let Some(project_root) = project_root else {
             bail!("attach requires either session_id or project_root");
         };
-        let session = Session::create(
+        // Lazy persistence (session-id-display-and-lazy-persist): hold the
+        // new session in memory with its id assigned but its `sessions` row
+        // un-written. The worker persists it on the first user message.
+        let session = Session::create_deferred(
             self.inner.db.clone(),
             project_root,
             session_worker::initial_active_agent(),

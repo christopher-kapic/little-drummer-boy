@@ -160,6 +160,19 @@ impl SessionWorkerHandle {
     pub fn live_status(&self) -> (bool, bool) {
         (self.live.has_active_jobs(), self.live.processing())
     }
+
+    /// The session's project id — read from the in-memory session so it is
+    /// available before the `sessions` row is persisted
+    /// (session-id-display-and-lazy-persist).
+    pub fn project_id(&self) -> String {
+        self.session.project_id.clone()
+    }
+
+    /// The session's 6-char display id — read from the in-memory session so
+    /// it is available before the `sessions` row is persisted.
+    pub fn short_id(&self) -> String {
+        self.session.short_id.clone()
+    }
 }
 
 /// Work items a client can ask the worker to perform.
@@ -403,6 +416,21 @@ async fn run_worker(
     while let Some(work) = work_rx.recv().await {
         match work {
             SessionWork::UserMessage(submission) => {
+                // Lazy persistence (session-id-display-and-lazy-persist): the
+                // first user message is what commits the `sessions` row.
+                // Flush it *before* `touch()` and before the driver runs, so
+                // the row exists ahead of any dependent write (tool_calls,
+                // inference_calls, locks). A persist failure aborts the
+                // message rather than letting dependents reference a missing
+                // row.
+                match session.persist_if_needed() {
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::error!(error = %e, session_id = %session_id,
+                            "persisting session on first message failed; dropping message");
+                        continue;
+                    }
+                }
                 if let Err(e) = session.touch() {
                     tracing::warn!(error = %e, "session touch failed");
                 }

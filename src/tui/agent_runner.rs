@@ -43,6 +43,10 @@ pub struct AgentRunner {
     /// Name of whoever's currently on top of the agent stack. The
     /// chrome reads this for the active-agent slot (GOALS §1a).
     pub active_agent: Arc<Mutex<String>>,
+    /// This session's full id. Shown in the startup graphic and printed on
+    /// exit (session-id-display-and-lazy-persist). Assigned by the daemon at
+    /// attach, before the `sessions` row is persisted.
+    pub session_id: uuid::Uuid,
     /// This session's 6-char display id (GOALS §17b). The TUI captures
     /// it as the predecessor short-id when this session spawns a
     /// `/compact` handoff, so the fresh session can draw a "compacted
@@ -229,6 +233,7 @@ fn try_spawn_inner(
         record_tx,
         events,
         active_agent,
+        session_id,
         short_id,
         project_id,
         usage,

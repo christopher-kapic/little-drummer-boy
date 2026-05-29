@@ -1202,7 +1202,13 @@ impl App {
         self.ensure_agent_runner();
         let outcome = match self.agent_runner.as_ref() {
             Some(Ok(runner)) => match runner.input_tx.try_send(submission) {
-                Ok(()) => DispatchOutcome::Sent,
+                Ok(()) => {
+                    // First user message commits the daemon's `sessions`
+                    // row (session-id-display-and-lazy-persist); record that
+                    // so the exit print knows the session was persisted.
+                    self.current_session_persisted = true;
+                    DispatchOutcome::Sent
+                }
                 Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                     self.history.push(HistoryEntry::Plain {
                         line: "engine: input queue full — wait for the current turn to finish"

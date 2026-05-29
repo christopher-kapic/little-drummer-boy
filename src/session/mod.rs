@@ -108,6 +108,14 @@ pub struct Session {
     /// repeat. In-memory only — a fresh attach starts the chain over,
     /// which is correct (a loop only matters within a live run).
     last_tool_call: Mutex<Option<LastToolCall>>,
+    /// Deferred-persistence state (session-id-display-and-lazy-persist).
+    /// A freshly-created session is held in memory with its `sessions` row
+    /// un-written; `pending_row` carries the row to INSERT on the first
+    /// user message. `None` once persisted (and for sessions created /
+    /// resumed already-persisted). [`Self::persist_if_needed`] is the one
+    /// flush point — it writes the `sessions` row *before* any dependent
+    /// write, so FK/ordering invariants hold.
+    pending_row: Mutex<Option<SessionRow>>,
 }
 
 /// The most recent dispatched tool call's loop-guard signature and its
@@ -127,6 +135,68 @@ impl Session {
             .create_session(&project_id, &project_root_str, active_agent)
             .context("creating session row")?;
         Self::from_row(db, project_root, row)
+    }
+
+    /// Create a brand-new session held **in memory only** — its `sessions`
+    /// row is not written yet (session-id-display-and-lazy-persist). The id
+    /// and short_id exist immediately (so the TUI can show the id at
+    /// startup), but the row lands in the DB only on the first user message
+    /// via [`Self::persist_if_needed`]. A session created this way and never
+    /// persisted leaves no DB trace and never appears in `session list`.
+    pub fn create_deferred(db: Db, project_root: PathBuf, active_agent: &str) -> Result<Self> {
+        let project_id = project_id_for(&project_root);
+        let project_root_str = project_root.to_string_lossy().into_owned();
+        let row = db
+            .new_session_row(&project_id, &project_root_str, active_agent)
+            .context("building deferred session row")?;
+        let session = Self::from_row(db, project_root, row.clone())?;
+        *session.pending_row.lock().unwrap() = Some(row);
+        Ok(session)
+    }
+
+    /// Write the deferred `sessions` row if it hasn't been written yet, and
+    /// return `true` when this call performed the write
+    /// (session-id-display-and-lazy-persist). Idempotent: a no-op (returns
+    /// `false`) for an already-persisted session — including every session
+    /// created via [`Self::create`] / [`Self::resume`] / [`Self::create_fork`],
+    /// which are persisted from the start.
+    ///
+    /// This is the **only** flush point, and it MUST be called before any
+    /// row that references the session (tool_calls, inference_calls, locks,
+    /// …) so the FK/ordering invariant holds. The session worker calls it on
+    /// the first user message, ahead of dispatching it to the driver. The
+    /// stored row carries the latest provider/model so a model picked before
+    /// the first message survives the deferred write.
+    pub fn persist_if_needed(&self) -> Result<bool> {
+        let row = {
+            let mut slot = self.pending_row.lock().unwrap();
+            match slot.take() {
+                Some(mut row) => {
+                    row.provider = self.active_provider();
+                    row.model = self.active_model();
+                    row
+                }
+                None => return Ok(false),
+            }
+        };
+        if let Err(e) = self.db.insert_session_row(&row) {
+            // Restore the pending row so a transient failure can retry on
+            // the next user message rather than silently losing the session.
+            *self.pending_row.lock().unwrap() = Some(row);
+            return Err(e).context("persisting deferred session row");
+        }
+        Ok(true)
+    }
+
+    /// Whether this session's `sessions` row has been written
+    /// (session-id-display-and-lazy-persist). `false` only for a deferred
+    /// session that has not yet seen its first user message; `true`
+    /// otherwise. Used by the lazy-persistence tests; the TUI's own
+    /// exit-print decision tracks the persistence trigger locally (it can't
+    /// reach this daemon-owned state synchronously).
+    #[cfg(test)]
+    pub fn is_persisted(&self) -> bool {
+        self.pending_row.lock().unwrap().is_none()
     }
 
     /// Branch a fork from `parent` at `fork_point_turn_id` (None = tail).
@@ -186,6 +256,9 @@ impl Session {
             tmp_dir: Mutex::new(None),
             sandbox_enabled: std::sync::atomic::AtomicBool::new(true),
             last_tool_call: Mutex::new(None),
+            // Persisted by default; `create_deferred` overrides this with the
+            // pending row right after construction.
+            pending_row: Mutex::new(None),
         })
     }
 
@@ -922,6 +995,64 @@ mod tests {
         // NOT consecutive — it starts a fresh chain at 1, so a
         // non-consecutive repeat never trips the guard.
         assert_eq!(s.bump_consecutive_call("sig-a"), 1);
+    }
+
+    #[test]
+    fn deferred_session_is_not_written_until_first_message() {
+        // session-id-display-and-lazy-persist: a deferred session has an id
+        // and short_id in memory but no `sessions` row, and never appears in
+        // listings until persisted.
+        let db = Db::open_in_memory().unwrap();
+        let s = Session::create_deferred(db.clone(), PathBuf::from("/x"), "orchestrator-build")
+            .unwrap();
+        // Id + short_id exist immediately (for the startup graphic).
+        assert!(!s.short_id.is_empty());
+        assert!(!s.is_persisted());
+        // No DB row yet: not fetchable, not listed.
+        assert!(db.get_session(s.id).unwrap().is_none());
+        assert!(db.list_sessions(true, 100).unwrap().is_empty());
+
+        // First user message → persist. The flush returns `true` once.
+        assert!(
+            s.persist_if_needed().unwrap(),
+            "first persist writes the row"
+        );
+        assert!(s.is_persisted());
+        let row = db.get_session(s.id).unwrap().expect("row now exists");
+        assert_eq!(row.short_id.as_deref(), Some(s.short_id.as_str()));
+        assert_eq!(db.list_sessions(true, 100).unwrap().len(), 1);
+
+        // Idempotent: a second flush is a no-op (returns `false`).
+        assert!(!s.persist_if_needed().unwrap());
+        assert_eq!(db.list_sessions(true, 100).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn deferred_persist_carries_provider_and_model() {
+        // A model picked before the first message survives the deferred
+        // write (session-id-display-and-lazy-persist).
+        let db = Db::open_in_memory().unwrap();
+        let s = Session::create_deferred(db.clone(), PathBuf::from("/x"), "orchestrator-build")
+            .unwrap();
+        // set_active_model's DB UPDATE is a no-op while un-persisted; the
+        // value lives in memory and must land in the deferred INSERT.
+        s.set_active_model("anthropic", "claude-opus-4-7").unwrap();
+        assert!(db.get_session(s.id).unwrap().is_none());
+        s.persist_if_needed().unwrap();
+        let row = db.get_session(s.id).unwrap().unwrap();
+        assert_eq!(row.provider.as_deref(), Some("anthropic"));
+        assert_eq!(row.model.as_deref(), Some("claude-opus-4-7"));
+    }
+
+    #[test]
+    fn create_is_persisted_immediately() {
+        // The non-deferred constructor writes the row up front, so
+        // persist_if_needed is a no-op and is_persisted is true.
+        let db = Db::open_in_memory().unwrap();
+        let s = Session::create(db.clone(), PathBuf::from("/x"), "coder").unwrap();
+        assert!(s.is_persisted());
+        assert!(!s.persist_if_needed().unwrap());
+        assert!(db.get_session(s.id).unwrap().is_some());
     }
 
     #[test]
