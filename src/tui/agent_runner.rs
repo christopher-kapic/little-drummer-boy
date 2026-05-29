@@ -581,10 +581,12 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
         // / `SessionEnded` have no TurnEvent analogue.
         InterruptRaised {
             interrupt_id,
+            description,
             questions: Some(questions),
             ..
         } => TurnEvent::InterruptRaised {
             interrupt_id,
+            description,
             questions,
         },
         SandboxState { enabled, .. } => TurnEvent::SandboxState { enabled },

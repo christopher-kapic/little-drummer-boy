@@ -441,6 +441,7 @@ fn opt(id: &str, label: &str) -> InterruptOption {
     InterruptOption {
         id: id.to_string(),
         label: label.to_string(),
+        description: None,
     }
 }
 

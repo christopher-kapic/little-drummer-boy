@@ -900,6 +900,13 @@ impl App {
         } else {
             0
         };
+        // The answering dialog (GOALS §3b) is a compact, bottom-anchored
+        // overlay sized to its content (capped), not a fullscreen modal.
+        let compact = self
+            .question_dialog
+            .as_ref()
+            .map(|d| d.desired_height())
+            .unwrap_or(0);
         PaneGeometry::compute(
             self.input_height(),
             self.indicator_lines(),
@@ -907,6 +914,7 @@ impl App {
             self.popup_lines(),
             self.total_history_lines(),
             dialog,
+            compact,
         )
     }
 
@@ -2182,6 +2190,7 @@ impl App {
             }
             TurnEvent::InterruptRaised {
                 interrupt_id,
+                description,
                 questions,
             } => {
                 // A `question` tool blocked the agent (GOALS §3b). Open
@@ -2193,6 +2202,7 @@ impl App {
                     Duration::from_millis(load_dialog_config(&self.launch.cwd).lockout_ms);
                 self.question_dialog = Some(crate::tui::dialog::question::QuestionDialog::new(
                     interrupt_id,
+                    description,
                     questions,
                     lockout,
                 ));

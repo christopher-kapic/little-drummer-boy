@@ -291,10 +291,19 @@ impl App {
 
         if let Some(prompt) = self.daemon_prompt.as_ref() {
             prompt.render(frame, rects.body);
-        } else if let Some(dialog) = self.question_dialog.as_ref() {
-            // Answering dialog (GOALS §3b) replaces the composer; render
-            // it over the body like the other modals so it owns input.
-            dialog.render(frame, rects.body);
+        } else if self.question_dialog.is_some() {
+            // Answering dialog (GOALS §3b): a compact, bottom-anchored
+            // overlay above the status row. History stays visible above
+            // it (codex bottom-pane style), so render the chat into `body`
+            // and the dialog into the `compact` slot. The dialog owns the
+            // cursor while it's open.
+            self.render_history(frame, rects.body);
+            if let Some(dialog) = self.question_dialog.as_mut() {
+                // Sync the scroll viewport to the real overlay height so a
+                // long option list scrolls with the focused row in view.
+                dialog.sync_viewport(rects.compact.height);
+                dialog.render(frame, rects.compact);
+            }
         } else if self.dialog.is_active() {
             self.dialog.render(frame, rects.body);
         } else if let Some(picker) = self.model_picker.as_ref() {

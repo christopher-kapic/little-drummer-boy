@@ -924,6 +924,11 @@ fn default_allow_freetext() -> bool {
 pub struct InterruptOption {
     pub id: String,
     pub label: String,
+    /// Optional one-line description rendered dimmed beneath the label.
+    /// Absent for options the agent didn't annotate (back-compat: an
+    /// un-annotated option is wire-equivalent to the legacy shape).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 /// A batch of one or more questions raised in a single interrupt. The
@@ -1259,10 +1264,12 @@ mod tests {
                 InterruptOption {
                     id: "now".into(),
                     label: "Backfill now".into(),
+                    description: None,
                 },
                 InterruptOption {
                     id: "later".into(),
                     label: "Defer".into(),
+                    description: None,
                 },
             ],
             allow_freetext: true,

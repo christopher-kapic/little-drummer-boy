@@ -130,6 +130,10 @@ pub enum TurnEvent {
     /// `ResolveInterrupt`. Carries the batch of questions to render.
     InterruptRaised {
         interrupt_id: uuid::Uuid,
+        /// Interrupt-level context (from `raise_interrupt(description, …)`),
+        /// rendered as a muted context header above the question prompt.
+        /// Empty when the agent supplied none.
+        description: String,
         questions: crate::daemon::proto::InterruptQuestionSet,
     },
 

@@ -43,6 +43,21 @@ use crate::tui::textfield::TextField;
 pub struct DialogOption {
     pub id: String,
     pub label: String,
+    /// Optional one-line description rendered dimmed under the label.
+    /// `None` renders exactly as a label-only option (back-compat).
+    pub description: Option<String>,
+}
+
+impl DialogOption {
+    /// Label-only option (no description). Convenience for call sites
+    /// (e.g. approval) that never annotate options.
+    pub fn new(id: impl Into<String>, label: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            label: label.into(),
+            description: None,
+        }
+    }
 }
 
 /// What a page asks for. The variants mirror the three answer modes; a
@@ -105,12 +120,19 @@ impl Page {
         self.is_select()
     }
 
-    /// Cursor positions on this page: one per option, then one for the
-    /// always-last "Type your own answer" affordance. A `text` page has
-    /// a single position (its input).
+    fn is_multiselect(&self) -> bool {
+        matches!(self.kind, PageKind::Multiselect)
+    }
+
+    /// Cursor positions on this page. A `text` page has a single
+    /// position (its input). A select page is `[options…] [custom]`. A
+    /// multiselect page is `[options…] [custom] [Next]` — the explicit
+    /// "Next" advance entry (Enter toggles options, never auto-advances).
     fn cursor_count(&self) -> usize {
         if self.is_text() {
             1
+        } else if self.is_multiselect() {
+            self.options.len() + 2
         } else {
             self.options.len() + 1
         }
@@ -120,6 +142,16 @@ impl Page {
     /// select/multiselect page.
     fn custom_index(&self) -> usize {
         self.options.len()
+    }
+
+    /// Index of the explicit "Next" advance entry on a multiselect page
+    /// (the row after the custom affordance). `None` for non-multiselect.
+    fn next_index(&self) -> Option<usize> {
+        if self.is_multiselect() {
+            Some(self.options.len() + 1)
+        } else {
+            None
+        }
     }
 }
 
@@ -181,6 +213,16 @@ pub struct DialogState {
     /// here.
     created_at: Instant,
     lockout: Duration,
+    /// First visible row index within the current page's row list (option
+    /// rows + custom + optional Next), used when the list is taller than
+    /// the viewport. Kept so the focused row stays in view. `viewport`
+    /// rows are visible at a time once [`set_viewport`](Self::set_viewport)
+    /// is fed the rendered cap.
+    scroll: usize,
+    /// Max visible rows the renderer last reported (the codex-style cap).
+    /// Zero means "unbounded" (no scrolling) until the renderer reports a
+    /// cap.
+    viewport: usize,
 }
 
 impl DialogState {
@@ -189,14 +231,21 @@ impl DialogState {
     /// is a programming error at the call site).
     pub fn new(pages: Vec<Page>, lockout: Duration) -> Self {
         let page_states = pages.iter().map(|_| PageState::default()).collect();
+        // A freetext page opens directly in typing mode (the spec: no
+        // space/enter to start). Input is still gated by the lockout in
+        // `handle_key`, so this only takes effect once the dialog is
+        // interactive.
+        let typing = pages.first().map(Page::is_text).unwrap_or(false);
         Self {
             pages,
             page_states,
             page: 0,
             cursor: 0,
-            typing: false,
+            typing,
             created_at: Instant::now(),
             lockout,
+            scroll: 0,
+            viewport: 0,
         }
     }
 
@@ -275,6 +324,61 @@ impl DialogState {
         self.page_states[page].custom.cursor_col()
     }
 
+    /// First visible row index for the current page's option list. The
+    /// renderer skips rows before this when the list is taller than the
+    /// viewport.
+    pub fn scroll(&self) -> usize {
+        self.scroll
+    }
+
+    /// The cursor index of the multiselect "Next" advance entry on the
+    /// current page, if any. Lets the renderer draw it as a row.
+    pub fn next_index(&self) -> Option<usize> {
+        if self.on_confirm_page() {
+            None
+        } else {
+            self.pages[self.page].next_index()
+        }
+    }
+
+    /// Whether the current page is a freetext (text) page.
+    pub fn current_is_text(&self) -> bool {
+        !self.on_confirm_page() && self.pages[self.page].is_text()
+    }
+
+    /// Tell the core how many option rows the renderer can show at once
+    /// (the codex-style cap, after line-accounting for multi-line rows),
+    /// and clamp scroll so the focused cursor stays in view. Called from
+    /// the renderer each frame with the height it computed.
+    pub fn set_viewport(&mut self, rows: usize) {
+        self.viewport = rows;
+        self.clamp_scroll();
+    }
+
+    /// Keep `scroll` so the focused `cursor` row is within the visible
+    /// window `[scroll, scroll + viewport)`. No-op when the viewport is
+    /// unbounded (`0`) or the page has no option list.
+    fn clamp_scroll(&mut self) {
+        if self.viewport == 0 || self.on_confirm_page() {
+            self.scroll = 0;
+            return;
+        }
+        let total = self.pages[self.page].cursor_count();
+        if total <= self.viewport {
+            self.scroll = 0;
+            return;
+        }
+        if self.cursor < self.scroll {
+            self.scroll = self.cursor;
+        } else if self.cursor >= self.scroll + self.viewport {
+            self.scroll = self.cursor + 1 - self.viewport;
+        }
+        let max_scroll = total.saturating_sub(self.viewport);
+        if self.scroll > max_scroll {
+            self.scroll = max_scroll;
+        }
+    }
+
     /// Apply a key. Returns the outcome the host acts on. Input is
     /// ignored (returns `Continue`) while [`locked`](Self::locked).
     pub fn handle_key(&mut self, key: KeyEvent) -> DialogOutcome {
@@ -297,15 +401,48 @@ impl DialogState {
 
     /// Keys while editing a custom / free-text field.
     fn handle_typing_key(&mut self, key: KeyEvent) -> DialogOutcome {
+        // On a freetext page (which opens directly in typing mode),
+        // Left/Right at the field boundary step between questions — the
+        // only way to leave a text field for a sibling question. Inside
+        // the text they move the field cursor as usual.
+        if self.pages[self.page].is_text() && self.page_count() > 1 {
+            let col = self.page_states[self.page].custom.cursor();
+            let len = self.page_states[self.page].custom.text().len();
+            if matches!(key.code, KeyCode::Left) && col == 0 {
+                return self.prev_page();
+            }
+            if matches!(key.code, KeyCode::Right) && col == len {
+                return self.next_page();
+            }
+        }
         match key.code {
-            // Enter exits typing mode back to cursor navigation. On a
-            // `text` page there's nowhere to navigate, but leaving typing
-            // mode is still the right "I'm done with this field" gesture.
             KeyCode::Enter => {
+                let page = &self.pages[self.page];
+                if page.is_text() {
+                    // Freetext question: Enter submits/advances (lone
+                    // question fast-paths; otherwise step to the next
+                    // page / review).
+                    return self.fast_path_submit_or_advance();
+                }
+                // Select/multiselect custom field: Enter commits the typed
+                // answer. Multiselect stays put (advance is the "Next"
+                // entry); single-select fast-paths.
                 self.typing = false;
-                DialogOutcome::Continue
+                if page.is_multiselect() {
+                    return DialogOutcome::Continue;
+                }
+                if self.page_states[self.page].custom.text().trim().is_empty() {
+                    return DialogOutcome::Continue;
+                }
+                self.fast_path_submit_or_advance()
             }
             _ => {
+                // On a single-select page, typing the custom answer is
+                // mutually exclusive with the radio options — clear any
+                // radio choice as soon as the user types.
+                if self.pages[self.page].is_select() {
+                    self.page_states[self.page].selected.clear();
+                }
                 self.page_states[self.page].custom.handle_key(key);
                 DialogOutcome::Continue
             }
@@ -315,17 +452,32 @@ impl DialogState {
     /// Keys on a select / multiselect / text page (not typing).
     fn handle_page_key(&mut self, key: KeyEvent) -> DialogOutcome {
         let page = &self.pages[self.page];
-        // `text` pages: a single field. Entering it switches to typing.
+        // `text` pages open directly in typing mode (see `new`/`next_page`),
+        // so `handle_typing_key` owns them. Reaching here means typing was
+        // toggled off with Enter; restore it on the next text-affecting key,
+        // and allow page navigation in a multi-question wizard.
         if page.is_text() {
             return match key.code {
-                KeyCode::Char(' ') | KeyCode::Enter => {
-                    self.typing = true;
-                    DialogOutcome::Continue
-                }
                 KeyCode::Left | KeyCode::Char('h') => self.prev_page(),
                 KeyCode::Right | KeyCode::Char('l') => self.next_page(),
-                _ => DialogOutcome::Continue,
+                _ => {
+                    // Any other key resumes editing the field.
+                    self.typing = true;
+                    self.handle_typing_key(key)
+                }
             };
+        }
+
+        // Number-key instant-select (1–9): target that option directly.
+        if let KeyCode::Char(c) = key.code
+            && let Some(d) = c.to_digit(10)
+            && (1..=9).contains(&d)
+        {
+            let idx = (d - 1) as usize;
+            if idx < page.options.len() {
+                return self.number_select(idx);
+            }
+            return DialogOutcome::Continue;
         }
 
         match key.code {
@@ -348,13 +500,44 @@ impl DialogState {
         }
     }
 
+    /// A number key targeted option `idx`. Single-select: select it and
+    /// advance (instant-accept). Multi-select: toggle it, no advance.
+    fn number_select(&mut self, idx: usize) -> DialogOutcome {
+        let page = &self.pages[self.page];
+        let id = page.options[idx].id.clone();
+        if page.is_select() {
+            self.cursor = idx;
+            self.clamp_scroll();
+            let st = &mut self.page_states[self.page];
+            // Radio + custom are mutually exclusive: choosing a radio
+            // clears any typed custom answer.
+            st.selected = vec![id];
+            st.custom.set("");
+            self.fast_path_submit_or_advance()
+        } else {
+            let st = &mut self.page_states[self.page];
+            if let Some(pos) = st.selected.iter().position(|s| *s == id) {
+                st.selected.remove(pos);
+            } else {
+                st.selected.push(id);
+            }
+            self.cursor = idx;
+            self.clamp_scroll();
+            DialogOutcome::Continue
+        }
+    }
+
     /// Space on a page: toggle the hovered option, or enter typing mode
-    /// on the custom affordance.
+    /// on the custom affordance. The "Next" entry (multiselect only) is
+    /// not a toggle target — space there is a no-op (Enter advances).
     fn toggle_or_type(&mut self) {
         let page = &self.pages[self.page];
+        if Some(self.cursor) == page.next_index() {
+            return;
+        }
         if self.cursor == page.custom_index() {
             // Hovering "Type your own answer": space begins typing.
-            self.typing = true;
+            self.begin_custom_typing();
             return;
         }
         let id = page.options[self.cursor].id.clone();
@@ -362,11 +545,13 @@ impl DialogState {
         let st = &mut self.page_states[self.page];
         if is_select {
             // Radio: toggling a new option replaces the prior selection;
-            // toggling the already-selected one clears it.
+            // toggling the already-selected one clears it. Radio + custom
+            // are mutually exclusive, so a fresh selection clears custom.
             if st.selected == [id.clone()] {
                 st.selected.clear();
             } else {
                 st.selected = vec![id];
+                st.custom.set("");
             }
         } else if let Some(pos) = st.selected.iter().position(|s| *s == id) {
             st.selected.remove(pos);
@@ -375,31 +560,58 @@ impl DialogState {
         }
     }
 
+    /// Begin editing the custom / free-text field of the current page. On
+    /// a single-select page the custom answer is mutually exclusive with
+    /// the radio options, so entering the field clears any radio choice.
+    fn begin_custom_typing(&mut self) {
+        if self.pages[self.page].is_select() {
+            self.page_states[self.page].selected.clear();
+        }
+        self.typing = true;
+    }
+
     /// Enter on a select/multiselect page (cursor mode).
     fn enter_on_page(&mut self) -> DialogOutcome {
         let page = &self.pages[self.page];
+        // Multiselect "Next" entry: the explicit advance.
+        if Some(self.cursor) == page.next_index() {
+            return self.fast_path_submit_or_advance();
+        }
         if self.cursor == page.custom_index() {
             // On the custom affordance: with text already typed, enter =
             // choose+submit that custom answer; with nothing typed, enter
             // = begin typing.
             if self.page_states[self.page].custom.text().trim().is_empty() {
-                self.typing = true;
+                self.begin_custom_typing();
+                return DialogOutcome::Continue;
+            }
+            // A multiselect never auto-advances on choosing custom; the
+            // "Next" entry advances. A single-select fast-paths.
+            if page.is_multiselect() {
                 return DialogOutcome::Continue;
             }
             return self.fast_path_submit_or_advance();
         }
-        // Hovering a proposed option: enter chooses it (radio for
-        // select; additive set for multiselect — but the single-question
-        // fast path means we then try to submit).
+        // Hovering a proposed option.
         let id = page.options[self.cursor].id.clone();
-        let is_select = page.is_select();
-        let st = &mut self.page_states[self.page];
-        if is_select {
+        if page.is_select() {
+            // Single-select: choose it (mutually exclusive with custom)
+            // and auto-advance.
+            let st = &mut self.page_states[self.page];
             st.selected = vec![id];
-        } else if !st.selected.contains(&id) {
-            st.selected.push(id);
+            st.custom.set("");
+            self.fast_path_submit_or_advance()
+        } else {
+            // Multiselect: Enter TOGGLES the focused option, never
+            // advances. The "Next" entry advances.
+            let st = &mut self.page_states[self.page];
+            if let Some(pos) = st.selected.iter().position(|s| *s == id) {
+                st.selected.remove(pos);
+            } else {
+                st.selected.push(id);
+            }
+            DialogOutcome::Continue
         }
-        self.fast_path_submit_or_advance()
     }
 
     /// Single-question fast path: if this is the only page and it's now
@@ -424,7 +636,7 @@ impl DialogState {
                     // user can fix it; refuse to submit.
                     if let Some(first) = (0..self.pages.len()).find(|&i| !self.is_answered(i)) {
                         self.page = first;
-                        self.cursor = 0;
+                        self.land_on_page();
                     }
                     DialogOutcome::Continue
                 }
@@ -441,26 +653,34 @@ impl DialogState {
             return;
         }
         self.cursor = (((self.cursor as i32 + delta) % n + n) % n) as usize;
+        self.clamp_scroll();
     }
 
-    /// Advance to the next page (or the confirm page). Resets the cursor.
+    /// Advance to the next page (or the confirm page). Resets the cursor
+    /// and scroll; a freetext page lands directly in typing mode.
     fn next_page(&mut self) -> DialogOutcome {
         if self.page < self.pages.len() {
             self.page += 1;
-            self.cursor = 0;
-            self.typing = false;
+            self.land_on_page();
         }
         DialogOutcome::Continue
     }
 
-    /// Step back one page. Resets the cursor.
+    /// Step back one page. Resets the cursor and scroll.
     fn prev_page(&mut self) -> DialogOutcome {
         if self.page > 0 {
             self.page -= 1;
-            self.cursor = 0;
-            self.typing = false;
+            self.land_on_page();
         }
         DialogOutcome::Continue
+    }
+
+    /// Reset per-page transient state after a page change. Freetext pages
+    /// open directly in typing mode (no space/enter to start).
+    fn land_on_page(&mut self) {
+        self.cursor = 0;
+        self.scroll = 0;
+        self.typing = !self.on_confirm_page() && self.pages[self.page].is_text();
     }
 
     /// Build the final answer list — one [`Answer`] per page.
@@ -516,10 +736,7 @@ mod tests {
     }
 
     fn opt(id: &str) -> DialogOption {
-        DialogOption {
-            id: id.into(),
-            label: id.to_uppercase(),
-        }
+        DialogOption::new(id, id.to_uppercase())
     }
 
     /// Build an already-unlocked single-select dialog for behavior tests.
@@ -618,15 +835,79 @@ mod tests {
         d.handle_key(press(KeyCode::Char('h')));
         d.handle_key(press(KeyCode::Char('i')));
         assert_eq!(d.custom_text(0), "hi");
-        // Enter exits typing mode.
-        d.handle_key(press(KeyCode::Enter));
-        assert!(!d.is_typing());
-        // Now enter on the custom affordance (text present) submits.
+        // Enter on the single-select custom field (text present) commits +
+        // fast-paths to submit (lone question).
         let out = d.handle_key(press(KeyCode::Enter));
         assert_eq!(
             out,
             DialogOutcome::Submit(vec![Answer::Text { text: "hi".into() }])
         );
+    }
+
+    #[test]
+    fn single_select_custom_and_radio_are_mutually_exclusive() {
+        // Two select pages so Enter on a select-custom field advances
+        // (leaving the typed custom in place) rather than submitting — that
+        // lets us come back and exercise "selecting a radio clears custom".
+        let mut d = unlocked(vec![
+            Page::select("q1", vec![opt("a"), opt("b")]),
+            Page::select("q2", vec![opt("c")]),
+        ]);
+        // Select a radio option.
+        d.handle_key(press(KeyCode::Char(' ')));
+        assert_eq!(d.selected_ids(0), &["a".to_string()]);
+        // Move to the custom affordance and start typing: the radio choice
+        // clears the moment the user types.
+        d.handle_key(press(KeyCode::Char('j')));
+        d.handle_key(press(KeyCode::Char('j'))); // custom index = 2
+        d.handle_key(press(KeyCode::Enter)); // begin typing (empty)
+        assert!(d.is_typing());
+        d.handle_key(press(KeyCode::Char('x')));
+        assert!(
+            d.selected_ids(0).is_empty(),
+            "typing custom clears the radio"
+        );
+        assert_eq!(d.custom_text(0), "x");
+        // Enter commits the custom answer and advances to q2 (2 pages).
+        d.handle_key(press(KeyCode::Enter));
+        assert_eq!(d.current_page(), 1);
+        // Back to q1; custom "x" is still present. Pick a radio via number
+        // key now that we're in navigation mode: custom text clears.
+        d.handle_key(press(KeyCode::Char('h')));
+        assert_eq!(d.current_page(), 0);
+        assert_eq!(d.custom_text(0), "x");
+        d.handle_key(press(KeyCode::Char('1')));
+        assert_eq!(d.selected_ids(0), &["a".to_string()]);
+        assert!(
+            d.custom_text(0).is_empty(),
+            "selecting a radio clears custom"
+        );
+    }
+
+    #[test]
+    fn multiselect_enter_toggles_and_next_advances() {
+        let mut d = unlocked(vec![
+            Page::multiselect("q1", vec![opt("a"), opt("b")]),
+            Page::text("q2"),
+        ]);
+        // Enter on the focused option toggles it (no advance).
+        d.handle_key(press(KeyCode::Enter));
+        assert_eq!(d.selected_ids(0), &["a".to_string()]);
+        assert_eq!(d.current_page(), 0, "multiselect Enter never advances");
+        // Enter again toggles it back off.
+        d.handle_key(press(KeyCode::Enter));
+        assert!(d.selected_ids(0).is_empty());
+        // Number key toggles a different option.
+        d.handle_key(press(KeyCode::Char('2')));
+        assert_eq!(d.selected_ids(0), &["b".to_string()]);
+        // Navigate to the explicit "Next" entry and Enter: advances.
+        // Layout: [a, b, custom, Next] => Next at index 3. The number key
+        // left the cursor on index 1, so step down to custom then Next.
+        d.handle_key(press(KeyCode::Down)); // index 2 (custom)
+        d.handle_key(press(KeyCode::Down)); // index 3 (Next)
+        assert_eq!(d.cursor(), 3);
+        d.handle_key(press(KeyCode::Enter));
+        assert_eq!(d.current_page(), 1, "Next advanced to the next question");
     }
 
     #[test]
@@ -652,25 +933,28 @@ mod tests {
     #[test]
     fn multi_question_nav_and_confirm_validation() {
         let mut d = unlocked(vec![Page::select("q1", vec![opt("a")]), Page::text("q2")]);
-        // Page 0: answer it (space selects, no fast-path because 2 pages).
-        d.handle_key(press(KeyCode::Char(' ')));
+        // Page 0 (single-select): Enter selects + auto-advances to page 1
+        // (no fast-path submit because there are two pages).
+        d.handle_key(press(KeyCode::Enter));
         assert_eq!(d.selected_ids(0), &["a".to_string()]);
-        // Right to page 1.
-        d.handle_key(press(KeyCode::Char('l')));
-        assert_eq!(d.current_page(), 1);
-        // Right to the confirm page WITHOUT answering q2.
-        d.handle_key(press(KeyCode::Char('l')));
+        assert_eq!(d.current_page(), 1, "auto-advanced to the text page");
+        // The text page opens directly in typing mode.
+        assert!(d.is_typing(), "freetext page opens in typing mode");
+        // Enter on the (empty) text page advances to the confirm page.
+        d.handle_key(press(KeyCode::Enter));
         assert!(d.on_confirm_page());
-        // Enter on confirm with an unanswered q2: refuses, jumps to q2.
+        // Enter on confirm with an unanswered q2: refuses, jumps to q2 and
+        // re-enters typing mode.
         let out = d.handle_key(press(KeyCode::Enter));
         assert_eq!(out, DialogOutcome::Continue);
         assert_eq!(d.current_page(), 1, "jumped to the unanswered page");
-        // Answer q2.
-        d.handle_key(press(KeyCode::Char(' '))); // begin typing
+        assert!(d.is_typing(), "landing on the text page re-enters typing");
+        // Answer q2 by typing; Enter advances to confirm.
         d.handle_key(press(KeyCode::Char('z')));
-        d.handle_key(press(KeyCode::Enter)); // exit typing
-        // Right to confirm, enter submits now.
-        d.handle_key(press(KeyCode::Char('l')));
+        let out = d.handle_key(press(KeyCode::Enter));
+        assert_eq!(out, DialogOutcome::Continue);
+        assert!(d.on_confirm_page());
+        // Enter submits now.
         let out = d.handle_key(press(KeyCode::Enter));
         assert_eq!(
             out,
@@ -684,8 +968,9 @@ mod tests {
     #[test]
     fn esc_cancels_even_while_typing() {
         let mut d = unlocked(vec![Page::text("q")]);
-        d.handle_key(press(KeyCode::Char(' '))); // enter typing
+        // A freetext page opens directly in typing mode.
         assert!(d.is_typing());
+        d.handle_key(press(KeyCode::Char('x'))); // mid-typing
         let out = d.handle_key(press(KeyCode::Esc));
         assert_eq!(out, DialogOutcome::Cancel);
     }
@@ -696,5 +981,27 @@ mod tests {
         assert_eq!(d.answered_flags(), vec![false, false]);
         d.handle_key(press(KeyCode::Char(' '))); // answer q1
         assert_eq!(d.answered_flags(), vec![true, false]);
+    }
+
+    #[test]
+    fn viewport_scroll_keeps_focus_in_view() {
+        let options: Vec<DialogOption> = (0..12).map(|i| opt(&format!("o{i}"))).collect();
+        let mut d = unlocked(vec![Page::select("?", options)]);
+        // Window of 4 rows.
+        d.set_viewport(4);
+        assert_eq!(d.scroll(), 0);
+        // Move focus down past the window; scroll follows.
+        for _ in 0..6 {
+            d.handle_key(press(KeyCode::Down));
+        }
+        assert_eq!(d.cursor(), 6);
+        assert!(d.cursor() >= d.scroll());
+        assert!(d.cursor() < d.scroll() + 4, "focus stays within the window");
+        // Move back up above the window; scroll follows up.
+        for _ in 0..6 {
+            d.handle_key(press(KeyCode::Up));
+        }
+        assert_eq!(d.cursor(), 0);
+        assert_eq!(d.scroll(), 0);
     }
 }

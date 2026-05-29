@@ -143,10 +143,7 @@ fn scope_page(prompt: String, wrapper: bool) -> Page {
 }
 
 fn opt(id: &str, label: &str) -> DialogOption {
-    DialogOption {
-        id: id.to_string(),
-        label: label.to_string(),
-    }
+    DialogOption::new(id, label)
 }
 
 /// Map the chosen option id to an [`ApprovalChoice`]. An unknown id (only

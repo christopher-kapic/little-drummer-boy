@@ -57,7 +57,8 @@ impl Tool for QuestionTool {
                                     "type": "object",
                                     "properties": {
                                         "id":    { "type": "string", "description": "Stable option id" },
-                                        "label": { "type": "string", "description": "Option label" }
+                                        "label": { "type": "string", "description": "Option label" },
+                                        "description": { "type": "string", "description": "Optional one-line option description" }
                                     },
                                     "required": ["id", "label"]
                                 }
@@ -182,7 +183,15 @@ fn parse_options(q: &Value, index: usize) -> Result<Vec<InterruptOption>> {
             .and_then(Value::as_str)
             .map(str::to_string)
             .unwrap_or_else(|| id.clone());
-        out.push(InterruptOption { id, label });
+        let description = opt
+            .get("description")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        out.push(InterruptOption {
+            id,
+            label,
+            description,
+        });
     }
     Ok(out)
 }
@@ -302,6 +311,7 @@ mod tests {
                     options: vec![InterruptOption {
                         id: "pg".into(),
                         label: "Postgres".into(),
+                        description: None,
                     }],
                     allow_freetext: true,
                 },

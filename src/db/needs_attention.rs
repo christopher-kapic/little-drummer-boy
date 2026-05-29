@@ -203,10 +203,12 @@ mod tests {
                 InterruptOption {
                     id: "y".into(),
                     label: "yes".into(),
+                    description: None,
                 },
                 InterruptOption {
                     id: "n".into(),
                     label: "no".into(),
+                    description: None,
                 },
             ],
             allow_freetext: true,
@@ -241,6 +243,7 @@ mod tests {
                     options: vec![InterruptOption {
                         id: "a".into(),
                         label: "A".into(),
+                        description: None,
                     }],
                     allow_freetext: true,
                 },

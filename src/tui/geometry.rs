@@ -34,6 +34,11 @@ pub struct PaneGeometry {
     pub status: u16,
     /// Dialog height. Zero when no dialog is open.
     pub dialog: u16,
+    /// Compact bottom-anchored overlay height (the answering/question
+    /// dialog, GOALS §3b). Unlike `dialog` (a fullscreen modal that hides
+    /// history), this sits at the bottom above the status row and lets
+    /// history show above it. Zero when no compact overlay is open.
+    pub compact: u16,
     /// History rows wanted by the current scrollback. The pane will grow
     /// to fit up to the terminal height; beyond that, old entries spill
     /// into terminal scrollback.
@@ -56,6 +61,10 @@ pub struct PaneRects {
     /// Slash popup rect. Zero-area when there's no slash query or a
     /// dialog is open.
     pub popup: Rect,
+    /// Compact bottom-anchored overlay rect (answering dialog). Zero-area
+    /// unless a compact overlay is open. Sits below `body` (history) and
+    /// above `status`.
+    pub compact: Rect,
     /// Status row — always rendered, including under a dialog.
     pub status: Rect,
 }
@@ -73,7 +82,24 @@ impl PaneGeometry {
         popup_height: u16,
         history_lines: u16,
         dialog_height: u16,
+        compact_height: u16,
     ) -> Self {
+        // The compact answering overlay takes precedence over the input
+        // row + slash popup (it owns input while open) but keeps history
+        // visible above it, bottom-anchored. A fullscreen `dialog` still
+        // wins outright.
+        if dialog_height == 0 && compact_height > 0 {
+            return Self {
+                input: 0,
+                indicator: 0,
+                queue: 0,
+                popup: 0,
+                status: STATUS_HEIGHT,
+                dialog: 0,
+                compact: compact_height,
+                history: history_lines.max(MIN_HISTORY_HEIGHT),
+            };
+        }
         if dialog_height > 0 {
             Self {
                 input: 0,
@@ -82,6 +108,7 @@ impl PaneGeometry {
                 popup: 0,
                 status: STATUS_HEIGHT,
                 dialog: dialog_height,
+                compact: 0,
                 history: history_lines.max(MIN_HISTORY_HEIGHT),
             }
         } else {
@@ -102,6 +129,7 @@ impl PaneGeometry {
                 popup: popup_height,
                 status: STATUS_HEIGHT,
                 dialog: 0,
+                compact: 0,
                 history: history_lines.max(MIN_HISTORY_HEIGHT),
             }
         }
@@ -114,7 +142,13 @@ impl PaneGeometry {
         if self.dialog > 0 {
             self.dialog + self.status
         } else {
-            self.history + self.indicator + self.queue + self.input + self.popup + self.status
+            self.history
+                + self.indicator
+                + self.queue
+                + self.input
+                + self.popup
+                + self.compact
+                + self.status
         }
     }
 
@@ -124,7 +158,7 @@ impl PaneGeometry {
         if self.dialog > 0 {
             self.status
         } else {
-            self.indicator + self.queue + self.input + self.popup + self.status
+            self.indicator + self.queue + self.input + self.popup + self.compact + self.status
         }
     }
 
@@ -139,6 +173,7 @@ impl PaneGeometry {
                 queue: Rect::new(0, 0, 0, 0),
                 input: Rect::new(0, 0, 0, 0),
                 popup: Rect::new(0, 0, 0, 0),
+                compact: Rect::new(0, 0, 0, 0),
                 status: parts[1],
             }
         } else {
@@ -148,6 +183,7 @@ impl PaneGeometry {
                 Constraint::Length(self.queue),
                 Constraint::Length(self.input),
                 Constraint::Length(self.popup),
+                Constraint::Length(self.compact),
                 Constraint::Length(self.status),
             ])
             .split(area);
@@ -157,7 +193,8 @@ impl PaneGeometry {
                 queue: parts[2],
                 input: parts[3],
                 popup: parts[4],
-                status: parts[5],
+                compact: parts[5],
+                status: parts[6],
             }
         }
     }
