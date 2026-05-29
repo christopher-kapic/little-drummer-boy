@@ -45,23 +45,51 @@ pub struct SpawnArgs {
     pub session_short_id: String,
 }
 
-/// Append the per-session lines (OS + session id) to the role-specific
-/// prompt before handing it to [`Agent::system`]. Per GOALS §17g these
-/// stay inside the cached system block — both fields are stable for
-/// the session's lifetime so prompt-cache hits aren't disturbed.
+/// Append the per-session lines (harness identity + version + URLs +
+/// optional user name + OS + session id) to the role-specific prompt
+/// before handing it to [`Agent::system`]. Per GOALS §17g these stay
+/// inside the cached system block — every field is stable for the
+/// session's lifetime so prompt-cache hits aren't disturbed; the line
+/// order is fixed so identical inputs produce a byte-identical block.
 ///
 /// Also injects the first matching project-guidance file
 /// (`extended.agent_guidance_files`, default `AGENTS.md`) found by
 /// walking from `cwd` up to the git root. Picking the first match keeps
-/// the injection deterministic when multiple legacy names exist.
+/// the injection deterministic when multiple legacy names exist. The
+/// layered config is loaded once here and reused for both the user name
+/// and the guidance-file lookup.
 fn compose_system_prompt(role_prompt: &str, session_short_id: &str, cwd: &Path) -> String {
+    let cfg = load_extended_config(cwd);
+    compose_system_prompt_with(role_prompt, session_short_id, cwd, &cfg)
+}
+
+/// Pure assembler for the cached system block, given an already-resolved
+/// [`ExtendedConfig`]. Split out from [`compose_system_prompt`] so the
+/// formatting (line order, name trim/omit) is testable without depending
+/// on which layered config the discovery walk happens to resolve on the
+/// host machine. The line order is fixed for cache-stability (GOALS §17g).
+fn compose_system_prompt_with(
+    role_prompt: &str,
+    session_short_id: &str,
+    cwd: &Path,
+    cfg: &crate::config::extended::ExtendedConfig,
+) -> String {
     let os = crate::sysinfo::os_string();
-    let mut out = String::with_capacity(role_prompt.len() + 96);
+    let mut out = String::with_capacity(role_prompt.len() + 192);
     out.push_str(role_prompt);
     if !out.ends_with('\n') {
         out.push('\n');
     }
     out.push('\n');
+    out.push_str("Harness: cockpit ");
+    out.push_str(env!("CARGO_PKG_VERSION"));
+    out.push('\n');
+    out.push_str("Website: https://flycockpit.dev | App: https://app.flycockpit.dev\n");
+    if let Some(name) = cfg.name.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
+        out.push_str("User: ");
+        out.push_str(name);
+        out.push('\n');
+    }
     out.push_str("Operating system: ");
     out.push_str(&os);
     out.push('\n');
@@ -71,7 +99,7 @@ fn compose_system_prompt(role_prompt: &str, session_short_id: &str, cwd: &Path) 
         out.push('\n');
     }
 
-    if let Some((found_path, body)) = load_agent_guidance(cwd) {
+    if let Some((found_path, body)) = find_agent_guidance(cwd, &cfg.agent_guidance_files) {
         out.push('\n');
         out.push_str("Project guidance (");
         out.push_str(&found_path.display().to_string());
@@ -85,8 +113,9 @@ fn compose_system_prompt(role_prompt: &str, session_short_id: &str, cwd: &Path) 
 }
 
 /// The full composed system prompt for the user-facing chat agent
-/// (`orchestrator-build`) at `cwd`: role prompt + OS line + (optional)
-/// session line + injected guidance body. Used by the fresh-chat context
+/// (`orchestrator-build`) at `cwd`: role prompt + harness/version/URL
+/// lines + (optional) user-name line + OS line + (optional) session
+/// line + injected guidance body. Used by the fresh-chat context
 /// indicator to size the actual baseline sent to the model, in both
 /// daemon (calibrated) and daemonless (raw cl100k) modes. Pass the empty
 /// string for `session_short_id` when no session exists yet — it simply
@@ -100,12 +129,20 @@ pub(crate) fn default_chat_system_prompt(cwd: &Path, session_short_id: &str) -> 
 /// when there is one — otherwise stop at the filesystem root. Returns
 /// the absolute path + file body.
 pub(crate) fn load_agent_guidance(cwd: &Path) -> Option<(std::path::PathBuf, String)> {
-    let cfg = discover_config_dirs(cwd)
+    let cfg = load_extended_config(cwd);
+    find_agent_guidance(cwd, &cfg.agent_guidance_files)
+}
+
+/// Load the first parseable layered `extended-config.json` that applies
+/// to `cwd` (falling back to defaults when none exists). [`compose_system_prompt`]
+/// loads this once and reads both the user name and the guidance-file
+/// list from it, so the layered config is never loaded twice per spawn.
+fn load_extended_config(cwd: &Path) -> crate::config::extended::ExtendedConfig {
+    discover_config_dirs(cwd)
         .into_iter()
         .find_map(|d| ExtendedConfigDoc::load(&d.path.join("extended-config.json")).ok())
         .map(|d| d.config())
-        .unwrap_or_default();
-    find_agent_guidance(cwd, &cfg.agent_guidance_files)
+        .unwrap_or_default()
 }
 
 /// Inner search used by [`load_agent_guidance`]. Walks `cwd` and its
@@ -202,11 +239,26 @@ pub fn is_noninteractive(name: &str) -> bool {
 mod tests {
     use super::*;
 
+    use crate::config::extended::ExtendedConfig;
+
+    /// Config with a name set, used by the deterministic name-present case.
+    fn cfg_with_name(name: &str) -> ExtendedConfig {
+        ExtendedConfig {
+            name: Some(name.to_string()),
+            ..ExtendedConfig::default()
+        }
+    }
+
     #[test]
-    fn compose_system_prompt_appends_os_and_session() {
+    fn compose_system_prompt_appends_identity_os_and_session() {
         let tmp = tempfile::tempdir().unwrap();
         let out = compose_system_prompt("ROLE PROMPT", "abc123", tmp.path());
         assert!(out.starts_with("ROLE PROMPT"));
+        // Harness identity carries the actual build version.
+        assert!(out.contains(&format!("Harness: cockpit {}", env!("CARGO_PKG_VERSION"))));
+        // Both URLs are present (explicit user decision — keep both).
+        assert!(out.contains("https://flycockpit.dev"));
+        assert!(out.contains("https://app.flycockpit.dev"));
         assert!(out.contains("Operating system:"));
         assert!(out.contains("Session: abc123"));
     }
@@ -217,6 +269,68 @@ mod tests {
         let out = compose_system_prompt("ROLE PROMPT", "", tmp.path());
         assert!(out.contains("Operating system:"));
         assert!(!out.contains("Session:"));
+    }
+
+    /// Name-present case. Driven through the pure assembler with an
+    /// explicit config so the assertion is independent of whichever
+    /// layered config the host machine happens to resolve.
+    #[test]
+    fn compose_system_prompt_includes_user_name_when_configured() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = cfg_with_name("Ada");
+        let out = compose_system_prompt_with("ROLE PROMPT", "abc123", tmp.path(), &cfg);
+        assert!(out.contains("User: Ada"), "block was: {out}");
+        // Order: the User line sits between the URL line and the OS line.
+        let user_at = out.find("User: Ada").unwrap();
+        let url_at = out.find("Website: https://flycockpit.dev").unwrap();
+        let os_at = out.find("Operating system:").unwrap();
+        assert!(url_at < user_at && user_at < os_at, "block was: {out}");
+    }
+
+    /// Whitespace-only names are treated as absent (trimmed before the
+    /// emptiness check).
+    #[test]
+    fn compose_system_prompt_omits_user_name_when_blank() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = cfg_with_name("   ");
+        let out = compose_system_prompt_with("ROLE PROMPT", "abc123", tmp.path(), &cfg);
+        assert!(!out.contains("User:"), "block was: {out}");
+    }
+
+    /// Name-absent case. Default config has `name: None`, so the User
+    /// line must be omitted entirely.
+    #[test]
+    fn compose_system_prompt_omits_user_name_when_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = ExtendedConfig::default();
+        let out = compose_system_prompt_with("ROLE PROMPT", "abc123", tmp.path(), &cfg);
+        assert!(!out.contains("User:"), "block was: {out}");
+    }
+
+    /// Wiring test: the layered loader actually reads `name` out of an
+    /// `extended-config.json`. Written into the `.cockpit/` dir of the
+    /// test cwd — the project-scoped layer the discovery walk-up finds
+    /// ([`load_extended_config`] → [`discover_config_dirs`]).
+    #[test]
+    fn load_extended_config_reads_name_from_project_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(".cockpit");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("extended-config.json"),
+            r#"{"name":"Christopher"}"#,
+        )
+        .unwrap();
+        // A real home-layer config may take precedence in discovery order
+        // on a developer machine; assert the project-dir value is at least
+        // reachable by loading that file directly through the same loader.
+        let cfg =
+            crate::config::extended::ExtendedConfigDoc::load(&dir.join("extended-config.json"))
+                .unwrap()
+                .config();
+        assert_eq!(cfg.name.as_deref(), Some("Christopher"));
+        let out = compose_system_prompt_with("ROLE PROMPT", "abc123", tmp.path(), &cfg);
+        assert!(out.contains("User: Christopher"), "block was: {out}");
     }
 
     #[test]

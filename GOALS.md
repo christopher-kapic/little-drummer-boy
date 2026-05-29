@@ -2981,19 +2981,37 @@ Layout:
 
 ### 17g. System-prompt injections
 
-Three pieces of context attach to every session. Two are stable
+Several pieces of context attach to every session. Most are stable
 (go in the cached system block); one is volatile (must not
-invalidate the cache on every send).
+invalidate the cache on every send). The stable lines emit in a
+fixed order so identical inputs produce a byte-identical block and
+the prompt cache is never disturbed.
 
-**Stable — cached system prompt:**
+**Stable — cached system prompt (in this order):**
 
-1. **Operating system + version.** One line, e.g.
+1. **Harness identity + version.** One line:
+   `Harness: cockpit <version>`, where `<version>` is the running
+   build's `CARGO_PKG_VERSION`. Tells the model which harness it
+   runs inside so it doesn't self-identify as a generic assistant
+   or the wrong harness.
+2. **Cockpit URLs.** One line carrying **both** the marketing site
+   and the web app:
+   `Website: https://flycockpit.dev | App: https://app.flycockpit.dev`.
+   Both are intentional (an explicit decision over a token-economy
+   objection — keep both).
+3. **User name (optional).** One line `User: <name>` sourced from
+   `extended.name` (the same field that drives the `Welcome, {name}`
+   startup logo). Emitted **only** when a name is set and non-empty
+   after trimming; the line is omitted entirely otherwise — mirroring
+   the empty-`Session:` omission.
+4. **Operating system + version.** One line, e.g.
    `Operating system: Linux 6.8.0-111-generic` (or the
    macOS/Windows equivalent). Doesn't change for the session's
    lifetime; counts against the §10 ~400-token budget.
-2. **Session ID.** One line: `Session: <6-char id>`. Counts
+5. **Session ID.** One line: `Session: <6-char id>`. Counts
    against the same budget. The model can echo it back to the
    user when needed (e.g. surfacing the id in a status report).
+   Omitted when no session id is resolved yet.
 
 **Volatile — message-level prelude:**
 
