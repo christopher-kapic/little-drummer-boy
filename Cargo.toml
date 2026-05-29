@@ -159,15 +159,6 @@ tiktoken-rs = "0.11"
 # using the same zbus version to keep one zbus in the tree.
 keepawake = "0.6"
 
-# Linux-only: logind `handle-lid-switch` inhibitor lock for
-# `/caffeinate` lid-close survival (the high-level inhibitor logind
-# always honors, unlike the `sleep` lock keepawake takes). Blocking
-# zbus matches keepawake's `zbus = "5"` so the dependency graph has a
-# single zbus. Held on a dedicated thread alongside the keepawake
-# assertion (see `daemon::caffeinate`).
-[target.'cfg(target_os = "linux")'.dependencies]
-zbus = "5"
-
 # OAuth device-code flow (Codex login). PKCE = SHA-256 + URL-safe base64
 # (no padding); `urlencoding` is just for the form-encoded body of the
 # RFC 8628 token exchange step.
@@ -216,6 +207,15 @@ tree-sitter-go = "0.25"
 tree-sitter-c = "0.24"
 tree-sitter-cpp = "0.23"
 rayon = "1"
+
+# Linux-only: logind `handle-lid-switch` inhibitor lock for
+# `/caffeinate` lid-close survival (the high-level inhibitor logind
+# always honors, unlike the `sleep` lock keepawake takes). Blocking
+# zbus matches keepawake's `zbus = "5"` so the dependency graph has a
+# single zbus. Held on a dedicated thread alongside the keepawake
+# assertion (see `daemon::caffeinate`).
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = "5"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
