@@ -43,6 +43,30 @@ pub struct SpawnArgs {
     /// is participating in. Empty string is acceptable for legacy /
     /// test paths where a session id isn't yet resolved.
     pub session_short_id: String,
+    /// Whether this agent is being spawned into a user-facing
+    /// interactive session (the daemon root, or an interactive handoff
+    /// such as `coder`) versus a one-shot leaf delegation
+    /// (`run_noninteractive`) or the `docs` pipeline. Gates the
+    /// cross-session recall tools (`session_search` / `session_read`):
+    /// they're registered only when `true`, so non-interactive contexts
+    /// don't pay their description tokens (token economy, GOALS §10).
+    /// This is the spawn-time analog of the runtime
+    /// [`crate::engine::interrupt::InterruptHub::is_interactive_attached`]
+    /// gate — the existing interactive-mode signal, not a new one.
+    pub interactive: bool,
+}
+
+/// Append the cross-session recall tools (`session_search` /
+/// `session_read`, prompt `search-old-sessions.md`) to `tb` when this
+/// spawn is interactive. Centralized so every user-facing agent shares
+/// one gate rather than each re-spelling the pair + the `interactive`
+/// check.
+fn with_recall_tools(tb: ToolBox, args: &SpawnArgs) -> ToolBox {
+    if !args.interactive {
+        return tb;
+    }
+    tb.with(Arc::new(crate::tools::session_search::SessionSearchTool))
+        .with(Arc::new(crate::tools::session_read::SessionReadTool))
 }
 
 /// Append the per-session lines (harness identity + version + URLs +
@@ -397,28 +421,31 @@ mod tests {
 /// when the focus is *making the change* (GOALS §3a). Delegates writes
 /// to `coder` via `task`.
 pub fn orchestrator_build(args: &SpawnArgs) -> Agent {
-    let tools = with_custom_tools(
-        ToolBox::new()
-            .with(Arc::new(crate::tools::read::ReadTool))
-            .with(Arc::new(crate::tools::bash::BashTool::new()))
-            .with(Arc::new(crate::tools::intel::TreeTool))
-            .with(Arc::new(crate::tools::intel::HotTool))
-            // The `jobs` meta-tool (GOALS §22) — fixed minimal schema, so
-            // the tools array stays byte-stable as branches are enabled.
-            // Structural: intercepted by the engine and routed to the
-            // driver-owned async-job authority.
-            .with(Arc::new(crate::tools::jobs::JobsTool))
-            // `question` (GOALS §3b): structural — blocks the turn until
-            // the user answers. Only `orchestrator-build` + `coder` get
-            // it; `explore`/`docs` are leaf-terminated and report up.
-            .with(Arc::new(crate::tools::question::QuestionTool))
-            // `skill` (GOALS §5): manual on-demand skill loading. Both
-            // interactive primaries get it; leaf agents don't.
-            .with(Arc::new(crate::tools::skill::SkillTool))
-            .with(Arc::new(crate::tools::task::TaskTool::with_subagents(&[
-                "coder", "explore", "docs",
-            ]))),
-        &args.cwd,
+    let tools = with_recall_tools(
+        with_custom_tools(
+            ToolBox::new()
+                .with(Arc::new(crate::tools::read::ReadTool))
+                .with(Arc::new(crate::tools::bash::BashTool::new()))
+                .with(Arc::new(crate::tools::intel::TreeTool))
+                .with(Arc::new(crate::tools::intel::HotTool))
+                // The `jobs` meta-tool (GOALS §22) — fixed minimal schema, so
+                // the tools array stays byte-stable as branches are enabled.
+                // Structural: intercepted by the engine and routed to the
+                // driver-owned async-job authority.
+                .with(Arc::new(crate::tools::jobs::JobsTool))
+                // `question` (GOALS §3b): structural — blocks the turn until
+                // the user answers. Only `orchestrator-build` + `coder` get
+                // it; `explore`/`docs` are leaf-terminated and report up.
+                .with(Arc::new(crate::tools::question::QuestionTool))
+                // `skill` (GOALS §5): manual on-demand skill loading. Both
+                // interactive primaries get it; leaf agents don't.
+                .with(Arc::new(crate::tools::skill::SkillTool))
+                .with(Arc::new(crate::tools::task::TaskTool::with_subagents(&[
+                    "coder", "explore", "docs",
+                ]))),
+            &args.cwd,
+        ),
+        args,
     );
 
     Agent {
@@ -434,29 +461,32 @@ pub fn orchestrator_build(args: &SpawnArgs) -> Agent {
 /// applies edits. Caller-determined interactivity: interactive when
 /// spawned from `orchestrator-build` (GOALS §3a/§3b).
 pub fn coder(args: &SpawnArgs) -> Agent {
-    let tools = ToolBox::new()
-        .with(Arc::new(crate::tools::read::ReadTool))
-        .with(Arc::new(crate::tools::readlock::ReadlockTool))
-        .with(Arc::new(crate::tools::writeunlock::WriteunlockTool))
-        .with(Arc::new(crate::tools::unlock::UnlockTool))
-        .with(Arc::new(crate::tools::editunlock::EditunlockTool))
-        .with(Arc::new(crate::tools::bash::BashTool::new()))
-        .with(Arc::new(crate::tools::intel::OutlineTool))
-        .with(Arc::new(crate::tools::intel::SymbolFindTool))
-        .with(Arc::new(crate::tools::intel::DepsTool))
-        .with(Arc::new(crate::tools::intel::CircularTool))
-        .with(Arc::new(crate::tools::intel::WordTool))
-        .with(Arc::new(crate::tools::intel::SearchTool))
-        // `question` (GOALS §3b): blocks the turn until the user answers.
-        .with(Arc::new(crate::tools::question::QuestionTool))
-        // `skill` (GOALS §5): manual on-demand skill loading.
-        .with(Arc::new(crate::tools::skill::SkillTool))
-        // `coder` delegates dependency-usage questions to the `docs`
-        // pipeline (GOALS §3a: coder → docs). Noninteractive; the docs
-        // unit returns one leaf report.
-        .with(Arc::new(crate::tools::task::TaskTool::with_subagents(&[
-            "docs",
-        ])));
+    let tools = with_recall_tools(
+        ToolBox::new()
+            .with(Arc::new(crate::tools::read::ReadTool))
+            .with(Arc::new(crate::tools::readlock::ReadlockTool))
+            .with(Arc::new(crate::tools::writeunlock::WriteunlockTool))
+            .with(Arc::new(crate::tools::unlock::UnlockTool))
+            .with(Arc::new(crate::tools::editunlock::EditunlockTool))
+            .with(Arc::new(crate::tools::bash::BashTool::new()))
+            .with(Arc::new(crate::tools::intel::OutlineTool))
+            .with(Arc::new(crate::tools::intel::SymbolFindTool))
+            .with(Arc::new(crate::tools::intel::DepsTool))
+            .with(Arc::new(crate::tools::intel::CircularTool))
+            .with(Arc::new(crate::tools::intel::WordTool))
+            .with(Arc::new(crate::tools::intel::SearchTool))
+            // `question` (GOALS §3b): blocks the turn until the user answers.
+            .with(Arc::new(crate::tools::question::QuestionTool))
+            // `skill` (GOALS §5): manual on-demand skill loading.
+            .with(Arc::new(crate::tools::skill::SkillTool))
+            // `coder` delegates dependency-usage questions to the `docs`
+            // pipeline (GOALS §3a: coder → docs). Noninteractive; the docs
+            // unit returns one leaf report.
+            .with(Arc::new(crate::tools::task::TaskTool::with_subagents(&[
+                "docs",
+            ]))),
+        args,
+    );
 
     Agent {
         name: "coder".to_string(),
@@ -474,19 +504,22 @@ pub fn coder(args: &SpawnArgs) -> Agent {
 /// as the tool result. The user sees the call rendered like any other
 /// tool in the orchestrator's history.
 pub fn explore(args: &SpawnArgs) -> Agent {
-    let tools = with_custom_tools(
-        ToolBox::new()
-            .with(Arc::new(crate::tools::read::ReadTool))
-            .with(Arc::new(crate::tools::bash::BashTool::new()))
-            .with(Arc::new(crate::tools::intel::TreeTool))
-            .with(Arc::new(crate::tools::intel::OutlineTool))
-            .with(Arc::new(crate::tools::intel::SymbolFindTool))
-            .with(Arc::new(crate::tools::intel::WordTool))
-            .with(Arc::new(crate::tools::intel::DepsTool))
-            .with(Arc::new(crate::tools::intel::HotTool))
-            .with(Arc::new(crate::tools::intel::CircularTool))
-            .with(Arc::new(crate::tools::intel::SearchTool)),
-        &args.cwd,
+    let tools = with_recall_tools(
+        with_custom_tools(
+            ToolBox::new()
+                .with(Arc::new(crate::tools::read::ReadTool))
+                .with(Arc::new(crate::tools::bash::BashTool::new()))
+                .with(Arc::new(crate::tools::intel::TreeTool))
+                .with(Arc::new(crate::tools::intel::OutlineTool))
+                .with(Arc::new(crate::tools::intel::SymbolFindTool))
+                .with(Arc::new(crate::tools::intel::WordTool))
+                .with(Arc::new(crate::tools::intel::DepsTool))
+                .with(Arc::new(crate::tools::intel::HotTool))
+                .with(Arc::new(crate::tools::intel::CircularTool))
+                .with(Arc::new(crate::tools::intel::SearchTool)),
+            &args.cwd,
+        ),
+        args,
     );
 
     Agent {

@@ -284,6 +284,9 @@ async fn run_worker(
         params: ModelParams::default(),
         cwd: project_root.clone(),
         session_short_id: session.short_id.clone(),
+        // The daemon root is always the user-facing interactive agent —
+        // it gets the cross-session recall tools.
+        interactive: true,
     };
     let root = Arc::new(builtin::orchestrator_build(&spawn_args));
 

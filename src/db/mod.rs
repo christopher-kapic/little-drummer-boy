@@ -28,6 +28,7 @@ pub mod needs_attention;
 pub mod packages;
 pub mod seed_tools;
 pub mod session_log;
+pub mod session_search;
 pub mod sessions;
 pub mod stats;
 pub mod tokenizer_calibration;
@@ -185,6 +186,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0010_sessions_read_archive.sql"),
     include_str!("migrations/0011_approval_grants.sql"),
     include_str!("migrations/0012_loop_guard_rules.sql"),
+    include_str!("migrations/0013_session_search_fts.sql"),
 ];
 
 fn migrate(conn: &Connection) -> Result<()> {

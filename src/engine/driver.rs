@@ -1462,7 +1462,7 @@ impl Driver {
                     let (tracker, handle) = self.begin_delegation_shrink(parent_full);
                     self.deleg_shrinks
                         .insert(parent_depth, PendingDelegationShrink { tracker, handle });
-                    let child = crate::engine::builtin::load(&child_agent, &self.spawn_args())?;
+                    let child = crate::engine::builtin::load(&child_agent, &self.spawn_args(true))?;
                     self.stack.push(AgentSession {
                         agent: Arc::new(child),
                         history: Vec::new(),
@@ -1518,7 +1518,7 @@ impl Driver {
                     let report = if child_agent == "docs" {
                         match crate::engine::docs_pipeline::run(
                             &brief,
-                            &self.spawn_args(),
+                            &self.spawn_args(false),
                             self.session.clone(),
                             self.locks.clone(),
                             self.redact.clone(),
@@ -1530,7 +1530,8 @@ impl Driver {
                             Err(e) => format!("Error: {e:#}"),
                         }
                     } else {
-                        let child = crate::engine::builtin::load(&child_agent, &self.spawn_args())?;
+                        let child =
+                            crate::engine::builtin::load(&child_agent, &self.spawn_args(false))?;
                         match run_noninteractive(
                             child,
                             self.redact.scrub(&brief),
@@ -1677,12 +1678,19 @@ impl Driver {
         hints
     }
 
-    fn spawn_args(&self) -> crate::engine::builtin::SpawnArgs {
+    /// Build [`SpawnArgs`] for a child agent. `interactive` distinguishes
+    /// a user-facing handoff (an interactive subagent — e.g. `coder`,
+    /// which gets the cross-session recall tools) from a one-shot leaf
+    /// delegation run via [`run_noninteractive`] (explore / docs, which
+    /// do not). This is the spawn-time analog of the runtime
+    /// interactive-mode gate.
+    fn spawn_args(&self, interactive: bool) -> crate::engine::builtin::SpawnArgs {
         crate::engine::builtin::SpawnArgs {
             model: self.stack[0].agent.model.clone(),
             params: self.stack[0].agent.params.clone(),
             cwd: self.cwd.clone(),
             session_short_id: self.session.short_id.clone(),
+            interactive,
         }
     }
 }

@@ -28,6 +28,8 @@ pub mod question;
 pub mod read;
 pub mod readlock;
 pub mod sandbox;
+pub mod session_read;
+pub mod session_search;
 pub mod shell_sandbox;
 pub mod skill;
 pub mod task;
