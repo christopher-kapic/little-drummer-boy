@@ -610,6 +610,7 @@ mod tests {
             subcommand: sub.map(str::to_string),
             key,
             wrapper,
+            span: None,
         }
     }
 

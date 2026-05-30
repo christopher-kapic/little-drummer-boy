@@ -32,7 +32,7 @@ use std::io::Cursor;
 
 use brush_parser::ast::{
     self, Command, CommandPrefixOrSuffixItem, CompoundCommand, IoFileRedirectTarget, IoRedirect,
-    Pipeline, SimpleCommand,
+    Pipeline, SimpleCommand, SourceLocation,
 };
 use brush_parser::{Parser, ParserOptions};
 
@@ -70,6 +70,23 @@ pub struct SimpleCommandInfo {
     /// Whether this command is a wrapper/eval that hides behavior the
     /// parser can't inspect (§1). Wrappers are never persistable (§2).
     pub wrapper: bool,
+    /// Char range `[start, end)` (0-based, end-exclusive) of this simple
+    /// command within the original command string, from `brush-parser`'s
+    /// AST source spans. Used by the approval dialog to highlight the
+    /// constituent this prompt decides inside the full verbatim command.
+    /// `None` when the parser did not place this command (no span info on
+    /// the node — e.g. a degenerate construct); the dialog then falls back
+    /// to a step indicator without an inline highlight.
+    pub span: Option<CharSpan>,
+}
+
+/// A 0-based, end-exclusive **char** range into the original command
+/// string. Char-indexed (matching `brush-parser`'s `SourcePosition.index`,
+/// which counts chars) so multi-byte input slices correctly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CharSpan {
+    pub start: usize,
+    pub end: usize,
 }
 
 /// The store key for a command-key grant: `argv[0]` plus the first
@@ -354,11 +371,20 @@ impl Decomposer {
             program: program.clone(),
             subcommand: subcommand.clone(),
         };
+        // Source span of this simple command within the original string,
+        // from the AST's `SourceLocation`. `index` counts chars (the
+        // tokenizer advances it once per `char`), so the range slices a
+        // `char`-indexed view correctly. `end` is exclusive.
+        let span = sc.location().map(|loc| CharSpan {
+            start: loc.start.index,
+            end: loc.end.index,
+        });
         self.simple_commands.push(SimpleCommandInfo {
             program,
             subcommand,
             key,
             wrapper,
+            span,
         });
     }
 
@@ -638,6 +664,64 @@ mod tests {
         // the presence of `-c`): the program isn't in the wrapper set.
         let c = classify("cargo build");
         assert!(!c.has_wrapper());
+    }
+
+    /// Slice the captured span out of the original string (char-indexed)
+    /// for a constituent, asserting the parser placed it.
+    fn span_text(cmd: &str, idx: usize) -> String {
+        let c = classify(cmd);
+        let sc = &c.simple_commands()[idx];
+        let span = sc.span.expect("simple command has a source span");
+        cmd.chars()
+            .skip(span.start)
+            .take(span.end - span.start)
+            .collect()
+    }
+
+    #[test]
+    fn span_covers_single_command_verbatim() {
+        // A single bare command's span is the whole string.
+        assert_eq!(
+            span_text("cd /home/christopher/secret-project", 0),
+            "cd /home/christopher/secret-project"
+        );
+    }
+
+    #[test]
+    fn span_isolates_each_chained_constituent() {
+        // `git push origin main && cargo build`: each constituent's span
+        // slices exactly its own substring (the operator/whitespace is not
+        // part of either).
+        let cmd = "git push origin main && cargo build";
+        assert_eq!(span_text(cmd, 0), "git push origin main");
+        assert_eq!(span_text(cmd, 1), "cargo build");
+    }
+
+    #[test]
+    fn span_isolates_each_pipe_stage() {
+        let cmd = "cat file | grep foo | wc -l";
+        assert_eq!(span_text(cmd, 0), "cat file");
+        assert_eq!(span_text(cmd, 1), "grep foo");
+        assert_eq!(span_text(cmd, 2), "wc -l");
+    }
+
+    #[test]
+    fn span_is_char_indexed_for_multibyte_input() {
+        // `héllo` has a 2-byte `é`; the span must index by char so the
+        // second constituent still slices correctly. (echo is keyed on
+        // argv[0]; we only care about the span here.)
+        let cmd = "echo héllo && rm x";
+        assert_eq!(span_text(cmd, 0), "echo héllo");
+        assert_eq!(span_text(cmd, 1), "rm x");
+    }
+
+    #[test]
+    fn span_isolates_inner_subshell_commands() {
+        // Inner simple commands of a subshell get their own spans, not the
+        // whole `( … )` group.
+        let cmd = "( cd /tmp && rm x )";
+        assert_eq!(span_text(cmd, 0), "cd /tmp");
+        assert_eq!(span_text(cmd, 1), "rm x");
     }
 
     #[test]

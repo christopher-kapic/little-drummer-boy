@@ -152,6 +152,7 @@ fn parse_question(q: &Value, index: usize) -> Result<InterruptQuestion> {
                     prompt,
                     options,
                     allow_freetext: true,
+                    command_detail: None,
                 })
             } else {
                 Ok(InterruptQuestion::Multi {
@@ -314,6 +315,7 @@ mod tests {
                         description: None,
                     }],
                     allow_freetext: true,
+                    command_detail: None,
                 },
                 InterruptQuestion::Freetext {
                     prompt: "Name?".into(),

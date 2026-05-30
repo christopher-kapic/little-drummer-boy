@@ -22,7 +22,7 @@ use unicode_width::UnicodeWidthStr;
 use uuid::Uuid;
 
 use crate::daemon::proto::{
-    InterruptOption, InterruptQuestion, InterruptQuestionSet, ResolveResponse,
+    CommandDetail, InterruptOption, InterruptQuestion, InterruptQuestionSet, ResolveResponse,
 };
 use crate::tui::dialog::{Answer, DialogOption, DialogOutcome, DialogState, Page, PageKind};
 use crate::tui::theme::{ACCENT_BLUE_INDEX, MUTED_COLOR_INDEX};
@@ -38,6 +38,16 @@ const MAX_DIALOG_HEIGHT: u16 = 16;
 
 const CUSTOM_LABEL: &str = "Type your own answer";
 const NEXT_LABEL: &str = "Next";
+
+/// Collapsed-view cap on the command-detail block: at most this many lines
+/// of the proposed command are shown before a `… N more lines` indicator.
+/// Kept small so the scope options never get pushed off-screen.
+const COMMAND_BLOCK_COLLAPSED_LINES: usize = 6;
+
+/// Expanded-view cap on the command-detail block height. Beyond this the
+/// block scrolls (Ctrl+↑/↓ or PageUp/PageDown). Still bounded so a giant
+/// heredoc can't bury the options.
+const COMMAND_BLOCK_EXPANDED_LINES: usize = 12;
 
 /// Leading hover/cursor glyph on every option row: "▸ " when focused,
 /// two spaces otherwise. Both render two cells wide, so the column a row's
@@ -73,6 +83,12 @@ pub struct QuestionDialog {
     questions: Vec<InterruptQuestion>,
     state: DialogState,
     result: Option<QuestionResult>,
+    /// Whether the bash command-detail block (when present) is expanded to
+    /// its full scrollable height vs. the compact truncated view.
+    command_expanded: bool,
+    /// First visible source-line of the command-detail block, used when the
+    /// expanded block is taller than its window. Clamped at render time.
+    command_scroll: usize,
 }
 
 impl QuestionDialog {
@@ -93,6 +109,8 @@ impl QuestionDialog {
             questions: set.questions,
             state,
             result: None,
+            command_expanded: false,
+            command_scroll: 0,
         }
     }
 
@@ -101,9 +119,123 @@ impl QuestionDialog {
         self.result.take()
     }
 
+    /// The command-detail block for the current page, if this is a bash
+    /// approval prompt. `None` for every other question.
+    fn command_detail(&self) -> Option<&CommandDetail> {
+        if self.state.on_confirm_page() {
+            return None;
+        }
+        let idx = self.state.current_page();
+        match self.questions.get(idx) {
+            Some(InterruptQuestion::Single {
+                command_detail: Some(cd),
+                ..
+            }) => Some(cd),
+            _ => None,
+        }
+    }
+
+    /// Total source-line count of the current command-detail block (1 per
+    /// `\n`-delimited line). Used to clamp the expand scroll.
+    fn command_line_count(&self) -> usize {
+        self.command_detail()
+            .map(|cd| cd.full_command.split('\n').count())
+            .unwrap_or(0)
+    }
+
+    /// Number of rendered lines the command-detail block occupies — matching
+    /// [`command_block_lines`](Self::command_block_lines): optional step
+    /// indicator + the shown command lines + the more/hidden markers.
+    /// Zero when there is no command detail on the current page.
+    fn command_block_height(&self) -> usize {
+        let Some(cd) = self.command_detail() else {
+            return 0;
+        };
+        let total = cd.full_command.split('\n').count();
+        let cap = if self.command_expanded {
+            COMMAND_BLOCK_EXPANDED_LINES
+        } else {
+            COMMAND_BLOCK_COLLAPSED_LINES
+        };
+        let scroll = if self.command_expanded {
+            self.command_scroll.min(total.saturating_sub(1))
+        } else {
+            0
+        };
+        let shown = cap.min(total.saturating_sub(scroll));
+        let mut h = shown;
+        if cd.step_count > 1 {
+            h += 1; // step indicator
+        }
+        if scroll > 0 {
+            h += 1; // "▲ more"
+        }
+        if total.saturating_sub(scroll + shown) > 0 {
+            h += 1; // "… N more" / "▼ N more"
+        }
+        h
+    }
+
+    /// Intercept the command-block expand/scroll keys before the generic
+    /// dialog sees them. These chords (Ctrl+E, PageUp/PageDown, Ctrl+↑/↓)
+    /// are no-ops in [`DialogState`] (its select pages ignore unmatched
+    /// keys), but intercepting here keeps them from ever reaching option
+    /// navigation and lets us own the scroll/expand state. Returns `true`
+    /// when the key was consumed for the command block.
+    fn handle_command_key(&mut self, key: KeyEvent) -> bool {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        if self.state.locked() || self.command_detail().is_none() {
+            return false;
+        }
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Char('e') if ctrl => {
+                self.command_expanded = !self.command_expanded;
+                if !self.command_expanded {
+                    self.command_scroll = 0;
+                }
+                true
+            }
+            // PageUp/PageDown scroll the expanded block unambiguously (the
+            // dialog never binds them). Ctrl+↑/↓ are the alias so the
+            // binding is reachable on keyboards without PgUp/PgDn — and
+            // Ctrl disambiguates them from option-list navigation.
+            KeyCode::PageDown if self.command_expanded => {
+                self.scroll_command(1);
+                true
+            }
+            KeyCode::PageUp if self.command_expanded => {
+                self.scroll_command(-1);
+                true
+            }
+            KeyCode::Down if self.command_expanded && ctrl => {
+                self.scroll_command(1);
+                true
+            }
+            KeyCode::Up if self.command_expanded && ctrl => {
+                self.scroll_command(-1);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn scroll_command(&mut self, delta: i32) {
+        let total = self.command_line_count();
+        let max = total.saturating_sub(COMMAND_BLOCK_EXPANDED_LINES);
+        let next = (self.command_scroll as i32 + delta).clamp(0, max as i32);
+        self.command_scroll = next as usize;
+    }
+
     /// Route a key. Returns `true` when the dialog wants to close (the
     /// host then drains [`take_result`](Self::take_result)).
     pub fn handle_key(&mut self, key: KeyEvent) -> bool {
+        // Command-block expand/scroll keys are handled here and never reach
+        // the generic dialog (no collision with option-select / confirm /
+        // cancel bindings).
+        if self.handle_command_key(key) {
+            return false;
+        }
         match self.state.handle_key(key) {
             DialogOutcome::Continue => false,
             DialogOutcome::Cancel => {
@@ -155,6 +287,11 @@ impl QuestionDialog {
         }
         // Prompt + blank separator.
         lines += 1 + 1;
+        // Command-detail block (+ blank separator) when present.
+        let block = self.command_block_height();
+        if block > 0 {
+            lines += block + 1;
+        }
         let page_idx = self.state.current_page();
         let page = &self.state.pages()[page_idx];
         match page.kind {
@@ -222,6 +359,11 @@ impl QuestionDialog {
             overhead = overhead.saturating_add(2);
         }
         overhead = overhead.saturating_add(2); // prompt + blank
+        // Command-detail block (+ its blank separator) eats into the budget.
+        let block = self.command_block_height();
+        if block > 0 {
+            overhead = overhead.saturating_add(block as u16 + 1);
+        }
         let budget = area_height.saturating_sub(overhead) as usize;
         let rows = self.row_line_counts(page_idx, &page);
         // How many leading rows (from the focused window) fit in `budget`
@@ -317,7 +459,32 @@ impl QuestionDialog {
         } else {
             "1-9: pick  ·  ↑/↓: move  ·  enter: choose"
         };
-        format!("{pick}{nav}  ·  esc: cancel")
+        // Discoverable command-block expand/scroll hint (bash approval only).
+        let cmd = self.command_block_hint();
+        format!("{pick}{nav}{cmd}  ·  esc: cancel")
+    }
+
+    /// Footer fragment for the command-block expand/scroll bindings, when a
+    /// command-detail block is present. Shows the expand toggle, and the
+    /// scroll keys once expanded.
+    fn command_block_hint(&self) -> String {
+        let Some(cd) = self.command_detail() else {
+            return String::new();
+        };
+        let total = cd.full_command.split('\n').count();
+        if self.command_expanded {
+            // Only advertise scroll when there's actually more than fits.
+            if total > COMMAND_BLOCK_EXPANDED_LINES {
+                "  ·  ctrl+e: collapse  ·  pgup/pgdn: scroll cmd".to_string()
+            } else {
+                "  ·  ctrl+e: collapse".to_string()
+            }
+        } else if total > COMMAND_BLOCK_COLLAPSED_LINES {
+            "  ·  ctrl+e: expand cmd".to_string()
+        } else {
+            // Short command fully visible; no expand affordance needed.
+            String::new()
+        }
     }
 
     /// Render the current question page. Returns the body lines and an
@@ -344,6 +511,15 @@ impl QuestionDialog {
             Style::default().add_modifier(Modifier::BOLD),
         )));
         lines.push(Line::default());
+
+        // Bash command-detail block (full verbatim command + highlight +
+        // step indicator), between the heading and the scope options.
+        if let Some(cd) = self.command_detail() {
+            for line in self.command_block_lines(cd) {
+                lines.push(line);
+            }
+            lines.push(Line::default());
+        }
 
         match page.kind {
             PageKind::Text => {
@@ -446,6 +622,133 @@ impl QuestionDialog {
             }
         }
         (lines, cursor)
+    }
+
+    /// Build the command-detail block: an optional `step N of M` indicator,
+    /// then the full verbatim command rendered as an indented monospace-ish
+    /// quoted block with the current constituent's char span highlighted
+    /// (underline + accent). Long / multi-line commands truncate to
+    /// [`COMMAND_BLOCK_COLLAPSED_LINES`] with a `… N more lines` indicator;
+    /// the expanded view shows a scrollable window of
+    /// [`COMMAND_BLOCK_EXPANDED_LINES`].
+    fn command_block_lines(&self, cd: &CommandDetail) -> Vec<Line<'static>> {
+        let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+        let mut out: Vec<Line<'static>> = Vec::new();
+
+        // Step indicator (compound commands only).
+        if cd.step_count > 1 {
+            out.push(Line::from(Span::styled(
+                format!("step {} of {}", cd.step, cd.step_count),
+                muted.add_modifier(Modifier::ITALIC),
+            )));
+        }
+
+        // Render each source line, mapping the global char-span highlight
+        // onto per-line segments. `char_base` is the running char offset of
+        // the current line's start within the whole command.
+        let highlight = cd.highlight.map(|h| (h.start as usize, h.end as usize));
+        let source_lines: Vec<&str> = cd.full_command.split('\n').collect();
+        let total = source_lines.len();
+
+        let cap = if self.command_expanded {
+            COMMAND_BLOCK_EXPANDED_LINES
+        } else {
+            COMMAND_BLOCK_COLLAPSED_LINES
+        };
+        let scroll = if self.command_expanded {
+            self.command_scroll.min(total.saturating_sub(1))
+        } else {
+            0
+        };
+        let shown = cap.min(total.saturating_sub(scroll));
+
+        // Char offset of the first shown line's start.
+        let mut char_base: usize = source_lines
+            .iter()
+            .take(scroll)
+            .map(|l| l.chars().count() + 1) // +1 for the consumed '\n'
+            .sum();
+
+        if scroll > 0 {
+            out.push(Line::from(Span::styled("  ▲ more".to_string(), muted)));
+        }
+
+        for line in &source_lines[scroll..scroll + shown] {
+            let line_len = line.chars().count();
+            out.push(self.command_source_line(line, char_base, line_len, highlight));
+            char_base += line_len + 1; // account for the '\n' separator
+        }
+
+        // Hidden-amount indicator.
+        let hidden_below = total.saturating_sub(scroll + shown);
+        if hidden_below > 0 {
+            let label = if self.command_expanded {
+                format!("  ▼ {hidden_below} more")
+            } else {
+                format!(
+                    "  … {hidden_below} more line{}  (ctrl+e: expand)",
+                    if hidden_below == 1 { "" } else { "s" }
+                )
+            };
+            out.push(Line::from(Span::styled(label, muted)));
+        }
+        out
+    }
+
+    /// Render one source line of the command block, styling the slice that
+    /// falls within the highlight span (if any). `char_base` is this line's
+    /// start offset (chars) within the whole command; `highlight` is the
+    /// global `[start, end)` char range.
+    fn command_source_line(
+        &self,
+        line: &str,
+        char_base: usize,
+        line_len: usize,
+        highlight: Option<(usize, usize)>,
+    ) -> Line<'static> {
+        // Indent so the command reads as a distinct quoted block.
+        let indent = "  ";
+        let plain = Style::default().fg(Color::White);
+        let hot = Style::default()
+            .fg(Color::Indexed(ACCENT_BLUE_INDEX))
+            .add_modifier(Modifier::UNDERLINED | Modifier::BOLD);
+
+        let line_start = char_base;
+        let line_end = char_base + line_len;
+        let chars: Vec<char> = line.chars().collect();
+
+        match highlight {
+            // No highlight, or this line lies entirely outside the span.
+            Some((hs, he)) if hs < line_end && he > line_start => {
+                // Clamp the span to this line's local char indices.
+                let local_start = hs.saturating_sub(line_start).min(line_len);
+                let local_end = (he - line_start).min(line_len);
+                let mut spans: Vec<Span<'static>> = vec![Span::raw(indent.to_string())];
+                if local_start > 0 {
+                    spans.push(Span::styled(
+                        chars[..local_start].iter().collect::<String>(),
+                        plain,
+                    ));
+                }
+                if local_end > local_start {
+                    spans.push(Span::styled(
+                        chars[local_start..local_end].iter().collect::<String>(),
+                        hot,
+                    ));
+                }
+                if local_end < line_len {
+                    spans.push(Span::styled(
+                        chars[local_end..].iter().collect::<String>(),
+                        plain,
+                    ));
+                }
+                Line::from(spans)
+            }
+            _ => Line::from(vec![
+                Span::raw(indent.to_string()),
+                Span::styled(line.to_string(), plain),
+            ]),
+        }
     }
 
     fn option_line(&self, num: &str, marker: &str, label: &str, hovered: bool) -> Line<'static> {
@@ -631,6 +934,7 @@ mod tests {
                 prompt: "DB?".into(),
                 options: vec![opt("pg", "Postgres"), opt("sqlite", "SQLite")],
                 allow_freetext: true,
+                command_detail: None,
             }],
         }
     }
@@ -754,6 +1058,7 @@ mod tests {
                     },
                 ],
                 allow_freetext: true,
+                command_detail: None,
             }],
         });
         assert!(
@@ -774,6 +1079,7 @@ mod tests {
                     description: Some("Relational engine".into()),
                 }],
                 allow_freetext: true,
+                command_detail: None,
             }],
         };
         let d = QuestionDialog::new(
@@ -954,6 +1260,7 @@ mod tests {
                 prompt: "Pick".into(),
                 options,
                 allow_freetext: true,
+                command_detail: None,
             }],
         };
         let mut d = dialog(set);
@@ -973,5 +1280,240 @@ mod tests {
             "cursor not below the window"
         );
         assert!(scroll > 0, "list should have scrolled");
+    }
+
+    // ---- bash command-detail block --------------------------------------
+
+    use crate::daemon::proto::{CharSpan, CommandDetail};
+
+    fn ctrl(code: KeyCode) -> KeyEvent {
+        KeyEvent {
+            code,
+            modifiers: KeyModifiers::CONTROL,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::empty(),
+        }
+    }
+
+    /// Build an approval-style dialog: one scope-select `Single` carrying a
+    /// command-detail block.
+    fn approval_dialog(detail: CommandDetail) -> QuestionDialog {
+        let set = InterruptQuestionSet {
+            questions: vec![InterruptQuestion::Single {
+                prompt: "Run `cd`?".into(),
+                options: vec![
+                    opt("once", "Yes, once"),
+                    opt("session", "Yes, for this session"),
+                ],
+                allow_freetext: false,
+                command_detail: Some(detail),
+            }],
+        };
+        QuestionDialog::new(Uuid::new_v4(), String::new(), set, Duration::ZERO)
+    }
+
+    fn render_text(d: &QuestionDialog, area: Rect) -> String {
+        render_lines(d, area).join("\n")
+    }
+
+    #[test]
+    fn shows_heading_and_full_command_verbatim() {
+        let d = approval_dialog(CommandDetail {
+            full_command: "cd /home/christopher/secret-project".into(),
+            highlight: None,
+            step: 1,
+            step_count: 1,
+        });
+        let area = Rect::new(0, 0, 80, 16);
+        let text = render_text(&d, area);
+        assert!(text.contains("Run `cd`?"), "heading unchanged");
+        assert!(
+            text.contains("cd /home/christopher/secret-project"),
+            "full command shown verbatim: {text}"
+        );
+        // Single-constituent: no step indicator.
+        assert!(
+            !text.contains("step "),
+            "no step indicator for a lone prompt"
+        );
+    }
+
+    #[test]
+    fn compound_shows_step_indicator_and_highlight() {
+        // `git push origin main && cargo build`, second step (cargo build),
+        // highlight span over chars [24, 35).
+        let cmd = "git push origin main && cargo build";
+        let d = approval_dialog(CommandDetail {
+            full_command: cmd.into(),
+            highlight: Some(CharSpan { start: 24, end: 35 }),
+            step: 2,
+            step_count: 2,
+        });
+        let cd = d.command_detail().unwrap().clone();
+        let block = d.command_block_lines(&cd);
+        let joined: String = block
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("step 2 of 2"), "step indicator: {joined}");
+        assert!(joined.contains(cmd), "full command present");
+        // The highlighted span renders as its own UNDERLINED span carrying
+        // exactly "cargo build".
+        let underlined: Vec<String> = block
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .filter(|s| s.style.add_modifier.contains(Modifier::UNDERLINED))
+            .map(|s| s.content.to_string())
+            .collect();
+        assert_eq!(
+            underlined,
+            vec!["cargo build".to_string()],
+            "the current constituent is the highlighted slice"
+        );
+    }
+
+    #[test]
+    fn long_command_truncates_with_more_indicator() {
+        // 200-line heredoc-ish command. Collapsed view must truncate.
+        let cmd: String = (0..200)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let d = approval_dialog(CommandDetail {
+            full_command: cmd,
+            highlight: None,
+            step: 1,
+            step_count: 1,
+        });
+        let cd = d.command_detail().unwrap().clone();
+        let block = d.command_block_lines(&cd);
+        let joined: String = block
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        // Hidden-amount indicator present; collapsed line cap respected.
+        assert!(
+            joined.contains("more line"),
+            "truncation indicator: {joined}"
+        );
+        assert!(
+            joined.contains("ctrl+e: expand"),
+            "expand affordance hinted"
+        );
+        // 200 lines, 6 shown + 1 indicator = 7 rendered lines (no step row).
+        assert_eq!(d.command_block_height(), COMMAND_BLOCK_COLLAPSED_LINES + 1);
+        // The footer also advertises the expand binding.
+        assert!(d.footer_hint().contains("ctrl+e: expand cmd"));
+    }
+
+    #[test]
+    fn expand_then_scroll_reveals_lower_lines() {
+        let cmd: String = (0..200)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut d = approval_dialog(CommandDetail {
+            full_command: cmd,
+            highlight: None,
+            step: 1,
+            step_count: 1,
+        });
+        // Ctrl+E expands.
+        assert!(!d.handle_key(ctrl(KeyCode::Char('e'))));
+        assert!(d.command_expanded);
+        assert_eq!(d.command_block_height(), COMMAND_BLOCK_EXPANDED_LINES + 1);
+        // PageDown scrolls within the block; a later line becomes visible.
+        for _ in 0..5 {
+            d.handle_key(press(KeyCode::PageDown));
+        }
+        assert_eq!(d.command_scroll, 5);
+        let cd = d.command_detail().unwrap().clone();
+        let block = d.command_block_lines(&cd);
+        let joined: String = block
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("line 5"), "scrolled into view: {joined}");
+        assert!(
+            joined.contains("▲ more"),
+            "leading more marker once scrolled"
+        );
+    }
+
+    #[test]
+    fn expand_key_does_not_leak_to_option_navigation() {
+        // Ctrl+E and PageDown must not move the option cursor or submit.
+        let mut d = approval_dialog(CommandDetail {
+            full_command: (0..50)
+                .map(|i| format!("l{i}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            highlight: None,
+            step: 1,
+            step_count: 1,
+        });
+        let before = d.state.cursor();
+        assert!(!d.handle_key(ctrl(KeyCode::Char('e'))));
+        assert!(!d.handle_key(press(KeyCode::PageDown)));
+        assert_eq!(
+            d.state.cursor(),
+            before,
+            "command keys never move the option cursor"
+        );
+        assert!(
+            d.take_result().is_none(),
+            "no submit/cancel from command keys"
+        );
+    }
+
+    #[test]
+    fn non_approval_question_has_no_command_block() {
+        // A plain question (no command_detail) renders no command block and
+        // no expand hint — the generic path is unchanged.
+        let d = dialog(single_q());
+        assert_eq!(d.command_block_height(), 0);
+        assert!(d.command_detail().is_none());
+        assert!(!d.footer_hint().contains("ctrl+e"));
+    }
+
+    #[test]
+    fn highlight_span_slices_multibyte_correctly() {
+        // `echo héllo && rm x`: highlight the second constituent "rm x" at
+        // char span [14, 18). The `é` is multi-byte but char-indexed spans
+        // must still slice exactly "rm x".
+        let cmd = "echo héllo && rm x";
+        let d = approval_dialog(CommandDetail {
+            full_command: cmd.into(),
+            highlight: Some(CharSpan { start: 14, end: 18 }),
+            step: 2,
+            step_count: 2,
+        });
+        let cd = d.command_detail().unwrap().clone();
+        let block = d.command_block_lines(&cd);
+        let underlined: Vec<String> = block
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .filter(|s| s.style.add_modifier.contains(Modifier::UNDERLINED))
+            .map(|s| s.content.to_string())
+            .collect();
+        assert_eq!(underlined, vec!["rm x".to_string()]);
     }
 }

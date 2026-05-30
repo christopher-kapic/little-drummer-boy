@@ -47,7 +47,8 @@ use anyhow::Result;
 use crate::approval::classify::{Classification, SimpleCommandInfo};
 use crate::approval::store::{GrantStore, LoopVerdict, Scope};
 use crate::daemon::proto::{
-    InterruptOption, InterruptQuestion, InterruptQuestionSet, ResolveResponse,
+    CharSpan, CommandDetail, InterruptOption, InterruptQuestion, InterruptQuestionSet,
+    ResolveResponse,
 };
 use crate::engine::interrupt::InterruptHub;
 use crate::tui::dialog::approval::{
@@ -140,12 +141,28 @@ impl Approver {
             Classification::Empty | Classification::Unparseable(_) => return Ok(Decision::Deny),
         };
 
+        // Pre-compute which constituents will actually prompt (a wrapper, or
+        // one not already granted). `step_count` (M) is that count; each
+        // prompting constituent's 1-based position within the sequence is
+        // its `step` (N). Already-granted constituents are allowed silently
+        // and don't advance the step counter — matching the spec's
+        // "M = constituents that actually trigger a prompt".
+        let step_count = simple_commands
+            .iter()
+            .filter(|info| self.will_prompt(info))
+            .count() as u32;
+
         // Track the broadest scope we settled on, for the caller's info.
         // A chain is only as "remembered" as its narrowest decision; we
         // report `Once` if any command was only approved once.
         let mut widest = Scope::Global;
+        let mut step: u32 = 0;
         for info in &simple_commands {
-            let decision = self.approve_one(info, command).await?;
+            let prompts = self.will_prompt(info);
+            if prompts {
+                step += 1;
+            }
+            let decision = self.approve_one(info, command, step, step_count).await?;
             match decision {
                 Decision::Deny => return Ok(Decision::Deny),
                 Decision::Allow { scope } => {
@@ -156,20 +173,37 @@ impl Approver {
         Ok(Decision::Allow { scope: widest })
     }
 
-    /// Decide one simple command: granted → allow; else prompt.
-    async fn approve_one(&self, info: &SimpleCommandInfo, full_command: &str) -> Result<Decision> {
+    /// Whether this constituent will raise a prompt rather than being
+    /// allowed silently: a wrapper (never persistable) always prompts;
+    /// otherwise it prompts only when not already granted.
+    fn will_prompt(&self, info: &SimpleCommandInfo) -> bool {
+        info.wrapper || !self.store.is_command_granted(&info.key)
+    }
+
+    /// Decide one simple command: granted → allow; else prompt. `step` /
+    /// `step_count` describe this constituent's position among the
+    /// prompting constituents (for the dialog's `step N of M`); they are
+    /// only meaningful when this constituent prompts.
+    async fn approve_one(
+        &self,
+        info: &SimpleCommandInfo,
+        full_command: &str,
+        step: u32,
+        step_count: u32,
+    ) -> Result<Decision> {
         if !info.wrapper && self.store.is_command_granted(&info.key) {
             // Already remembered at some applicable scope.
             return Ok(Decision::Allow {
                 scope: Scope::Session,
             });
         }
-        // Prompt with the approval key — the exact thing a grant would
-        // cover (`gh pr`, `cargo build`, `ls`), so the user sees what
-        // they're remembering, not the full arg-laden command line.
-        let _ = full_command;
+        // The heading still shows the approval key — the exact thing a grant
+        // would cover (`gh pr`, `cargo build`, `ls`) — so a "remember" choice
+        // records the key, not the arg-laden command line. The full command
+        // rides alongside as presentational detail (`CommandDetail`).
         let label = info.key.as_storage_str();
-        let choice = self.prompt(&label, info.wrapper).await?;
+        let detail = command_detail(info, full_command, step, step_count);
+        let choice = self.prompt(&label, info.wrapper, detail).await?;
         match choice {
             ApprovalChoice::Deny => Ok(Decision::Deny),
             ApprovalChoice::Approve(Scope::Once) => Ok(Decision::Allow { scope: Scope::Once }),
@@ -193,7 +227,9 @@ impl Approver {
                 scope: Scope::Session,
             });
         }
-        let choice = self.prompt(&path.display().to_string(), false).await?;
+        let choice = self
+            .prompt(&path.display().to_string(), false, None)
+            .await?;
         match choice {
             ApprovalChoice::Deny => Ok(Decision::Deny),
             ApprovalChoice::Approve(Scope::Once) => Ok(Decision::Allow { scope: Scope::Once }),
@@ -298,13 +334,20 @@ impl Approver {
 
     /// Raise an approval interrupt and block until the user answers,
     /// reusing the `question`-tool interrupt path verbatim. Returns the
-    /// chosen scope, or `Deny` on dismissal.
-    async fn prompt(&self, label: &str, wrapper: bool) -> Result<ApprovalChoice> {
-        let question = scope_question(label, wrapper);
+    /// chosen scope, or `Deny` on dismissal. `detail` carries the optional
+    /// bash command-detail block (the full verbatim command + highlight +
+    /// step N/M); `None` for path approvals.
+    async fn prompt(
+        &self,
+        label: &str,
+        wrapper: bool,
+        detail: Option<CommandDetail>,
+    ) -> Result<ApprovalChoice> {
+        let description = prompt_description(label, wrapper, detail.as_ref());
+        let question = scope_question(label, wrapper, detail);
         let set = InterruptQuestionSet {
             questions: vec![question],
         };
-        let description = prompt_description(label, wrapper);
 
         // Persist → register → emit, in that order (same invariant the
         // `question` tool relies on: a fast client can't resolve before
@@ -363,6 +406,8 @@ fn repeat_question(tool: &str) -> InterruptQuestion {
         ],
         // Fixed choices; no free-text.
         allow_freetext: false,
+        // The loop-guard prompt carries no bash command-detail block.
+        command_detail: None,
     }
 }
 
@@ -405,7 +450,7 @@ fn response_to_repeat_choice(response: &ResolveResponse) -> RepeatChoice {
 /// scopes; wrapper variant offers only one-time approval (the dialog
 /// shows the "can't be remembered" note). Option ids are shared with the
 /// TUI dialog so the resolution maps back cleanly.
-fn scope_question(label: &str, wrapper: bool) -> InterruptQuestion {
+fn scope_question(label: &str, wrapper: bool, detail: Option<CommandDetail>) -> InterruptQuestion {
     let prompt = if wrapper {
         format!("Run `{label}`? Wrappers can't be remembered.")
     } else {
@@ -426,14 +471,65 @@ fn scope_question(label: &str, wrapper: bool) -> InterruptQuestion {
         options,
         // No free-text on a scope select — the choices are fixed.
         allow_freetext: false,
+        command_detail: detail,
     }
 }
 
-fn prompt_description(label: &str, wrapper: bool) -> String {
-    if wrapper {
-        format!("Approve wrapper `{label}` (once only)?")
+/// Build the presentational command-detail block for one constituent.
+/// `step`/`step_count` give the `step N of M` indicator; the highlight span
+/// is omitted for a single-prompt command (no step indicator) so the dialog
+/// shows the full command without an inline highlight. The span is also
+/// dropped if it doesn't lie within the command's char length (defensive:
+/// a stale/degenerate span must never produce a wrong highlight — the
+/// silent-corruption hazard the project forbids).
+fn command_detail(
+    info: &SimpleCommandInfo,
+    full_command: &str,
+    step: u32,
+    step_count: u32,
+) -> Option<CommandDetail> {
+    // Only highlight when there's more than one prompting constituent;
+    // a lone prompt shows the full command with no step/highlight.
+    let highlight = if step_count > 1 {
+        info.span.and_then(|s| {
+            let char_len = full_command.chars().count();
+            if s.start <= s.end && s.end <= char_len {
+                Some(CharSpan {
+                    start: s.start as u32,
+                    end: s.end as u32,
+                })
+            } else {
+                None
+            }
+        })
     } else {
-        format!("Approve `{label}`?")
+        None
+    };
+    Some(CommandDetail {
+        full_command: full_command.to_string(),
+        highlight,
+        step,
+        step_count,
+    })
+}
+
+fn prompt_description(label: &str, wrapper: bool, detail: Option<&CommandDetail>) -> String {
+    // Include the full command (and step indicator) so headless / log
+    // surfaces aren't worse off than the TUI.
+    let suffix = match detail {
+        Some(cd) if cd.step_count > 1 => {
+            format!(
+                " — `{}` (step {} of {})",
+                cd.full_command, cd.step, cd.step_count
+            )
+        }
+        Some(cd) => format!(" — `{}`", cd.full_command),
+        None => String::new(),
+    };
+    if wrapper {
+        format!("Approve wrapper `{label}` (once only){suffix}?")
+    } else {
+        format!("Approve `{label}`{suffix}?")
     }
 }
 
@@ -508,6 +604,7 @@ mod tests {
                 subcommand: Some("build".into()),
             },
             wrapper: false,
+            span: None,
         };
         approver
             .store
@@ -520,6 +617,264 @@ mod tests {
             .await
             .unwrap();
         assert!(decision.is_allowed());
+    }
+
+    /// Pull the command-detail off the open interrupt with `iid`.
+    fn open_command_detail(
+        db: &crate::db::Db,
+        sid: uuid::Uuid,
+        iid: uuid::Uuid,
+    ) -> Option<CommandDetail> {
+        let open = db.list_open_interrupts(sid).unwrap();
+        let row = open.iter().find(|r| r.interrupt_id == iid)?;
+        let set = row.questions.as_ref()?;
+        match set.questions.first()? {
+            InterruptQuestion::Single { command_detail, .. } => command_detail.clone(),
+            _ => None,
+        }
+    }
+
+    #[tokio::test]
+    async fn compound_prompts_carry_step_count_and_full_command() {
+        // Neither constituent granted: two prompts, each with the full
+        // command verbatim, `step 1 of 2` / `step 2 of 2`, and the active
+        // constituent's highlight span. A "session" grant on the second
+        // records the KEY (`cargo build`), not the full command.
+        let tmp = tempfile::tempdir().unwrap();
+        let (approver, _) = approver(tmp.path());
+        let db = approver.db.clone();
+        let sid = approver.session_id;
+        let hub = approver.interrupts.clone();
+        let cmd = "git push origin main && cargo build";
+
+        let resolver = tokio::spawn(async move {
+            // First prompt: step 1 of 2, highlight over "git push origin main".
+            let iid = loop {
+                let open = db.list_open_interrupts(sid).unwrap();
+                if let Some(row) = open.first() {
+                    break row.interrupt_id;
+                }
+                tokio::task::yield_now().await;
+            };
+            let cd = open_command_detail(&db, sid, iid).expect("first prompt has command_detail");
+            assert_eq!(cd.full_command, cmd);
+            assert_eq!((cd.step, cd.step_count), (1, 2));
+            let h = cd.highlight.expect("step 1 highlighted");
+            let slice: String = cmd
+                .chars()
+                .skip(h.start as usize)
+                .take((h.end - h.start) as usize)
+                .collect();
+            assert_eq!(slice, "git push origin main");
+            // Approve once.
+            assert!(hub.resolve(
+                iid,
+                ResolveResponse::Single {
+                    selected_id: ID_ONCE.into(),
+                }
+            ));
+
+            // Second prompt: step 2 of 2, highlight over "cargo build".
+            let iid2 = loop {
+                let open = db.list_open_interrupts(sid).unwrap();
+                // Wait for a *different* (the second) interrupt.
+                if let Some(row) = open.iter().find(|r| r.interrupt_id != iid) {
+                    break row.interrupt_id;
+                }
+                tokio::task::yield_now().await;
+            };
+            let cd2 =
+                open_command_detail(&db, sid, iid2).expect("second prompt has command_detail");
+            assert_eq!(cd2.full_command, cmd);
+            assert_eq!((cd2.step, cd2.step_count), (2, 2));
+            let h2 = cd2.highlight.expect("step 2 highlighted");
+            let slice2: String = cmd
+                .chars()
+                .skip(h2.start as usize)
+                .take((h2.end - h2.start) as usize)
+                .collect();
+            assert_eq!(slice2, "cargo build");
+            // Remember for the session.
+            assert!(hub.resolve(
+                iid2,
+                ResolveResponse::Single {
+                    selected_id: ID_SESSION.into(),
+                }
+            ));
+        });
+
+        let decision = approver.approve_command(cmd).await.unwrap();
+        resolver.await.unwrap();
+        assert!(decision.is_allowed());
+
+        // The grant recorded the KEY for the remembered constituent only.
+        let cargo_key = ApprovalKey {
+            program: "cargo".into(),
+            subcommand: Some("build".into()),
+        };
+        assert!(
+            approver.store.is_command_granted(&cargo_key),
+            "remembered `cargo build` key"
+        );
+        // The once-approved git push was NOT remembered.
+        let git_key = ApprovalKey {
+            program: "git".into(),
+            subcommand: Some("push".into()),
+        };
+        assert!(
+            !approver.store.is_command_granted(&git_key),
+            "`git push` was once-only, not stored"
+        );
+    }
+
+    #[tokio::test]
+    async fn granted_first_half_prompts_once_as_step_1_of_1() {
+        // `git push origin main && cargo build` with `git push` already
+        // granted: exactly one prompt, labelled step 1 of 1 (M counts only
+        // prompting constituents), full command shown, no highlight.
+        let tmp = tempfile::tempdir().unwrap();
+        let (approver, _) = approver(tmp.path());
+        // Pre-grant `git push`.
+        let git_info = SimpleCommandInfo {
+            program: "git".into(),
+            subcommand: Some("push".into()),
+            key: ApprovalKey {
+                program: "git".into(),
+                subcommand: Some("push".into()),
+            },
+            wrapper: false,
+            span: None,
+        };
+        approver
+            .store
+            .record_command(&git_info, Scope::Session)
+            .unwrap();
+
+        let db = approver.db.clone();
+        let sid = approver.session_id;
+        let hub = approver.interrupts.clone();
+        let cmd = "git push origin main && cargo build";
+        let resolver = tokio::spawn(async move {
+            let iid = loop {
+                let open = db.list_open_interrupts(sid).unwrap();
+                if let Some(row) = open.first() {
+                    break row.interrupt_id;
+                }
+                tokio::task::yield_now().await;
+            };
+            let cd = open_command_detail(&db, sid, iid).expect("command_detail present");
+            assert_eq!(cd.full_command, cmd);
+            assert_eq!(
+                (cd.step, cd.step_count),
+                (1, 1),
+                "M counts only prompting steps"
+            );
+            // Single prompting step → no highlight.
+            assert!(cd.highlight.is_none(), "lone prompt is not highlighted");
+            assert!(hub.resolve(
+                iid,
+                ResolveResponse::Single {
+                    selected_id: ID_ONCE.into(),
+                }
+            ));
+        });
+        let decision = approver.approve_command(cmd).await.unwrap();
+        resolver.await.unwrap();
+        assert!(decision.is_allowed());
+    }
+
+    #[tokio::test]
+    async fn wrapper_prompt_shows_full_command_once_only() {
+        // A wrapper (`bash -c …`) offers only "Yes, once" and still shows
+        // the full command in the detail block.
+        let tmp = tempfile::tempdir().unwrap();
+        let (approver, _) = approver(tmp.path());
+        let db = approver.db.clone();
+        let sid = approver.session_id;
+        let hub = approver.interrupts.clone();
+        let cmd = "bash -c 'echo hi'";
+        let resolver = tokio::spawn(async move {
+            let iid = loop {
+                let open = db.list_open_interrupts(sid).unwrap();
+                if let Some(row) = open.first() {
+                    break row.interrupt_id;
+                }
+                tokio::task::yield_now().await;
+            };
+            // Wrapper → single option, full command in the detail block.
+            let open = db.list_open_interrupts(sid).unwrap();
+            let set = open[0].questions.as_ref().unwrap();
+            match set.questions.first().unwrap() {
+                InterruptQuestion::Single {
+                    options,
+                    command_detail,
+                    ..
+                } => {
+                    assert_eq!(options.len(), 1, "wrapper offers only `Yes, once`");
+                    assert_eq!(
+                        command_detail.as_ref().unwrap().full_command,
+                        cmd,
+                        "wrapper shows the full command"
+                    );
+                }
+                _ => panic!("expected Single"),
+            }
+            assert!(hub.resolve(
+                iid,
+                ResolveResponse::Single {
+                    selected_id: ID_ONCE.into(),
+                }
+            ));
+        });
+        let decision = approver.approve_command(cmd).await.unwrap();
+        resolver.await.unwrap();
+        assert_eq!(decision, Decision::Allow { scope: Scope::Once });
+    }
+
+    #[test]
+    fn prompt_description_includes_full_command() {
+        // The persisted/headless description carries the full command + step.
+        let detail = CommandDetail {
+            full_command: "git push && cargo build".into(),
+            highlight: None,
+            step: 2,
+            step_count: 2,
+        };
+        let desc = prompt_description("cargo build", false, Some(&detail));
+        assert!(
+            desc.contains("git push && cargo build"),
+            "full command in desc"
+        );
+        assert!(desc.contains("step 2 of 2"), "step indicator in desc");
+        // Single-step: no step indicator, but still the full command.
+        let lone = CommandDetail {
+            full_command: "cd /tmp".into(),
+            highlight: None,
+            step: 1,
+            step_count: 1,
+        };
+        let desc = prompt_description("cd", false, Some(&lone));
+        assert!(desc.contains("cd /tmp"));
+        assert!(!desc.contains("step "));
+    }
+
+    #[test]
+    fn command_detail_drops_out_of_range_span() {
+        // A span beyond the command length is dropped, never used to slice
+        // (defensive: no wrong highlight).
+        let info = SimpleCommandInfo {
+            program: "x".into(),
+            subcommand: None,
+            key: ApprovalKey {
+                program: "x".into(),
+                subcommand: None,
+            },
+            wrapper: false,
+            span: Some(crate::approval::classify::CharSpan { start: 2, end: 999 }),
+        };
+        let cd = command_detail(&info, "x && y", 2, 2).unwrap();
+        assert!(cd.highlight.is_none(), "out-of-range span dropped");
+        assert_eq!((cd.step, cd.step_count), (2, 2));
     }
 
     #[tokio::test]

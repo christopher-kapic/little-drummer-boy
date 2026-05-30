@@ -722,6 +722,7 @@ mod tests {
                 subcommand: Some("build".into()),
             },
             wrapper: false,
+            span: None,
         };
         approver
             .store()

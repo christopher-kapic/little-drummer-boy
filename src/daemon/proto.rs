@@ -967,6 +967,15 @@ pub enum InterruptQuestion {
         options: Vec<InterruptOption>,
         #[serde(default = "default_allow_freetext")]
         allow_freetext: bool,
+        /// Optional structured command-detail block (bash approval, §sandbox
+        /// part 1). When present the answering dialog renders the full
+        /// verbatim command beneath the heading, with the current step's
+        /// constituent highlighted and a `step N of M` indicator for
+        /// compound commands. Absent for every non-approval `Single`
+        /// question, so the field is wire-equivalent to the legacy shape
+        /// (back-compat: an un-annotated `Single` carries `None`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        command_detail: Option<CommandDetail>,
     },
     Multi {
         prompt: String,
@@ -992,6 +1001,38 @@ pub struct InterruptOption {
     /// un-annotated option is wire-equivalent to the legacy shape).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+}
+
+/// Structured detail for a bash-command approval prompt. Rides on a
+/// [`InterruptQuestion::Single`] so the answering dialog can show the full
+/// verbatim command beneath the (terse) heading and, for compound
+/// commands, point at the constituent this prompt is deciding. Purely
+/// presentational — the grant still keys on the heading's approval key,
+/// never on this text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandDetail {
+    /// The full command string the agent proposed, verbatim.
+    pub full_command: String,
+    /// Char range `[start, end)` (0-based, end-exclusive) of the
+    /// constituent this prompt decides, within `full_command`. `None` for
+    /// a single-constituent command (no highlight) or when the parser
+    /// could not place the constituent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub highlight: Option<CharSpan>,
+    /// 1-based position of this prompt among the constituents that
+    /// actually prompt, and the total count of such constituents. `(1, 1)`
+    /// for a single-prompt command, which the dialog renders with no `step`
+    /// indicator.
+    pub step: u32,
+    pub step_count: u32,
+}
+
+/// A 0-based, end-exclusive char range into a source string. Char-indexed
+/// (not byte-indexed) so multi-byte input slices correctly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CharSpan {
+    pub start: u32,
+    pub end: u32,
 }
 
 /// A batch of one or more questions raised in a single interrupt. The
@@ -1336,11 +1377,63 @@ mod tests {
                 },
             ],
             allow_freetext: true,
+            command_detail: None,
         };
         let s = serde_json::to_string(&q).unwrap();
         let v: Value = serde_json::from_str(&s).unwrap();
         assert_eq!(v["kind"], json!("single"));
         assert_eq!(v["data"]["options"].as_array().unwrap().len(), 2);
+        // A `None` command_detail is omitted from the wire (back-compat).
+        assert!(v["data"].get("command_detail").is_none());
+    }
+
+    #[test]
+    fn command_detail_round_trips_and_is_additive() {
+        // A populated command_detail survives the wire and an old-shape
+        // `Single` (no command_detail key) still deserializes.
+        let q = InterruptQuestion::Single {
+            prompt: "Run `cargo build`?".into(),
+            options: vec![InterruptOption {
+                id: "once".into(),
+                label: "Yes, once".into(),
+                description: None,
+            }],
+            allow_freetext: false,
+            command_detail: Some(CommandDetail {
+                full_command: "git push && cargo build".into(),
+                highlight: Some(CharSpan { start: 11, end: 22 }),
+                step: 2,
+                step_count: 2,
+            }),
+        };
+        let s = serde_json::to_string(&q).unwrap();
+        let back: InterruptQuestion = serde_json::from_str(&s).unwrap();
+        match back {
+            InterruptQuestion::Single { command_detail, .. } => {
+                let cd = command_detail.expect("command_detail survives");
+                assert_eq!(cd.full_command, "git push && cargo build");
+                assert_eq!(cd.highlight, Some(CharSpan { start: 11, end: 22 }));
+                assert_eq!((cd.step, cd.step_count), (2, 2));
+            }
+            other => panic!("expected Single, got {other:?}"),
+        }
+
+        // Legacy shape (no command_detail field) deserializes to `None`.
+        let legacy = json!({
+            "kind": "single",
+            "data": {
+                "prompt": "Run `ls`?",
+                "options": [{ "id": "once", "label": "Yes, once" }],
+                "allow_freetext": false
+            }
+        });
+        let back: InterruptQuestion = serde_json::from_value(legacy).unwrap();
+        match back {
+            InterruptQuestion::Single { command_detail, .. } => {
+                assert!(command_detail.is_none());
+            }
+            other => panic!("expected Single, got {other:?}"),
+        }
     }
 
     #[tokio::test]

@@ -212,6 +212,7 @@ mod tests {
                 },
             ],
             allow_freetext: true,
+            command_detail: None,
         };
         let iid = db
             .raise_interrupt(s.session_id, "coder", "paused on something", Some(&q))
@@ -246,6 +247,7 @@ mod tests {
                         description: None,
                     }],
                     allow_freetext: true,
+                    command_detail: None,
                 },
                 InterruptQuestion::Freetext {
                     prompt: "name?".into(),
