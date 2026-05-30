@@ -27,6 +27,7 @@ pub mod compact;
 pub mod deleg_shrink;
 pub mod docs_pipeline;
 pub mod driver;
+pub mod guidance_diff;
 pub mod interrupt;
 pub mod jobs;
 pub mod message;

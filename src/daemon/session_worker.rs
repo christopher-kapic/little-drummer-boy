@@ -290,6 +290,15 @@ async fn run_worker(
     };
     let root = Arc::new(builtin::build(&spawn_args));
 
+    // Snapshot the resolved agent-guidance file body that just went into
+    // the frozen system block (live instructions-file diff injection,
+    // prompt `instructions-file-live-diff.md`). This is the start-of-
+    // session baseline a later in-place edit is diffed against; the driver
+    // checks it on every outbound request. Recomputed on each worker spawn
+    // (fresh or resumed) because `builtin::build` re-composes the system
+    // block from the current file each time.
+    session.snapshot_guidance_baseline(&project_root);
+
     let (driver_input_tx, driver_input_rx) =
         mpsc::channel::<crate::engine::message::UserSubmission>(WORK_QUEUE_CAPACITY);
     let (driver_control_tx, driver_control_rx) =

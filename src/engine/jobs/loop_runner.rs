@@ -200,6 +200,11 @@ async fn run_iteration(
             // an approver, so it's inert here; the threshold is irrelevant.
             None,
             crate::config::extended::MIN_LOOP_GUARD_THRESHOLD,
+            // A loop/job fork runs on the session-root agent's frozen
+            // system block (GOALS §22), so it benefits from the live
+            // instructions-file diff injection the same as the interactive
+            // root conversation (`instructions-file-live-diff.md`).
+            true,
             turn_tx,
         )
         .await?;

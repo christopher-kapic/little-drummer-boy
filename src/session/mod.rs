@@ -516,6 +516,119 @@ impl Session {
             .context("inserting inference_request")
     }
 
+    /// Snapshot the resolved agent-guidance file body at session start
+    /// (live instructions-file diff injection, prompt
+    /// `instructions-file-live-diff.md`). Called once when the session's
+    /// system prompt is composed (the daemon session-worker spawn): the
+    /// frozen system block carries this body, so it becomes the baseline a
+    /// later in-place edit is diffed against.
+    ///
+    /// Resolves the same first-matching guidance file
+    /// [`crate::engine::builtin`] bakes into the system block. When one
+    /// resolves, stores `(path, hash)` on the session row and the body in
+    /// the content-addressed `guidance_contents` table. When none resolves,
+    /// clears the baseline (NULL) so the feature stays inert for this
+    /// session. Best-effort: a failure here must never break session
+    /// startup.
+    pub fn snapshot_guidance_baseline(&self, cwd: &std::path::Path) {
+        let baseline = match crate::engine::builtin::load_agent_guidance(cwd) {
+            Some((path, body)) => {
+                let hash = crate::engine::guidance_diff::hash_contents(&body);
+                if let Err(e) = self.db.put_guidance_contents(&hash, &body) {
+                    tracing::warn!(error = %e, "guidance baseline: storing contents failed");
+                    return;
+                }
+                Some(crate::db::guidance::GuidanceBaseline {
+                    path: path.display().to_string(),
+                    hash,
+                })
+            }
+            None => None,
+        };
+        if let Err(e) = self.db.set_guidance_baseline(self.id, baseline.as_ref()) {
+            tracing::warn!(error = %e, "guidance baseline: setting baseline failed");
+        }
+    }
+
+    /// Check the resolved guidance file for an in-place edit since the
+    /// session's stored baseline, and — when one is found — return the
+    /// synthetic system-message body to append at the end of history (live
+    /// instructions-file diff injection). The returned string is the
+    /// authoritative framing header + unified diff (or full contents); the
+    /// caller scrubs it through [`crate::redact`] before appending, exactly
+    /// like any other outbound content.
+    ///
+    /// Returns `None` (no injection) when:
+    /// - no baseline was stored (no guidance file at session start), or
+    /// - re-resolution finds no guidance file (deleted mid-session), or
+    /// - re-resolution finds a *different* file than the baseline path
+    ///   (the file switched — out of scope), or
+    /// - the resolved file's hash is unchanged (idempotent: already at
+    ///   baseline, nothing to inject).
+    ///
+    /// On a real in-place change it persists the new body into the
+    /// content-addressed table and **advances the baseline** to the new
+    /// `(path, hash)` so the same change is injected exactly once; the next
+    /// request diffs from the just-injected version.
+    pub fn guidance_change_injection(&self, cwd: &std::path::Path) -> Option<String> {
+        let baseline = match self.db.guidance_baseline(self.id) {
+            Ok(Some(b)) => b,
+            // No baseline stored → feature inert for this session.
+            Ok(None) => return None,
+            Err(e) => {
+                tracing::warn!(error = %e, "guidance diff: reading baseline failed");
+                return None;
+            }
+        };
+
+        // Re-resolve the currently-winning guidance file. Deleted → None;
+        // switched → a different path. Both are out of scope.
+        let (current_path, current_body) = crate::engine::builtin::load_agent_guidance(cwd)?;
+        let current_path = current_path.display().to_string();
+        if current_path != baseline.path {
+            // File deleted or a different file now wins — no in-place
+            // change to track. Leave the baseline as-is; do not inject.
+            return None;
+        }
+
+        let current_hash = crate::engine::guidance_diff::hash_contents(&current_body);
+        if current_hash == baseline.hash {
+            // Unchanged since baseline — idempotent no-op.
+            return None;
+        }
+
+        // A genuine in-place edit. Persist the new body (content-addressed,
+        // idempotent) and build the injection from the prior stored body.
+        if let Err(e) = self.db.put_guidance_contents(&current_hash, &current_body) {
+            tracing::warn!(error = %e, "guidance diff: storing new contents failed");
+            return None;
+        }
+        let prior = self
+            .db
+            .guidance_contents(&baseline.hash)
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "guidance diff: reading prior contents failed");
+                None
+            });
+        let injection =
+            crate::engine::guidance_diff::decide_injection(prior.as_deref(), &current_body);
+        let message = crate::engine::guidance_diff::injection_message(&current_path, &injection);
+
+        // Advance the baseline so this change injects exactly once.
+        let advanced = crate::db::guidance::GuidanceBaseline {
+            path: current_path,
+            hash: current_hash,
+        };
+        if let Err(e) = self.db.set_guidance_baseline(self.id, Some(&advanced)) {
+            tracing::warn!(error = %e, "guidance diff: advancing baseline failed");
+            // Returning the message anyway would risk re-injecting the same
+            // change next turn (baseline not advanced). Skip this injection
+            // rather than risk a loop.
+            return None;
+        }
+        Some(message)
+    }
+
     /// Append one event to the session timeline (session-log-export Part
     /// B). Always-on, engine/daemon-owned. Returns the assigned monotonic
     /// `seq`. Best-effort callers may ignore the result.
@@ -1077,5 +1190,155 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].model, "claude-opus-4-7");
         assert_eq!(rows[0].provider, "anthropic");
+    }
+
+    // ---- live instructions-file diff injection ----------------------------
+    // (prompt `instructions-file-live-diff.md`)
+
+    /// A session rooted in a tempdir holding an `AGENTS.md` guidance file.
+    /// Returns the session, the dir handle (kept alive), and the file path.
+    fn guidance_session(body: &str) -> (Session, tempfile::TempDir, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("AGENTS.md");
+        std::fs::write(&path, body).unwrap();
+        let db = Db::open_in_memory().unwrap();
+        let s = Session::create(db, tmp.path().to_path_buf(), "Build").unwrap();
+        (s, tmp, path)
+    }
+
+    #[test]
+    fn snapshot_records_baseline_and_contents() {
+        let (s, tmp, _path) = guidance_session("RULE A\nRULE B\n");
+        s.snapshot_guidance_baseline(tmp.path());
+        let baseline = s.db.guidance_baseline(s.id).unwrap().expect("baseline set");
+        assert!(baseline.path.ends_with("AGENTS.md"));
+        // The content-addressed table holds the exact body.
+        let stored = s.db.guidance_contents(&baseline.hash).unwrap();
+        assert_eq!(stored.as_deref(), Some("RULE A\nRULE B\n"));
+        // Hash matches the pure hasher over the body.
+        assert_eq!(
+            baseline.hash,
+            crate::engine::guidance_diff::hash_contents("RULE A\nRULE B\n")
+        );
+    }
+
+    #[test]
+    fn snapshot_with_no_guidance_file_leaves_null_baseline() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open_in_memory().unwrap();
+        let s = Session::create(db, tmp.path().to_path_buf(), "Build").unwrap();
+        s.snapshot_guidance_baseline(tmp.path());
+        assert_eq!(s.db.guidance_baseline(s.id).unwrap(), None);
+        // And no injection ever fires for such a session.
+        assert!(s.guidance_change_injection(tmp.path()).is_none());
+    }
+
+    #[test]
+    fn in_place_edit_injects_unified_diff_then_is_idempotent() {
+        let (s, tmp, path) =
+            guidance_session("line one\nline two\nline three\nline four\nline five\n");
+        s.snapshot_guidance_baseline(tmp.path());
+        // No change yet → no injection.
+        assert!(s.guidance_change_injection(tmp.path()).is_none());
+
+        // Edit one line in place.
+        std::fs::write(
+            &path,
+            "line one\nline two\nline THREE\nline four\nline five\n",
+        )
+        .unwrap();
+        let msg = s
+            .guidance_change_injection(tmp.path())
+            .expect("a change should inject");
+        assert!(
+            msg.contains("changed since this conversation began"),
+            "header missing: {msg}"
+        );
+        assert!(msg.contains("- line three"), "diff missing removal: {msg}");
+        assert!(msg.contains("+ line THREE"), "diff missing addition: {msg}");
+
+        // Idempotent: the same content does not re-inject (baseline
+        // advanced to the edited body).
+        assert!(
+            s.guidance_change_injection(tmp.path()).is_none(),
+            "the same change must not re-inject"
+        );
+
+        // A further edit produces a new diff (now diffed from the edited
+        // body, not the original).
+        std::fs::write(
+            &path,
+            "line one\nline two\nline THREE\nline FOUR\nline five\n",
+        )
+        .unwrap();
+        let msg2 = s
+            .guidance_change_injection(tmp.path())
+            .expect("a further change should inject");
+        assert!(msg2.contains("+ line FOUR"), "second diff: {msg2}");
+        // It diffs from the previously-injected version, so the first edit
+        // ("THREE") is now context, not a `+` line.
+        assert!(!msg2.contains("+ line THREE"), "second diff: {msg2}");
+    }
+
+    #[test]
+    fn near_total_rewrite_injects_full_contents_not_a_diff() {
+        let (s, tmp, path) = guidance_session("alpha\nbeta\ngamma\ndelta\nepsilon\n");
+        s.snapshot_guidance_baseline(tmp.path());
+        // Rewrite every line.
+        std::fs::write(&path, "ALPHA\nBETA\nGAMMA\nDELTA\nEPSILON\n").unwrap();
+        let msg = s
+            .guidance_change_injection(tmp.path())
+            .expect("a change should inject");
+        // Full-contents fallback: the new lines appear verbatim with no
+        // `+ ` diff prefixes.
+        assert!(msg.contains("ALPHA\nBETA\nGAMMA"), "full contents: {msg}");
+        assert!(
+            !msg.contains("+ ALPHA"),
+            "should not be a noisy diff: {msg}"
+        );
+        assert!(
+            !msg.contains("- alpha"),
+            "should not be a noisy diff: {msg}"
+        );
+    }
+
+    #[test]
+    fn deleted_file_injects_nothing_and_does_not_error() {
+        let (s, tmp, path) = guidance_session("RULES\n");
+        s.snapshot_guidance_baseline(tmp.path());
+        std::fs::remove_file(&path).unwrap();
+        // Out of scope: deletion is not an in-place change. No injection,
+        // no error, and the baseline is left intact.
+        assert!(s.guidance_change_injection(tmp.path()).is_none());
+        assert!(s.db.guidance_baseline(s.id).unwrap().is_some());
+    }
+
+    #[test]
+    fn switched_file_injects_nothing() {
+        // Start with AGENTS.md as the resolved file.
+        let (s, tmp, agents) = guidance_session("AGENTS RULES\n");
+        s.snapshot_guidance_baseline(tmp.path());
+        // Delete AGENTS.md and add a CLAUDE.md — a *different* file now
+        // wins. Out of scope: the baseline path no longer matches, so no
+        // injection even though guidance content "changed".
+        std::fs::remove_file(&agents).unwrap();
+        std::fs::write(tmp.path().join("CLAUDE.md"), "CLAUDE RULES\n").unwrap();
+        assert!(s.guidance_change_injection(tmp.path()).is_none());
+    }
+
+    #[test]
+    fn snapshot_is_recomputed_to_current_file_on_each_call() {
+        // Mirrors a worker respawn (resume): re-snapshotting picks up the
+        // current file as the new baseline, so a post-snapshot edit diffs
+        // from the latest body.
+        let (s, tmp, path) = guidance_session("v1\n");
+        s.snapshot_guidance_baseline(tmp.path());
+        std::fs::write(&path, "v2\n").unwrap();
+        s.snapshot_guidance_baseline(tmp.path());
+        // Baseline is now v2 → editing to v2 again is a no-op.
+        assert!(s.guidance_change_injection(tmp.path()).is_none());
+        // Editing to v3 injects, diffed from v2.
+        std::fs::write(&path, "v3\n").unwrap();
+        assert!(s.guidance_change_injection(tmp.path()).is_some());
     }
 }

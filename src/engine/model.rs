@@ -634,4 +634,45 @@ mod tests {
             .expect("keyless provider must build");
         assert_eq!(model.model_id(), "local-model");
     }
+
+    /// A trailing `Message::System` (the live instructions-file diff
+    /// injection, `instructions-file-live-diff.md`) appended to history
+    /// must show up in the captured/as-sent request body's `history`
+    /// array, after the prior turns. This is the shape the
+    /// `inference_requests` store records, so the audit acceptance check
+    /// ("captured body contains a trailing system message with the diff")
+    /// holds.
+    #[test]
+    fn assembled_request_carries_trailing_system_injection() {
+        let history = vec![
+            Message::user("hello"),
+            Message::System {
+                content: "Your instructions file (`/p/AGENTS.md`) changed since this \
+                          conversation began. Apply the updated version:\n- old\n+ new"
+                    .to_string(),
+            },
+        ];
+        let prompt = Message::user("do the thing");
+        let body = assembled_request(
+            "m",
+            "openai-compatible",
+            "SYSTEM PROMPT",
+            &history,
+            &prompt,
+            &[],
+            &ModelParams::default(),
+        );
+        // The cached system prefix is untouched — the injection is append-
+        // only, riding in `history`, never in `system`.
+        assert_eq!(body["system"], "SYSTEM PROMPT");
+        let hist = body["history"].as_array().expect("history is an array");
+        // The system injection is the LAST history entry (end of history),
+        // and serializes with the system role.
+        let last = hist.last().expect("non-empty history");
+        assert_eq!(last["role"], "system", "got {last}");
+        let rendered = serde_json::to_string(last).unwrap();
+        assert!(rendered.contains("changed since this conversation began"));
+        assert!(rendered.contains("- old"));
+        assert!(rendered.contains("+ new"));
+    }
 }

@@ -1289,6 +1289,12 @@ impl Driver {
                 top.agent.clone()
             };
 
+            // The session-root conversation is the only one with a frozen
+            // system block reused across requests — it's where the live
+            // instructions-file diff (`instructions-file-live-diff.md`)
+            // injects. Subagents (stack depth > 1) recompose a fresh system
+            // prompt on spawn, so they skip it.
+            let is_root = self.stack.len() == 1;
             let turn_result = {
                 let top = self.stack.last_mut().expect("stack never empty");
                 turn(
@@ -1303,6 +1309,7 @@ impl Driver {
                     cancel.clone(),
                     self.approver.clone(),
                     self.loop_guard_threshold,
+                    is_root,
                     tx,
                 )
                 .await
@@ -1787,6 +1794,10 @@ pub(crate) async fn run_noninteractive(
             cancel.clone(),
             approver.clone(),
             loop_guard_threshold,
+            // A noninteractive child delegation recomposes its own fresh
+            // system prompt on spawn, so it never needs the live
+            // instructions-file diff injection.
+            false,
             &sink_tx,
         )
         .await?;

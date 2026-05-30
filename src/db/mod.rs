@@ -21,6 +21,7 @@
 //! Database path: `~/.local/share/cockpit/cockpit.db`
 //! (XDG-canonical via [`crate::config::resolve::cockpit_data_dir`]).
 
+pub mod guidance;
 pub mod inference_calls;
 pub mod lang;
 pub mod locks;
@@ -190,6 +191,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0013_session_search_fts.sql"),
     include_str!("migrations/0014_plans.sql"),
     include_str!("migrations/0015_rename_build_agent.sql"),
+    include_str!("migrations/0016_guidance_baseline.sql"),
 ];
 
 fn migrate(conn: &Connection) -> Result<()> {

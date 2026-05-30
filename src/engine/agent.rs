@@ -295,6 +295,7 @@ pub async fn turn(
     cancel: tokio_util::sync::CancellationToken,
     approver: Option<Arc<crate::approval::Approver>>,
     loop_guard_threshold: u32,
+    is_root: bool,
     tx: &mpsc::Sender<TurnEvent>,
 ) -> Result<TurnOutcome> {
     let tools = agent.tools.definitions();
@@ -312,6 +313,28 @@ pub async fn turn(
     // send" measures from when the provider last saw (and cached) the
     // prefix.
     session.note_send();
+
+    // Live instructions-file diff injection (prompt
+    // `instructions-file-live-diff.md`). The session's guidance file
+    // (`AGENTS.md`/`CLAUDE.md`) was baked into the frozen system block at
+    // session start; an in-place edit since then is invisible to the model
+    // because the cached prefix is held byte-stable. Detect that here and
+    // append the change as a synthetic system-role message at the END of
+    // history — append only, so the cached system prefix is untouched
+    // (cache-safe). Gated to the session root: subagents recompose a fresh
+    // system prompt on spawn and already carry the latest file, so they
+    // need no injection. The baseline advances on inject, so each distinct
+    // change is injected exactly once (idempotent across turns).
+    //
+    // The message goes through the normal outbound redaction chokepoint
+    // (`redact.scrub`) like any other content — not routed around it — and
+    // is appended *before* `prompt`, so it lands at the end of the prior
+    // conversation, immediately ahead of the current user message.
+    if is_root && let Some(message) = session.guidance_change_injection(&cwd) {
+        history.push(Message::System {
+            content: redact.scrub(&message),
+        });
+    }
 
     // One id per round-trip, shared by the captured request body
     // (`inference_requests`), the metadata row (`inference_calls`), and
