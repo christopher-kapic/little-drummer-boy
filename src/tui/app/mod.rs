@@ -176,6 +176,10 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "Compress the conversation to save context",
     },
     SlashCommand {
+        name: "copy",
+        description: "Copy the last response to the clipboard (arg: markdown/plain/rich)",
+    },
+    SlashCommand {
         name: "editor",
         description: "Open $EDITOR in an embedded pane (arg: left/right/top/bottom)",
     },
@@ -2648,6 +2652,73 @@ impl App {
         self.show_toast(msg, kind);
     }
 
+    /// `/copy [format]` — copy the last assistant response (message text,
+    /// excluding tool-call chrome) to the system clipboard. Default
+    /// format is `markdown` (the raw response verbatim); `plain` strips
+    /// the markdown; `rich` copies HTML. Mirrors the context-menu copy
+    /// path (`execute_context_menu_action`) and reuses the clipboard
+    /// module. Surfaces feedback via a toast.
+    pub(super) fn handle_copy_command(&mut self, arg: &str) {
+        let format = match parse_copy_format(arg) {
+            Some(f) => f,
+            None => {
+                self.show_toast(
+                    "Usage: `/copy [markdown|plain|rich]` (markdown is the default)",
+                    ToastKind::Info,
+                );
+                return;
+            }
+        };
+        let Some(text) = last_agent_text(&self.history) else {
+            self.show_toast("No response to copy yet.", ToastKind::Info);
+            return;
+        };
+        let (msg, kind) = match format {
+            CopyFormat::Markdown => match crate::clipboard::copy_plain(&text) {
+                Ok(()) => (
+                    "Copied last response (markdown).".to_string(),
+                    ToastKind::Success,
+                ),
+                Err(e) => (format!("Copy failed: {e}"), ToastKind::Error),
+            },
+            CopyFormat::Plain => {
+                let plain = crate::clipboard::markdown_to_plain(&text);
+                match crate::clipboard::copy_plain(&plain) {
+                    Ok(()) => (
+                        "Copied last response (plain).".to_string(),
+                        ToastKind::Success,
+                    ),
+                    Err(e) => (format!("Copy failed: {e}"), ToastKind::Error),
+                }
+            }
+            CopyFormat::Rich => {
+                let html = crate::clipboard::markdown_to_html(&text);
+                match crate::clipboard::copy_rich(&text, &html) {
+                    Ok(()) => (
+                        "Copied last response (rich).".to_string(),
+                        ToastKind::Success,
+                    ),
+                    Err(crate::clipboard::CopyError::UnsupportedOverSsh) => {
+                        // No multi-format clipboard pathway over SSH —
+                        // fall back to plain so `/copy rich` never
+                        // silently does nothing, and say why.
+                        match crate::clipboard::copy_plain(&text) {
+                            Ok(()) => (
+                                "SSH — copied last response as plain text \
+                                 (rich copy unavailable over SSH)."
+                                    .to_string(),
+                                ToastKind::Success,
+                            ),
+                            Err(e) => (format!("Copy failed: {e}"), ToastKind::Error),
+                        }
+                    }
+                    Err(e) => (format!("Copy failed: {e}"), ToastKind::Error),
+                }
+            }
+        };
+        self.show_toast(msg, kind);
+    }
+
     /// Toggle every agent message's `expanded` flag. Bound to `Ctrl+J`
     /// for keyboard-only use. If any entry is currently collapsed we
     /// expand them all; otherwise we collapse them all.
@@ -3231,6 +3302,10 @@ impl App {
                 self.start_compact();
                 return false;
             }
+            "copy" => {
+                self.handle_copy_command(&slash_args(&raw));
+                return false;
+            }
             "prune" => {
                 self.arm_prune_confirm();
                 return false;
@@ -3629,6 +3704,39 @@ fn parse_sandbox_arg(args: &str) -> Result<Option<bool>, String> {
 /// Extract the argument string from a full slash line. The command
 /// token (whatever was typed before the first space) is dropped; the
 /// remainder is the args. `/git status` → `status`; `/git` → ``.
+/// Output format for `/copy`. `Markdown` keeps the raw response text
+/// verbatim; `Plain` strips markdown; `Rich` copies HTML.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CopyFormat {
+    Markdown,
+    Plain,
+    Rich,
+}
+
+/// Parse the `/copy` format argument. An empty argument defaults to
+/// `Markdown` (bare `/copy`). Returns `None` for an unrecognized
+/// argument so the caller can show usage.
+fn parse_copy_format(arg: &str) -> Option<CopyFormat> {
+    match arg.trim().to_ascii_lowercase().as_str() {
+        "" | "markdown" => Some(CopyFormat::Markdown),
+        "plain" | "plaintext" => Some(CopyFormat::Plain),
+        "rich" | "richtext" => Some(CopyFormat::Rich),
+        _ => None,
+    }
+}
+
+/// The text of the last assistant response in `history`, excluding
+/// tool-call chrome (tool calls are non-`Agent` history variants).
+/// `None` when no assistant message with text exists yet. Mirrors the
+/// extraction in `agent_message_at_or_before` /
+/// `copy_last_agent_message_as_rich_text`.
+fn last_agent_text(history: &[HistoryEntry]) -> Option<String> {
+    history.iter().rev().find_map(|e| match e {
+        HistoryEntry::Agent { text, .. } if !text.trim().is_empty() => Some(text.clone()),
+        _ => None,
+    })
+}
+
 fn slash_args(raw: &str) -> String {
     let rest = raw.strip_prefix('/').unwrap_or(raw);
     match rest.find(char::is_whitespace) {
@@ -4043,6 +4151,15 @@ mod slash_rank_tests {
     }
 
     #[test]
+    fn copy_command_is_registered() {
+        // `/copy` (copy-last-response) must be dispatchable.
+        assert!(
+            SLASH_COMMANDS.iter().any(|c| c.name == "copy"),
+            "/copy must be a registered slash command"
+        );
+    }
+
+    #[test]
     fn new_and_clear_are_both_registered_aliases() {
         // `/new` and `/clear` are both menu entries routing to the one
         // fresh-session handler (`"new" | "clear"` dispatch arm).
@@ -4161,6 +4278,73 @@ mod local_cmd_tests {
         assert!(out.contains("hello"));
         let (_o, failed) = exec_capture_shell("exit 3", std::path::Path::new("."));
         assert!(failed);
+    }
+}
+
+#[cfg(test)]
+mod copy_cmd_tests {
+    use super::{CopyFormat, last_agent_text, parse_copy_format};
+    use crate::tui::history::HistoryEntry;
+
+    fn agent(text: &str) -> HistoryEntry {
+        HistoryEntry::Agent {
+            name: "coder".to_string(),
+            text: text.to_string(),
+            reasoning: String::new(),
+            timestamp: chrono::Local::now(),
+            expanded: false,
+            think_duration: None,
+        }
+    }
+
+    #[test]
+    fn bare_and_markdown_default_to_markdown() {
+        assert_eq!(parse_copy_format(""), Some(CopyFormat::Markdown));
+        assert_eq!(parse_copy_format("markdown"), Some(CopyFormat::Markdown));
+        // Whitespace-only / mixed case still resolve.
+        assert_eq!(parse_copy_format("  "), Some(CopyFormat::Markdown));
+        assert_eq!(parse_copy_format("MarkDown"), Some(CopyFormat::Markdown));
+    }
+
+    #[test]
+    fn plain_and_rich_aliases_parse() {
+        assert_eq!(parse_copy_format("plain"), Some(CopyFormat::Plain));
+        assert_eq!(parse_copy_format("plaintext"), Some(CopyFormat::Plain));
+        assert_eq!(parse_copy_format("rich"), Some(CopyFormat::Rich));
+        assert_eq!(parse_copy_format("richtext"), Some(CopyFormat::Rich));
+    }
+
+    #[test]
+    fn unknown_format_is_none() {
+        assert_eq!(parse_copy_format("html"), None);
+        assert_eq!(parse_copy_format("md"), None);
+    }
+
+    #[test]
+    fn last_agent_text_skips_non_agent_and_empty() {
+        // No agent messages → None (the no-response path).
+        assert_eq!(last_agent_text(&[]), None);
+        assert_eq!(
+            last_agent_text(&[HistoryEntry::Plain {
+                line: "tool chrome".to_string(),
+            }]),
+            None
+        );
+
+        // Tool chrome after the agent message must not shadow it, and a
+        // trailing empty agent turn is ignored.
+        let history = vec![
+            agent("first response"),
+            HistoryEntry::Plain {
+                line: "a tool ran".to_string(),
+            },
+            agent("**last** response"),
+            agent("   "),
+        ];
+        assert_eq!(
+            last_agent_text(&history).as_deref(),
+            Some("**last** response")
+        );
     }
 }
 
