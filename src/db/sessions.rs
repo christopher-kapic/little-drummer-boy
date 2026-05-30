@@ -53,6 +53,12 @@ pub struct SessionRow {
     /// migration 0010). `None` = live. Archived sessions are hidden from
     /// the browser by default.
     pub archived_at: Option<i64>,
+    /// `true` for a throwaway `/side` side-conversation fork (migration
+    /// 0017). Ephemeral sessions are excluded from every list query, never
+    /// auto-titled, never surfaced as resumable, and are discarded when the
+    /// side conversation ends, the owning process exits, or the daemon
+    /// sweeps orphans on boot.
+    pub ephemeral: bool,
 }
 
 impl SessionRow {
@@ -82,6 +88,7 @@ impl SessionRow {
             user_renamed: user_renamed != 0,
             last_viewed_at: row.get("last_viewed_at")?,
             archived_at: row.get("archived_at")?,
+            ephemeral: row.get::<_, i64>("ephemeral")? != 0,
         })
     }
 }
@@ -174,6 +181,7 @@ impl Db {
             user_renamed: false,
             last_viewed_at: None,
             archived_at: None,
+            ephemeral: false,
         })
     }
 
@@ -214,6 +222,27 @@ impl Db {
         parent_session_id: Uuid,
         fork_point_turn_id: Option<String>,
     ) -> Result<SessionRow> {
+        self.create_fork_inner(parent_session_id, fork_point_turn_id, false)
+    }
+
+    /// Create an **ephemeral** side-conversation fork (`/side`). Identical
+    /// to [`Self::create_fork`] but marks the row `ephemeral = 1`, so it is
+    /// excluded from every list query, never auto-titled, never resumable,
+    /// and discarded when the side conversation ends / its process exits.
+    pub fn create_ephemeral_fork(
+        &self,
+        parent_session_id: Uuid,
+        fork_point_turn_id: Option<String>,
+    ) -> Result<SessionRow> {
+        self.create_fork_inner(parent_session_id, fork_point_turn_id, true)
+    }
+
+    fn create_fork_inner(
+        &self,
+        parent_session_id: Uuid,
+        fork_point_turn_id: Option<String>,
+        ephemeral: bool,
+    ) -> Result<SessionRow> {
         let session_id = Uuid::new_v4();
         let now = Utc::now().timestamp();
         self.with_conn(|conn| {
@@ -226,8 +255,8 @@ impl Db {
                  (session_id, project_id, project_root, started_at,
                   last_active_at, active_agent, short_id,
                   parent_session_id, fork_point_turn_id,
-                  provider, model)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                  provider, model, ephemeral)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 params![
                     session_id.to_string(),
                     parent.project_id,
@@ -240,6 +269,7 @@ impl Db {
                     fork_point_turn_id,
                     parent.provider,
                     parent.model,
+                    ephemeral as i64,
                 ],
             )
             .context("inserting fork session")?;
@@ -260,6 +290,7 @@ impl Db {
                 user_renamed: false,
                 last_viewed_at: None,
                 archived_at: None,
+                ephemeral,
             })
         })
     }
@@ -350,7 +381,7 @@ impl Db {
             let affected = conn
                 .execute(
                     "UPDATE sessions SET title = ?1
-                 WHERE session_id = ?2 AND user_renamed = 0",
+                 WHERE session_id = ?2 AND user_renamed = 0 AND ephemeral = 0",
                     params![title, session_id.to_string()],
                 )
                 .context("setting auto title")?;
@@ -363,7 +394,7 @@ impl Db {
         self.with_conn(|conn| {
             let mut stmt = conn
                 .prepare(
-                    "SELECT * FROM sessions WHERE parent_session_id = ?1
+                    "SELECT * FROM sessions WHERE parent_session_id = ?1 AND ephemeral = 0
                  ORDER BY last_active_at DESC",
                 )
                 .context("preparing list_forks")?;
@@ -384,7 +415,7 @@ impl Db {
         self.with_conn(|conn| {
             let count: i64 = conn
                 .query_row(
-                    "SELECT COUNT(*) FROM sessions WHERE parent_session_id = ?1",
+                    "SELECT COUNT(*) FROM sessions WHERE parent_session_id = ?1 AND ephemeral = 0",
                     [parent_session_id.to_string()],
                     |row| row.get(0),
                 )
@@ -401,7 +432,7 @@ impl Db {
             let mut stmt = conn
                 .prepare(
                     "SELECT * FROM sessions
-                 WHERE project_id = ?1 AND parent_session_id IS NULL
+                 WHERE project_id = ?1 AND parent_session_id IS NULL AND ephemeral = 0
                  ORDER BY last_active_at DESC LIMIT ?2",
                 )
                 .context("preparing list_root_sessions")?;
@@ -439,6 +470,54 @@ impl Db {
             }
             Ok(())
         })
+    }
+
+    /// Discard a single ephemeral side-conversation session (`/side`),
+    /// cascading to its descendant forks. No-op (returns `Ok(false)`) when
+    /// the id is unknown or the row is **not** ephemeral — a guard so a
+    /// stray discard can never delete a persisted session. Returns `true`
+    /// when an ephemeral row was deleted.
+    pub fn discard_ephemeral_session(&self, session_id: Uuid) -> Result<bool> {
+        // Guard on the typed row flag — only an ephemeral session is ever
+        // discarded this way, so a stray call can't drop a persisted one.
+        match self.get_session(session_id)? {
+            Some(row) if row.ephemeral => {}
+            _ => return Ok(false),
+        }
+        self.delete_session(session_id, true)?;
+        Ok(true)
+    }
+
+    /// Sweep every ephemeral session row (and descendant forks) from the DB.
+    /// Run once on daemon boot as the SIGKILL backstop: a side conversation
+    /// whose owning process died uncatchably can leave an orphaned ephemeral
+    /// row behind, and this clears it so ephemeral sessions never accumulate.
+    /// Returns the number of root ephemeral sessions removed.
+    pub fn sweep_ephemeral_sessions(&self) -> Result<usize> {
+        let roots = self.with_conn(|conn| {
+            let mut stmt = conn
+                .prepare("SELECT session_id FROM sessions WHERE ephemeral = 1")
+                .context("preparing ephemeral sweep")?;
+            let rows = stmt
+                .query_map([], |row| {
+                    let s: String = row.get(0)?;
+                    parse_uuid(&s)
+                })
+                .context("querying ephemeral sweep")?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.context("decoding ephemeral row")?);
+            }
+            Ok(out)
+        })?;
+        let mut removed = 0;
+        for id in roots {
+            // Cascade in case a side conversation itself spawned forks.
+            if self.delete_session(id, true).is_ok() {
+                removed += 1;
+            }
+        }
+        Ok(removed)
     }
 
     /// Set the read/unread marker to now (migration 0010). Called when a
@@ -616,10 +695,11 @@ impl Db {
     pub fn list_sessions(&self, only_open: bool, limit: u32) -> Result<Vec<SessionRow>> {
         self.with_conn(|conn| {
             let sql = if only_open {
-                "SELECT * FROM sessions WHERE ended_at IS NULL
+                "SELECT * FROM sessions WHERE ended_at IS NULL AND ephemeral = 0
                  ORDER BY last_active_at DESC LIMIT ?1"
             } else {
-                "SELECT * FROM sessions ORDER BY last_active_at DESC LIMIT ?1"
+                "SELECT * FROM sessions WHERE ephemeral = 0
+                 ORDER BY last_active_at DESC LIMIT ?1"
             };
             let mut stmt = conn.prepare(sql).context("preparing list_sessions")?;
             let rows = stmt
@@ -704,7 +784,7 @@ impl Db {
         self.with_conn(|conn| {
             let result = conn.query_row(
                 "SELECT * FROM sessions
-                 WHERE project_id = ?1 AND ended_at IS NULL
+                 WHERE project_id = ?1 AND ended_at IS NULL AND ephemeral = 0
                  ORDER BY last_active_at DESC LIMIT 1",
                 [project_id],
                 SessionRow::from_row,
@@ -1091,5 +1171,103 @@ mod tests {
         // Idempotent: a second call returns the same id, doesn't churn.
         let again = db.ensure_short_id(s.session_id).unwrap();
         assert_eq!(again, backfilled);
+    }
+
+    // ---- `/side` ephemeral side-conversation forks (migration 0017) -------
+
+    #[test]
+    fn create_ephemeral_fork_marks_row_ephemeral() {
+        let db = Db::open_in_memory().unwrap();
+        let parent = db.create_session("p", "/x", "a").unwrap();
+        let side = db
+            .create_ephemeral_fork(parent.session_id, Some("turn-3".into()))
+            .unwrap();
+        assert!(side.ephemeral, "side fork row should be ephemeral");
+        assert_eq!(side.parent_session_id, Some(parent.session_id));
+        let stored = db.get_session(side.session_id).unwrap().unwrap();
+        assert!(stored.ephemeral);
+        // A plain fork is NOT ephemeral.
+        let plain = db.create_fork(parent.session_id, None).unwrap();
+        assert!(!plain.ephemeral);
+    }
+
+    #[test]
+    fn ephemeral_sessions_excluded_from_all_list_queries() {
+        let db = Db::open_in_memory().unwrap();
+        let root = db.create_session("p", "/x", "a").unwrap();
+        let _side = db.create_ephemeral_fork(root.session_id, None).unwrap();
+
+        // Root listing: only the persisted root, no ephemeral fork.
+        let roots = db.list_root_sessions("p", 100).unwrap();
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].session_id, root.session_id);
+
+        // Direct-forks listing of the parent: the ephemeral fork is hidden.
+        let forks = db.list_forks(root.session_id).unwrap();
+        assert!(
+            forks.is_empty(),
+            "ephemeral fork must not appear in list_forks"
+        );
+        assert_eq!(db.count_forks_for(root.session_id).unwrap(), 0);
+
+        // Flat open-session list (`cockpit session list`).
+        let open = db.list_sessions(true, 100).unwrap();
+        assert!(open.iter().all(|s| !s.ephemeral));
+        assert_eq!(open.len(), 1);
+
+        // `cockpit -c` continue: never resumes the ephemeral fork.
+        let recent = db.most_recent_open_session_for("p").unwrap().unwrap();
+        assert_eq!(recent.session_id, root.session_id);
+
+        // Browser summaries (the daemon + daemonless shared path).
+        let summaries = db.list_session_summaries(Some("p"), None, 100).unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].fork_count, 0);
+    }
+
+    #[test]
+    fn ephemeral_sessions_are_never_auto_titled() {
+        let db = Db::open_in_memory().unwrap();
+        let parent = db.create_session("p", "/x", "a").unwrap();
+        let side = db.create_ephemeral_fork(parent.session_id, None).unwrap();
+        let updated = db.set_auto_title(side.session_id, "auto-name").unwrap();
+        assert!(!updated, "auto-title must refuse an ephemeral row");
+        let row = db.get_session(side.session_id).unwrap().unwrap();
+        assert!(row.title.is_none());
+    }
+
+    #[test]
+    fn discard_ephemeral_session_removes_row_and_guards_persisted() {
+        let db = Db::open_in_memory().unwrap();
+        let parent = db.create_session("p", "/x", "a").unwrap();
+        let side = db.create_ephemeral_fork(parent.session_id, None).unwrap();
+
+        // Discarding the ephemeral fork drops its row.
+        assert!(db.discard_ephemeral_session(side.session_id).unwrap());
+        assert!(db.get_session(side.session_id).unwrap().is_none());
+
+        // Guard: discarding a *persisted* session is a no-op, leaves it intact.
+        assert!(!db.discard_ephemeral_session(parent.session_id).unwrap());
+        assert!(db.get_session(parent.session_id).unwrap().is_some());
+
+        // Unknown id is a no-op, not an error.
+        assert!(!db.discard_ephemeral_session(Uuid::new_v4()).unwrap());
+    }
+
+    #[test]
+    fn sweep_ephemeral_sessions_clears_orphans_only() {
+        let db = Db::open_in_memory().unwrap();
+        let root = db.create_session("p", "/x", "a").unwrap();
+        let _plain_fork = db.create_fork(root.session_id, None).unwrap();
+        let side_a = db.create_ephemeral_fork(root.session_id, None).unwrap();
+        let side_b = db.create_ephemeral_fork(root.session_id, None).unwrap();
+
+        let removed = db.sweep_ephemeral_sessions().unwrap();
+        assert_eq!(removed, 2);
+        assert!(db.get_session(side_a.session_id).unwrap().is_none());
+        assert!(db.get_session(side_b.session_id).unwrap().is_none());
+        // The persisted root + its plain fork survive the sweep.
+        assert!(db.get_session(root.session_id).unwrap().is_some());
+        assert_eq!(db.count_forks_for(root.session_id).unwrap(), 1);
     }
 }

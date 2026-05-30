@@ -163,6 +163,36 @@ pub(super) struct PendingCompact {
     pub(super) predecessor_short_id: String,
 }
 
+/// An open `/side` side conversation. Created when `/side` forks the main
+/// session into an ephemeral throwaway and switches the TUI onto it; the
+/// snapshot is everything needed to restore the **main** session exactly
+/// where the user left off when the side conversation ends (`/side end`,
+/// Esc, or process exit). Restoring re-binds the saved runner and view
+/// verbatim — no re-attach, so no lost scrollback. While `Some`, the chrome
+/// shows the side indicator and the ephemeral fork id is discarded on exit.
+pub(super) struct SideConversation {
+    /// The ephemeral fork's session id — the row to discard on exit.
+    pub(super) side_session_id: uuid::Uuid,
+    /// The daemon socket the side fork lives on (the same one the parent
+    /// runner is attached to), so the discard RPC reaches the right daemon.
+    pub(super) socket: std::path::PathBuf,
+    /// Saved main-session view, restored on exit.
+    saved_runner: Option<Result<AgentRunner, String>>,
+    saved_history: Vec<HistoryEntry>,
+    saved_queue: Vec<String>,
+    saved_pending: Option<PendingMsg>,
+    saved_prunable_tokens: u64,
+    saved_cache_cold: bool,
+    saved_elided_event_ids: std::collections::HashSet<String>,
+    saved_active_jobs: std::collections::BTreeMap<String, ActiveJob>,
+    saved_pending_stop_confirm: Option<Vec<String>>,
+    saved_chat_scroll_offset: usize,
+    saved_project_id: Option<String>,
+    saved_session_id: Option<uuid::Uuid>,
+    saved_session_short_id: Option<String>,
+    saved_current_session_persisted: bool,
+}
+
 const SLASH_COMMANDS: &[SlashCommand] = &[
     SlashCommand {
         name: "caffeinate",
@@ -279,6 +309,10 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
     SlashCommand {
         name: "settings",
         description: "Open the settings dialog",
+    },
+    SlashCommand {
+        name: "side",
+        description: "Start a throwaway side conversation forked from here (`/side end` to discard)",
     },
     SlashCommand {
         name: "skills",
@@ -742,6 +776,12 @@ pub struct App {
     /// event so it stays in sync across all clients (incl. until-idle
     /// auto-off). Not client-owned: the assertion lives in the daemon.
     pub(super) caffeinate_active: bool,
+    /// An open `/side` side conversation, or `None` in the main session. While
+    /// `Some`, the TUI is bound to an ephemeral throwaway fork: the chrome
+    /// shows the side indicator, `/side end` and the empty-composer Esc exit
+    /// it, and the fork is discarded on exit (or process death — see the run
+    /// teardown and the daemon boot sweep).
+    pub(super) side_conversation: Option<SideConversation>,
     /// Daemon is draining for a graceful shutdown
     /// (`daemon-graceful-drain-shutdown.md`). Set from the daemon-global
     /// `DaemonDraining` event. While set, the composer refuses new
@@ -966,6 +1006,7 @@ impl App {
             ctrl_c_armed_at: None,
             no_sandbox,
             caffeinate_active: false,
+            side_conversation: None,
             daemon_draining: false,
         };
         // First-run convenience: if the daemon prompt doesn't gate
@@ -1078,6 +1119,14 @@ impl App {
         let result = self.event_loop(&mut terminal);
 
         refresh_handle.abort();
+
+        // Process-exit cleanup for an open `/side` (no orphaned ephemeral
+        // sessions): discard the throwaway fork *before* the daemon guard
+        // reaps an owned ephemeral daemon, so the discard RPC still reaches a
+        // live daemon. The daemon's boot sweep is the SIGKILL backstop.
+        if self.side_conversation.is_some() {
+            self.end_side_conversation(false);
+        }
 
         // Daemonless teardown (happy path): reap the owned ephemeral daemon
         // and stop its signal watcher. The guard routes a synchronous
@@ -1396,6 +1445,14 @@ impl App {
             return Ok(());
         }
         self.pending_new_session = false;
+
+        // `/new` from inside a side conversation: discard the ephemeral fork
+        // first (no orphan), then proceed to open a fresh session. We don't
+        // restore the main session's view — `/new` is clearing everything
+        // anyway — but the discard must still fire and the chrome flag clear.
+        if self.side_conversation.is_some() {
+            self.end_side_conversation(false);
+        }
 
         // Alt-screen mode: the chat pane is the whole canvas, and
         // there's no terminal scrollback to spill into. Clearing
@@ -2050,6 +2107,12 @@ impl App {
     /// attach (clearing its unread state). Mirrors `commit_compact`'s
     /// transcript reset; new agent output streams in live.
     pub(super) fn resume_session(&mut self, session_id: uuid::Uuid) {
+        // Resuming another session from inside a side conversation: discard the
+        // ephemeral fork first (no orphan). The resume below then overwrites
+        // the restored main view with the resumed session's.
+        if self.side_conversation.is_some() {
+            self.end_side_conversation(false);
+        }
         match agent_runner::attach_to_session(
             &self.launch.cwd,
             session_id,
@@ -2091,6 +2154,191 @@ impl App {
                     line: format!("/resume: could not attach to session: {e}"),
                 });
             }
+        }
+    }
+
+    /// `/side [end]`: throwaway side conversation forked from here.
+    ///
+    /// - bare `/side` forks the current session into an **ephemeral** fork
+    ///   and switches the TUI onto it (full prior history stays visible).
+    /// - `/side end` returns to the unchanged main session and discards the
+    ///   ephemeral fork.
+    ///
+    /// `/side` while already in a side conversation is a flat, deterministic
+    /// no-op (a persisted branch is `/fork`, not nested `/side`).
+    pub(super) fn handle_side_command(&mut self, args: &str) {
+        let arg = args.trim();
+        if arg.eq_ignore_ascii_case("end") {
+            if self.side_conversation.is_some() {
+                self.end_side_conversation(true);
+            } else {
+                self.history.push(HistoryEntry::Plain {
+                    line: "/side: not in a side conversation".to_string(),
+                });
+            }
+            return;
+        }
+        if !arg.is_empty() {
+            self.history.push(HistoryEntry::Plain {
+                line: "Usage: `/side` to start, `/side end` to discard".to_string(),
+            });
+            return;
+        }
+        if self.side_conversation.is_some() {
+            // Deterministic no-op: already in a side conversation, don't nest.
+            self.history.push(HistoryEntry::Plain {
+                line: "/side: already in a side conversation (`/side end` to discard)".to_string(),
+            });
+            return;
+        }
+        self.enter_side_conversation();
+    }
+
+    /// Fork the current (main) session into an ephemeral throwaway and switch
+    /// the TUI onto it. The fork reuses `ForkSession` (with `ephemeral`), and
+    /// we keep the visible scrollback so the user sees the full prior history.
+    /// The main-session view is snapshotted into `side_conversation` so a
+    /// later `/side end` / Esc / exit restores it verbatim.
+    fn enter_side_conversation(&mut self) {
+        // Need a live runner: the side fork goes onto the same daemon, and
+        // forking off an un-persisted session has nothing to branch from.
+        let (parent_session_id, socket) = match self.agent_runner.as_ref() {
+            Some(Ok(runner)) => (runner.session_id, runner.socket.clone()),
+            _ => {
+                self.history.push(HistoryEntry::Plain {
+                    line: "/side: no active session to fork from".to_string(),
+                });
+                return;
+            }
+        };
+        // Forking off a never-persisted session has no parent row in the DB.
+        if !self.current_session_persisted {
+            self.history.push(HistoryEntry::Plain {
+                line: "/side: send a message first — there's nothing to fork yet".to_string(),
+            });
+            return;
+        }
+
+        let (side_session_id, side_short_id) =
+            match agent_runner::fork_session_blocking(&socket, parent_session_id, true) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    // Fork failed (daemon error): report and stay in main.
+                    self.history.push(HistoryEntry::Plain {
+                        line: format!("/side: could not fork: {e}"),
+                    });
+                    return;
+                }
+            };
+
+        // Attach to the ephemeral fork. On failure, discard the orphan fork
+        // we just created and stay in the main session, untouched.
+        let runner = match agent_runner::attach_to_session(
+            &self.launch.cwd,
+            side_session_id,
+            self.no_sandbox,
+            self.lifecycle_mode(),
+        ) {
+            Ok(runner) => runner,
+            Err(e) => {
+                let _ = agent_runner::discard_session_blocking(&socket, side_session_id);
+                self.history.push(HistoryEntry::Plain {
+                    line: format!("/side: could not enter side conversation: {e}"),
+                });
+                return;
+            }
+        };
+        self.arm_daemon_guard(&runner);
+
+        // Snapshot the main-session view, then swap onto the side fork. We
+        // keep `history` (prior scrollback stays visible) but take everything
+        // else into the snapshot so `end` restores it exactly.
+        let side = SideConversation {
+            side_session_id,
+            socket,
+            saved_runner: self.agent_runner.take(),
+            saved_history: self.history.clone(),
+            saved_queue: std::mem::take(&mut self.queue),
+            saved_pending: self.pending.take(),
+            saved_prunable_tokens: self.prunable_tokens,
+            saved_cache_cold: self.cache_cold,
+            saved_elided_event_ids: std::mem::take(&mut self.elided_event_ids),
+            saved_active_jobs: std::mem::take(&mut self.active_jobs),
+            saved_pending_stop_confirm: self.pending_stop_confirm.take(),
+            saved_chat_scroll_offset: self.chat_scroll_offset,
+            saved_project_id: self.project_id.clone(),
+            saved_session_id: self.launch.session_id,
+            saved_session_short_id: self.launch.session_short_id.clone(),
+            saved_current_session_persisted: self.current_session_persisted,
+        };
+
+        self.project_id = Some(runner.project_id.clone());
+        self.launch.session_id = Some(runner.session_id);
+        self.launch.session_short_id = Some(runner.short_id.clone());
+        // The ephemeral fork is never surfaced as resumable — keep
+        // `current_session_persisted = false` so the exit-tail never prints
+        // its id, even though the fork has a (throwaway) DB row.
+        self.current_session_persisted = false;
+        // Reset the live-view fields the side conversation tracks on its own;
+        // the visible scrollback (history) is intentionally preserved.
+        self.queue.clear();
+        self.pending = None;
+        self.prunable_tokens = 0;
+        self.cache_cold = true;
+        self.elided_event_ids.clear();
+        self.active_jobs.clear();
+        self.pending_stop_confirm = None;
+        self.chat_scroll_offset = 0;
+        self.agent_runner = Some(Ok(runner));
+        self.side_conversation = Some(side);
+
+        self.history.push(HistoryEntry::Plain {
+            line: format!(
+                "Side conversation {side_short_id} — a throwaway fork. `/side end` (or Esc on an empty line) to discard and return."
+            ),
+        });
+    }
+
+    /// End the open side conversation: restore the main-session view verbatim
+    /// and discard the ephemeral fork (row + descendant forks). Unconditional
+    /// — no "keep this fork?" prompt (that's `/fork`). `announce` controls the
+    /// confirmation line; the process-exit path passes `false`.
+    pub(super) fn end_side_conversation(&mut self, announce: bool) {
+        let Some(side) = self.side_conversation.take() else {
+            return;
+        };
+
+        // Discard the ephemeral fork: stops its worker and deletes its row.
+        // Best-effort — a transport failure still leaves the daemon's boot
+        // sweep as the backstop, so an orphan can't survive long.
+        if let Err(e) = agent_runner::discard_session_blocking(&side.socket, side.side_session_id) {
+            tracing::warn!(error = %e, side_session_id = %side.side_session_id,
+                "discarding ephemeral side session failed; boot sweep will reclaim it");
+        }
+
+        // Restore the main-session view exactly as it was on entry.
+        self.agent_runner = side.saved_runner;
+        self.history = side.saved_history;
+        self.queue = side.saved_queue;
+        self.pending = side.saved_pending;
+        self.prunable_tokens = side.saved_prunable_tokens;
+        self.cache_cold = side.saved_cache_cold;
+        self.elided_event_ids = side.saved_elided_event_ids;
+        self.active_jobs = side.saved_active_jobs;
+        self.pending_stop_confirm = side.saved_pending_stop_confirm;
+        self.chat_scroll_offset = side.saved_chat_scroll_offset;
+        self.project_id = side.saved_project_id;
+        self.launch.session_id = side.saved_session_id;
+        self.launch.session_short_id = side.saved_session_short_id;
+        self.current_session_persisted = side.saved_current_session_persisted;
+        // The daemonless ownership guard stays armed throughout — the side
+        // fork lives on the same owned daemon, so it's never dropped and
+        // needs no re-arming here.
+
+        if announce {
+            self.history.push(HistoryEntry::Plain {
+                line: "Side conversation discarded — back in the main session.".to_string(),
+            });
         }
     }
 
@@ -3803,6 +4051,10 @@ impl App {
                 "/fork: stub — the ForkSession RPC is live in the daemon; the TUI \
                  re-attach flow on top of it ships in a later cut."
             }
+            "side" => {
+                self.handle_side_command(&slash_args(&raw));
+                return false;
+            }
             "rename" => {
                 self.handle_rename_command(&slash_args(&raw));
                 return false;
@@ -4817,6 +5069,15 @@ mod slash_rank_tests {
         assert!(
             SLASH_COMMANDS.iter().any(|c| c.name == "skills"),
             "/skills must be a registered slash command"
+        );
+    }
+
+    #[test]
+    fn side_command_is_registered() {
+        // `/side` (ephemeral throwaway side conversation) must be dispatchable.
+        assert!(
+            SLASH_COMMANDS.iter().any(|c| c.name == "side"),
+            "/side must be a registered slash command"
         );
     }
 

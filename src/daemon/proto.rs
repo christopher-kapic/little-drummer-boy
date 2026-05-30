@@ -218,12 +218,20 @@ pub enum Request {
     UnarchiveSession { session_id: Uuid },
 
     /// Branch a fork off `parent_session_id` at `fork_point_turn_id`
-    /// (None = tail). GOALS §17e.
+    /// (None = tail). GOALS §17e. `ephemeral` marks a throwaway `/side`
+    /// side-conversation fork — excluded from lists, never auto-titled,
+    /// discarded on end/exit.
     ForkSession {
         parent_session_id: Uuid,
         #[serde(default)]
         fork_point_turn_id: Option<String>,
+        #[serde(default)]
+        ephemeral: bool,
     },
+
+    /// Stop an ephemeral side-conversation (`/side`) worker and discard its
+    /// row + descendant forks. No-op for a non-ephemeral session (guarded).
+    DiscardSession { session_id: Uuid },
 
     /// Manually set a session's title; locks out auto-titling.
     /// GOALS §17d.

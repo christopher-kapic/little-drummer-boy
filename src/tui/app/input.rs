@@ -162,6 +162,20 @@ impl App {
             return false;
         }
 
+        // Side conversation exit (`/side`): Esc on an empty composer (and no
+        // open slash query) ends the side conversation — returns to the
+        // unchanged main session and discards the ephemeral fork. Deterministic
+        // gate: only fires while in a side conversation with nothing typed, so
+        // Esc keeps its vim Normal-mode / slash-cancel meaning otherwise.
+        if matches!(key.code, KeyCode::Esc)
+            && self.side_conversation.is_some()
+            && self.composer.is_empty()
+            && self.slash_query().is_none()
+        {
+            self.end_side_conversation(true);
+            return false;
+        }
+
         // Modal dialog rule: whenever a modal is open we must
         // `return false` (consume the key) before any other handler
         // sees it. Otherwise navigation chars (`j`/`k`/etc.) that the

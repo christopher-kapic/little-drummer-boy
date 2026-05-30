@@ -421,6 +421,64 @@ pub fn daemon_request_at_blocking(socket: &Path, req: Request) -> Result<Respons
     })
 }
 
+/// Run one request-response RPC against the daemon at `socket`. Unlike
+/// [`daemon_request_blocking`] (which probes the *canonical* daemon paths),
+/// this targets a specific socket — the one the live runner is attached to.
+/// That matters in daemonless mode, where the runner owns a per-pid
+/// ephemeral daemon the canonical paths don't point at.
+fn request_on_socket(socket: &Path, req: Request) -> Result<Response, String> {
+    let runtime =
+        tokio::runtime::Handle::try_current().map_err(|_| "no tokio runtime".to_string())?;
+    let socket = socket.to_path_buf();
+    tokio::task::block_in_place(|| {
+        runtime.block_on(async {
+            let client = crate::daemon::client::DaemonClient::connect(&socket)
+                .await
+                .map_err(|e| format!("daemon connect: {e}"))?;
+            client
+                .request_ok(req)
+                .await
+                .map_err(|e| format!("daemon request: {e}"))
+        })
+    })
+}
+
+/// Fork `parent_session_id` at its tail into a fresh session on the daemon
+/// at `socket`, returning `(session_id, short_id)`. `ephemeral` marks it a
+/// throwaway `/side` side-conversation fork (excluded from lists, never
+/// auto-titled, discarded on end/exit).
+pub fn fork_session_blocking(
+    socket: &Path,
+    parent_session_id: uuid::Uuid,
+    ephemeral: bool,
+) -> Result<(uuid::Uuid, String), String> {
+    match request_on_socket(
+        socket,
+        Request::ForkSession {
+            parent_session_id,
+            fork_point_turn_id: None,
+            ephemeral,
+        },
+    )? {
+        Response::Forked {
+            session_id,
+            short_id,
+            ..
+        } => Ok((session_id, short_id)),
+        other => Err(format!("unexpected fork response: {other:?}")),
+    }
+}
+
+/// Discard an ephemeral side-conversation (`/side`) on the daemon at
+/// `socket`: stops its worker and deletes its row + descendant forks. A
+/// non-ephemeral session is left untouched (daemon-side guard).
+pub fn discard_session_blocking(socket: &Path, session_id: uuid::Uuid) -> Result<(), String> {
+    match request_on_socket(socket, Request::DiscardSession { session_id })? {
+        Response::Ack => Ok(()),
+        other => Err(format!("unexpected discard response: {other:?}")),
+    }
+}
+
 /// List sessions for the `/sessions` browser. `project_id = Some(p)` +
 /// `parent = None` → root sessions in `p`; `parent = Some(s)` → direct
 /// forks of `s`; both `None` → every open session (all-projects scope).

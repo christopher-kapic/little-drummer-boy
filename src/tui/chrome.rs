@@ -121,6 +121,22 @@ pub fn caffeinate_glyph_spans(active: bool) -> Vec<Span<'static>> {
     )]
 }
 
+/// Side-conversation indicator (`/side`, GOALS §1a). Rendered **only**
+/// while a throwaway side conversation is open — additive to the fixed
+/// chrome (cwd + branch), never displacing a slot, the same pattern as the
+/// `☕` caffeinate glyph. Magenta reads as "you're somewhere temporary"
+/// without competing with the yellow branch badge; the trailing space keeps
+/// it off the cwd text. Returns an empty vec in the main session.
+pub fn side_glyph_spans(active: bool) -> Vec<Span<'static>> {
+    if !active {
+        return Vec::new();
+    }
+    vec![Span::styled(
+        "⑃ side ".to_string(),
+        Style::default().fg(Color::Magenta),
+    )]
+}
+
 pub fn repo_counts(repo: &RepoStatus) -> String {
     let mut parts = Vec::new();
     if repo.staged > 0 {
@@ -133,4 +149,19 @@ pub fn repo_counts(repo: &RepoStatus) -> String {
         parts.push(format!("^{}", repo.unpushed));
     }
     parts.join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn side_glyph_present_only_when_active() {
+        // Off in the main session; an additive indicator while a `/side`
+        // side conversation is open (never a permanent slot).
+        assert!(side_glyph_spans(false).is_empty());
+        let spans = side_glyph_spans(true);
+        assert_eq!(spans.len(), 1);
+        assert!(spans[0].content.contains("side"));
+    }
 }

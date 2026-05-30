@@ -1333,7 +1333,11 @@ impl App {
         // Caffeination glyph (☕) leads the right-hand chrome while active,
         // driven by the daemon-broadcast state (GOALS §1a). Additive to the
         // fixed cwd + branch chrome — never displaces it.
-        let mut right = chrome::caffeinate_glyph_spans(self.caffeinate_active);
+        // Side-conversation indicator (`/side`) leads the right-hand chrome
+        // while a throwaway side conversation is open, ahead of the ☕ glyph.
+        // Additive to the fixed cwd + branch chrome — never displaces it.
+        let mut right = chrome::side_glyph_spans(self.side_conversation.is_some());
+        right.extend(chrome::caffeinate_glyph_spans(self.caffeinate_active));
         right.extend(chrome::status_line_spans(&self.launch));
         let mut left = chrome::left_status_spans(&self.launch);
         // Transient async-jobs strip (GOALS §22): only when ≥1 job is

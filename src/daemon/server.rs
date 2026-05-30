@@ -142,6 +142,14 @@ pub fn boot(paths: DaemonPaths) -> Result<DaemonContext> {
     if let Err(e) = db.prune_usage_events(before) {
         tracing::warn!(error = %e, "pruning usage_events on boot failed");
     }
+    // SIGKILL backstop for `/side`: a side conversation whose owning process
+    // died uncatchably can orphan an ephemeral session row. Sweep them on
+    // boot so ephemeral sessions never accumulate. Best-effort.
+    match db.sweep_ephemeral_sessions() {
+        Ok(n) if n > 0 => tracing::info!(count = n, "swept orphaned ephemeral sessions on boot"),
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "sweeping ephemeral sessions on boot failed"),
+    }
     Ok(DaemonContext::new(db, locks, paths))
 }
 
@@ -481,7 +489,10 @@ async fn handle_request(
         Request::ForkSession {
             parent_session_id,
             fork_point_turn_id,
-        } => fork_session(ctx, parent_session_id, fork_point_turn_id),
+            ephemeral,
+        } => fork_session(ctx, parent_session_id, fork_point_turn_id, ephemeral),
+
+        Request::DiscardSession { session_id } => discard_session(state, ctx, session_id).await,
 
         Request::RenameSession { session_id, title } => rename_session(ctx, session_id, &title),
 
@@ -1041,6 +1052,7 @@ fn fork_session(
     ctx: &DaemonContext,
     parent_session_id: Uuid,
     fork_point_turn_id: Option<String>,
+    ephemeral: bool,
 ) -> std::result::Result<Response, ErrorPayload> {
     // Guard rail: refuse forks of unknown parents with the typed
     // `UnknownSession` code so the TUI can surface a friendlier error
@@ -1055,16 +1067,48 @@ fn fork_session(
         }
         Err(e) => return Err(internal(e)),
     }
-    let row = ctx
-        .db
-        .create_fork(parent_session_id, fork_point_turn_id.clone())
-        .map_err(internal)?;
+    // `/side` forks land ephemeral (excluded from lists, never auto-titled,
+    // discarded on end/exit); `/fork` forks persist normally.
+    let row = if ephemeral {
+        ctx.db
+            .create_ephemeral_fork(parent_session_id, fork_point_turn_id.clone())
+    } else {
+        ctx.db
+            .create_fork(parent_session_id, fork_point_turn_id.clone())
+    }
+    .map_err(internal)?;
     Ok(Response::Forked {
         session_id: row.session_id,
         short_id: row.short_id.unwrap_or_default(),
         parent_session_id,
         fork_point_turn_id,
     })
+}
+
+/// Discard an ephemeral side-conversation (`/side`): stop its live worker
+/// (cancelling jobs, ending the current turn) then delete its row +
+/// descendant forks. Guarded — a non-ephemeral session is left untouched,
+/// so a stray discard can never drop a persisted session. Idempotent: an
+/// already-gone session acks without error.
+async fn discard_session(
+    state: &mut ClientState,
+    ctx: &DaemonContext,
+    session_id: Uuid,
+) -> std::result::Result<Response, ErrorPayload> {
+    // Detach this client from the session it's discarding so the daemon
+    // doesn't keep streaming a torn-down worker's events at it.
+    if let Some(att) = &state.attached
+        && att.handle.session_id == session_id
+    {
+        state.attached = None;
+    }
+    // Stop the live worker first (cancels async jobs, ends the turn), the
+    // same interrupt-then-drop ordering delete uses.
+    ctx.registry.interrupt_and_stop(session_id).await;
+    ctx.db
+        .discard_ephemeral_session(session_id)
+        .map_err(internal)?;
+    Ok(Response::Ack)
 }
 
 fn rename_session(
