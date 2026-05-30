@@ -123,8 +123,8 @@ pub enum Command {
     #[command(subcommand)]
     Plan(PlanCommand),
 
-    /// Initialize cockpit in this project (writes AGENTS.md and an
-    /// extended-config.json skeleton).
+    /// Explore the project with an agent and write its instructions file
+    /// (default `AGENTS.md`); never touches `extended-config.json`.
     Init(InitArgs),
 
     /// Generate shell completion script.
@@ -504,10 +504,14 @@ pub struct PrArgs {
 
 #[derive(Debug, clap::Args)]
 pub struct InitArgs {
-    /// Skip prompts and write defaults.
-    #[arg(long)]
-    pub non_interactive: bool,
-    /// Overwrite existing AGENTS.md / extended-config.json.
+    /// Target instructions file (defaults to the first configured
+    /// `agent_guidance_files`, i.e. `AGENTS.md`).
+    pub path: Option<String>,
+    /// Regenerate (overwrite from scratch) an existing target file.
     #[arg(long)]
     pub force: bool,
+    /// Force a fresh ephemeral daemon for this run instead of attaching
+    /// to a long-running one.
+    #[arg(long)]
+    pub ephemeral: bool,
 }

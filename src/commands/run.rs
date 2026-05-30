@@ -88,6 +88,20 @@ async fn run_turn(
     prompt: String,
     no_sandbox: bool,
 ) -> Result<i32> {
+    attach_send_pump(client, prompt, no_sandbox, args.format).await
+}
+
+/// Attach a fresh headless session, send `prompt`, and pump events to
+/// completion, returning the run exit code. Shared by `cockpit run` and
+/// `cockpit init` so both drive the identical non-interactive turn over
+/// the daemon. The caller owns the daemon lifecycle (probe/spawn +
+/// ephemeral guard).
+pub(crate) async fn attach_send_pump(
+    client: &crate::daemon::client::DaemonClient,
+    prompt: String,
+    no_sandbox: bool,
+    format: OutputFormat,
+) -> Result<i32> {
     let cwd = std::env::current_dir().context("resolving cwd")?;
     let project_root = cwd.to_string_lossy().into_owned();
 
@@ -99,10 +113,10 @@ async fn run_turn(
             session_id: None,
             project_root: Some(project_root),
             no_sandbox,
-            // `cockpit run` streams events but has no UI to answer an
-            // interrupt — a non-interactive attach. The loop guard treats
-            // the session as headless and auto-rejects a back-to-back
-            // repeat (with the guidance error) rather than blocking.
+            // A streamed run has no UI to answer an interrupt — a
+            // non-interactive attach. The loop guard treats the session as
+            // headless and auto-rejects a back-to-back repeat (with the
+            // guidance error) rather than blocking.
             interactive: false,
         })
         .await?;
@@ -121,7 +135,7 @@ async fn run_turn(
         .context("sending user message")?;
 
     // Pump events until the turn completes (or the session ends).
-    pump_events(client, session_id, args.format).await
+    pump_events(client, session_id, format).await
 }
 
 fn build_prompt(args: &RunArgs) -> Result<String> {

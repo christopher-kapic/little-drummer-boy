@@ -256,7 +256,16 @@ impl App {
                 let result = dialog.take_result();
                 self.question_dialog = None;
                 if let Some(result) = result {
-                    self.resolve_question_dialog(result);
+                    // A local `/init` existing-file prompt resolves here
+                    // (update/overwrite/cancel), not back to the daemon —
+                    // matched by the synthetic interrupt id. Every other
+                    // dialog is a real `question`-tool interrupt.
+                    if self.init_choice_for(&result).is_some() {
+                        let selected = init_selected_id(&result);
+                        self.resolve_init_choice(selected.as_deref());
+                    } else {
+                        self.resolve_question_dialog(result);
+                    }
                 }
             }
             return false;
@@ -1346,6 +1355,35 @@ impl App {
             self.composer.set_vim_mode(VimMode::Insert);
         }
         false
+    }
+
+    /// Whether a just-closed question dialog `result` is the local
+    /// `/init` existing-file prompt (matched by the pending init's
+    /// synthetic interrupt id) rather than a real daemon interrupt.
+    fn init_choice_for(&self, result: &crate::tui::dialog::question::QuestionResult) -> Option<()> {
+        use crate::tui::dialog::question::QuestionResult;
+        let id = match result {
+            QuestionResult::Submit { interrupt_id, .. }
+            | QuestionResult::Cancel { interrupt_id } => *interrupt_id,
+        };
+        self.pending_init
+            .as_ref()
+            .filter(|p| p.interrupt_id == id)
+            .map(|_| ())
+    }
+}
+
+/// The chosen single-select option id from a closed `/init` prompt, or
+/// `None` for cancel / a malformed response.
+fn init_selected_id(result: &crate::tui::dialog::question::QuestionResult) -> Option<String> {
+    use crate::daemon::proto::ResolveResponse;
+    use crate::tui::dialog::question::QuestionResult;
+    match result {
+        QuestionResult::Submit { responses, .. } => match responses.first() {
+            Some(ResolveResponse::Single { selected_id }) => Some(selected_id.clone()),
+            _ => None,
+        },
+        QuestionResult::Cancel { .. } => None,
     }
 }
 

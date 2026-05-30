@@ -199,6 +199,17 @@ pub(super) struct PendingCompact {
     pub(super) predecessor_short_id: String,
 }
 
+/// A `/init` whose target file already exists, awaiting the user's
+/// update/overwrite/cancel choice in the (locally-driven) question
+/// dialog. The dialog carries `interrupt_id`; the close handler matches
+/// it so the local choice resolves here rather than going to the daemon.
+pub(super) struct PendingInit {
+    /// The synthetic interrupt id minted for the local choice dialog.
+    pub(super) interrupt_id: uuid::Uuid,
+    /// The target path to hand the agent (relative to cwd when under it).
+    pub(super) display: String,
+}
+
 /// An open `/side` side conversation. Created when `/side` forks the main
 /// session into an ephemeral throwaway and switches the TUI onto it; the
 /// snapshot is everything needed to restore the **main** session exactly
@@ -281,6 +292,10 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
     SlashCommand {
         name: "git",
         description: "Run a git command and share its output with the agent",
+    },
+    SlashCommand {
+        name: "init",
+        description: "Explore the project and write its instructions file (arg: target path)",
     },
     SlashCommand {
         name: "jobs",
@@ -529,6 +544,12 @@ pub struct App {
     /// and on submit/cancel sends `ResolveInterrupt` back to the daemon.
     /// `None` when no question is pending.
     pub(super) question_dialog: Option<crate::tui::dialog::question::QuestionDialog>,
+    /// In-flight `/init` awaiting the user's update/overwrite/cancel
+    /// choice. Set when the target file already exists; the question
+    /// dialog open at that moment is this local prompt (not a daemon
+    /// interrupt), so its close resolves here instead of going back to the
+    /// daemon. `None` whenever no `/init` choice is pending.
+    pub(super) pending_init: Option<PendingInit>,
     /// True after we've successfully connected to (or started) the daemon.
     pub(super) daemon_connected: bool,
     /// Daemonless mode (`DaemonChoice::ContinueWithout`): this TUI owns its
@@ -992,6 +1013,7 @@ impl App {
             context_pane: None,
             daemon_prompt,
             question_dialog: None,
+            pending_init: None,
             daemon_connected,
             daemonless: false,
             daemon_guard: None,
@@ -1770,6 +1792,157 @@ impl App {
             xml_escape(args),
             capped
         ));
+    }
+
+    /// `/init [path]`: explore the project and write its instructions
+    /// file via the normal `Build` → `coder` (single-writer) delegation
+    /// path. With no arg the target is the first configured guidance
+    /// filename (`agent_guidance_files[0]`, default `AGENTS.md`); with an
+    /// arg it's that path. When the target already exists, opens the
+    /// update/overwrite/cancel prompt (reusing the question dialog) and
+    /// honors the choice; otherwise dispatches the fresh-write turn
+    /// immediately. `extended-config.json` is never touched.
+    pub(super) fn handle_init_command(&mut self, args: &str) {
+        if self.busy {
+            self.history.push(HistoryEntry::Plain {
+                line: "/init: a turn is already running — wait for it to finish".to_string(),
+            });
+            return;
+        }
+        let explicit = {
+            let a = args.trim();
+            if a.is_empty() { None } else { Some(a) }
+        };
+        let target = crate::commands::init::resolve_target(&self.launch.cwd, explicit);
+        let display = crate::commands::init::display_target(&self.launch.cwd, &target);
+
+        if target.exists() {
+            // Existing target: ask update / overwrite / cancel via the
+            // shared question dialog, driven locally (no daemon interrupt).
+            use crate::daemon::proto::{InterruptOption, InterruptQuestion, InterruptQuestionSet};
+            let interrupt_id = uuid::Uuid::new_v4();
+            let set = InterruptQuestionSet {
+                questions: vec![InterruptQuestion::Single {
+                    prompt: format!("`{display}` already exists — how should /init proceed?"),
+                    options: vec![
+                        InterruptOption {
+                            id: "update".into(),
+                            label: "Update in place".into(),
+                            description: Some(
+                                "Revise and extend, preserving accurate content".into(),
+                            ),
+                        },
+                        InterruptOption {
+                            id: "overwrite".into(),
+                            label: "Overwrite from scratch".into(),
+                            description: Some("Replace the file entirely".into()),
+                        },
+                        InterruptOption {
+                            id: "cancel".into(),
+                            label: "Cancel".into(),
+                            description: None,
+                        },
+                    ],
+                    allow_freetext: false,
+                    command_detail: None,
+                }],
+            };
+            let lockout = Duration::from_millis(load_dialog_config(&self.launch.cwd).lockout_ms);
+            self.pending_init = Some(PendingInit {
+                interrupt_id,
+                display,
+            });
+            self.question_dialog = Some(crate::tui::dialog::question::QuestionDialog::new(
+                interrupt_id,
+                String::new(),
+                set,
+                lockout,
+            ));
+            return;
+        }
+
+        // Fresh file: dispatch the create turn straight away.
+        let prompt = crate::commands::init::build_init_prompt(
+            &display,
+            crate::commands::init::InitMode::Create,
+        );
+        self.dispatch_init_turn(&display, prompt);
+    }
+
+    /// Resolve a closed `/init` existing-file prompt. `selected_id` is the
+    /// chosen option id (or `None` on Esc/cancel). Update/overwrite
+    /// dispatch the corresponding agent turn; cancel leaves the file
+    /// untouched.
+    pub(super) fn resolve_init_choice(&mut self, selected_id: Option<&str>) {
+        let Some(pending) = self.pending_init.take() else {
+            return;
+        };
+        let mode = match selected_id {
+            Some("update") => crate::commands::init::InitMode::Update,
+            Some("overwrite") => crate::commands::init::InitMode::Overwrite,
+            _ => {
+                self.history.push(HistoryEntry::Plain {
+                    line: format!("/init: cancelled — `{}` left untouched", pending.display),
+                });
+                return;
+            }
+        };
+        let prompt = crate::commands::init::build_init_prompt(&pending.display, mode);
+        self.dispatch_init_turn(&pending.display, prompt);
+    }
+
+    /// Send an `/init` turn to the agent: render `/init <target>` as the
+    /// user's turn (display side) and hand the full exploration+write
+    /// instruction to the agent as the wire (wire/user split, GOALS §14).
+    /// Reuses the runner input channel `submit_input` uses, including the
+    /// working-span bookkeeping so an orphaned dispatch never hangs the
+    /// indicator.
+    fn dispatch_init_turn(&mut self, display: &str, wire: String) {
+        self.chat_scroll_offset = 0;
+        self.begin_working_span();
+        self.history.push(HistoryEntry::User {
+            text: format!("/init {display}"),
+            timestamp: chrono::Local::now(),
+        });
+        self.ensure_agent_runner();
+        let submission = crate::engine::message::UserSubmission::text(wire);
+        let orphaned = match self.agent_runner.as_ref() {
+            Some(Ok(runner)) => match runner.input_tx.try_send(submission) {
+                Ok(()) => {
+                    self.current_session_persisted = true;
+                    false
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    self.history.push(HistoryEntry::Plain {
+                        line: "/init: engine input queue full — try again in a moment".to_string(),
+                    });
+                    true
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    self.history.push(HistoryEntry::Plain {
+                        line: "/init: engine driver task has exited".to_string(),
+                    });
+                    true
+                }
+            },
+            Some(Err(e)) => {
+                self.history.push(HistoryEntry::Plain {
+                    line: format!("/init: engine: {e}"),
+                });
+                true
+            }
+            None => {
+                self.history.push(HistoryEntry::Plain {
+                    line: "/init: no engine runner — cannot start".to_string(),
+                });
+                true
+            }
+        };
+        // A turn the worker never received emits no `AgentIdle`, so undo
+        // the span this dispatch opened.
+        if orphaned {
+            self.end_working_span();
+        }
     }
 
     /// `/jobs` (GOALS §22): list active async jobs, or `/jobs cancel
@@ -4191,6 +4364,10 @@ impl App {
             }
             "llm-mode" => {
                 self.handle_llm_mode_command(&slash_args(&raw));
+                return false;
+            }
+            "init" => {
+                self.handle_init_command(&slash_args(&raw));
                 return false;
             }
             "jobs" => {
