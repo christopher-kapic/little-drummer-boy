@@ -60,33 +60,73 @@ pub async fn run(args: ExportArgs) -> Result<()> {
     // point-lookups per session; the read is bounded by the session's
     // history, which is acceptable to do on the current task for a
     // one-shot CLI export.
-    let bundle = collect_bundle(&db, target.session_id)?;
-    let zip_bytes = build_zip(&db, &target, &bundle)?;
-
     let out_path = args
         .output
         .clone()
         .unwrap_or_else(|| default_output_path(&target));
 
-    if out_path.exists() && !args.force {
+    let summary = write_bundle_zip(&db, &target, &out_path, args.force)?;
+
+    println!(
+        "Exported session `{}` ({} session{}, {} bytes) → {}",
+        target.short_id.as_deref().unwrap_or("?"),
+        summary.session_count,
+        if summary.session_count == 1 { "" } else { "s" },
+        summary.byte_len,
+        out_path.display()
+    );
+    Ok(())
+}
+
+/// What a completed bundle write produced — surfaced so callers (CLI
+/// and the TUI debug export) can report identical stats.
+#[derive(Debug)]
+pub(crate) struct BundleSummary {
+    pub session_count: usize,
+    pub byte_len: usize,
+}
+
+/// Assemble the full debug bundle for `target` (the session plus its
+/// descendant forks and `/compact` successors) and write it to
+/// `out_path`. This is the single zip-assembly implementation behind
+/// both the CLI `cockpit export` and the TUI `/export debug` command.
+///
+/// `overwrite` controls the clobber policy: `false` refuses to replace
+/// an existing file (the CLI's no-clobber-without-`--force` guarantee);
+/// `true` replaces it unconditionally (the TUI path, which has no force
+/// flag and is specified to overwrite its own prior export). The CLI
+/// passes `args.force` here, so its guarantee is preserved.
+pub(crate) fn write_bundle_zip(
+    db: &Db,
+    target: &SessionRow,
+    out_path: &std::path::Path,
+    overwrite: bool,
+) -> Result<BundleSummary> {
+    if out_path.exists() && !overwrite {
         anyhow::bail!(
             "output path `{}` already exists — pass `--force` to overwrite",
             out_path.display()
         );
     }
 
-    std::fs::write(&out_path, &zip_bytes)
+    // The walk is cheap point-lookups per session; the read is bounded
+    // by each session's history.
+    let bundle = collect_bundle(db, target.session_id)?;
+    let zip_bytes = build_zip(db, target, &bundle)?;
+
+    if let Some(parent) = out_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating export directory `{}`", parent.display()))?;
+    }
+    std::fs::write(out_path, &zip_bytes)
         .with_context(|| format!("writing export to `{}`", out_path.display()))?;
 
-    println!(
-        "Exported session `{}` ({} session{}, {} bytes) → {}",
-        target.short_id.as_deref().unwrap_or("?"),
-        bundle.len(),
-        if bundle.len() == 1 { "" } else { "s" },
-        zip_bytes.len(),
-        out_path.display()
-    );
-    Ok(())
+    Ok(BundleSummary {
+        session_count: bundle.len(),
+        byte_len: zip_bytes.len(),
+    })
 }
 
 /// Resolve a user-supplied identifier to a session row. `Ok(Ok(row))` on
@@ -625,5 +665,52 @@ mod tests {
             manifest["target"]["short_id"],
             json!(target.short_id.clone().unwrap())
         );
+    }
+
+    /// The shared `write_bundle_zip` is the one implementation behind the
+    /// CLI and the TUI debug export. `overwrite = false` preserves the
+    /// CLI's no-clobber-without-`--force` guarantee; `overwrite = true`
+    /// (the TUI path, which has no force flag) replaces the prior file.
+    /// It also creates the export directory if missing.
+    #[test]
+    fn write_bundle_zip_overwrite_mode_vs_clobber_guard() {
+        let db = Db::open_in_memory().unwrap();
+        let s = db.create_session("p", "/proj", "coder").unwrap();
+        let call = Uuid::new_v4();
+        db.insert_inference_request(
+            &call.to_string(),
+            s.session_id,
+            &json!({"model": "m", "system": "s", "tools": [], "history": []}),
+        )
+        .unwrap();
+        db.insert_session_event(
+            s.session_id,
+            SessionEventKind::InferenceRequest,
+            Some("coder"),
+            Some(&call.to_string()),
+            &json!({}),
+        )
+        .unwrap();
+        let target = db.get_session(s.session_id).unwrap().unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        // A nested dir that does not exist yet — the writer must create it.
+        let out = tmp.path().join(".cockpit").join("exports").join("x.zip");
+        assert!(!out.parent().unwrap().exists());
+
+        // First write succeeds and creates the directory.
+        let summary = write_bundle_zip(&db, &target, &out, false).unwrap();
+        assert_eq!(summary.session_count, 1);
+        assert!(summary.byte_len > 0);
+        assert!(out.exists());
+
+        // Clobber guard: a second write with `overwrite = false` is refused.
+        let err = write_bundle_zip(&db, &target, &out, false).unwrap_err();
+        assert!(err.to_string().contains("already exists"));
+
+        // Overwrite mode replaces the file unconditionally (TUI path).
+        let again = write_bundle_zip(&db, &target, &out, true).unwrap();
+        assert_eq!(again.session_count, 1);
+        assert!(out.exists());
     }
 }

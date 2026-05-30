@@ -22,7 +22,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyboardEnhancementFlags, MouseButton,
@@ -187,6 +187,10 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
     SlashCommand {
         name: "exit",
         description: "Quit cockpit",
+    },
+    SlashCommand {
+        name: "export",
+        description: "Export the current conversation to .cockpit/exports/ (arg: debug for the full bundle)",
     },
     SlashCommand {
         name: "favorite",
@@ -3399,6 +3403,10 @@ impl App {
                 self.handle_rename_command(&slash_args(&raw));
                 return false;
             }
+            "export" => {
+                self.handle_export_command(&slash_args(&raw));
+                return false;
+            }
             _ => return false,
         };
         self.history.push(HistoryEntry::Plain {
@@ -3449,6 +3457,88 @@ impl App {
                 });
             }
         }
+    }
+
+    /// `/export [debug]` — export the current session into
+    /// `{cwd}/.cockpit/exports/`. Default exports the live transcript as
+    /// `<short_id>.json` (user-facing form, GOALS §14); `debug` exports
+    /// the full CLI bundle `.zip`. Both overwrite their own prior file
+    /// and surface success/failure as a chat line, never a panic.
+    pub(super) fn handle_export_command(&mut self, arg: &str) {
+        // Authoritative current session: the live runner if attached,
+        // else the last-attached ids tracked on launch info.
+        let (session_id, short_id) = match self.agent_runner.as_ref() {
+            Some(Ok(runner)) => (Some(runner.session_id), Some(runner.short_id.clone())),
+            _ => (self.launch.session_id, self.launch.session_short_id.clone()),
+        };
+        let Some(session_id) = session_id else {
+            self.history.push(HistoryEntry::Plain {
+                line: "/export: no active session yet — send a message first".to_string(),
+            });
+            return;
+        };
+        // `<short_id>`, falling back to the full UUID (matching the CLI's
+        // `default_output_path`).
+        let file_stem = short_id
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| session_id.to_string());
+        let exports_dir = self.launch.cwd.join(".cockpit").join("exports");
+
+        if arg.trim() == "debug" {
+            self.export_debug_bundle(session_id, &file_stem, &exports_dir);
+        } else {
+            self.export_transcript_json(&file_stem, &exports_dir);
+        }
+    }
+
+    /// `/export` (default) — write the live transcript as
+    /// `<stem>.json`, overwriting any prior file.
+    fn export_transcript_json(&mut self, file_stem: &str, exports_dir: &Path) {
+        let out_path = exports_dir.join(format!("{file_stem}.json"));
+        let result = (|| -> anyhow::Result<()> {
+            std::fs::create_dir_all(exports_dir).with_context(|| {
+                format!("creating export directory `{}`", exports_dir.display())
+            })?;
+            let value = crate::tui::history::export_transcript(&self.history);
+            let json = serde_json::to_string_pretty(&value)?;
+            std::fs::write(&out_path, json)
+                .with_context(|| format!("writing export to `{}`", out_path.display()))?;
+            Ok(())
+        })();
+        let line = match result {
+            Ok(()) => format!("Exported conversation → {}", out_path.display()),
+            Err(e) => format!("/export: {e}"),
+        };
+        self.history.push(HistoryEntry::Plain { line });
+    }
+
+    /// `/export debug` (hidden) — write the full CLI bundle `.zip` for
+    /// the current session, overwriting any prior file. Reads the DB
+    /// directly (like the CLI) so it works regardless of daemon state,
+    /// reusing the single shared zip-assembly implementation.
+    fn export_debug_bundle(&mut self, session_id: uuid::Uuid, file_stem: &str, exports_dir: &Path) {
+        let out_path = exports_dir.join(format!("{file_stem}.zip"));
+        let result = (|| -> anyhow::Result<crate::commands::export::BundleSummary> {
+            let db = crate::db::Db::open_default()?;
+            let target = db
+                .get_session(session_id)?
+                .ok_or_else(|| anyhow::anyhow!("session `{session_id}` not found in the DB"))?;
+            // Unconditional overwrite (the TUI has no `--force`); this
+            // does not weaken the CLI's no-clobber-without-`--force`
+            // guarantee, which lives in `commands::export::run`.
+            crate::commands::export::write_bundle_zip(&db, &target, &out_path, true)
+        })();
+        let line = match result {
+            Ok(summary) => format!(
+                "Exported debug bundle ({} session{}, {} bytes) → {}",
+                summary.session_count,
+                if summary.session_count == 1 { "" } else { "s" },
+                summary.byte_len,
+                out_path.display()
+            ),
+            Err(e) => format!("/export debug: {e}"),
+        };
+        self.history.push(HistoryEntry::Plain { line });
     }
 
     /// Re-read launch info (provider/model/favorite) from disk and
@@ -4304,6 +4394,23 @@ mod slash_rank_tests {
         assert!(
             SLASH_COMMANDS.iter().any(|c| c.name == "copy"),
             "/copy must be a registered slash command"
+        );
+    }
+
+    #[test]
+    fn export_command_is_registered_and_visible() {
+        // `/export` must be a registered, available (menu-visible) slash
+        // command. The `debug` argument is hidden — it's an arg of
+        // `/export`, never its own menu entry — so there is no `export
+        // debug` command name.
+        let export = SLASH_COMMANDS
+            .iter()
+            .find(|c| c.name == "export")
+            .expect("/export must be a registered slash command");
+        assert!(export.is_available(), "/export must be visible in the menu");
+        assert!(
+            !SLASH_COMMANDS.iter().any(|c| c.name == "export debug"),
+            "`debug` is a hidden arg of /export, not its own command"
         );
     }
 

@@ -321,6 +321,132 @@ pub struct Rendered {
     pub continuations: Vec<bool>,
 }
 
+/// The user-facing string for a [`ToolCallState`] — the recovery view
+/// (GOALS §14): how the call settled, as the TUI labels it.
+fn tool_state_str(state: ToolCallState) -> &'static str {
+    match state {
+        ToolCallState::Processing => "processing",
+        ToolCallState::Success => "success",
+        ToolCallState::Failed => "failed",
+        ToolCallState::BadCall => "bad_call",
+    }
+}
+
+/// Serialize one [`ToolCall`] into the user-facing JSON shape used by
+/// the `/export` transcript: the original (user-facing) input + the
+/// recovery state, never the wire form (GOALS §14).
+fn tool_call_json(c: &ToolCall) -> serde_json::Value {
+    serde_json::json!({
+        "call_id": c.call_id,
+        "tool": c.tool,
+        "summary": c.summary,
+        "input": c.full_input,
+        "output": c.output,
+        "state": tool_state_str(c.state),
+    })
+}
+
+/// Export the live TUI transcript (`App.history`) as an ordered array of
+/// conversation turns for `/export`. This mirrors what the TUI renders:
+/// user and assistant messages plus tool calls / results in their
+/// user-facing form (`full_input` / `summary` + recovery `state`, not
+/// the wire input — GOALS §14). Only the current session's live state is
+/// included; the fork tree and compaction predecessors are out of scope
+/// (that's what `/export debug` is for).
+pub fn export_transcript(history: &[HistoryEntry]) -> serde_json::Value {
+    let turns: Vec<serde_json::Value> = history
+        .iter()
+        .map(|entry| match entry {
+            HistoryEntry::User { text, timestamp } => serde_json::json!({
+                "type": "user",
+                "text": text,
+                "timestamp": timestamp.to_rfc3339(),
+            }),
+            HistoryEntry::Plain { line } => serde_json::json!({
+                "type": "note",
+                "text": line,
+            }),
+            HistoryEntry::Agent {
+                name,
+                text,
+                reasoning,
+                timestamp,
+                think_duration,
+                ..
+            } => serde_json::json!({
+                "type": "assistant",
+                "agent": name,
+                "text": text,
+                "reasoning": reasoning,
+                "timestamp": timestamp.to_rfc3339(),
+                "think_ms": think_duration.map(|d| d.as_millis() as u64),
+            }),
+            HistoryEntry::Diff {
+                tool,
+                path,
+                old,
+                new,
+            } => serde_json::json!({
+                "type": "diff",
+                "tool": tool,
+                "path": path,
+                "old": old,
+                "new": new,
+            }),
+            HistoryEntry::ToolBox { calls, .. } => serde_json::json!({
+                "type": "tool_calls",
+                "calls": calls.iter().map(tool_call_json).collect::<Vec<_>>(),
+            }),
+            HistoryEntry::ToolLine {
+                call_id,
+                tool,
+                summary,
+                state,
+            } => serde_json::json!({
+                "type": "tool_call",
+                "call_id": call_id,
+                "tool": tool,
+                "summary": summary,
+                "state": tool_state_str(*state),
+            }),
+            HistoryEntry::LocalCommand {
+                label,
+                output,
+                failed,
+            } => serde_json::json!({
+                "type": "local_command",
+                "label": label,
+                "output": output,
+                "failed": failed,
+            }),
+            HistoryEntry::Subagent {
+                parent,
+                child,
+                outcome,
+                ..
+            } => serde_json::json!({
+                "type": "subagent",
+                "parent": parent,
+                "child": child,
+                "report": outcome.as_ref().map(|o| o.report.clone()),
+                "failed": outcome.as_ref().map(|o| o.failed),
+                "duration_ms": outcome.as_ref().map(|o| o.duration.as_millis() as u64),
+            }),
+            HistoryEntry::CompactBoundary {
+                predecessor_short_id,
+                seed_tool_count,
+                seed_tool_tokens,
+            } => serde_json::json!({
+                "type": "compact_boundary",
+                "predecessor_short_id": predecessor_short_id,
+                "seed_tool_count": seed_tool_count,
+                "seed_tool_tokens": seed_tool_tokens,
+            }),
+        })
+        .collect();
+    serde_json::Value::Array(turns)
+}
+
 /// Render one history entry. The renderer receives the area's `width`
 /// so it can right-align timestamps and pad the user-message
 /// background to the full width.
@@ -1718,6 +1844,60 @@ pub fn format_think_duration(d: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `/export` serializes the live transcript as an ordered turns
+    /// array; tool calls carry the user-facing input (`full_input`) +
+    /// recovery `state`, never the wire form (GOALS §14).
+    #[test]
+    fn export_transcript_is_ordered_user_facing_turns() {
+        let ts = chrono::Local::now();
+        let history = vec![
+            HistoryEntry::User {
+                text: "do a thing".to_string(),
+                timestamp: ts,
+            },
+            HistoryEntry::Agent {
+                name: "coder".to_string(),
+                text: "on it".to_string(),
+                reasoning: "thinking".to_string(),
+                timestamp: ts,
+                expanded: false,
+                think_duration: Some(Duration::from_millis(1200)),
+            },
+            HistoryEntry::ToolBox {
+                calls: vec![ToolCall {
+                    call_id: "tc-1".to_string(),
+                    tool: "read".to_string(),
+                    // User-facing summary/input — NOT the wire path.
+                    summary: "a.rs".to_string(),
+                    full_input: "a.rs".to_string(),
+                    output: "fn main() {}".to_string(),
+                    state: ToolCallState::Success,
+                }],
+                view_offset: 0,
+                follow: true,
+                expanded: false,
+            },
+        ];
+
+        let v = export_transcript(&history);
+        let arr = v.as_array().expect("turns array");
+        assert_eq!(arr.len(), 3, "one turn per history entry, in order");
+        assert_eq!(arr[0]["type"], "user");
+        assert_eq!(arr[0]["text"], "do a thing");
+        assert_eq!(arr[1]["type"], "assistant");
+        assert_eq!(arr[1]["agent"], "coder");
+        assert_eq!(arr[2]["type"], "tool_calls");
+        let call = &arr[2]["calls"][0];
+        assert_eq!(call["tool"], "read");
+        // User-facing input + recovery state, never the wire form.
+        assert_eq!(call["input"], "a.rs");
+        assert_eq!(call["state"], "success");
+        assert!(
+            call.get("wire_input").is_none(),
+            "the JSON export must never carry the wire form"
+        );
+    }
 
     #[test]
     fn dots_cycle_four_phases() {
