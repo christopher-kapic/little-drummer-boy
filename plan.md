@@ -1552,10 +1552,30 @@ struct GraphNode {
 }
 ```
 
+**Execution model — built (`engine::exec`, prompt 4).** The scheduler /
+worktree dispatch / serial merge queue / merge-resolver below are implemented
+in `engine::exec` (`scheduler.rs`, `worktree.rs`, `reslock.rs`,
+`merge_queue.rs`, `resolver.rs`), driven by the daemon-resident ralph executor
+(§3b) and reachable via `cockpit plan run <slug>`. `worktree-proposal.md` is
+the authoritative design and is now an **implemented spec**, not a proposal —
+with one reframe: its "multiple ralph plans in parallel" language is superseded
+by **parallel *steps* within the one running plan** (see below).
+
+**One plan at a time per project.** Inter-plan parallelism is deliberately
+**rejected**: concurrent plans on different branches are a merge/resource
+hazard, and a user who wants more parallelism puts the work in **one larger
+plan** whose steps parallelize under the scheduler + merge queue. There is a
+**single execution slot per project**: starting a plan while another is
+`in_progress` leaves the new one `pending` (queued); it begins only when the
+running plan completes and tears down. All concurrency lives in the intra-plan
+step DAG.
+
 **Scheduler.**
 
 - Topological execution; a node is `Eligible` when all its dependency
-  nodes are `Finished`.
+  nodes are `Finished` (in `engine::exec` terms: a step is eligible iff
+  every step it depends on has **`Merged`** — landed on the plan's main
+  worktree, not merely implemented).
 - A worker pool (default size: `min(num_cpus, 4)`) pulls eligible
   nodes. Each node runs as a subagent by default (fresh context per
   node, returns a structured report); a node can declare `fork:
@@ -1642,10 +1662,26 @@ internal. The tables are named for the user-facing words:
   the edge would close a loop, and the error **names the offending
   cycle**; a cyclic state is never persisted.
 - `plan_step_tests` — per-step tests: `command`, `phase`
-  (`post_step` | `branch_stable` — the `branch_stable` trigger semantics
-  are finalized in prompt 4; the field is modeled and stored now),
-  `concurrency` (`parallel` default | `exclusive`) + `resource_key`
-  (non-NULL iff `exclusive`).
+  (`post_step` | `branch_stable`), `concurrency` (`parallel` default |
+  `exclusive`) + `resource_key` (non-NULL iff `exclusive`).
+  - **`post_step`** tests run in the step's worktree after its feature is
+    implemented; green is the precondition for entering the merge queue.
+  - **`branch_stable`** tests (FINALIZED, prompt 4) are the heavier
+    integration/E2E suite, **pooled across all of the plan's steps** and run
+    as a **merge gate at quiescence** — when the merge queue is empty *and*
+    no step is actively executing (the branch has momentarily settled),
+    debounced so the suite re-runs only if the plan tip advanced since its
+    last run. They do **not** run per-step or per-merge. A red
+    `branch_stable` run raises a `needs_attention` item and the plan's
+    branch is **not** offered for merge while it stays red; the **final**
+    quiescence run (last step merged, queue drained) is the
+    plan-completion gate — a green run there is the precondition for marking
+    the plan `done`.
+  - An **`exclusive: <key>`** test acquires a keyed resource lock before
+    running (same `Mutex`-keyed-map + FIFO-waiter primitive as the file-lock
+    manager, keyed on the opaque resource string): two tests holding the
+    same key never run concurrently; different keys parallelize; `parallel`
+    tests take no lock. Built in `engine::exec::reslock`.
 
 **Test-concurrency decision (settled, prompt 1).** `exclusive:<key>`
 (an opaque resource key like `"port:8080"` or `"gpu0"`) is the **v1
@@ -2947,10 +2983,29 @@ Sub-questions:
 - **Q4a.** The default is `subagent`. Settled.
 - **Q4b.** Per-call override (model passes `mode: "fork"`) — **yes**,
   shipping in v1. The choice is per-task, not session-wide.
-- **Q4c.** Filesystem isolation (worktree) is a separate per-node
-  flag on graph plans (`node.worktree: true` triggers a
-  `git worktree add`). Decoupled from `mode`. Subagents and forks
-  can each opt into a worktree independently.
+- **Q4c — RESOLVED (worktree default + merge queue; shared-tree opt-out).**
+  Filesystem isolation is a **per-plan** mode, not a per-node flag, and it
+  is **on by default**. A plan's `isolation_mode` (`worktree` default |
+  `shared_tree`) governs every step:
+  - **`worktree` (default):** each parallel step runs in its own
+    `git worktree add .cockpit/wt/<step-id> -b <branch> <base>` on a
+    harness-owned branch, with an isolating `.cockpit/` dropped at the
+    worktree root (so config/session discovery resolves there, not the
+    parent repo). Completed step branches land through a **serial merge
+    queue** (rebase onto the plan tip → mandatory post-rebase re-test →
+    fast-forward, with a merge-resolver `coder` task on conflict or
+    post-rebase failure). This is `worktree-proposal.md` (now an implemented
+    spec), built in `engine::exec`.
+  - **`shared_tree` (opt-out):** all steps run in **one** working tree,
+    serialized by the in-daemon file-lock manager (this §4.1) — **no**
+    worktrees, **no** merge queue. The per-plan toggle is authored at plan
+    time; the global default (`worktree`) is config
+    (`defaultIsolationMode`) and is exposed in `/settings`.
+
+  Earlier drafts framed isolation as a per-node `node.worktree: true` flag
+  decoupled from `mode`; the per-plan mode supersedes that. The merge queue,
+  keyed exclusive-test locks, and quiescence-gated `branch_stable` tests
+  (below) all live behind this resolution.
 - **Q4d.** Forks and subagents both share the parent process's
   in-memory lock manager naturally — no IPC required. (Settled by
   in-process design.)

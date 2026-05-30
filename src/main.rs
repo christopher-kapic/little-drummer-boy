@@ -99,6 +99,7 @@ async fn async_main() -> Result<()> {
         Some(Command::Pr(args)) => commands::pr::run(args).await,
         Some(Command::Packages(sub)) => commands::packages::run(sub).await,
         Some(Command::Kcl(sub)) => commands::kcl::run(sub).await,
+        Some(Command::Plan(sub)) => commands::plan::run(sub).await,
         Some(Command::Init(args)) => commands::init::run(args).await,
         Some(Command::Completion { shell }) => {
             use clap::CommandFactory;

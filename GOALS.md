@@ -923,6 +923,18 @@ case because it has two callers with opposite needs:
   by the file-lock manager. Each `coder` can `raise_interrupt(
   description, question?)` to pause itself and push an item onto
   the daemon's **needs-attention queue** (see §8).
+  - **Isolation + merge model (implemented, `engine::exec`):** by
+    default each parallel step runs in its own git worktree on a
+    harness-owned branch, and completed step branches land through a
+    **serial merge queue** (rebase → mandatory post-rebase re-test →
+    fast-forward, with a merge-resolver `coder` task on conflict /
+    post-rebase failure); a `shared_tree` plan opts out and runs in one
+    tree serialized by the file-lock manager. cockpit runs **one plan at
+    a time per project** — parallelism is intra-plan (independent steps),
+    never inter-plan. The authoritative spec is `worktree-proposal.md`
+    (an implemented spec), with the scheduler / merge-queue / keyed
+    exclusive-test locks / quiescence-gated `branch_stable` gate detailed
+    in `plan.md` §4.1. Entry point: `cockpit plan run <slug>`.
 
 ##### Interrupt payload schema
 

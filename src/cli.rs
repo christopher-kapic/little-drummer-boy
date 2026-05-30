@@ -119,6 +119,10 @@ pub enum Command {
     #[command(subcommand)]
     Kcl(KclCommand),
 
+    /// Execute and inspect plans (planning-mode worktree execution).
+    #[command(subcommand)]
+    Plan(PlanCommand),
+
     /// Initialize cockpit in this project (writes AGENTS.md and an
     /// extended-config.json skeleton).
     Init(InitArgs),
@@ -184,6 +188,30 @@ pub struct RunArgs {
     /// the run completes. Useful for CI and clean-state scripts.
     #[arg(long)]
     pub ephemeral: bool,
+}
+
+// ---- plan execution subcommands ----
+
+#[derive(Debug, Subcommand)]
+pub enum PlanCommand {
+    /// Execute a plan: run its steps under the plan's isolation mode
+    /// (worktree + serial merge queue by default), landing completed step
+    /// branches through post-rebase-tested merges.
+    Run {
+        /// Plan slug to execute.
+        slug: String,
+        /// Spawn each step's coder through a fresh ephemeral daemon (CI /
+        /// clean-state). Default attaches to the long-running daemon.
+        #[arg(long)]
+        ephemeral: bool,
+    },
+    /// Show a plan's steps + their execution status.
+    Status {
+        /// Plan slug.
+        slug: String,
+    },
+    /// List all plans (active first).
+    List,
 }
 
 // ---- agent subcommands ----

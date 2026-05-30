@@ -1,7 +1,22 @@
-# Worktrees for ralph-in-harness — proposal
+# Worktrees for plan execution — implemented spec
 
-Sketch for using git worktrees to run multiple ralph plans in parallel,
-with a dedicated merge-resolver agent landing branches back on master.
+**Status: IMPLEMENTED** (prompt 4, `engine::exec`). This was originally a
+proposal; it is now the authoritative spec for cockpit's plan-execution
+isolation and merge model, resolving `plan.md` §4.1's Q4c in favour of
+**worktree + serial merge queue as the default**, with `shared_tree` +
+file-locks as the per-plan opt-out.
+
+**Reframe:** the original sketch described running *multiple ralph plans in
+parallel*. That is superseded — cockpit runs **one plan at a time per
+project** (a single execution slot; additional started plans queue). The
+parallelism described below applies to **dependency-independent *steps* within
+the one running plan**, each in its own worktree on its own branch. Everywhere
+this doc says "N ralph plans in parallel," read "N independent steps of the one
+running plan."
+
+Using git worktrees to run independent plan steps in parallel, with a
+dedicated merge-resolver agent landing step branches back on the plan's main
+worktree.
 
 ## Worktree refresher
 

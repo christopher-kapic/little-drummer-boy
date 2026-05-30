@@ -275,7 +275,12 @@ impl Tool for CreatePlanTool {
             .and_then(Value::as_str)
             .map(str::to_string);
         let isolation_mode = match args.get("isolation_mode").and_then(Value::as_str) {
-            None | Some("worktree") => IsolationMode::Worktree,
+            // Omitted → the global default (`/settings` → "plan isolation",
+            // resolved Q4c default `worktree`).
+            None => crate::config::extended::load_for_cwd(&ctx.cwd)
+                .default_isolation_mode
+                .into(),
+            Some("worktree") => IsolationMode::Worktree,
             Some("shared_tree") => IsolationMode::SharedTree,
             Some(other) => {
                 return Err(invalid_input(format!(

@@ -18,6 +18,7 @@ pub mod mcp;
 pub mod meta;
 pub mod models;
 pub mod packages;
+pub mod plan;
 pub mod pr;
 pub mod providers;
 pub mod run;

@@ -19,7 +19,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 
-use crate::config::extended::{LlmMode, ThinkingDisplay, VimModeSetting};
+use crate::config::extended::{IsolationModeSetting, LlmMode, ThinkingDisplay, VimModeSetting};
 use crate::config::providers::ProvidersConfig;
 use crate::tui::textfield::TextField;
 use crate::tui::theme::MUTED_COLOR_INDEX;
@@ -179,9 +179,9 @@ pub(super) struct GrabState {
 
 /// Rows on the UI page (vim mode, thinking, llm mode, render-agent-markdown,
 /// render-user-markdown, mouse, rich-text-copy, emojis, caffeinate
-/// display-awake, name, packages dir, utility model, plan branch root,
-/// loop-guard threshold, instructions file).
-pub(super) const UI_ROWS: usize = 15;
+/// display-awake, name, packages dir, utility model, plan branch root, plan
+/// isolation, loop-guard threshold, instructions file).
+pub(super) const UI_ROWS: usize = 16;
 
 /// Cursor index of the `instructions file` drill-in row (the last row). The
 /// instructions sub-page's back-nav returns the UI cursor here.
@@ -238,6 +238,17 @@ pub(super) fn thinking_label(t: ThinkingDisplay) -> &'static str {
 
 fn cycle_llm_mode(m: LlmMode) -> LlmMode {
     m.toggled()
+}
+
+pub(super) fn isolation_mode_label(m: IsolationModeSetting) -> &'static str {
+    match m {
+        IsolationModeSetting::Worktree => {
+            "worktree (default — one git worktree per parallel step + serial merge queue)"
+        }
+        IsolationModeSetting::SharedTree => {
+            "shared_tree (one tree, serialized by the file-lock manager; no worktrees/merge queue)"
+        }
+    }
 }
 
 pub(super) fn llm_mode_label(m: LlmMode) -> &'static str {
@@ -427,11 +438,17 @@ impl SettingsDialog {
                     p.editing = Some(UiField::PlanBranchRoot);
                 }
                 13 => {
+                    // Toggle the global default plan isolation mode (Q4c).
+                    self.extended.default_isolation_mode =
+                        self.extended.default_isolation_mode.toggled();
+                    p.status = save_status(self.save_extended());
+                }
+                14 => {
                     p.buf =
                         TextField::new(self.extended.loop_guard.effective_threshold().to_string());
                     p.editing = Some(UiField::LoopGuardThreshold);
                 }
-                14 => {
+                15 => {
                     return Nav::Replace(Page::Instructions(InstructionsPage {
                         cursor: 0,
                         grabbed: None,
@@ -546,7 +563,7 @@ impl SettingsDialog {
         )));
         lines.push(Line::default());
 
-        let rows: [(&str, String); 15] = [
+        let rows: [(&str, String); 16] = [
             (
                 "vim mode",
                 vim_label(self.extended.tui.vim_mode).to_string(),
@@ -637,6 +654,10 @@ impl SettingsDialog {
                     "{} (prefix for suggested plan branches: <root>/<feature>)",
                     self.extended.plan_branch_root
                 ),
+            ),
+            (
+                "plan isolation",
+                isolation_mode_label(self.extended.default_isolation_mode).to_string(),
             ),
             (
                 "loop-guard threshold",

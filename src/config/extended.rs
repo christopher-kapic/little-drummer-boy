@@ -101,6 +101,15 @@ pub struct ExtendedConfig {
     #[serde(rename = "planBranchRoot", default = "default_plan_branch_root")]
     pub plan_branch_root: String,
 
+    /// Global default filesystem-isolation mode for new plans (`plan.md`
+    /// §4.1 Q4c, resolved by prompt 4). `worktree` (the default) runs each
+    /// parallel step in its own git worktree behind a serial merge queue;
+    /// `shared_tree` is the per-plan opt-out that runs all steps in one tree
+    /// serialized by the file-lock manager. The authoring flow seeds a new
+    /// plan's `isolation_mode` from this; `/settings` exposes the toggle.
+    #[serde(rename = "defaultIsolationMode", default)]
+    pub default_isolation_mode: IsolationModeSetting,
+
     /// The LLM-strength steering axis (`prompts/llm-modes-defensive-normal.md`).
     /// `defensive` (the default) renders explicit, steering tool/parameter
     /// descriptions, selects `defensive.md` per-mode agent prompts, and routes
@@ -180,6 +189,40 @@ where
 
 fn default_plan_branch_root() -> String {
     "cockpit-plan".to_string()
+}
+
+/// Global default plan isolation mode (`plan.md` §4.1 Q4c). Mirrors
+/// [`crate::db::plans::IsolationMode`] at the config layer; the authoring
+/// flow translates this into the per-plan stored mode.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum IsolationModeSetting {
+    /// One git worktree per parallel step + a serial merge queue (default —
+    /// the resolved Q4c decision).
+    #[default]
+    Worktree,
+    /// All steps share one working tree, serialized by the file-lock
+    /// manager; no worktrees, no merge queue.
+    SharedTree,
+}
+
+impl IsolationModeSetting {
+    /// Flip between the two values — the `/settings` toggle action.
+    pub fn toggled(self) -> Self {
+        match self {
+            IsolationModeSetting::Worktree => IsolationModeSetting::SharedTree,
+            IsolationModeSetting::SharedTree => IsolationModeSetting::Worktree,
+        }
+    }
+}
+
+impl From<IsolationModeSetting> for crate::db::plans::IsolationMode {
+    fn from(s: IsolationModeSetting) -> Self {
+        match s {
+            IsolationModeSetting::Worktree => crate::db::plans::IsolationMode::Worktree,
+            IsolationModeSetting::SharedTree => crate::db::plans::IsolationMode::SharedTree,
+        }
+    }
 }
 
 /// The two scan-dir entries a brand-new install ships pre-seeded with
@@ -646,6 +689,7 @@ impl Default for ExtendedConfig {
             dialog: DialogConfig::default(),
             skills: SkillsConfig::default(),
             plan_branch_root: default_plan_branch_root(),
+            default_isolation_mode: IsolationModeSetting::default(),
             llm_mode: LlmMode::default(),
         }
     }
@@ -983,6 +1027,41 @@ mod tests {
         assert!(on_disk.contains("\"planBranchRoot\""), "{on_disk}");
         let doc2 = ExtendedConfigDoc::load(&path).unwrap();
         assert_eq!(doc2.config().plan_branch_root, "wip");
+    }
+
+    #[test]
+    fn default_isolation_mode_defaults_to_worktree() {
+        // The resolved Q4c default: a config that omits the field reads
+        // `worktree` (worktree + merge queue), not `shared_tree`.
+        let cfg = ExtendedConfig::default();
+        assert_eq!(cfg.default_isolation_mode, IsolationModeSetting::Worktree);
+        let parsed: ExtendedConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            parsed.default_isolation_mode,
+            IsolationModeSetting::Worktree
+        );
+        // Maps onto the DB-layer isolation mode.
+        let db_mode: crate::db::plans::IsolationMode = parsed.default_isolation_mode.into();
+        assert_eq!(db_mode, crate::db::plans::IsolationMode::Worktree);
+    }
+
+    #[test]
+    fn default_isolation_mode_round_trips() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("extended-config.json");
+        std::fs::write(&path, "{}").unwrap();
+        let mut doc = ExtendedConfigDoc::load(&path).unwrap();
+        let mut cfg = doc.config();
+        cfg.default_isolation_mode = IsolationModeSetting::SharedTree;
+        doc.write(&cfg).unwrap();
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(on_disk.contains("\"defaultIsolationMode\""), "{on_disk}");
+        assert!(on_disk.contains("shared_tree"), "{on_disk}");
+        let doc2 = ExtendedConfigDoc::load(&path).unwrap();
+        assert_eq!(
+            doc2.config().default_isolation_mode,
+            IsolationModeSetting::SharedTree
+        );
     }
 
     #[test]
