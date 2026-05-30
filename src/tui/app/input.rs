@@ -325,6 +325,16 @@ impl App {
             return false;
         }
 
+        // `/permissions` overlay. Modal: route the key to the pane (it owns
+        // navigation + the delete action), close on its request, and always
+        // consume so nothing leaks into the composer underneath.
+        if let Some(pane) = self.permissions_pane.as_mut() {
+            if pane.handle_key(key) {
+                self.permissions_pane = None;
+            }
+            return false;
+        }
+
         // `/context` overlay (read-only snapshot). Same modal rule: route
         // the key to the pane, close on its request (Esc / q), and always
         // consume so nothing leaks into the composer underneath.
@@ -1328,6 +1338,7 @@ impl App {
             || self.sessions_pane.is_some()
             || self.skills_pane.is_some()
             || self.plans_pane.is_some()
+            || self.permissions_pane.is_some()
             || self.context_pane.is_some()
             || self.context_menu.is_some()
         {

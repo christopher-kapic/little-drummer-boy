@@ -233,6 +233,10 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "Clear the chat and start a fresh session",
     },
     SlashCommand {
+        name: "permissions",
+        description: "View and delete persisted command/path approvals across project and global scopes",
+    },
+    SlashCommand {
         name: "pin",
         description: "Pin a message so it survives /compact verbatim (arg: text)",
     },
@@ -424,6 +428,12 @@ pub struct App {
     /// other panes; reads plans from the daemon via `ListPlans` /
     /// `PlanDetail`.
     pub(super) plans_pane: Option<crate::tui::plans_pane::PlansPane>,
+    /// `/permissions` pane — view + delete persisted command/path/loop
+    /// approvals across the project and global file scopes. `None` when
+    /// closed. Routed input/render alongside the other panes; the one
+    /// mutating action (delete) rewrites the backing `approvals.json` via
+    /// the approval store's load→mutate→atomic-store path.
+    pub(super) permissions_pane: Option<crate::tui::permissions_pane::PermissionsPane>,
     /// `/context` overlay — a read-only, dismissable snapshot of the live
     /// context-window composition (colored per-category bar + legend).
     /// `None` when closed. Routed input/render alongside the other panes;
@@ -861,6 +871,7 @@ impl App {
             sessions_pane: None,
             skills_pane: None,
             plans_pane: None,
+            permissions_pane: None,
             context_pane: None,
             daemon_prompt,
             question_dialog: None,
@@ -2996,6 +3007,16 @@ impl App {
             }
             return;
         }
+        // `/permissions` overlay: same full-body wheel-scroll / eat-
+        // everything-else rule as the other informational panes.
+        if let Some(pane) = self.permissions_pane.as_mut() {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => pane.scroll_up(),
+                MouseEventKind::ScrollDown => pane.scroll_down(),
+                _ => {}
+            }
+            return;
+        }
         // `/context` overlay: a fixed-size snapshot (no scroll), so just
         // eat every mouse event while it's open so nothing reaches the
         // chat underneath.
@@ -3570,6 +3591,12 @@ impl App {
             }
             "plans" => {
                 self.plans_pane = Some(crate::tui::plans_pane::PlansPane::open());
+                return false;
+            }
+            "permissions" => {
+                self.permissions_pane = Some(crate::tui::permissions_pane::PermissionsPane::open(
+                    &self.launch.cwd,
+                ));
                 return false;
             }
             "fork" => {
@@ -4579,6 +4606,15 @@ mod slash_rank_tests {
         assert!(
             SLASH_COMMANDS.iter().any(|c| c.name == "plans"),
             "/plans must be a registered slash command"
+        );
+    }
+
+    #[test]
+    fn permissions_command_is_registered() {
+        // `/permissions` (delete-only approvals manager) must be dispatchable.
+        assert!(
+            SLASH_COMMANDS.iter().any(|c| c.name == "permissions"),
+            "/permissions must be a registered slash command"
         );
     }
 

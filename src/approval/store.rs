@@ -464,8 +464,109 @@ impl GrantStore {
 /// `<global config dir>` for approvals. We prefer `~/.config/cockpit`
 /// (XDG-canonical), the same home-scoped layer config discovery treats
 /// as the user-level config root.
-fn global_approvals_dir() -> Option<PathBuf> {
+pub(crate) fn global_approvals_dir() -> Option<PathBuf> {
     dirs::home_dir().map(|home| home.join(".config/cockpit"))
+}
+
+/// A management-UI grant kind: the four entry buckets a project/global
+/// `approvals.json` carries. Unlike [`GrantKind`] (which only spans the
+/// command/path grants the approval flow records), this also names the
+/// two loop-guard buckets so the `/permissions` UI can list and delete
+/// every persisted entry — not just commands and paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManagedGrantKind {
+    /// A command-key grant (`commands` set).
+    Command,
+    /// A path grant (`paths` set).
+    Path,
+    /// A loop-guard always-accept rule (`loop_accept` set).
+    LoopAccept,
+    /// A loop-guard always-reject rule (`loop_reject` set).
+    LoopReject,
+}
+
+impl ManagedGrantKind {
+    /// Stable, human-facing label for the kind (used as the section
+    /// heading in the `/permissions` pane).
+    pub fn label(self) -> &'static str {
+        match self {
+            ManagedGrantKind::Command => "Commands",
+            ManagedGrantKind::Path => "Paths",
+            ManagedGrantKind::LoopAccept => "Loop always-accept",
+            ManagedGrantKind::LoopReject => "Loop always-reject",
+        }
+    }
+}
+
+/// The four ordered grant buckets of one scope's `approvals.json`, each a
+/// sorted list of its entry keys. Produced by [`list_managed_grants`] for
+/// the `/permissions` management UI; the order (commands, paths, accept,
+/// reject) is the order the UI renders sections in.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ManagedGrants {
+    pub commands: Vec<String>,
+    pub paths: Vec<String>,
+    pub loop_accept: Vec<String>,
+    pub loop_reject: Vec<String>,
+}
+
+impl ManagedGrants {
+    /// Whether the scope has no persisted grants of any kind — drives the
+    /// pane's explicit empty-state per scope.
+    pub fn is_empty(&self) -> bool {
+        self.commands.is_empty()
+            && self.paths.is_empty()
+            && self.loop_accept.is_empty()
+            && self.loop_reject.is_empty()
+    }
+
+    /// The entries for one kind, in sorted order.
+    pub fn entries(&self, kind: ManagedGrantKind) -> &[String] {
+        match kind {
+            ManagedGrantKind::Command => &self.commands,
+            ManagedGrantKind::Path => &self.paths,
+            ManagedGrantKind::LoopAccept => &self.loop_accept,
+            ManagedGrantKind::LoopReject => &self.loop_reject,
+        }
+    }
+}
+
+/// Read every persisted grant from the `approvals.json` in `dir` (a scope's
+/// `.cockpit/` for project, the config dir for global). A missing or
+/// unparseable file reads as no grants — the management UI shows an empty
+/// scope, never an error. Entries come out sorted (the on-disk `BTreeSet`
+/// ordering) so the listing is stable.
+pub fn list_managed_grants(dir: &Path) -> ManagedGrants {
+    let file = load_approvals(dir).unwrap_or_default();
+    ManagedGrants {
+        commands: file.commands.into_iter().collect(),
+        paths: file.paths.into_iter().collect(),
+        loop_accept: file.loop_accept.into_iter().collect(),
+        loop_reject: file.loop_reject.into_iter().collect(),
+    }
+}
+
+/// Remove a single grant `key` of `kind` from the `approvals.json` in
+/// `dir`, rewriting the file via the same load→mutate→atomic-store path
+/// the approval store uses to *record* grants. Reloading first means a
+/// concurrent edit to a different entry is preserved (we only drop the one
+/// key, never clobber the whole file from a stale snapshot). Returns `true`
+/// if the key was present and removed; `false` (no write) if it wasn't —
+/// so a double-delete or a vanished entry is a harmless no-op. The change
+/// takes effect on the next approval check, which re-reads the file.
+pub fn delete_managed_grant(dir: &Path, kind: ManagedGrantKind, key: &str) -> Result<bool> {
+    let mut file = load_approvals(dir).unwrap_or_default();
+    let set = match kind {
+        ManagedGrantKind::Command => &mut file.commands,
+        ManagedGrantKind::Path => &mut file.paths,
+        ManagedGrantKind::LoopAccept => &mut file.loop_accept,
+        ManagedGrantKind::LoopReject => &mut file.loop_reject,
+    };
+    if !set.remove(key) {
+        return Ok(false);
+    }
+    store_approvals(dir, &file)?;
+    Ok(true)
 }
 
 /// File name for the per-scope approvals store inside a `.cockpit/` dir.
@@ -868,6 +969,118 @@ mod tests {
             Err(StoreError::OnceNotPersistable)
         ));
         assert!(store.loop_rule(&sig).is_none());
+    }
+
+    // ---- management API (`/permissions`) ---------------------------------
+
+    #[test]
+    fn list_managed_grants_groups_by_kind_and_sorts() {
+        let dir = tempfile::tempdir().unwrap();
+        // Seed one of each bucket through the normal store write paths so
+        // the file shape is exactly what production records.
+        let db = Db::open_in_memory().unwrap();
+        let session =
+            crate::session::Session::create(db.clone(), dir.path().to_path_buf(), "coder").unwrap();
+        let mut store = GrantStore::new(db, session.id, dir.path().to_path_buf());
+        store.project_root = Some(dir.path().to_path_buf());
+        store
+            .record_command(&cmd_info("gh", Some("pr"), false), Scope::Project)
+            .unwrap();
+        store
+            .record_command(&cmd_info("cargo", Some("build"), false), Scope::Project)
+            .unwrap();
+        store
+            .record_path(&dir.path().join("src"), Scope::Project)
+            .unwrap();
+        let sig = GrantStore::loop_signature("read", &serde_json::json!({"path": "x"}));
+        store
+            .record_loop_rule(&sig, LoopVerdict::Accept, Scope::Project)
+            .unwrap();
+
+        let grants = list_managed_grants(&dir.path().join(".cockpit"));
+        // Commands are sorted; both present.
+        assert_eq!(
+            grants.commands,
+            vec!["cargo build".to_string(), "gh pr".to_string()]
+        );
+        assert_eq!(grants.paths.len(), 1);
+        assert_eq!(grants.loop_accept, vec![sig]);
+        assert!(grants.loop_reject.is_empty());
+        assert!(!grants.is_empty());
+    }
+
+    #[test]
+    fn list_managed_grants_missing_file_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let grants = list_managed_grants(dir.path());
+        assert!(grants.is_empty(), "no approvals.json → empty, not an error");
+    }
+
+    #[test]
+    fn delete_managed_grant_removes_one_leaves_others() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_in_memory().unwrap();
+        let session =
+            crate::session::Session::create(db.clone(), dir.path().to_path_buf(), "coder").unwrap();
+        let mut store = GrantStore::new(db, session.id, dir.path().to_path_buf());
+        store.project_root = Some(dir.path().to_path_buf());
+        store
+            .record_command(&cmd_info("gh", Some("pr"), false), Scope::Project)
+            .unwrap();
+        store
+            .record_command(&cmd_info("cargo", Some("build"), false), Scope::Project)
+            .unwrap();
+        let cockpit = dir.path().join(".cockpit");
+
+        // Deleting one command leaves the other intact.
+        assert!(delete_managed_grant(&cockpit, ManagedGrantKind::Command, "gh pr").unwrap());
+        let grants = list_managed_grants(&cockpit);
+        assert_eq!(grants.commands, vec!["cargo build".to_string()]);
+
+        // The removal is durable: a fresh store no longer treats it as granted.
+        assert!(!store.is_command_granted(&ApprovalKey {
+            program: "gh".into(),
+            subcommand: Some("pr".into()),
+        }));
+        assert!(store.is_command_granted(&ApprovalKey {
+            program: "cargo".into(),
+            subcommand: Some("build".into()),
+        }));
+    }
+
+    #[test]
+    fn delete_managed_grant_handles_each_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let cockpit = dir.path().join(".cockpit");
+        let db = Db::open_in_memory().unwrap();
+        let session =
+            crate::session::Session::create(db.clone(), dir.path().to_path_buf(), "coder").unwrap();
+        let mut store = GrantStore::new(db, session.id, dir.path().to_path_buf());
+        store.project_root = Some(dir.path().to_path_buf());
+        let path = dir.path().join("data");
+        store.record_path(&path, Scope::Project).unwrap();
+        let acc = GrantStore::loop_signature("read", &serde_json::json!({"p": 1}));
+        let rej = GrantStore::loop_signature("bash", &serde_json::json!({"c": "x"}));
+        store
+            .record_loop_rule(&acc, LoopVerdict::Accept, Scope::Project)
+            .unwrap();
+        store
+            .record_loop_rule(&rej, LoopVerdict::Reject, Scope::Project)
+            .unwrap();
+
+        let path_key = list_managed_grants(&cockpit).paths[0].clone();
+        assert!(delete_managed_grant(&cockpit, ManagedGrantKind::Path, &path_key).unwrap());
+        assert!(delete_managed_grant(&cockpit, ManagedGrantKind::LoopAccept, &acc).unwrap());
+        assert!(delete_managed_grant(&cockpit, ManagedGrantKind::LoopReject, &rej).unwrap());
+        assert!(list_managed_grants(&cockpit).is_empty());
+    }
+
+    #[test]
+    fn delete_managed_grant_absent_key_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        // No file at all: deleting an absent key returns false, writes nothing.
+        assert!(!delete_managed_grant(dir.path(), ManagedGrantKind::Command, "nope").unwrap());
+        assert!(!dir.path().join(APPROVALS_FILE).exists());
     }
 
     #[test]

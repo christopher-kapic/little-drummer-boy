@@ -370,6 +370,16 @@ impl App {
                 p.render(frame, rects.body);
             }
             self.plans_pane = pane;
+        } else if self.permissions_pane.is_some() {
+            // Same take/render/restore as the other panes. Renders into
+            // `rects.body` so the fixed chrome (cwd + git branch + context
+            // + active agent) stays visible — the overlay is a view, not a
+            // chrome change.
+            let mut pane = self.permissions_pane.take();
+            if let Some(p) = pane.as_mut() {
+                p.render(frame, rects.body);
+            }
+            self.permissions_pane = pane;
         } else if self.context_pane.is_some() {
             // Same take/render/restore as the other panes. Renders into
             // `rects.body` so the fixed chrome (cwd + git branch + context

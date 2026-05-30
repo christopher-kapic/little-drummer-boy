@@ -30,6 +30,7 @@ pub mod markdown;
 pub mod model_picker;
 pub mod nav;
 pub mod paste;
+pub mod permissions_pane;
 pub mod plans_pane;
 pub mod pty;
 pub mod sessions_pane;
