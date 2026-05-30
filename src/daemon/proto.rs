@@ -246,6 +246,14 @@ pub enum Request {
     /// `project_root` (the client's cwd) so per-project config applies.
     ListSkills { project_root: String },
 
+    /// List every plan (active first, newest within a group) for the
+    /// read-only `/plans` browser. Plans are global, so no project scope.
+    ListPlans,
+
+    /// Full detail of one plan for the `/plans` drill-in: its steps with
+    /// dependency edges, per-step status, and each step's tests.
+    PlanDetail { plan_id: Uuid },
+
     /// List discovered agents (bundled + on-disk + agent_dirs).
     ListAgents,
 
@@ -423,6 +431,18 @@ pub enum Response {
 
     Skills {
         skills: Vec<SkillSummary>,
+    },
+
+    /// Answer to [`Request::ListPlans`]: every plan, active first.
+    Plans {
+        plans: Vec<PlanSummaryWire>,
+    },
+
+    /// Answer to [`Request::PlanDetail`]: the plan plus its full step DAG
+    /// and per-step tests. `None`-equivalent (an error) when no such plan.
+    PlanDetail {
+        plan: PlanSummaryWire,
+        steps: Vec<PlanStepWire>,
     },
 
     Agents {
@@ -876,6 +896,48 @@ pub struct SkillSummary {
     pub name: String,
     pub description: String,
     pub source: String,
+}
+
+/// One plan as the `/plans` browser sees it: list-row fields plus the
+/// step count. Mirrors [`crate::db::plans::PlanSummary`] flattened for the
+/// wire (status / isolation rendered as their stored string form).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanSummaryWire {
+    pub plan_id: Uuid,
+    pub slug: String,
+    pub title: String,
+    pub description: String,
+    /// `"pending" | "in_progress" | "done"`.
+    pub status: String,
+    pub base_branch: Option<String>,
+    pub target_branch: Option<String>,
+    pub step_count: i64,
+    pub created_at: i64,
+}
+
+/// One step in a plan's DAG for the `/plans` drill-in. `depends_on` lists
+/// the *titles* of the steps this one must run after (resolved daemon-side
+/// from the dependency edges) so the browser can render prerequisites
+/// without a second lookup. `tests` carries each test's phase + concurrency.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanStepWire {
+    pub step_id: Uuid,
+    pub title: String,
+    /// `"pending" | "in_progress" | "done"`.
+    pub status: String,
+    /// Titles of the prerequisite steps (this step depends on them).
+    pub depends_on: Vec<String>,
+    pub tests: Vec<PlanTestWire>,
+}
+
+/// One per-step test for the `/plans` drill-in.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanTestWire {
+    pub command: String,
+    /// `"post_step" | "branch_stable"`.
+    pub phase: String,
+    /// `"parallel"`, or `"exclusive: <resource-key>"`.
+    pub concurrency: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

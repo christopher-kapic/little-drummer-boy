@@ -748,7 +748,11 @@ dependencies, what to do next); a building conversation talks
 about the *code* (this file, this function, this diff). Bundling
 both into one agent forces the model to context-switch every turn
 and produces worse output in both modes. `/plan` and `/build`
-slash commands swap which primary agent owns the conversation.
+slash commands swap which primary agent owns the conversation. The
+read-only **`/plans`** slash command opens a browser over the stored
+graph plans (`plan.md` §4.1): a plan list → per-plan step-DAG view,
+mirroring `/sessions`. Authoring stays with `Plan`; execution controls
+land later.
 
 **Structural payoff of the specialist split.** Only `coder`
 writes. The file-lock manager (`plan.md` §4.1) therefore has a

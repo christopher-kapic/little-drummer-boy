@@ -478,6 +478,9 @@ async fn handle_request(
                 .collect();
             Ok(Response::Skills { skills })
         }
+        Request::ListPlans => list_plans(ctx),
+        Request::PlanDetail { plan_id } => plan_detail(ctx, plan_id),
+
         Request::ListAgents => Err(not_implemented("ListAgents")),
         Request::ListModels { .. } => Err(not_implemented("ListModels")),
 
@@ -929,6 +932,90 @@ fn list_sessions(
         });
     }
     Ok(Response::Sessions { sessions })
+}
+
+/// List every plan (active first, newest within a group) for the
+/// read-only `/plans` browser. Plans are global — no project scope.
+fn list_plans(ctx: &DaemonContext) -> std::result::Result<Response, ErrorPayload> {
+    let summaries = ctx.db.list_all_plan_summaries().map_err(internal)?;
+    let plans = summaries.into_iter().map(plan_summary_wire).collect();
+    Ok(Response::Plans { plans })
+}
+
+/// Full detail of one plan: its steps with dependency prerequisites
+/// (resolved to titles), per-step status, and each step's tests. Reads the
+/// edge list once and indexes it so each step's `depends_on` is a lookup.
+fn plan_detail(ctx: &DaemonContext, plan_id: Uuid) -> std::result::Result<Response, ErrorPayload> {
+    let plan = match ctx.db.plan_by_id(plan_id).map_err(internal)? {
+        Some(p) => p,
+        None => {
+            return Err(ErrorPayload {
+                code: ErrorCode::BadRequest,
+                message: format!("unknown plan {plan_id}"),
+            });
+        }
+    };
+    let step_count = ctx.db.list_steps(plan_id).map_err(internal)?.len() as i64;
+    let summary = plan_summary_wire(crate::db::plans::PlanSummary { plan, step_count });
+
+    let steps = ctx.db.list_steps(plan_id).map_err(internal)?;
+    let edges = ctx.db.list_dependencies(plan_id).map_err(internal)?;
+    // `id → title` so dependency targets render as titles, not uuids.
+    let title_by_id: std::collections::HashMap<Uuid, String> =
+        steps.iter().map(|s| (s.id, s.title.clone())).collect();
+
+    let mut wire_steps = Vec::with_capacity(steps.len());
+    for step in &steps {
+        // `from depends on to`: this step's prerequisites are the `to`
+        // endpoints of edges whose `from` is this step.
+        let depends_on = edges
+            .iter()
+            .filter(|(from, _)| *from == step.id)
+            .filter_map(|(_, to)| title_by_id.get(to).cloned())
+            .collect();
+        let tests = ctx
+            .db
+            .list_step_tests(step.id)
+            .map_err(internal)?
+            .into_iter()
+            .map(|t| proto::PlanTestWire {
+                command: t.command,
+                phase: t.phase.as_str().to_string(),
+                concurrency: match t.concurrency {
+                    crate::db::plans::TestConcurrency::Parallel => "parallel".to_string(),
+                    crate::db::plans::TestConcurrency::Exclusive { resource_key } => {
+                        format!("exclusive: {resource_key}")
+                    }
+                },
+            })
+            .collect();
+        wire_steps.push(proto::PlanStepWire {
+            step_id: step.id,
+            title: step.title.clone(),
+            status: step.status.as_str().to_string(),
+            depends_on,
+            tests,
+        });
+    }
+    Ok(Response::PlanDetail {
+        plan: summary,
+        steps: wire_steps,
+    })
+}
+
+/// Flatten a [`crate::db::plans::PlanSummary`] onto the wire shape.
+fn plan_summary_wire(s: crate::db::plans::PlanSummary) -> proto::PlanSummaryWire {
+    proto::PlanSummaryWire {
+        plan_id: s.plan.id,
+        slug: s.plan.slug,
+        title: s.plan.title,
+        description: s.plan.description,
+        status: s.plan.status.as_str().to_string(),
+        base_branch: s.plan.base_branch,
+        target_branch: s.plan.target_branch,
+        step_count: s.step_count,
+        created_at: s.plan.created_at,
+    }
 }
 
 fn fork_session(

@@ -229,6 +229,10 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "Pin a message so it survives /compact verbatim (arg: text)",
     },
     SlashCommand {
+        name: "plans",
+        description: "Browse plans and their step dependency graphs (read-only)",
+    },
+    SlashCommand {
         name: "prune",
         description: "Collapse superseded snapshot reads to reclaim context",
     },
@@ -399,6 +403,11 @@ pub struct App {
     /// skill (name + description + source). `None` when closed. Routed
     /// input/render alongside `stats_pane` / `sessions_pane`.
     pub(super) skills_pane: Option<crate::tui::skills_pane::SkillsPane>,
+    /// `/plans` browser pane — a read-only, two-level overlay (plan list →
+    /// step DAG). `None` when closed. Routed input/render alongside the
+    /// other panes; reads plans from the daemon via `ListPlans` /
+    /// `PlanDetail`.
+    pub(super) plans_pane: Option<crate::tui::plans_pane::PlansPane>,
     /// "Daemon not running" prompt shown at startup. Once the user picks,
     /// this is taken and the prompt closes.
     pub(super) daemon_prompt: Option<crate::tui::daemon_prompt::DaemonPromptDialog>,
@@ -821,6 +830,7 @@ impl App {
             stats_pane: None,
             sessions_pane: None,
             skills_pane: None,
+            plans_pane: None,
             daemon_prompt,
             question_dialog: None,
             daemon_connected,
@@ -2814,6 +2824,16 @@ impl App {
             }
             return;
         }
+        // `/plans` overlay: same full-body wheel-scroll / eat-everything-
+        // else rule as the other informational panes.
+        if let Some(pane) = self.plans_pane.as_mut() {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => pane.scroll_up(),
+                MouseEventKind::ScrollDown => pane.scroll_down(),
+                _ => {}
+            }
+            return;
+        }
         // Embedded pane (GOALS §1i/§1e): divider drag-resize, click-to-
         // focus, and PTY mouse forwarding. Consumes the event when it
         // lands on the divider or inside the pane so the chat handlers
@@ -3365,6 +3385,10 @@ impl App {
             "skills" => {
                 self.skills_pane =
                     Some(crate::tui::skills_pane::SkillsPane::open(&self.launch.cwd));
+                return false;
+            }
+            "plans" => {
+                self.plans_pane = Some(crate::tui::plans_pane::PlansPane::open());
                 return false;
             }
             "fork" => {
@@ -4252,6 +4276,15 @@ mod slash_rank_tests {
         assert!(
             SLASH_COMMANDS.iter().any(|c| c.name == "skills"),
             "/skills must be a registered slash command"
+        );
+    }
+
+    #[test]
+    fn plans_command_is_registered() {
+        // `/plans` (read-only plan browser) must be dispatchable.
+        assert!(
+            SLASH_COMMANDS.iter().any(|c| c.name == "plans"),
+            "/plans must be a registered slash command"
         );
     }
 

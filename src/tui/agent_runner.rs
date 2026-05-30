@@ -382,6 +382,27 @@ pub fn list_sessions_blocking(
     }
 }
 
+/// List every plan (active first) for the `/plans` browser. Daemon down →
+/// `Err(String)`; the pane renders it inline rather than refusing to open.
+pub fn list_plans_blocking() -> Result<Vec<proto::PlanSummaryWire>, String> {
+    match daemon_request_blocking(Request::ListPlans)? {
+        Response::Plans { plans } => Ok(plans),
+        other => Err(format!("unexpected list_plans response: {other:?}")),
+    }
+}
+
+/// Fetch one plan's full detail (steps + dependency prerequisites + tests)
+/// for the `/plans` drill-in. `Err(String)` on a daemon/transport failure
+/// or an unknown plan id.
+pub fn plan_detail_blocking(
+    plan_id: uuid::Uuid,
+) -> Result<(proto::PlanSummaryWire, Vec<proto::PlanStepWire>), String> {
+    match daemon_request_blocking(Request::PlanDetail { plan_id })? {
+        Response::PlanDetail { plan, steps } => Ok((plan, steps)),
+        other => Err(format!("unexpected plan_detail response: {other:?}")),
+    }
+}
+
 /// Fetch live `(has_active_jobs, processing)` status for the candidate
 /// session ids. Daemon down / no live worker → empty map; callers treat
 /// absent ids as not-processing / no-jobs.

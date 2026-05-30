@@ -363,6 +363,44 @@ impl Db {
         })
     }
 
+    /// Summaries of **every** plan (active first, newest within a group),
+    /// each with its step count. This is the read-only `/plans` browser
+    /// view: `in_progress` before `pending` before `done`, and within each
+    /// status group the most recently created plan first. Unlike
+    /// [`Db::list_active_plan_summaries`] it includes `done` plans.
+    pub fn list_all_plan_summaries(&self) -> Result<Vec<PlanSummary>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT p.*, \
+                       (SELECT COUNT(*) FROM plan_steps s WHERE s.plan_id = p.id) AS step_count \
+                     FROM plans p \
+                     ORDER BY \
+                       CASE p.status \
+                         WHEN 'in_progress' THEN 0 \
+                         WHEN 'pending' THEN 1 \
+                         WHEN 'done' THEN 2 \
+                         ELSE 3 \
+                       END, \
+                       p.created_at DESC",
+                )
+                .context("preparing list_all_plan_summaries")?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok(PlanSummary {
+                        plan: PlanRow::from_row(row)?,
+                        step_count: row.get("step_count")?,
+                    })
+                })
+                .context("querying list_all_plan_summaries")?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.context("decoding plan summary")?);
+            }
+            Ok(out)
+        })
+    }
+
     /// Set a plan's status.
     pub fn set_plan_status(&self, id: Uuid, status: PlanStatus) -> Result<()> {
         let now = Utc::now().timestamp();
@@ -907,6 +945,43 @@ mod tests {
         assert!(!slugs.contains(&"p3"), "done plans excluded");
         let p1_summary = summaries.iter().find(|s| s.plan.slug == "p1").unwrap();
         assert_eq!(p1_summary.step_count, 1);
+    }
+
+    #[test]
+    fn list_all_orders_active_first_then_newest() {
+        let db = Db::open_in_memory().unwrap();
+        // Create in a deliberately interleaved order; the query must
+        // reorder to in_progress → pending → done, newest within a group.
+        let done_old = db.create_plan(&sample_plan("done_old")).unwrap();
+        db.set_plan_status(done_old.id, PlanStatus::Done).unwrap();
+        let pending_old = db.create_plan(&sample_plan("pending_old")).unwrap();
+        let in_prog = db.create_plan(&sample_plan("in_prog")).unwrap();
+        db.set_plan_status(in_prog.id, PlanStatus::InProgress)
+            .unwrap();
+        let pending_new = db.create_plan(&sample_plan("pending_new")).unwrap();
+        let done_new = db.create_plan(&sample_plan("done_new")).unwrap();
+        db.set_plan_status(done_new.id, PlanStatus::Done).unwrap();
+
+        let slugs: Vec<_> = db
+            .list_all_plan_summaries()
+            .unwrap()
+            .into_iter()
+            .map(|s| s.plan.slug)
+            .collect();
+        // in_progress first; pending group newest-first; done group
+        // newest-first. (created_at uses second granularity, but the
+        // status grouping is the load-bearing assertion.)
+        assert_eq!(slugs[0], "in_prog", "in_progress sorts to the top");
+        let in_prog_pos = slugs.iter().position(|s| s == "in_prog").unwrap();
+        let first_pending = slugs.iter().position(|s| s.starts_with("pending")).unwrap();
+        let first_done = slugs.iter().position(|s| s.starts_with("done")).unwrap();
+        assert!(
+            in_prog_pos < first_pending && first_pending < first_done,
+            "status grouping in_progress < pending < done: {slugs:?}"
+        );
+        // done plans are included (unlike list_active_plan_summaries).
+        assert!(slugs.contains(&"done_old".to_string()));
+        assert!(slugs.contains(&"done_new".to_string()));
     }
 
     #[test]

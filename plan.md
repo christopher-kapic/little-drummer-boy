@@ -1675,6 +1675,15 @@ cockpit graph run <slug>           execute the DAG
 cockpit graph status <slug>        per-node state + lock contention
 ```
 
+The TUI mirror of the read paths is the **`/plans`** slash command: a
+read-only, two-level browser (plan list → step DAG) modeled on
+`/sessions`. The list shows each plan's title, status, target branch,
+step count, and one-line description (active first); drilling into a plan
+shows its steps with their dependency prerequisites, per-step status, and
+each step's tests (phase + concurrency, e.g. an `exclusive: port:8080`
+badge). Authoring stays with `Plan`; plan *execution* controls
+(start/pause/status) land in a later cut via the pane's outcome seam.
+
 **Evaluator-gated nodes** ([`features/oh-my-codex.md` §4](./features/oh-my-codex.md)).
 A graph node can declare an evaluator: a *plain shell command* that
 returns `{ pass: bool, score?: number }` JSON. The node runs in an

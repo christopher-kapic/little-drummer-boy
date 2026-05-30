@@ -299,6 +299,20 @@ impl App {
             return false;
         }
 
+        // `/plans` browser (read-only). Same modal rule: route the key,
+        // close on the pane's request, and always consume so nothing leaks
+        // into the composer underneath. v1 only emits `Close`; execution
+        // controls slot in as more `PlansOutcome` variants here later.
+        if let Some(pane) = self.plans_pane.as_mut() {
+            match pane.handle_key(key) {
+                Some(crate::tui::plans_pane::PlansOutcome::Close) => {
+                    self.plans_pane = None;
+                }
+                None => {}
+            }
+            return false;
+        }
+
         // Ctrl+J toggles every agent reasoning block's expand/collapse
         // state. (See the doc comment on `toggle_recent_reasoning` for
         // why this is a keybind rather than a click handler.) Only
@@ -1291,6 +1305,7 @@ impl App {
             || self.stats_pane.is_some()
             || self.sessions_pane.is_some()
             || self.skills_pane.is_some()
+            || self.plans_pane.is_some()
             || self.context_menu.is_some()
         {
             return;
