@@ -241,6 +241,10 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "Collapse superseded snapshot reads to reclaim context",
     },
     SlashCommand {
+        name: "ps",
+        description: "List this session's running async jobs",
+    },
+    SlashCommand {
         name: "rename",
         description: "Rename the current session (arg: title)",
     },
@@ -267,6 +271,10 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
     SlashCommand {
         name: "stats",
         description: "On-device model and project performance (tokens, recovery, languages)",
+    },
+    SlashCommand {
+        name: "stop",
+        description: "Stop this session's async jobs (arg: job-id for one, bare for all)",
     },
 ];
 
@@ -606,6 +614,12 @@ pub struct App {
     /// else cancels). `Some` holds nothing meaningful — its presence is
     /// the armed flag; the numbers were already pushed to history.
     pub(super) pending_prune_confirm: bool,
+    /// Bare `/stop` confirm armed: the user ran `/stop` with no id, saw
+    /// the `Stop N job(s) in this session? [y/N]` prompt, and the next
+    /// `y` commits (anything else cancels). Carries the current-session
+    /// job ids captured at arm time so the cancel set can't drift between
+    /// the prompt and the confirmation.
+    pub(super) pending_stop_confirm: Option<Vec<String>>,
     /// `RecordUsage` requests made before the daemon runner exists.
     /// Flushed (with tag project ids backfilled) once it's created.
     pub(super) pending_usage: Vec<crate::daemon::proto::Request>,
@@ -690,6 +704,9 @@ pub struct App {
 /// A live async job tracked by the TUI for the jobs strip / `/jobs`.
 #[derive(Debug, Clone)]
 pub(super) struct ActiveJob {
+    /// Session that owns the job. `/jobs` shows every session's jobs;
+    /// `/ps` / `/stop` filter to the current session by this id.
+    pub(super) session_id: uuid::Uuid,
     pub(super) label: String,
     /// `loop` / `timer` / `background`.
     pub(super) kind: String,
@@ -875,6 +892,7 @@ impl App {
             elided_event_ids: std::collections::HashSet::new(),
             pending_compact: None,
             pending_prune_confirm: false,
+            pending_stop_confirm: None,
             pending_usage: Vec::new(),
             pending_external_edit: false,
             mouse_capture,
@@ -1334,6 +1352,8 @@ impl App {
         // The new session starts with no async jobs; the daemon's fresh
         // session has its own (empty) authority.
         self.active_jobs.clear();
+        // An armed bare-`/stop` confirm referenced the old session's jobs.
+        self.pending_stop_confirm = None;
         // Fresh thread → no wire-side elisions yet.
         self.elided_event_ids.clear();
         self.prunable_tokens = 0;
@@ -1617,18 +1637,143 @@ impl App {
             line: "/jobs: active —".to_string(),
         });
         for (job_id, j) in &self.active_jobs {
-            let progress = if j.kind == "background" {
-                String::new()
-            } else {
-                format!(" {} iter", j.iteration)
-            };
             self.history.push(HistoryEntry::Plain {
                 line: format!(
-                    "  {job_id} [{}]{progress}  {}  (cancel: /jobs cancel {job_id})",
-                    j.kind, j.label
+                    "  {}  (cancel: /jobs cancel {job_id})",
+                    format_job_line(job_id, j)
                 ),
             });
         }
+    }
+
+    /// The id of the session this client is attached to (live runner if
+    /// connected, else the last-attached id from launch info). `None`
+    /// before the first session exists. Same resolution `/rename` uses.
+    pub(super) fn current_session_id(&self) -> Option<uuid::Uuid> {
+        match self.agent_runner.as_ref() {
+            Some(Ok(runner)) => Some(runner.session_id),
+            _ => self.launch.session_id,
+        }
+    }
+
+    /// Job ids in `active_jobs` that belong to the current session, in the
+    /// map's (stable, job-id) order. The single filter `/ps` and `/stop`
+    /// share so the listed set, the cancel set, and the confirm count can
+    /// never disagree. Empty when there's no current session or no jobs.
+    pub(super) fn current_session_job_ids(&self) -> Vec<String> {
+        match self.current_session_id() {
+            Some(sid) => session_job_ids(&self.active_jobs, sid),
+            None => Vec::new(),
+        }
+    }
+
+    /// `/ps` — list only the current session's running async jobs, using
+    /// the same per-job formatting `/jobs` shows. Empty state matches the
+    /// spec. Current-session-scoped; never reaches other sessions (that's
+    /// `/jobs`).
+    pub(super) fn handle_ps_command(&mut self) {
+        let ids = self.current_session_job_ids();
+        if ids.is_empty() {
+            self.history.push(HistoryEntry::Plain {
+                line: "No background jobs in this session.".to_string(),
+            });
+            return;
+        }
+        self.history.push(HistoryEntry::Plain {
+            line: "/ps: active in this session —".to_string(),
+        });
+        for job_id in ids {
+            if let Some(j) = self.active_jobs.get(&job_id) {
+                self.history.push(HistoryEntry::Plain {
+                    line: format!("  {}  (stop: /stop {job_id})", format_job_line(&job_id, j)),
+                });
+            }
+        }
+    }
+
+    /// `/stop` — stop current-session jobs. `/stop <job-id>` cancels that
+    /// one immediately (reusing the `/jobs cancel` `CancelJob` path);
+    /// refuses an id outside the current session rather than reaching
+    /// across. Bare `/stop` arms a `[y/N]` confirm to cancel them all.
+    pub(super) fn handle_stop_command(&mut self, args: &str) {
+        let job_id = args.trim();
+        if job_id.is_empty() {
+            self.arm_stop_confirm();
+            return;
+        }
+        let in_session = self.current_session_job_ids().iter().any(|id| id == job_id);
+        if !in_session {
+            self.history.push(HistoryEntry::Plain {
+                line: format!(
+                    "/stop: no job `{job_id}` in this session (use /jobs for other sessions)"
+                ),
+            });
+            return;
+        }
+        self.cancel_job(job_id, "/stop");
+    }
+
+    /// Send a `CancelJob` for one job over the runner's record channel —
+    /// the same fire-and-forget path `/jobs cancel` uses. `cmd` is the
+    /// command label for the rendered line.
+    fn cancel_job(&mut self, job_id: &str, cmd: &str) {
+        let sent = self.send_daemon_request(crate::daemon::proto::Request::CancelJob {
+            job_id: job_id.to_string(),
+        });
+        let line = if sent {
+            format!("{cmd}: cancel requested for `{job_id}`")
+        } else {
+            format!("{cmd}: no daemon connection — cannot cancel `{job_id}`")
+        };
+        self.history.push(HistoryEntry::Plain { line });
+    }
+
+    /// Bare `/stop`: count the current-session jobs and arm the `[y/N]`
+    /// confirm (mirrors `/prune`'s arm-then-commit). With zero jobs it
+    /// says so and arms nothing.
+    pub(super) fn arm_stop_confirm(&mut self) {
+        let ids = self.current_session_job_ids();
+        if ids.is_empty() {
+            self.history.push(HistoryEntry::Plain {
+                line: "No background jobs in this session.".to_string(),
+            });
+            self.pending_stop_confirm = None;
+            return;
+        }
+        let n = ids.len();
+        self.history.push(HistoryEntry::Plain {
+            line: format!("/stop: Stop {n} job(s) in this session? [y/N]"),
+        });
+        self.pending_stop_confirm = Some(ids);
+    }
+
+    /// Commit an armed bare `/stop`: cancel every job captured at arm
+    /// time. A job that already ended (no longer in `active_jobs`) is
+    /// skipped silently — its strip entry is already gone.
+    pub(super) fn commit_stop(&mut self) {
+        let Some(ids) = self.pending_stop_confirm.take() else {
+            return;
+        };
+        let mut cancelled = 0;
+        for job_id in ids {
+            if self.active_jobs.contains_key(&job_id) {
+                self.cancel_job(&job_id, "/stop");
+                cancelled += 1;
+            }
+        }
+        if cancelled == 0 {
+            self.history.push(HistoryEntry::Plain {
+                line: "/stop: those jobs already ended.".to_string(),
+            });
+        }
+    }
+
+    /// Cancel an armed bare `/stop`.
+    pub(super) fn cancel_stop(&mut self) {
+        self.pending_stop_confirm = None;
+        self.history.push(HistoryEntry::Plain {
+            line: "/stop: cancelled.".to_string(),
+        });
     }
 
     /// Send a fire-and-forget daemon request over the runner's record
@@ -1830,6 +1975,7 @@ impl App {
                 self.prunable_tokens = 0;
                 self.elided_event_ids.clear();
                 self.active_jobs.clear();
+                self.pending_stop_confirm = None;
                 self.chat_scroll_offset = 0;
                 self.agent_runner = Some(Ok(runner));
                 let label = if short_id.is_empty() {
@@ -2250,6 +2396,7 @@ impl App {
                 ));
             }
             TurnEvent::JobStarted {
+                session_id,
                 job_id,
                 label,
                 kind,
@@ -2257,6 +2404,7 @@ impl App {
                 self.active_jobs.insert(
                     job_id.clone(),
                     ActiveJob {
+                        session_id,
                         label: label.clone(),
                         kind,
                         iteration: 0,
@@ -3352,6 +3500,14 @@ impl App {
                 self.handle_jobs_command(&slash_args(&raw));
                 return false;
             }
+            "ps" => {
+                self.handle_ps_command();
+                return false;
+            }
+            "stop" => {
+                self.handle_stop_command(&slash_args(&raw));
+                return false;
+            }
             "caffeinate" => {
                 self.handle_caffeinate_command(&slash_args(&raw));
                 return false;
@@ -3890,6 +4046,33 @@ fn last_agent_text(history: &[HistoryEntry]) -> Option<String> {
     })
 }
 
+/// Job ids in `jobs` owned by `session_id`, in map (stable, job-id)
+/// order. The pure core of `/ps` / `/stop` scoping — the list, the
+/// cancel set, and the bare-`/stop` confirm count all read from here so
+/// they can't disagree, and it filters strictly to `session_id` so
+/// neither command ever touches another session's jobs.
+fn session_job_ids(
+    jobs: &std::collections::BTreeMap<String, ActiveJob>,
+    session_id: uuid::Uuid,
+) -> Vec<String> {
+    jobs.iter()
+        .filter(|(_, j)| j.session_id == session_id)
+        .map(|(id, _)| id.clone())
+        .collect()
+}
+
+/// The per-job core line shared by `/jobs` and `/ps`: `job-id [kind]`,
+/// the iteration count for loop/timer jobs, and the label. Each caller
+/// appends its own cancel/stop hint.
+fn format_job_line(job_id: &str, j: &ActiveJob) -> String {
+    let progress = if j.kind == "background" {
+        String::new()
+    } else {
+        format!(" {} iter", j.iteration)
+    };
+    format!("{job_id} [{}]{progress}  {}", j.kind, j.label)
+}
+
 fn slash_args(raw: &str) -> String {
     let rest = raw.strip_prefix('/').unwrap_or(raw);
     match rest.find(char::is_whitespace) {
@@ -4415,6 +4598,25 @@ mod slash_rank_tests {
     }
 
     #[test]
+    fn ps_and_stop_are_registered() {
+        // `/ps` (current-session job list) and `/stop` (current-session
+        // job stop) must both be dispatchable; `/jobs` (all-sessions) is
+        // kept alongside them.
+        assert!(
+            SLASH_COMMANDS.iter().any(|c| c.name == "ps"),
+            "/ps must be a registered slash command"
+        );
+        assert!(
+            SLASH_COMMANDS.iter().any(|c| c.name == "stop"),
+            "/stop must be a registered slash command"
+        );
+        assert!(
+            SLASH_COMMANDS.iter().any(|c| c.name == "jobs"),
+            "/jobs must remain a registered slash command"
+        );
+    }
+
+    #[test]
     fn new_and_clear_are_both_registered_aliases() {
         // `/new` and `/clear` are both menu entries routing to the one
         // fresh-session handler (`"new" | "clear"` dispatch arm).
@@ -4425,6 +4627,81 @@ mod slash_rank_tests {
         assert!(
             SLASH_COMMANDS.iter().any(|c| c.name == "clear"),
             "/clear must be a registered slash command"
+        );
+    }
+}
+
+#[cfg(test)]
+mod session_jobs_tests {
+    use super::{ActiveJob, format_job_line, session_job_ids};
+    use std::collections::BTreeMap;
+    use std::time::Instant;
+
+    fn job(session_id: uuid::Uuid, kind: &str, iteration: u64) -> ActiveJob {
+        ActiveJob {
+            session_id,
+            label: format!("{kind} job"),
+            kind: kind.to_string(),
+            iteration,
+            last_activity: Instant::now(),
+        }
+    }
+
+    fn fixture() -> (uuid::Uuid, uuid::Uuid, BTreeMap<String, ActiveJob>) {
+        let a = uuid::Uuid::from_u128(1);
+        let b = uuid::Uuid::from_u128(2);
+        let mut jobs = BTreeMap::new();
+        jobs.insert("job-a1".to_string(), job(a, "loop", 3));
+        jobs.insert("job-a2".to_string(), job(a, "background", 0));
+        jobs.insert("job-b1".to_string(), job(b, "timer", 1));
+        (a, b, jobs)
+    }
+
+    #[test]
+    fn filters_to_only_the_current_session() {
+        // `/ps` scope: session `a` sees its two jobs, in stable job-id
+        // order, and never session `b`'s.
+        let (a, b, jobs) = fixture();
+        assert_eq!(session_job_ids(&jobs, a), vec!["job-a1", "job-a2"]);
+        assert_eq!(session_job_ids(&jobs, b), vec!["job-b1"]);
+    }
+
+    #[test]
+    fn empty_when_session_has_no_jobs() {
+        // `/ps` empty-state basis: a session with no jobs yields nothing.
+        let (_, _, jobs) = fixture();
+        let other = uuid::Uuid::from_u128(99);
+        assert!(session_job_ids(&jobs, other).is_empty());
+    }
+
+    #[test]
+    fn cross_session_id_is_not_in_current_set() {
+        // `/stop <id>` refusal basis: an id owned by another session is
+        // not a member of the current session's id set.
+        let (a, _, jobs) = fixture();
+        let current = session_job_ids(&jobs, a);
+        assert!(!current.iter().any(|id| id == "job-b1"));
+        assert!(current.iter().any(|id| id == "job-a1"));
+    }
+
+    #[test]
+    fn bare_stop_count_matches_current_session_jobs() {
+        // Bare `/stop` confirm count `N` = number of current-session jobs.
+        let (a, b, jobs) = fixture();
+        assert_eq!(session_job_ids(&jobs, a).len(), 2);
+        assert_eq!(session_job_ids(&jobs, b).len(), 1);
+    }
+
+    #[test]
+    fn job_line_shows_iteration_for_loops_but_not_background() {
+        let a = uuid::Uuid::from_u128(1);
+        assert_eq!(
+            format_job_line("job-a1", &job(a, "loop", 3)),
+            "job-a1 [loop] 3 iter  loop job"
+        );
+        assert_eq!(
+            format_job_line("job-a2", &job(a, "background", 0)),
+            "job-a2 [background]  background job"
         );
     }
 }

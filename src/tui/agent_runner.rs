@@ -540,11 +540,12 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
         },
         AgentIdle { .. } => TurnEvent::AgentIdle,
         JobStarted {
+            session_id,
             job_id,
             label,
             kind,
-            ..
         } => TurnEvent::JobStarted {
+            session_id,
             job_id,
             label,
             kind,

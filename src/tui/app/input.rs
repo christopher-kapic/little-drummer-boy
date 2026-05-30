@@ -106,6 +106,18 @@ impl App {
             return false;
         }
 
+        // Bare `/stop` confirm armed: `[y/N]` — only `y` commits; any
+        // other non-modifier key (incl. Enter, since the default is No)
+        // cancels. Ahead of composer routing so the keystroke doesn't
+        // leak into the textbox.
+        if self.pending_stop_confirm.is_some() && !is_modifier_only(&key) {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => self.commit_stop(),
+                _ => self.cancel_stop(),
+            }
+            return false;
+        }
+
         // Context menu intercepts keys while open. Arrows / j-k move
         // the focus, Enter executes, Esc dismisses, any other
         // printable key dismisses without executing (so the user can

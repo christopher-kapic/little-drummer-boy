@@ -139,8 +139,11 @@ pub enum TurnEvent {
 
     /// An async job (loop / timer / background, GOALS §22) started. UI
     /// only — drives the transient jobs strip. `kind` is `loop` /
-    /// `timer` / `background`.
+    /// `timer` / `background`. `session_id` lets a multi-session client
+    /// scope per-session views (`/ps`, `/stop`) without reaching across
+    /// sessions.
     JobStarted {
+        session_id: uuid::Uuid,
         job_id: String,
         label: String,
         kind: String,

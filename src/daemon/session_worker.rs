@@ -658,6 +658,9 @@ fn turn_event_to_proto(event: TurnEvent, session_id: Uuid) -> Vec<proto::Event> 
         // synthesizes the `TurnEvent` form. No wire event to forward.
         TurnEvent::InterruptRaised { .. } => vec![],
         TurnEvent::JobStarted {
+            // The engine stamps the originating session; the worker's own
+            // `session_id` is authoritative for the wire event and equals it.
+            session_id: _,
             job_id,
             label,
             kind,
