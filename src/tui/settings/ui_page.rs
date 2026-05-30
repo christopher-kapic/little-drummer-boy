@@ -24,6 +24,7 @@ use crate::config::providers::ProvidersConfig;
 use crate::tui::textfield::TextField;
 use crate::tui::theme::MUTED_COLOR_INDEX;
 
+use super::reset::{ResetButton, ResetOutcome};
 use super::{Nav, Page, SettingsDialog, save_status};
 
 /// `/settings → UI` state.
@@ -33,6 +34,11 @@ pub(crate) struct UiPage {
     pub(super) editing: Option<UiField>,
     pub(super) buf: TextField,
     pub(super) status: Option<String>,
+    /// Page-level "reset display toggles to defaults" confirm state (the
+    /// last navigable row). Resets only [`crate::config::extended::TuiConfig`]
+    /// — utility model, instructions, name, and packages dir are
+    /// preserved.
+    pub(super) reset: ResetButton,
     /// `Some` while the utility-model picker overlay is open. Replaces
     /// the page body until the user selects, types a custom id, clears,
     /// or cancels.
@@ -177,15 +183,25 @@ pub(super) struct GrabState {
     pub(super) original_name: Option<String>,
 }
 
-/// Rows on the UI page (vim mode, thinking, llm mode, render-agent-markdown,
-/// render-user-markdown, mouse, rich-text-copy, emojis, caffeinate
-/// display-awake, name, packages dir, utility model, plan branch root, plan
-/// isolation, loop-guard threshold, instructions file).
-pub(super) const UI_ROWS: usize = 16;
+/// Labeled config rows on the UI page (vim mode, thinking, llm mode,
+/// render-agent-markdown, render-user-markdown, mouse, rich-text-copy,
+/// emojis, caffeinate display-awake, name, packages dir, utility model,
+/// plan branch root, plan isolation, loop-guard threshold, instructions
+/// file). The `[reset to defaults]` button follows at cursor
+/// [`UI_CONFIG_ROWS`].
+pub(super) const UI_CONFIG_ROWS: usize = 16;
 
-/// Cursor index of the `instructions file` drill-in row (the last row). The
-/// instructions sub-page's back-nav returns the UI cursor here.
-pub(super) const UI_INSTRUCTIONS_ROW: usize = UI_ROWS - 1;
+/// Total navigable rows: the labeled config rows plus the trailing
+/// `[reset to defaults]` button.
+pub(super) const UI_ROWS: usize = UI_CONFIG_ROWS + 1;
+
+/// Cursor index of the `[reset to defaults]` button (the last navigable
+/// row).
+pub(super) const UI_RESET_ROW: usize = UI_CONFIG_ROWS;
+
+/// Cursor index of the `instructions file` drill-in row (the last config
+/// row). The instructions sub-page's back-nav returns the UI cursor here.
+pub(super) const UI_INSTRUCTIONS_ROW: usize = UI_CONFIG_ROWS - 1;
 
 /// Recompute the model-entry scroll offset from a List-mode `cursor`
 /// that includes the two synthetic action rows. The action rows live
@@ -275,6 +291,7 @@ impl SettingsDialog {
             status: None,
             utility_picker: None,
             pending_mouse_capture: None,
+            reset: ResetButton::default(),
         });
         let mut page = std::mem::replace(&mut self.page, placeholder);
         let nav = if let Page::Ui(p) = &mut page {
@@ -363,9 +380,11 @@ impl SettingsDialog {
                 });
             }
             KeyCode::Up | KeyCode::Char('k') => {
+                p.reset.disarm();
                 p.cursor = crate::tui::nav::wrap_prev(p.cursor, rows);
             }
             KeyCode::Down | KeyCode::Char('j') => {
+                p.reset.disarm();
                 p.cursor = crate::tui::nav::wrap_next(p.cursor, rows);
             }
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => match p.cursor {
@@ -455,6 +474,18 @@ impl SettingsDialog {
                         status: None,
                     }));
                 }
+                UI_RESET_ROW => {
+                    // Page-level reset: arm on first activation, apply on
+                    // the second. Resets only the display toggles
+                    // (TuiConfig) — utility model, instructions, name, and
+                    // packages dir are preserved.
+                    if p.reset.activate() == ResetOutcome::Apply {
+                        self.reset_ui_display_toggles(p);
+                        p.status = save_status(self.save_extended());
+                    } else {
+                        p.status = None;
+                    }
+                }
                 _ => {}
             },
             _ => {}
@@ -538,6 +569,23 @@ impl SettingsDialog {
                 }
             }
         }
+    }
+
+    /// Reset only the display toggles to their defaults: the whole
+    /// [`crate::config::extended::TuiConfig`] (vim mode, thinking,
+    /// agent/user markdown, mouse, rich-text copy, emojis, caffeinate
+    /// display-awake, and the rest of the TUI block) goes back to
+    /// `TuiConfig::default()`. Everything outside `TuiConfig` —
+    /// `utility_model`, `instructions` (agent-guidance files), `name`,
+    /// `packages_directory`, `llm_mode`, plan settings — is left
+    /// untouched, per the UI-page reset contract.
+    ///
+    /// `pending_mouse_capture` is set so the App reconciles crossterm's
+    /// mouse-capture mode on dialog close, exactly as a manual mouse
+    /// toggle does.
+    fn reset_ui_display_toggles(&mut self, p: &mut UiPage) {
+        self.extended.tui = crate::config::extended::TuiConfig::default();
+        p.pending_mouse_capture = Some(self.extended.tui.mouse_capture);
     }
 
     /// Persist the chosen utility model (or `None` to unset) and close
@@ -696,6 +744,14 @@ impl SettingsDialog {
                 Span::styled(value.clone(), muted),
             ]));
         }
+
+        // `[reset to defaults]` button — the last navigable row. Resets
+        // only the display toggles (TuiConfig); see `reset_ui_display_toggles`.
+        lines.push(Line::default());
+        lines.push(
+            p.reset
+                .render_line(p.cursor == UI_RESET_ROW, "reset display to defaults"),
+        );
 
         if let Some(field) = p.editing {
             let prompt = match field {
@@ -923,6 +979,7 @@ impl SettingsDialog {
                     status: None,
                     utility_picker: None,
                     pending_mouse_capture: None,
+                    reset: ResetButton::default(),
                 }));
             }
             KeyCode::Up | KeyCode::Char('k') => {

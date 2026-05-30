@@ -268,6 +268,21 @@ pub struct SkillsConfig {
     pub ancestor_walk: bool,
 }
 
+impl SkillsConfig {
+    /// The fresh-install default a user sees on a brand-new install: the
+    /// [`SEEDED_SCAN_DIRS`] materialized as editable rows, everything else
+    /// at its derived default (ancestor-walk off, Codex mode). This is the
+    /// target a `/settings → Skills` page-level reset restores to — it
+    /// matches what [`load_for_cwd`] seeds, so reset and fresh install
+    /// agree rather than diverging to the empty derived `Default`.
+    pub fn seeded_default() -> Self {
+        Self {
+            scan_dirs: SEEDED_SCAN_DIRS.iter().map(|s| s.to_string()).collect(),
+            ..Self::default()
+        }
+    }
+}
+
 /// Answering-dialog config (GOALS §3b). Governs the reusable selectable-
 /// pages dialog that the `question` tool — and, later, tool-approval
 /// prompts — present over the composer.
@@ -744,9 +759,10 @@ pub fn load_for_cwd(cwd: &Path) -> ExtendedConfig {
     // Fresh install: no extended-config on disk. Materialize the seeded
     // skills scan-dirs so new users discover (and see in `/settings`) the
     // default skill directories.
-    let mut cfg = ExtendedConfig::default();
-    cfg.skills.scan_dirs = SEEDED_SCAN_DIRS.iter().map(|s| s.to_string()).collect();
-    cfg
+    ExtendedConfig {
+        skills: SkillsConfig::seeded_default(),
+        ..Default::default()
+    }
 }
 
 /// Round-trip loader/saver for `extended-config.json` that preserves

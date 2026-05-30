@@ -23,6 +23,7 @@ use ratatui::widgets::{Paragraph, Wrap};
 use crate::tui::textfield::TextField;
 use crate::tui::theme::MUTED_COLOR_INDEX;
 
+use super::reset::{ResetButton, ResetOutcome};
 use super::{Nav, Page, SettingsDialog, save_status};
 
 /// Number of leading toggle rows before the scan-dir list: row 0 is the
@@ -36,6 +37,9 @@ pub(super) struct SkillsPage {
     pub(super) cursor: usize,
     pub(super) grabbed: Option<GrabState>,
     pub(super) status: Option<String>,
+    /// Page-level "reset to defaults" confirm state (the last navigable
+    /// row, below the `[+ add directory]` synthetic row).
+    pub(super) reset: ResetButton,
 }
 
 pub(super) struct GrabState {
@@ -51,6 +55,7 @@ impl SettingsDialog {
             cursor: 0,
             grabbed: None,
             status: None,
+            reset: ResetButton::default(),
         });
         let mut page = std::mem::replace(&mut self.page, placeholder);
         let nav = if let Page::Skills(p) = &mut page {
@@ -91,10 +96,11 @@ impl SettingsDialog {
 
         let dir_count = self.extended.skills.scan_dirs.len();
         // Rows: 0,1 = toggles, TOGGLE_ROWS..TOGGLE_ROWS+dir_count =
-        // entries, then the `[+ add]` synthetic row (the last navigable
-        // index); `nav_len` is the row count.
+        // entries, then the `[+ add]` synthetic row, then the
+        // `[reset to defaults]` button (the last navigable index).
         let add_cursor = TOGGLE_ROWS + dir_count;
-        let nav_len = add_cursor + 1;
+        let reset_cursor = add_cursor + 1;
+        let nav_len = reset_cursor + 1;
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => return Nav::Close,
             KeyCode::Left | KeyCode::Backspace | KeyCode::Char('h') => {
@@ -103,15 +109,19 @@ impl SettingsDialog {
                 });
             }
             KeyCode::Up | KeyCode::Char('k') => {
+                p.reset.disarm();
                 p.cursor = crate::tui::nav::wrap_prev(p.cursor, nav_len);
             }
             KeyCode::Down | KeyCode::Char('j') => {
+                p.reset.disarm();
                 p.cursor = crate::tui::nav::wrap_next(p.cursor, nav_len);
             }
             KeyCode::Char('a') => {
+                p.reset.disarm();
                 self.start_skills_grab_on_new(p);
             }
             KeyCode::Char('d') | KeyCode::Delete => {
+                p.reset.disarm();
                 if let Some(idx) = dir_index(p.cursor, dir_count) {
                     self.extended.skills.scan_dirs.remove(idx);
                     // Keep the cursor on a valid row.
@@ -121,7 +131,20 @@ impl SettingsDialog {
                 }
             }
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
-                if p.cursor == 0 {
+                if p.cursor == reset_cursor {
+                    // Page-level reset: arm on first activation, apply on
+                    // the second.
+                    if p.reset.activate() == ResetOutcome::Apply {
+                        self.extended.skills =
+                            crate::config::extended::SkillsConfig::seeded_default();
+                        p.cursor = p
+                            .cursor
+                            .min(TOGGLE_ROWS + self.extended.skills.scan_dirs.len());
+                        p.status = save_status(self.save_extended());
+                    } else {
+                        p.status = None;
+                    }
+                } else if p.cursor == 0 {
                     // Toggle auto-`!`.
                     self.extended.skills.auto_bang_commands =
                         !self.extended.skills.auto_bang_commands;
@@ -316,6 +339,15 @@ impl SettingsDialog {
                 Span::raw(marker),
                 Span::styled("[+ add directory]".to_string(), style),
             ]));
+
+            // `[reset to defaults]` button — the last navigable row, just
+            // below `[+ add directory]`. Hidden (like `[+ add]`) while a
+            // row is grabbed.
+            let reset_idx = TOGGLE_ROWS + self.extended.skills.scan_dirs.len() + 1;
+            lines.push(
+                p.reset
+                    .render_line(p.cursor == reset_idx, "reset to defaults"),
+            );
         }
 
         if let Some(status) = &p.status {
@@ -362,6 +394,7 @@ mod tests {
             cursor: 0,
             grabbed: None,
             status: None,
+            reset: ResetButton::default(),
         });
         d
     }
@@ -377,6 +410,7 @@ mod tests {
             cursor: 0,
             grabbed: None,
             status: None,
+            reset: ResetButton::default(),
         });
         d
     }
@@ -472,6 +506,7 @@ mod tests {
             cursor: TOGGLE_ROWS,
             grabbed: None,
             status: None,
+            reset: ResetButton::default(),
         });
         d.handle_key(press(KeyCode::Char('d')));
         assert!(d.extended.skills.scan_dirs.is_empty());
@@ -505,6 +540,7 @@ mod tests {
             cursor: TOGGLE_ROWS, // first dir row
             grabbed: None,
             status: None,
+            reset: ResetButton::default(),
         });
         d.handle_key(press(KeyCode::Enter)); // grab existing
         for ch in "XYZ".chars() {
@@ -533,5 +569,76 @@ mod tests {
         assert_eq!(dir_index(TOGGLE_ROWS + 1, 2), Some(1));
         // Cursor TOGGLE_ROWS + 2 = `[+ add]` synthetic row.
         assert_eq!(dir_index(TOGGLE_ROWS + 2, 2), None);
+    }
+
+    /// Place the cursor on the `[reset to defaults]` row for the current
+    /// scan-dir count.
+    fn put_on_reset_row(d: &mut SettingsDialog) {
+        let reset_cursor = TOGGLE_ROWS + d.extended.skills.scan_dirs.len() + 1;
+        if let Page::Skills(p) = &mut d.page {
+            p.cursor = reset_cursor;
+        } else {
+            panic!("expected Skills page");
+        }
+    }
+
+    #[test]
+    fn skills_reset_arms_then_restores_seeded_default() {
+        use crate::config::extended::SkillsConfig;
+        let tmp = TempDir::new().unwrap();
+        let mut d = fresh_skills_dialog(&tmp);
+        // Diverge from the seeded default.
+        d.extended.skills.scan_dirs = vec!["weird/dir".into()];
+        d.extended.skills.ancestor_walk = true;
+        d.extended.skills.auto_bang_commands = true;
+
+        put_on_reset_row(&mut d);
+
+        // First activation arms only.
+        d.handle_key(press(KeyCode::Enter));
+        match &d.page {
+            Page::Skills(p) => assert!(p.reset.is_pending(), "first activation arms"),
+            other => panic!("expected Skills, got {other:?}"),
+        }
+        assert_eq!(
+            d.extended.skills.scan_dirs,
+            vec!["weird/dir".to_string()],
+            "arming must not mutate config"
+        );
+
+        // Second activation applies + saves.
+        d.handle_key(press(KeyCode::Enter));
+        match &d.page {
+            Page::Skills(p) => assert!(!p.reset.is_pending(), "applying disarms"),
+            other => panic!("expected Skills, got {other:?}"),
+        }
+        let want = SkillsConfig::seeded_default();
+        assert_eq!(d.extended.skills.scan_dirs, want.scan_dirs);
+        assert!(!d.extended.skills.ancestor_walk, "ancestor walk reset off");
+        assert!(
+            !d.extended.skills.auto_bang_commands,
+            "auto-! reset to Codex mode"
+        );
+        // Persisted.
+        let reloaded = ExtendedConfigDoc::load(&d.extended_path).unwrap().config();
+        assert_eq!(reloaded.skills.scan_dirs, want.scan_dirs);
+        assert!(!reloaded.skills.ancestor_walk);
+    }
+
+    #[test]
+    fn skills_reset_pending_cancelled_by_navigation() {
+        let tmp = TempDir::new().unwrap();
+        let mut d = fresh_skills_dialog(&tmp);
+        put_on_reset_row(&mut d);
+        d.handle_key(press(KeyCode::Enter)); // arm
+        match &d.page {
+            Page::Skills(p) => assert!(p.reset.is_pending()),
+            other => panic!("expected Skills, got {other:?}"),
+        }
+        d.handle_key(press(KeyCode::Up)); // navigate away
+        match &d.page {
+            Page::Skills(p) => assert!(!p.reset.is_pending(), "navigation disarms reset"),
+            other => panic!("expected Skills, got {other:?}"),
+        }
     }
 }

@@ -26,6 +26,7 @@
 mod agents_page;
 mod auth;
 mod providers;
+mod reset;
 mod skills_page;
 mod tools_page;
 mod ui_page;
@@ -125,6 +126,7 @@ pub(super) enum Page {
 
 use agents_page::AgentsPage;
 use providers::{AddState, AddStep, ProvidersPage};
+use reset::ResetButton;
 use skills_page::SkillsPage;
 use tools_page::ToolsPage;
 pub use tools_page::{builtin_tool_names, default_template_for};
@@ -588,6 +590,7 @@ impl SettingsDialog {
                             buf: TextField::default(),
                             edit_target: None,
                             status: None,
+                            reset: ResetButton::default(),
                         });
                     }
                     "UI" => {
@@ -599,6 +602,7 @@ impl SettingsDialog {
                             status: None,
                             utility_picker: None,
                             pending_mouse_capture: None,
+                            reset: ResetButton::default(),
                         });
                     }
                     "Skills" => {
@@ -607,6 +611,7 @@ impl SettingsDialog {
                             cursor: 0,
                             grabbed: None,
                             status: None,
+                            reset: ResetButton::default(),
                         });
                     }
                     _ => {}
@@ -1210,6 +1215,7 @@ mod tests {
             status: None,
             utility_picker: None,
             pending_mouse_capture: None,
+            reset: reset::ResetButton::default(),
         });
         d.handle_key(press(KeyCode::Enter));
         assert_eq!(
@@ -2183,5 +2189,204 @@ mod tests {
             vec!["AGENTS.md".to_string()],
             "esc should restore the original filename"
         );
+    }
+
+    // ── Page-level "reset to defaults" buttons ─────────────────────────
+
+    /// Move the cursor to a row by issuing `n` Down keys from the top.
+    fn cursor_down(d: &mut SettingsDialog, n: usize) {
+        for _ in 0..n {
+            d.handle_key(press(KeyCode::Down));
+        }
+    }
+
+    #[test]
+    fn tools_reset_arms_then_restores_builtins_and_drops_custom() {
+        use crate::config::extended::ToolCommandTemplate;
+        let tmp = TempDir::new().unwrap();
+        let mut d = fresh_dialog(&tmp);
+        enter_tools_from_root(&mut d);
+
+        // Diverge a built-in and add a custom user tool.
+        d.extended.tools.insert(
+            "webfetch".into(),
+            ToolCommandTemplate {
+                enabled: false,
+                command: "mangled".into(),
+                description: Some("mangled".into()),
+            },
+        );
+        d.extended.tools.insert(
+            "my_custom".into(),
+            ToolCommandTemplate {
+                enabled: true,
+                command: "echo hi".into(),
+                description: None,
+            },
+        );
+
+        // The reset button is the last navigable row, at cursor
+        // builtins*3 (= 6). Move there.
+        let reset_row = builtin_tool_names().len() * 3;
+        cursor_down(&mut d, reset_row);
+
+        // First activation arms (no change yet).
+        d.handle_key(press(KeyCode::Enter));
+        match &d.page {
+            Page::Tools(p) => assert!(p.reset.is_pending(), "first activation arms"),
+            other => panic!("expected Tools, got {other:?}"),
+        }
+        assert_eq!(
+            d.extended.tools.get("webfetch").map(|e| e.command.as_str()),
+            Some("mangled"),
+            "arming must not mutate config"
+        );
+        assert!(d.extended.tools.contains_key("my_custom"));
+
+        // Second activation applies + saves.
+        d.handle_key(press(KeyCode::Enter));
+        match &d.page {
+            Page::Tools(p) => assert!(!p.reset.is_pending(), "applying disarms"),
+            other => panic!("expected Tools, got {other:?}"),
+        }
+        assert!(
+            !d.extended.tools.contains_key("my_custom"),
+            "custom tool removed"
+        );
+        for name in builtin_tool_names() {
+            let got = d.extended.tools.get(*name).expect("built-in present");
+            let want = default_template_for(name);
+            assert_eq!(got.enabled, want.enabled, "{name} enabled restored");
+            assert_eq!(got.command, want.command, "{name} command restored");
+            assert_eq!(
+                got.description, want.description,
+                "{name} description restored"
+            );
+        }
+        // Persisted to disk.
+        let reloaded = ExtendedConfigDoc::load(&d.extended_path).unwrap().config();
+        assert!(!reloaded.tools.contains_key("my_custom"));
+        let wf = reloaded.tools.get("webfetch").expect("webfetch persisted");
+        assert_eq!(wf.command, default_template_for("webfetch").command);
+    }
+
+    #[test]
+    fn tools_reset_pending_cancelled_by_navigation() {
+        let tmp = TempDir::new().unwrap();
+        let mut d = fresh_dialog(&tmp);
+        enter_tools_from_root(&mut d);
+        let reset_row = builtin_tool_names().len() * 3;
+        cursor_down(&mut d, reset_row);
+        d.handle_key(press(KeyCode::Enter)); // arm
+        match &d.page {
+            Page::Tools(p) => assert!(p.reset.is_pending()),
+            other => panic!("expected Tools, got {other:?}"),
+        }
+        // Navigate away → disarm.
+        d.handle_key(press(KeyCode::Up));
+        match &d.page {
+            Page::Tools(p) => assert!(!p.reset.is_pending(), "navigation disarms reset"),
+            other => panic!("expected Tools, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ui_reset_restores_toggles_but_preserves_other_fields() {
+        use crate::config::extended::{ThinkingDisplay, TuiConfig, VimModeSetting};
+        use std::path::PathBuf;
+        let tmp = TempDir::new().unwrap();
+        let mut d = fresh_dialog(&tmp);
+        enter_ui_from_root(&mut d);
+
+        // Mutate display toggles away from their defaults.
+        d.extended.tui.vim_mode = VimModeSetting::Disabled;
+        d.extended.tui.thinking = ThinkingDisplay::Verbose;
+        d.extended.tui.render_agent_markdown = false;
+        d.extended.tui.render_user_markdown = true;
+        d.extended.tui.mouse_capture = false;
+        d.extended.tui.rich_text_copy = false;
+        d.extended.tui.use_emojis = true;
+        d.extended.tui.caffeinate_display_awake = true;
+        // Set the NON-toggle fields a UI reset must preserve.
+        d.extended.utility_model = Some("openai:gpt-tiny".into());
+        d.extended.name = Some("Ada".into());
+        d.extended.packages_directory = Some(PathBuf::from("/tmp/pkgs"));
+        d.extended.agent_guidance_files = vec!["MINE.md".into()];
+
+        // Reset button is the last navigable row (UI_RESET_ROW).
+        cursor_down(&mut d, ui_page::UI_RESET_ROW);
+        d.handle_key(press(KeyCode::Enter)); // arm
+        match &d.page {
+            Page::Ui(p) => assert!(p.reset.is_pending()),
+            other => panic!("expected Ui, got {other:?}"),
+        }
+        // Arming must not change anything.
+        assert_eq!(d.extended.tui.vim_mode, VimModeSetting::Disabled);
+
+        d.handle_key(press(KeyCode::Enter)); // apply
+        match &d.page {
+            Page::Ui(p) => {
+                assert!(!p.reset.is_pending(), "applying disarms");
+                assert_eq!(
+                    p.pending_mouse_capture,
+                    Some(TuiConfig::default().mouse_capture),
+                    "reset signals the App to reconcile mouse capture"
+                );
+            }
+            other => panic!("expected Ui, got {other:?}"),
+        }
+
+        // Display toggles back to TuiConfig::default().
+        let def = TuiConfig::default();
+        assert_eq!(d.extended.tui.vim_mode, def.vim_mode);
+        assert_eq!(d.extended.tui.thinking, def.thinking);
+        assert_eq!(
+            d.extended.tui.render_agent_markdown,
+            def.render_agent_markdown
+        );
+        assert_eq!(
+            d.extended.tui.render_user_markdown,
+            def.render_user_markdown
+        );
+        assert_eq!(d.extended.tui.mouse_capture, def.mouse_capture);
+        assert_eq!(d.extended.tui.rich_text_copy, def.rich_text_copy);
+        assert_eq!(d.extended.tui.use_emojis, def.use_emojis);
+        assert_eq!(
+            d.extended.tui.caffeinate_display_awake,
+            def.caffeinate_display_awake
+        );
+
+        // Non-toggle fields preserved.
+        assert_eq!(d.extended.utility_model.as_deref(), Some("openai:gpt-tiny"));
+        assert_eq!(d.extended.name.as_deref(), Some("Ada"));
+        assert_eq!(
+            d.extended.packages_directory,
+            Some(PathBuf::from("/tmp/pkgs"))
+        );
+        assert_eq!(d.extended.agent_guidance_files, vec!["MINE.md".to_string()]);
+
+        // Persisted.
+        let reloaded = ExtendedConfigDoc::load(&d.extended_path).unwrap().config();
+        assert_eq!(reloaded.tui.vim_mode, def.vim_mode);
+        assert_eq!(reloaded.utility_model.as_deref(), Some("openai:gpt-tiny"));
+        assert_eq!(reloaded.name.as_deref(), Some("Ada"));
+    }
+
+    #[test]
+    fn ui_reset_pending_cancelled_by_navigation() {
+        let tmp = TempDir::new().unwrap();
+        let mut d = fresh_dialog(&tmp);
+        enter_ui_from_root(&mut d);
+        cursor_down(&mut d, ui_page::UI_RESET_ROW);
+        d.handle_key(press(KeyCode::Enter)); // arm
+        match &d.page {
+            Page::Ui(p) => assert!(p.reset.is_pending()),
+            other => panic!("expected Ui, got {other:?}"),
+        }
+        d.handle_key(press(KeyCode::Up)); // navigate away
+        match &d.page {
+            Page::Ui(p) => assert!(!p.reset.is_pending(), "navigation disarms reset"),
+            other => panic!("expected Ui, got {other:?}"),
+        }
     }
 }

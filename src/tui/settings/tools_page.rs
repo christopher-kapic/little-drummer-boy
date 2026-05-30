@@ -13,6 +13,7 @@ use crate::config::extended::ToolCommandTemplate;
 use crate::tui::textfield::TextField;
 use crate::tui::theme::MUTED_COLOR_INDEX;
 
+use super::reset::{ResetButton, ResetOutcome};
 use super::{Nav, Page, SettingsDialog, save_status};
 
 /// `/settings → Tools` state. Edits the user-defined bash-command
@@ -24,6 +25,9 @@ pub(super) struct ToolsPage {
     /// Which tool's row is being edited, when `editing` is `Some`.
     pub(super) edit_target: Option<String>,
     pub(super) status: Option<String>,
+    /// Page-level "reset to defaults" confirm state (the last navigable
+    /// row).
+    pub(super) reset: ResetButton,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq)]
@@ -76,6 +80,7 @@ impl SettingsDialog {
             buf: TextField::default(),
             edit_target: None,
             status: None,
+            reset: ResetButton::default(),
         });
         let mut page = std::mem::replace(&mut self.page, placeholder);
         let nav = if let Page::Tools(p) = &mut page {
@@ -138,7 +143,10 @@ impl SettingsDialog {
         // an "add tool" affordance in v1 to keep the UI tight.
         let builtins = builtin_tool_names();
         let rows_per_tool = 3usize;
-        let total_rows = builtins.len() * rows_per_tool;
+        let tool_rows = builtins.len() * rows_per_tool;
+        // The `[reset to defaults]` button is the last navigable row.
+        let reset_row = tool_rows;
+        let total_rows = tool_rows + 1;
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => return Nav::Close,
             KeyCode::Left | KeyCode::Backspace | KeyCode::Char('h') => {
@@ -147,12 +155,14 @@ impl SettingsDialog {
                 });
             }
             KeyCode::Up | KeyCode::Char('k') => {
+                p.reset.disarm();
                 p.cursor = crate::tui::nav::wrap_prev(p.cursor, total_rows);
             }
             KeyCode::Down | KeyCode::Char('j') => {
+                p.reset.disarm();
                 p.cursor = crate::tui::nav::wrap_next(p.cursor, total_rows);
             }
-            KeyCode::Char('t') => {
+            KeyCode::Char('t') if p.cursor < tool_rows => {
                 let tool_idx = p.cursor / rows_per_tool;
                 if let Some(name) = builtins.get(tool_idx).copied() {
                     let entry = self
@@ -164,7 +174,7 @@ impl SettingsDialog {
                     p.status = save_status(self.save_extended());
                 }
             }
-            KeyCode::Char('r') => {
+            KeyCode::Char('r') if p.cursor < tool_rows => {
                 let tool_idx = p.cursor / rows_per_tool;
                 if let Some(name) = builtins.get(tool_idx).copied() {
                     self.extended
@@ -174,6 +184,17 @@ impl SettingsDialog {
                 }
             }
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                if p.cursor == reset_row {
+                    // Page-level reset: arm on first activation, apply on
+                    // the second.
+                    if p.reset.activate() == ResetOutcome::Apply {
+                        self.reset_tools_to_defaults();
+                        p.status = save_status(self.save_extended());
+                    } else {
+                        p.status = None;
+                    }
+                    return Nav::Stay;
+                }
                 let tool_idx = p.cursor / rows_per_tool;
                 let row_in_tool = p.cursor % rows_per_tool;
                 if let Some(name) = builtins.get(tool_idx).copied() {
@@ -204,6 +225,18 @@ impl SettingsDialog {
             _ => {}
         }
         Nav::Stay
+    }
+
+    /// Reset the tools map to its default state: every built-in template
+    /// restored to its [`default_template_for`] default, and every
+    /// user-added/custom tool entry removed.
+    fn reset_tools_to_defaults(&mut self) {
+        self.extended.tools.clear();
+        for name in builtin_tool_names() {
+            self.extended
+                .tools
+                .insert(name.to_string(), default_template_for(name));
+        }
     }
 
     pub(super) fn render_tools_page(&self, frame: &mut Frame, area: Rect, p: &ToolsPage) {
@@ -263,6 +296,14 @@ impl SettingsDialog {
             }
             lines.push(Line::default());
         }
+
+        // `[reset to defaults]` button — the last navigable row, at
+        // cursor `builtins.len() * 3`.
+        let reset_row = builtins.len() * 3;
+        lines.push(
+            p.reset
+                .render_line(p.cursor == reset_row, "reset to defaults"),
+        );
 
         if let Some(field) = p.editing {
             let prompt = match field {
