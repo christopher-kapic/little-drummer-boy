@@ -1092,10 +1092,12 @@ fn plan_detail(ctx: &DaemonContext, plan_id: Uuid) -> std::result::Result<Respon
             });
         }
     };
-    let step_count = ctx.db.list_steps(plan_id).map_err(internal)?.len() as i64;
-    let summary = plan_summary_wire(crate::db::plans::PlanSummary { plan, step_count });
-
     let steps = ctx.db.list_steps(plan_id).map_err(internal)?;
+    let summary = plan_summary_wire(crate::db::plans::PlanSummary {
+        plan,
+        step_count: steps.len() as i64,
+    });
+
     let edges = ctx.db.list_dependencies(plan_id).map_err(internal)?;
     // `id → title` so dependency targets render as titles, not uuids.
     let title_by_id: std::collections::HashMap<Uuid, String> =
