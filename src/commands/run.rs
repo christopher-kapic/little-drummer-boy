@@ -88,7 +88,14 @@ async fn run_turn(
     prompt: String,
     no_sandbox: bool,
 ) -> Result<i32> {
-    attach_send_pump(client, prompt, no_sandbox, args.format).await
+    attach_send_pump(
+        client,
+        prompt,
+        no_sandbox,
+        args.format,
+        args.model.as_deref(),
+    )
+    .await
 }
 
 /// Attach a fresh headless session, send `prompt`, and pump events to
@@ -101,13 +108,16 @@ pub(crate) async fn attach_send_pump(
     prompt: String,
     no_sandbox: bool,
     format: OutputFormat,
+    model_override: Option<&str>,
 ) -> Result<i32> {
     let cwd = std::env::current_dir().context("resolving cwd")?;
     let project_root = cwd.to_string_lossy().into_owned();
 
     // Attach a fresh session. `no_sandbox` (sandboxing part 2) makes this
     // noninteractive session start unsandboxed unless the daemon was
-    // launched `--no-sandbox` (which wins).
+    // launched `--no-sandbox` (which wins). `model_override` (`--model`, the
+    // plan executor passes the plan's pinned model) overrides every spawned
+    // agent's frontmatter model for this session's run.
     let attached = client
         .request_ok(Request::Attach {
             session_id: None,
@@ -118,6 +128,7 @@ pub(crate) async fn attach_send_pump(
             // headless and auto-rejects a back-to-back repeat (with the
             // guidance error) rather than blocking.
             interactive: false,
+            model_override: model_override.map(str::to_string),
         })
         .await?;
     let session_id = match attached {

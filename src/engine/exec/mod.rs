@@ -710,6 +710,7 @@ mod tests {
                 base_branch: Some("main".into()),
                 target_branch: Some("cockpit-plan/p".into()),
                 isolation_mode: isolation,
+                model: None,
             })
             .unwrap();
         (db, plan.id)
@@ -728,6 +729,7 @@ mod tests {
                 base_branch: None,
                 target_branch: None,
                 isolation_mode: IsolationMode::Worktree,
+                model: None,
             })
             .unwrap();
         let ex = Executor::new(db);
@@ -756,6 +758,7 @@ mod tests {
                 base_branch: None,
                 target_branch: None,
                 isolation_mode: IsolationMode::Worktree,
+                model: None,
             })
             .unwrap();
         let ex = Executor::new(db);
@@ -1026,6 +1029,7 @@ mod tests {
                 base_branch: Some("main".into()),
                 target_branch: Some("cockpit-plan/e2e".into()),
                 isolation_mode: IsolationMode::Worktree,
+                model: None,
             })
             .unwrap();
         // Two independent steps, each with a branch_stable test (pooled).
@@ -1087,6 +1091,7 @@ mod tests {
                 base_branch: Some("main".into()),
                 target_branch: Some("cockpit-plan/dep".into()),
                 isolation_mode: IsolationMode::Worktree,
+                model: None,
             })
             .unwrap();
         let a = db.add_step(plan.id, "a", "{}", &[], &[]).unwrap();
@@ -1120,6 +1125,7 @@ mod tests {
                 base_branch: Some("main".into()),
                 target_branch: Some("cockpit-plan/shared".into()),
                 isolation_mode: IsolationMode::SharedTree,
+                model: None,
             })
             .unwrap();
         db.add_step(plan.id, "alpha", "{}", &[], &[]).unwrap();
@@ -1164,6 +1170,7 @@ mod tests {
                 base_branch: Some("main".into()),
                 target_branch: Some("cockpit-plan/fail".into()),
                 isolation_mode: IsolationMode::Worktree,
+                model: None,
             })
             .unwrap();
         let a = db

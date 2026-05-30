@@ -147,6 +147,11 @@ pub struct PlanRow {
     pub base_branch: Option<String>,
     pub target_branch: Option<String>,
     pub isolation_mode: IsolationMode,
+    /// Plan-level model override in canonical `provider/model` slash form,
+    /// or `None` for no override. When set, it overrides every agent's
+    /// frontmatter model for that plan's run (precedence: plan → frontmatter
+    /// → session); unset behaves exactly as before.
+    pub model: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -166,6 +171,7 @@ impl PlanRow {
             base_branch: row.get("base_branch")?,
             target_branch: row.get("target_branch")?,
             isolation_mode: IsolationMode::from_str(&isolation),
+            model: row.get("model")?,
             created_at: row.get("created_at")?,
             updated_at: row.get("updated_at")?,
         })
@@ -253,6 +259,29 @@ pub struct NewPlan {
     pub base_branch: Option<String>,
     pub target_branch: Option<String>,
     pub isolation_mode: IsolationMode,
+    /// Optional plan-level model in `provider/model` slash form.
+    pub model: Option<String>,
+}
+
+/// Resolved fields for a plan duplicate ([`Db::duplicate_plan`]). The caller
+/// (`cockpit plan duplicate`) resolves slug + branch derivation/collisions and
+/// model validation, then hands the final values here.
+#[derive(Debug, Clone)]
+pub struct DuplicateSpec<'a> {
+    /// The new (already-unique) slug.
+    pub new_slug: &'a str,
+    /// Base branch (copied from the source or overridden by the caller).
+    pub base_branch: Option<&'a str>,
+    /// Target branch (made distinct from the source's, or overridden).
+    pub target_branch: Option<&'a str>,
+    /// Plan-level model in `provider/model` slash form, or `None`.
+    pub model: Option<&'a str>,
+    /// Isolation mode (copied from the source).
+    pub isolation_mode: IsolationMode,
+    /// Title (copied from the source).
+    pub title: &'a str,
+    /// Description (copied from the source).
+    pub description: &'a str,
 }
 
 /// A summary row for list/inspect: the plan plus its step count.
@@ -277,8 +306,8 @@ impl Db {
             conn.execute(
                 "INSERT INTO plans \
                  (id, slug, title, description, status, base_branch, target_branch, \
-                  isolation_mode, created_at, updated_at) \
-                 VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, ?7, ?8, ?8)",
+                  isolation_mode, model, created_at, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, ?7, ?8, ?9, ?9)",
                 params![
                     id.to_string(),
                     plan.slug,
@@ -287,6 +316,7 @@ impl Db {
                     plan.base_branch,
                     plan.target_branch,
                     plan.isolation_mode.as_str(),
+                    plan.model,
                     now,
                 ],
             )
@@ -302,6 +332,7 @@ impl Db {
             base_branch: plan.base_branch.clone(),
             target_branch: plan.target_branch.clone(),
             isolation_mode: plan.isolation_mode,
+            model: plan.model.clone(),
             created_at: now,
             updated_at: now,
         })
@@ -438,6 +469,152 @@ impl Db {
                 anyhow::bail!("no plan with id `{id}`");
             }
             Ok(())
+        })
+    }
+
+    /// Overrides applied to a plan duplicate at creation time.
+    ///
+    /// `slug` / `base_branch` / `target_branch`, when `Some`, replace the
+    /// copied values; when `None` they're derived (slug + target branch are
+    /// made unique). `model` always replaces the duplicate's model (pass the
+    /// source's own value through to preserve it, or `None` to clear).
+    ///
+    /// Deep-copy a plan into a fresh, independent `pending` plan: clones the
+    /// `plans` row plus every `plan_steps`, `plan_step_deps`, and
+    /// `plan_step_tests`, assigning fresh UUIDs throughout and rewriting
+    /// dependency/test edges to the new ids. Step `position`, titles,
+    /// `feature_description`, and each test's command/phase/concurrency/
+    /// `resource_key` are preserved; the duplicate's `status` and every
+    /// `plan_steps.status` reset to `'pending'`. The whole copy is one
+    /// transaction — a partial copy is never left behind on error.
+    ///
+    /// Slug / `target_branch` derivation + collision policy is the caller's
+    /// (`cockpit plan duplicate`) responsibility; this method takes the final
+    /// resolved values and fails (rolling back) if `slug` is already taken.
+    pub fn duplicate_plan(&self, source_id: Uuid, spec: &DuplicateSpec<'_>) -> Result<PlanRow> {
+        let DuplicateSpec {
+            new_slug,
+            base_branch,
+            target_branch,
+            model,
+            isolation_mode,
+            title,
+            description,
+        } = *spec;
+        let now = Utc::now().timestamp();
+        let new_plan_id = Uuid::new_v4();
+        self.with_conn(|conn| {
+            let tx = conn
+                .unchecked_transaction()
+                .context("begin duplicate_plan tx")?;
+
+            // Slug uniqueness (the UNIQUE constraint would also catch this,
+            // but a named error is clearer than an opaque constraint failure).
+            let slug_taken: bool = tx
+                .query_row(
+                    "SELECT 1 FROM plans WHERE slug = ?1",
+                    params![new_slug],
+                    |_| Ok(()),
+                )
+                .optional()
+                .context("checking slug uniqueness")?
+                .is_some();
+            if slug_taken {
+                anyhow::bail!("a plan with slug `{new_slug}` already exists");
+            }
+
+            tx.execute(
+                "INSERT INTO plans \
+                 (id, slug, title, description, status, base_branch, target_branch, \
+                  isolation_mode, model, created_at, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, ?7, ?8, ?9, ?9)",
+                params![
+                    new_plan_id.to_string(),
+                    new_slug,
+                    title,
+                    description,
+                    base_branch,
+                    target_branch,
+                    isolation_mode.as_str(),
+                    model,
+                    now,
+                ],
+            )
+            .context("inserting duplicate plan")?;
+
+            // Copy steps, building a source-id → new-id map so dep/test edges
+            // can be rewritten. Reset each step's status to 'pending'.
+            let mut id_map: std::collections::HashMap<Uuid, Uuid> =
+                std::collections::HashMap::new();
+            let src_steps = read_steps(&tx, source_id)?;
+            for step in &src_steps {
+                let new_step_id = Uuid::new_v4();
+                id_map.insert(step.id, new_step_id);
+                tx.execute(
+                    "INSERT INTO plan_steps \
+                     (id, plan_id, title, feature_description, status, position, \
+                      created_at, updated_at) \
+                     VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, ?6)",
+                    params![
+                        new_step_id.to_string(),
+                        new_plan_id.to_string(),
+                        step.title,
+                        step.feature_description,
+                        step.position,
+                        now,
+                    ],
+                )
+                .context("copying step")?;
+
+                // Copy that step's tests under the new step id.
+                for test in read_step_tests(&tx, step.id)? {
+                    let (concurrency, resource_key) = test.concurrency.to_columns();
+                    tx.execute(
+                        "INSERT INTO plan_step_tests \
+                         (id, step_id, command, phase, concurrency, resource_key, \
+                          position, created_at) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                        params![
+                            Uuid::new_v4().to_string(),
+                            new_step_id.to_string(),
+                            test.command,
+                            test.phase.as_str(),
+                            concurrency,
+                            resource_key,
+                            test.position,
+                            now,
+                        ],
+                    )
+                    .context("copying step test")?;
+                }
+            }
+
+            // Rewrite every dependency edge to the new step ids. The source
+            // graph is acyclic (the insert path guarantees it), so the copy
+            // is acyclic by construction — no cycle check needed.
+            for (from, to) in read_plan_edges(&tx, source_id)? {
+                let (Some(new_from), Some(new_to)) = (id_map.get(&from), id_map.get(&to)) else {
+                    anyhow::bail!("dangling dependency edge in source plan `{source_id}`");
+                };
+                insert_edge(&tx, new_plan_id, *new_from, *new_to, now)?;
+            }
+
+            tx.commit().context("commit duplicate_plan tx")?;
+            Ok(())
+        })?;
+
+        Ok(PlanRow {
+            id: new_plan_id,
+            slug: new_slug.to_string(),
+            title: title.to_string(),
+            description: description.to_string(),
+            status: PlanStatus::Pending,
+            base_branch: base_branch.map(str::to_string),
+            target_branch: target_branch.map(str::to_string),
+            isolation_mode,
+            model: model.map(str::to_string),
+            created_at: now,
+            updated_at: now,
         })
     }
 
@@ -731,6 +908,37 @@ fn insert_edge(conn: &Connection, plan_id: Uuid, from: Uuid, to: Uuid, now: i64)
     Ok(())
 }
 
+/// Steps of a plan in authoring order, read inside an open transaction
+/// (the duplicate-plan deep copy reads + writes in one tx).
+fn read_steps(conn: &Connection, plan_id: Uuid) -> Result<Vec<StepRow>> {
+    let mut stmt = conn
+        .prepare("SELECT * FROM plan_steps WHERE plan_id = ?1 ORDER BY position")
+        .context("preparing read_steps")?;
+    let rows = stmt
+        .query_map(params![plan_id.to_string()], StepRow::from_row)
+        .context("querying read_steps")?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.context("decoding step row")?);
+    }
+    Ok(out)
+}
+
+/// Tests of a step in authoring order, read inside an open transaction.
+fn read_step_tests(conn: &Connection, step_id: Uuid) -> Result<Vec<TestRow>> {
+    let mut stmt = conn
+        .prepare("SELECT * FROM plan_step_tests WHERE step_id = ?1 ORDER BY position")
+        .context("preparing read_step_tests")?;
+    let rows = stmt
+        .query_map(params![step_id.to_string()], TestRow::from_row)
+        .context("querying read_step_tests")?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.context("decoding test row")?);
+    }
+    Ok(out)
+}
+
 /// All `(from, to)` edges of a plan, read inside an open transaction.
 fn read_plan_edges(conn: &Connection, plan_id: Uuid) -> Result<Vec<(Uuid, Uuid)>> {
     let mut stmt = conn
@@ -810,6 +1018,7 @@ mod tests {
             base_branch: Some("main".to_string()),
             target_branch: Some("cockpit-plan/feature".to_string()),
             isolation_mode: IsolationMode::Worktree,
+            model: None,
         }
     }
 
@@ -993,5 +1202,116 @@ mod tests {
         let got = db.plan_by_id(plan.id).unwrap().unwrap();
         assert_eq!(got.base_branch.as_deref(), Some("develop"));
         assert_eq!(got.target_branch.as_deref(), Some("cockpit-plan/x"));
+    }
+
+    #[test]
+    fn create_plan_round_trips_model() {
+        let db = Db::open_in_memory().unwrap();
+        let mut np = sample_plan("m");
+        np.model = Some("anthropic/claude-opus-4-8".to_string());
+        let plan = db.create_plan(&np).unwrap();
+        assert_eq!(plan.model.as_deref(), Some("anthropic/claude-opus-4-8"));
+        let got = db.plan_by_id(plan.id).unwrap().unwrap();
+        assert_eq!(got.model.as_deref(), Some("anthropic/claude-opus-4-8"));
+    }
+
+    #[test]
+    fn duplicate_deep_copies_graph_and_resets_status() {
+        let db = Db::open_in_memory().unwrap();
+        let src = db.create_plan(&sample_plan("orig")).unwrap();
+        // Build A → (B depends on A) with a test on B; advance the source.
+        let a = db.add_step(src.id, "A", "{\"o\":1}", &[], &[]).unwrap();
+        let tests = vec![NewTest {
+            command: "cargo test".to_string(),
+            phase: TestPhase::PostStep,
+            concurrency: TestConcurrency::Exclusive {
+                resource_key: "port:8080".to_string(),
+            },
+        }];
+        let b = db
+            .add_step(src.id, "B", "{\"o\":2}", &[a.id], &tests)
+            .unwrap();
+        db.set_plan_status(src.id, PlanStatus::InProgress).unwrap();
+
+        let dup = db
+            .duplicate_plan(
+                src.id,
+                &DuplicateSpec {
+                    new_slug: "orig-2",
+                    base_branch: Some("main"),
+                    target_branch: Some("cockpit-plan/orig-2"),
+                    model: Some("anthropic/claude-opus-4-8"),
+                    isolation_mode: IsolationMode::Worktree,
+                    title: "Plan orig",
+                    description: "one-liner",
+                },
+            )
+            .unwrap();
+
+        // Fresh plan: pending status, the new model, distinct ids.
+        assert_ne!(dup.id, src.id);
+        assert_eq!(dup.status, PlanStatus::Pending);
+        assert_eq!(dup.model.as_deref(), Some("anthropic/claude-opus-4-8"));
+        assert_eq!(dup.target_branch.as_deref(), Some("cockpit-plan/orig-2"));
+
+        // Steps copied with fresh ids, preserved order/titles/packets, reset
+        // status; source steps untouched (still in_progress source).
+        let dup_steps = db.list_steps(dup.id).unwrap();
+        assert_eq!(dup_steps.len(), 2);
+        assert_eq!(dup_steps[0].title, "A");
+        assert_eq!(dup_steps[1].title, "B");
+        assert_eq!(dup_steps[1].feature_description, "{\"o\":2}");
+        for s in &dup_steps {
+            assert_eq!(s.status, PlanStatus::Pending);
+            assert_ne!(s.id, a.id);
+            assert_ne!(s.id, b.id);
+            assert_eq!(s.plan_id, dup.id);
+        }
+
+        // Dependency edge rewired to the new ids (new-B depends on new-A).
+        let deps = db.list_dependencies(dup.id).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0], (dup_steps[1].id, dup_steps[0].id));
+
+        // Test copied under the new step id, with its concurrency preserved.
+        let dup_tests = db.list_step_tests(dup_steps[1].id).unwrap();
+        assert_eq!(dup_tests.len(), 1);
+        assert_eq!(
+            dup_tests[0].concurrency,
+            TestConcurrency::Exclusive {
+                resource_key: "port:8080".to_string()
+            }
+        );
+
+        // Source is untouched.
+        assert_eq!(
+            db.plan_by_id(src.id).unwrap().unwrap().status,
+            PlanStatus::InProgress
+        );
+        assert_eq!(db.list_steps(src.id).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn duplicate_rejects_taken_slug() {
+        let db = Db::open_in_memory().unwrap();
+        let src = db.create_plan(&sample_plan("dupe")).unwrap();
+        db.create_plan(&sample_plan("dupe-taken")).unwrap();
+        assert!(
+            db.duplicate_plan(
+                src.id,
+                &DuplicateSpec {
+                    new_slug: "dupe-taken",
+                    base_branch: None,
+                    target_branch: None,
+                    model: None,
+                    isolation_mode: IsolationMode::Worktree,
+                    title: "t",
+                    description: "d",
+                },
+            )
+            .is_err()
+        );
+        // The failed duplicate left nothing behind (still just the two plans).
+        assert_eq!(db.list_all_plan_summaries().unwrap().len(), 2);
     }
 }

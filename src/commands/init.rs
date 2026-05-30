@@ -152,6 +152,7 @@ pub async fn run(args: InitArgs, no_sandbox: bool) -> Result<()> {
         prompt,
         no_sandbox,
         crate::cli::OutputFormat::Default,
+        None,
     )
     .await;
 

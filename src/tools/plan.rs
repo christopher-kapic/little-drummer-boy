@@ -302,6 +302,10 @@ impl Tool for CreatePlanTool {
             base_branch,
             target_branch,
             isolation_mode,
+            // The plan-level model is set via `cockpit plan duplicate --model`
+            // (prompt `plan-duplication-and-model-override.md`); the authoring
+            // tool leaves it unset (no override).
+            model: None,
         })?;
 
         Ok(ToolOutput::text(format!(

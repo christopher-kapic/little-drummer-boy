@@ -135,6 +135,10 @@ fn try_spawn_inner(
                     // `question` prompts) — mark this attach interactive so
                     // the loop guard prompts here instead of auto-rejecting.
                     interactive: true,
+                    // The interactive TUI uses the session's active model; the
+                    // plan-level override is only for the headless plan-run
+                    // path (`cockpit run --model`).
+                    model_override: None,
                 })
                 .await
                 .map_err(|e| format!("attach: {e}"))?;

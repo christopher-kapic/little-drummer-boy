@@ -63,6 +63,26 @@ pub struct SpawnArgs {
     /// both read one value. Resolved from the layered `extended-config.json`
     /// at session start; live-switched via `/llm-mode`.
     pub llm_mode: crate::config::extended::LlmMode,
+    /// Plan-level model override (prompt
+    /// `plan-duplication-and-model-override.md`): when a plan pins a `model`,
+    /// every agent spawned by that plan's run uses it, **overriding** even an
+    /// agent's frontmatter `model` (precedence: plan → frontmatter → session).
+    /// `None` outside a plan run, where the session model + frontmatter behave
+    /// exactly as before. Resolved once when the session worker starts and
+    /// threaded onto every spawn.
+    pub model_override: Option<Arc<Model>>,
+}
+
+impl SpawnArgs {
+    /// The model an agent factory should spawn under: the plan-level override
+    /// when present, else the session model. This is the precedence floor —
+    /// the per-agent frontmatter `model` (handled in [`resolve_agent_model`])
+    /// applies only when there is no plan-level override.
+    fn effective_model(&self) -> Arc<Model> {
+        self.model_override
+            .clone()
+            .unwrap_or_else(|| self.model.clone())
+    }
 }
 
 /// Append the cross-session recall tools (`session_search` /
@@ -406,6 +426,7 @@ mod tests {
             session_short_id: String::new(),
             interactive: true,
             llm_mode: crate::config::extended::LlmMode::default(),
+            model_override: None,
         }
     }
 
@@ -467,6 +488,71 @@ mod tests {
         assert!(!is_noninteractive("coder"));
         assert!(is_noninteractive("explore"));
         assert!(is_noninteractive("docs"));
+    }
+
+    /// A bare [`crate::agents::AgentDef`] carrying an optional frontmatter
+    /// `model`, for exercising [`resolve_agent_model`] precedence.
+    fn def_with_model(model: Option<&str>) -> crate::agents::AgentDef {
+        crate::agents::AgentDef {
+            name: "custom".to_string(),
+            description: "x".to_string(),
+            mode: crate::agents::AgentMode::default(),
+            model: model.map(str::to_string),
+            temperature: None,
+            tools: None,
+            permission: None,
+            prompt: "body".to_string(),
+            prompt_variants: std::collections::HashMap::new(),
+            source: std::path::PathBuf::new(),
+        }
+    }
+
+    /// A second, distinct [`Model`] to stand in for a plan-level override, so
+    /// the precedence assertions can compare by pointer identity.
+    fn override_model() -> Arc<Model> {
+        use crate::config::providers::{ActiveModelRef, ProviderEntry, ProvidersConfig};
+        use std::collections::BTreeMap;
+        let mut providers = BTreeMap::new();
+        providers.insert(
+            "lmstudio".to_string(),
+            ProviderEntry {
+                url: "http://localhost:1/v1".into(),
+                headers: vec![],
+                ..ProviderEntry::default()
+            },
+        );
+        let pcfg = ProvidersConfig {
+            providers,
+            active_model: Some(ActiveModelRef {
+                provider: "lmstudio".into(),
+                model: "override".into(),
+                thinking_mode: None,
+            }),
+            ..ProvidersConfig::default()
+        };
+        Arc::new(Model::from_config(&pcfg).unwrap())
+    }
+
+    #[test]
+    fn plan_model_override_beats_frontmatter() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut args = test_spawn_args(tmp.path());
+        let over = override_model();
+        args.model_override = Some(over.clone());
+        // Even with a frontmatter model set, the plan-level override wins.
+        let def = def_with_model(Some("anthropic/claude-opus-4-8"));
+        let resolved = resolve_agent_model(&def, &args);
+        assert!(Arc::ptr_eq(&resolved, &over));
+    }
+
+    #[test]
+    fn no_override_no_frontmatter_uses_session_model() {
+        let tmp = tempfile::tempdir().unwrap();
+        let args = test_spawn_args(tmp.path());
+        // No plan override, no frontmatter selector → the session model.
+        let def = def_with_model(None);
+        let resolved = resolve_agent_model(&def, &args);
+        assert!(Arc::ptr_eq(&resolved, &args.model));
     }
 
     /// Config with a name set, used by the deterministic name-present case.
@@ -653,7 +739,8 @@ fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) -> Agent {
     // Cross-session recall tools, gated on interactive spawn.
     tb = with_recall_tools(tb, args);
 
-    // Per-agent model override: a `provider:model-id` selector resolved
+    // Model precedence (plan → frontmatter → session): a plan-level override
+    // wins outright; else a `provider/model` frontmatter selector is resolved
     // through the same provider pipeline the foreground model uses. On any
     // failure (unconfigured provider, malformed selector) fall back to the
     // session model rather than failing the spawn — the override is a
@@ -815,11 +902,17 @@ fn append_custom_subagents(out: &mut Vec<String>, cwd: &Path) {
     }
 }
 
-/// Resolve a per-agent `model` override to a concrete [`Model`]. Falls
-/// back to the session model on any failure so an override pointing at an
-/// unconfigured provider degrades gracefully rather than breaking the
-/// spawn.
+/// Resolve the model an agent spawns under, by precedence: a plan-level
+/// override (when this spawn belongs to a plan run) → the agent's frontmatter
+/// `model` → the session model. The frontmatter selector uses the canonical
+/// `provider/model` slash form ([`crate::config::provider::split_provider_model`]).
+/// Falls back to the session model on any failure so an override pointing at
+/// an unconfigured provider degrades gracefully rather than breaking the spawn.
 fn resolve_agent_model(def: &crate::agents::AgentDef, args: &SpawnArgs) -> Arc<Model> {
+    // A plan-level model overrides the frontmatter entirely.
+    if let Some(model) = &args.model_override {
+        return model.clone();
+    }
     let Some(selector) = def
         .model
         .as_deref()
@@ -828,7 +921,7 @@ fn resolve_agent_model(def: &crate::agents::AgentDef, args: &SpawnArgs) -> Arc<M
     else {
         return args.model.clone();
     };
-    let Some((provider, model_id)) = selector.split_once(':') else {
+    let Some((provider, model_id)) = crate::config::provider::split_provider_model(selector) else {
         return args.model.clone();
     };
     let cfg = discover_config_dirs(&args.cwd)
@@ -836,7 +929,7 @@ fn resolve_agent_model(def: &crate::agents::AgentDef, args: &SpawnArgs) -> Arc<M
         .find_map(|d| crate::config::providers::ConfigDoc::load(&d.path.join("config.json")).ok())
         .map(|d| d.providers())
         .unwrap_or_default();
-    match Model::for_provider(&cfg, provider, model_id) {
+    match Model::for_provider(&cfg, &provider, &model_id) {
         Ok(m) => Arc::new(m),
         Err(_) => args.model.clone(),
     }
@@ -881,7 +974,7 @@ pub fn build(args: &SpawnArgs) -> Agent {
         name: "Build".to_string(),
         system: compose_system_prompt(BUILD_PROMPT, &args.session_short_id, &args.cwd),
         tools,
-        model: args.model.clone(),
+        model: args.effective_model(),
         params: args.params.clone(),
         llm_mode: args.llm_mode,
     }
@@ -922,7 +1015,7 @@ pub fn coder(args: &SpawnArgs) -> Agent {
         name: "coder".to_string(),
         system: compose_system_prompt(CODER_PROMPT, &args.session_short_id, &args.cwd),
         tools,
-        model: args.model.clone(),
+        model: args.effective_model(),
         params: args.params.clone(),
         llm_mode: args.llm_mode,
     }
@@ -957,7 +1050,7 @@ pub fn explore(args: &SpawnArgs) -> Agent {
         name: "explore".to_string(),
         system: compose_system_prompt(EXPLORE_PROMPT, &args.session_short_id, &args.cwd),
         tools,
-        model: args.model.clone(),
+        model: args.effective_model(),
         params: args.params.clone(),
         llm_mode: args.llm_mode,
     }
@@ -1004,7 +1097,7 @@ pub fn plan(args: &SpawnArgs) -> Agent {
         name: "Plan".to_string(),
         system: compose_system_prompt(PLAN_PROMPT, &args.session_short_id, &args.cwd),
         tools,
-        model: args.model.clone(),
+        model: args.effective_model(),
         params: args.params.clone(),
         llm_mode: args.llm_mode,
     }
@@ -1037,7 +1130,7 @@ pub fn plan_author(args: &SpawnArgs) -> Agent {
         name: "plan-author".to_string(),
         system: compose_system_prompt(PLAN_AUTHOR_PROMPT, &args.session_short_id, &args.cwd),
         tools,
-        model: args.model.clone(),
+        model: args.effective_model(),
         params: args.params.clone(),
         llm_mode: args.llm_mode,
     }
@@ -1072,7 +1165,7 @@ pub fn docs_resolver(
         name: "docs-resolver".to_string(),
         system: compose_system_prompt(DOCS_RESOLVER_PROMPT, &args.session_short_id, &args.cwd),
         tools,
-        model: args.model.clone(),
+        model: args.effective_model(),
         params: args.params.clone(),
         llm_mode: args.llm_mode,
     }
@@ -1094,7 +1187,7 @@ pub fn docs_answerer(args: &SpawnArgs) -> Agent {
         name: "docs-answerer".to_string(),
         system: compose_system_prompt(DOCS_ANSWERER_PROMPT, &args.session_short_id, &args.cwd),
         tools,
-        model: args.model.clone(),
+        model: args.effective_model(),
         params: args.params.clone(),
         llm_mode: args.llm_mode,
     }

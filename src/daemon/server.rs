@@ -404,6 +404,7 @@ async fn handle_request(
             project_root,
             no_sandbox,
             interactive,
+            model_override,
         } => attach(
             state,
             ctx,
@@ -411,6 +412,7 @@ async fn handle_request(
             project_root,
             no_sandbox,
             interactive,
+            model_override,
         ),
 
         Request::SendUserMessage { text, images } => {
@@ -849,11 +851,16 @@ fn attach(
     project_root: Option<String>,
     no_sandbox: bool,
     interactive: bool,
+    model_override: Option<String>,
 ) -> std::result::Result<Response, ErrorPayload> {
     // The client's `--no-sandbox` only governs sessions it *creates*
     // (sandboxing part 2). On resume of an existing session id the session
     // keeps its own runtime state, so the flag is ignored there.
     let client_no_sandbox = no_sandbox && session_id.is_none();
+    // The plan-level model override (`cockpit run --model`) governs only
+    // sessions this attach *creates*; on resume the worker is already
+    // running, so the flag is ignored (mirrors `--no-sandbox`).
+    let model_override = model_override.filter(|_| session_id.is_none());
     let project_root = project_root.map(PathBuf::from);
 
     let cfg_root = match (session_id, &project_root) {
@@ -887,6 +894,7 @@ fn attach(
             &providers_cfg,
             &extended_cfg,
             client_no_sandbox,
+            model_override.as_deref(),
         )
         .map_err(internal)?;
 

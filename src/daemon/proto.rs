@@ -152,6 +152,15 @@ pub enum Request {
         /// treated as headless — the safe, non-blocking default.
         #[serde(default)]
         interactive: bool,
+        /// Plan-level model override (prompt
+        /// `plan-duplication-and-model-override.md`): a `provider/model`
+        /// selector that overrides every spawned agent's frontmatter model
+        /// for this session's run. Set by `cockpit run --model` (the plan
+        /// executor passes the plan's pinned model). `None` leaves the
+        /// session on its active model + per-agent frontmatter. Ignored on
+        /// resume of an existing session. Defaults to `None`.
+        #[serde(default)]
+        model_override: Option<String>,
     },
 
     /// Send a user message into the currently attached session. The

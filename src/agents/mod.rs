@@ -10,7 +10,7 @@
 //! ---
 //! description: One-line description.
 //! mode: subagent
-//! model: anthropic:claude-opus-4-7
+//! model: anthropic/claude-opus-4-7
 //! temperature: 0.2
 //! tools: [read, bash, search]
 //! ---

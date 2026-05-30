@@ -212,6 +212,25 @@ pub enum PlanCommand {
     },
     /// List all plans (active first).
     List,
+    /// Deep-copy a plan into a fresh `pending` plan with its own slug,
+    /// branch policy, and optional plan-level model.
+    Duplicate {
+        /// Source plan slug.
+        slug: String,
+        /// New plan slug; derived from the source (`<slug>-2`, …) when omitted.
+        #[arg(long = "slug")]
+        new_slug: Option<String>,
+        /// Plan-level model in `provider/model` form for the duplicate.
+        #[arg(long)]
+        model: Option<String>,
+        /// Base branch for the duplicate; copied from the source when omitted.
+        #[arg(long)]
+        base_branch: Option<String>,
+        /// Target branch for the duplicate; derived distinct from the source's
+        /// when omitted.
+        #[arg(long)]
+        target_branch: Option<String>,
+    },
 }
 
 // ---- agent subcommands ----

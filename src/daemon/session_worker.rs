@@ -225,6 +225,7 @@ pub fn spawn(
     locks: Arc<LockManager>,
     redact: Arc<RedactionTable>,
     model: Arc<Model>,
+    model_override: Option<Arc<Model>>,
     project_root: PathBuf,
     client_no_sandbox: bool,
 ) -> (SessionWorkerHandle, tokio::task::JoinHandle<()>) {
@@ -265,6 +266,7 @@ pub fn spawn(
         locks,
         redact,
         model,
+        model_override,
         project_root,
         work_rx,
         event_tx,
@@ -281,6 +283,7 @@ async fn run_worker(
     locks: Arc<LockManager>,
     redact: Arc<RedactionTable>,
     model: Arc<Model>,
+    model_override: Option<Arc<Model>>,
     project_root: PathBuf,
     mut work_rx: mpsc::Receiver<SessionWork>,
     event_tx: broadcast::Sender<proto::Event>,
@@ -302,6 +305,9 @@ async fn run_worker(
         // it gets the cross-session recall tools.
         interactive: true,
         llm_mode,
+        // Plan-level model override (`plan-duplication-and-model-override.md`):
+        // when set, the root and every spawned subagent run under it.
+        model_override: model_override.clone(),
     };
     // Root primary: the session's stored active agent (so a resume restarts
     // on `Plan` after a `/plan` swap, `plan.md §4.6.d`), falling back to
@@ -386,6 +392,11 @@ async fn run_worker(
         root,
         max_concurrent_jobs,
     );
+    // Propagate any plan-level model override to the whole delegation tree
+    // (`plan-duplication-and-model-override.md`): the root already runs under
+    // it (loaded with the override `SpawnArgs`); this carries it down to
+    // delegated subagents whose frontmatter would otherwise win.
+    driver.set_model_override(model_override);
     let job_cmd_tx = driver.job_command_sender();
     // Capture the driver's cancel handle (GOALS §3a) before moving it into
     // its task, so a user ctrl+c (`SessionWork::Cancel`) can abort the

@@ -22,7 +22,7 @@ fn parse_agent_reads_frontmatter_and_body() {
     let text = "---\n\
 description: A custom reviewer.\n\
 mode: subagent\n\
-model: anthropic:claude-opus-4-7\n\
+model: anthropic/claude-opus-4-7\n\
 temperature: 0.3\n\
 tools: [read, bash, search]\n\
 ---\n\
@@ -32,7 +32,7 @@ You are a reviewer. Be terse.\n";
     assert_eq!(def.name, "my-reviewer");
     assert_eq!(def.description, "A custom reviewer.");
     assert_eq!(def.mode, AgentMode::Subagent);
-    assert_eq!(def.model.as_deref(), Some("anthropic:claude-opus-4-7"));
+    assert_eq!(def.model.as_deref(), Some("anthropic/claude-opus-4-7"));
     assert_eq!(def.temperature, Some(0.3));
     assert_eq!(
         def.tools,

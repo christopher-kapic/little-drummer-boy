@@ -193,6 +193,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0015_rename_build_agent.sql"),
     include_str!("migrations/0016_guidance_baseline.sql"),
     include_str!("migrations/0017_sessions_ephemeral.sql"),
+    include_str!("migrations/0018_plan_model.sql"),
 ];
 
 fn migrate(conn: &Connection) -> Result<()> {

@@ -131,7 +131,11 @@ fn read_string(value: Option<&Value>) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-fn split_provider_model(value: &str) -> Option<(String, String)> {
+/// Split a canonical `provider/model` selector into its two halves,
+/// trimming each. Returns `None` for a malformed string (no `/`, or an
+/// empty provider or model). The slash form is the uniform model-string
+/// convention across plans, agent frontmatter, and config.
+pub fn split_provider_model(value: &str) -> Option<(String, String)> {
     let (provider, model) = value.split_once('/')?;
     let provider = provider.trim();
     let model = model.trim();

@@ -79,6 +79,7 @@ impl SessionRegistry {
         providers_cfg: &ProvidersConfig,
         extended_cfg: &ExtendedConfig,
         client_no_sandbox: bool,
+        model_override: Option<&str>,
     ) -> Result<SessionWorkerHandle> {
         // Resume path.
         if let Some(id) = session_id {
@@ -88,7 +89,15 @@ impl SessionRegistry {
             let session = Session::resume(self.inner.db.clone(), id)
                 .context("resuming session")?
                 .ok_or_else(|| anyhow::anyhow!("unknown session {id}"))?;
-            return self.start_worker(session, providers_cfg, extended_cfg, client_no_sandbox);
+            // Resume keeps the running worker's model; an override only seeds
+            // a newly-created session (matched by the server's gating).
+            return self.start_worker(
+                session,
+                providers_cfg,
+                extended_cfg,
+                client_no_sandbox,
+                None,
+            );
         }
 
         // Create path.
@@ -109,7 +118,13 @@ impl SessionRegistry {
                 .set_active_model(&active.provider, &active.model)
                 .context("setting active model on new session")?;
         }
-        self.start_worker(session, providers_cfg, extended_cfg, client_no_sandbox)
+        self.start_worker(
+            session,
+            providers_cfg,
+            extended_cfg,
+            client_no_sandbox,
+            model_override,
+        )
     }
 
     fn lookup(&self, session_id: Uuid) -> Option<SessionWorkerHandle> {
@@ -122,6 +137,7 @@ impl SessionRegistry {
         providers_cfg: &ProvidersConfig,
         extended_cfg: &ExtendedConfig,
         client_no_sandbox: bool,
+        model_override: Option<&str>,
     ) -> Result<SessionWorkerHandle> {
         let session_id = session.id;
         let project_root = session.project_root.clone();
@@ -143,12 +159,25 @@ impl SessionRegistry {
                 .with_shutdown_gate(self.inner.shutdown.clone()),
         );
 
+        // Plan-level model override (`cockpit run --model`): a well-formed
+        // `provider/model` selector built through the same provider pipeline as
+        // the session model, with the same shutdown gate. A malformed selector
+        // or unconfigured provider degrades to no override rather than failing
+        // the attach — the executor already validated `--model` up front.
+        let model_override = model_override
+            .and_then(crate::config::provider::split_provider_model)
+            .and_then(|(provider, model_id)| {
+                Model::for_provider(providers_cfg, &provider, &model_id).ok()
+            })
+            .map(|m| Arc::new(m.with_shutdown_gate(self.inner.shutdown.clone())));
+
         let session = Arc::new(session);
         let (handle, join) = session_worker::spawn(
             session,
             self.inner.locks.clone(),
             redact,
             model,
+            model_override,
             project_root,
             client_no_sandbox,
         );

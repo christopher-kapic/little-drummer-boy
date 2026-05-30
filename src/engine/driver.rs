@@ -217,6 +217,13 @@ pub struct Driver {
     /// `Vec` indexed by depth would also work, but the map makes the
     /// "no tracker at this depth" case explicit.
     deleg_shrinks: std::collections::HashMap<usize, PendingDelegationShrink>,
+    /// Plan-level model override (prompt
+    /// `plan-duplication-and-model-override.md`): when a plan run pins a
+    /// `model`, it overrides every spawned agent's frontmatter model. Carried
+    /// here so child [`SpawnArgs`] (built in [`Self::spawn_args`]) propagate it
+    /// to the whole delegation tree — coder, merge-resolver, any subagent.
+    /// `None` outside a plan run.
+    model_override: Option<Arc<crate::engine::model::Model>>,
 }
 
 /// An in-flight compact-after-delegation: the decision tracker plus the
@@ -301,7 +308,18 @@ impl Driver {
             cancel_current: Arc::new(std::sync::Mutex::new(None)),
             approver: None,
             deleg_shrinks: std::collections::HashMap::new(),
+            model_override: None,
         }
+    }
+
+    /// Install the plan-level model override (prompt
+    /// `plan-duplication-and-model-override.md`) before the main loop starts,
+    /// so every child spawn propagates it. The root agent already runs under
+    /// the override (the session worker loads it with the override
+    /// [`SpawnArgs`]); this is what carries the override down to delegated
+    /// subagents whose frontmatter would otherwise win.
+    pub fn set_model_override(&mut self, model: Option<Arc<crate::engine::model::Model>>) {
+        self.model_override = model;
     }
 
     /// Swap in the session worker's client-wired interrupt hub (GOALS
@@ -1851,6 +1869,9 @@ impl Driver {
             // The active LLM mode rides on the root agent; child spawns
             // inherit it so the whole invocation tree renders one mode.
             llm_mode: self.stack[0].agent.llm_mode,
+            // A plan-level model override propagates to the whole delegation
+            // tree so every spawned agent runs under it.
+            model_override: self.model_override.clone(),
         }
     }
 }
