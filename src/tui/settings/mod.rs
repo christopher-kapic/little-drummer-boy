@@ -607,6 +607,7 @@ impl SettingsDialog {
                             editing: None,
                             buf: TextField::default(),
                             status: None,
+                            utility_picker: None,
                             pending_mouse_capture: None,
                         });
                     }
@@ -706,7 +707,9 @@ impl SettingsDialog {
                 }
             }
             Page::Ui(p) => {
-                if p.editing.is_some() {
+                if p.utility_picker.is_some() {
+                    "↑/↓  enter: select  esc: back / cancel"
+                } else if p.editing.is_some() {
                     "type to edit  enter: apply  esc: cancel"
                 } else {
                     "↑/↓  enter: edit / cycle  h: back  esc: close"
@@ -1458,18 +1461,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn editing_utility_model_row_persists() {
+    fn type_chars(d: &mut SettingsDialog, s: &str) {
         use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
-        let tmp = TempDir::new().unwrap();
-        let mut d = fresh_dialog(&tmp);
-        enter_ui_from_root(&mut d);
-        // Row 10 = utility model (row 7 is the caffeinate-display toggle).
-        for _ in 0..10 {
-            d.handle_key(press(KeyCode::Char('j')));
-        }
-        d.handle_key(press(KeyCode::Enter)); // begin editing
-        for ch in "anthropic:claude-haiku".chars() {
+        for ch in s.chars() {
             d.handle_key(KeyEvent {
                 code: KeyCode::Char(ch),
                 modifiers: KeyModifiers::empty(),
@@ -1477,19 +1471,214 @@ mod tests {
                 state: KeyEventState::empty(),
             });
         }
-        d.handle_key(press(KeyCode::Enter)); // commit + save
+    }
+
+    /// Move to the utility-model row (idx 10) and open the picker.
+    fn open_utility_picker(d: &mut SettingsDialog) {
+        enter_ui_from_root(d);
+        for _ in 0..10 {
+            d.handle_key(press(KeyCode::Char('j')));
+        }
+        d.handle_key(press(KeyCode::Enter)); // open picker
+    }
+
+    fn utility_picker(d: &SettingsDialog) -> &ui_page::UtilityModelPicker {
+        match &d.page {
+            Page::Ui(p) => p.utility_picker.as_ref().expect("picker open"),
+            other => panic!("expected Ui page, got {other:?}"),
+        }
+    }
+
+    /// With no configured models, opening the field drops straight into
+    /// the free-text fallback (Custom mode), and a typed `provider:model-id`
+    /// is accepted + persisted.
+    #[test]
+    fn utility_picker_no_models_falls_back_to_free_text() {
+        let tmp = TempDir::new().unwrap();
+        let mut d = fresh_dialog(&tmp);
+        open_utility_picker(&mut d);
+        // No providers → no entries → Custom mode immediately.
+        let picker = utility_picker(&d);
+        assert!(picker.entries.is_empty(), "no models configured");
+        assert!(
+            matches!(picker.mode, ui_page::PickerMode::Custom { .. }),
+            "empty list opens straight into free-text entry"
+        );
+        type_chars(&mut d, "anthropic:claude-haiku");
+        d.handle_key(press(KeyCode::Enter)); // accept
         assert_eq!(
             d.extended.utility_model.as_deref(),
             Some("anthropic:claude-haiku")
         );
+        // Picker closed, status reflects the save.
+        match &d.page {
+            Page::Ui(p) => {
+                assert!(p.utility_picker.is_none(), "picker closes on accept");
+                assert_eq!(p.status.as_deref(), Some("saved"));
+            }
+            other => panic!("expected Ui, got {other:?}"),
+        }
         let reloaded = crate::config::extended::ExtendedConfigDoc::load(&d.extended_path)
             .unwrap()
             .config();
         assert_eq!(
             reloaded.utility_model.as_deref(),
             Some("anthropic:claude-haiku"),
-            "utility model edit must persist to disk"
+            "free-text utility model must persist to disk"
         );
+    }
+
+    fn dialog_with_models(tmp: &TempDir) -> SettingsDialog {
+        let path = tmp.path().join("config.json");
+        // Two providers, each with two models, in natural (stored) order.
+        std::fs::write(
+            &path,
+            r#"{"providers":{
+                "anthropic":{"url":"https://a","headers":[],
+                    "models":[{"id":"opus"},{"id":"haiku","name":"Haiku"}]},
+                "openai":{"url":"https://o","headers":[],
+                    "models":[{"id":"gpt-5"}]}
+            }}"#,
+        )
+        .unwrap();
+        SettingsDialog::open(path)
+    }
+
+    /// The picker builds a grouped list across all configured providers,
+    /// each as `provider:model-id`, in provider-then-natural order.
+    #[test]
+    fn utility_picker_builds_grouped_list() {
+        let tmp = TempDir::new().unwrap();
+        let mut d = dialog_with_models(&tmp);
+        open_utility_picker(&mut d);
+        let picker = utility_picker(&d);
+        let values: Vec<String> = picker.entries.iter().map(|e| e.value()).collect();
+        // Providers iterate in BTreeMap order (anthropic, openai); each
+        // provider's models keep their stored order. No ranking.
+        assert_eq!(
+            values,
+            vec![
+                "anthropic:opus".to_string(),
+                "anthropic:haiku".to_string(),
+                "openai:gpt-5".to_string(),
+            ]
+        );
+        // With no current value, the cursor lands on the first model row
+        // (past the [clear] + [custom] action rows), and the human name
+        // is carried for display.
+        assert!(matches!(
+            picker.mode,
+            ui_page::PickerMode::List { cursor: 2, .. }
+        ));
+        assert_eq!(
+            picker.entries[1].display_name.as_deref(),
+            Some("Haiku"),
+            "human name is preserved for display"
+        );
+    }
+
+    /// Selecting a model row sets + saves `provider:model-id`.
+    #[test]
+    fn utility_picker_select_sets_and_saves() {
+        let tmp = TempDir::new().unwrap();
+        let mut d = dialog_with_models(&tmp);
+        open_utility_picker(&mut d);
+        // Cursor starts on the first model row (anthropic:opus); Enter picks it.
+        d.handle_key(press(KeyCode::Enter));
+        assert_eq!(d.extended.utility_model.as_deref(), Some("anthropic:opus"));
+        match &d.page {
+            Page::Ui(p) => assert!(p.utility_picker.is_none(), "picker closes on select"),
+            other => panic!("expected Ui, got {other:?}"),
+        }
+        let reloaded = crate::config::extended::ExtendedConfigDoc::load(&d.extended_path)
+            .unwrap()
+            .config();
+        assert_eq!(reloaded.utility_model.as_deref(), Some("anthropic:opus"));
+    }
+
+    /// The current value is pre-selected (highlighted) when the picker opens.
+    #[test]
+    fn utility_picker_preselects_current_value() {
+        let tmp = TempDir::new().unwrap();
+        let mut d = dialog_with_models(&tmp);
+        d.extended.utility_model = Some("openai:gpt-5".into());
+        // Persist so entering the UI page (which reloads extended-config)
+        // preserves the value.
+        d.save_extended().unwrap();
+        open_utility_picker(&mut d);
+        let picker = utility_picker(&d);
+        // openai:gpt-5 is entry index 2; +2 action rows = cursor 4.
+        match &picker.mode {
+            ui_page::PickerMode::List { cursor, .. } => assert_eq!(*cursor, 4),
+            _ => panic!("expected List mode"),
+        }
+        assert_eq!(picker.current.as_deref(), Some("openai:gpt-5"));
+    }
+
+    /// Free-text fallback from a populated list: the `[custom…]` action
+    /// switches to typing, and an id absent from every provider is accepted.
+    #[test]
+    fn utility_picker_custom_accepts_unlisted_id() {
+        let tmp = TempDir::new().unwrap();
+        let mut d = dialog_with_models(&tmp);
+        open_utility_picker(&mut d);
+        // Move up from the first model row to the [custom] action (row 1).
+        d.handle_key(press(KeyCode::Up)); // → [custom]
+        match &utility_picker(&d).mode {
+            ui_page::PickerMode::List { cursor, .. } => assert_eq!(*cursor, 1),
+            _ => panic!("expected List mode on the custom row"),
+        }
+        d.handle_key(press(KeyCode::Enter)); // → Custom mode
+        assert!(matches!(
+            utility_picker(&d).mode,
+            ui_page::PickerMode::Custom { .. }
+        ));
+        type_chars(&mut d, "local:my-llama");
+        d.handle_key(press(KeyCode::Enter));
+        assert_eq!(d.extended.utility_model.as_deref(), Some("local:my-llama"));
+    }
+
+    /// Clearing: the `[clear]` action unsets the value back to `None`.
+    #[test]
+    fn utility_picker_clear_unsets_value() {
+        let tmp = TempDir::new().unwrap();
+        let mut d = dialog_with_models(&tmp);
+        d.extended.utility_model = Some("anthropic:opus".into());
+        d.save_extended().unwrap();
+        open_utility_picker(&mut d);
+        // Move up to the [clear] action (row 0) and pick it.
+        // From the preselected current (anthropic:opus = cursor 2), Up twice
+        // lands on [clear] (0).
+        d.handle_key(press(KeyCode::Up));
+        d.handle_key(press(KeyCode::Up));
+        match &utility_picker(&d).mode {
+            ui_page::PickerMode::List { cursor, .. } => assert_eq!(*cursor, 0),
+            _ => panic!("expected List mode on the clear row"),
+        }
+        d.handle_key(press(KeyCode::Enter));
+        assert_eq!(d.extended.utility_model, None, "clear unsets the value");
+        let reloaded = crate::config::extended::ExtendedConfigDoc::load(&d.extended_path)
+            .unwrap()
+            .config();
+        assert_eq!(reloaded.utility_model, None);
+    }
+
+    /// A blank custom entry also clears the value (unset).
+    #[test]
+    fn utility_picker_blank_custom_clears() {
+        let tmp = TempDir::new().unwrap();
+        let mut d = dialog_with_models(&tmp);
+        d.extended.utility_model = Some("anthropic:opus".into());
+        d.save_extended().unwrap();
+        open_utility_picker(&mut d);
+        d.handle_key(press(KeyCode::Up)); // → [custom]
+        d.handle_key(press(KeyCode::Enter)); // → Custom (pre-filled with current)
+        // Clear the pre-filled buffer, then accept empty.
+        for _ in 0..40 {
+            d.handle_key(press(KeyCode::Backspace));
+        }
+        d.handle_key(press(KeyCode::Enter));
+        assert_eq!(d.extended.utility_model, None, "blank custom clears");
     }
 
     #[test]

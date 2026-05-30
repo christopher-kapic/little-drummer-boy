@@ -20,6 +20,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 
 use crate::config::extended::{ThinkingDisplay, VimModeSetting};
+use crate::config::providers::ProvidersConfig;
 use crate::tui::textfield::TextField;
 use crate::tui::theme::MUTED_COLOR_INDEX;
 
@@ -32,6 +33,13 @@ pub(crate) struct UiPage {
     pub(super) editing: Option<UiField>,
     pub(super) buf: TextField,
     pub(super) status: Option<String>,
+    /// `Some` while the utility-model picker overlay is open. Replaces
+    /// the page body until the user selects, types a custom id, clears,
+    /// or cancels.
+    /// Boxed: the picker (model list + text field) is much larger than
+    /// the page's other fields, so inlining it inflates the `Dialog` /
+    /// `Nav` enum variants (clippy::large_enum_variant).
+    pub(super) utility_picker: Option<Box<UtilityModelPicker>>,
     /// Last value the user toggled the `mouse` setting to. The App
     /// reads this on dialog close to decide whether to push or pop
     /// crossterm's `EnableMouseCapture`. None = user didn't touch it.
@@ -42,9 +50,105 @@ pub(crate) struct UiPage {
 pub(super) enum UiField {
     Name,
     PackagesDir,
-    UtilityModel,
     PlanBranchRoot,
     LoopGuardThreshold,
+}
+
+/// A single selectable model row in the utility-model picker, shown as
+/// `provider:model-id` plus the human `name` when present. Built from
+/// the configured providers in their natural order — no ranking.
+#[derive(Clone)]
+pub(super) struct UtilityModelEntry {
+    pub(super) provider_id: String,
+    pub(super) model_id: String,
+    pub(super) display_name: Option<String>,
+}
+
+impl UtilityModelEntry {
+    /// The stored form: `provider:model-id`.
+    pub(super) fn value(&self) -> String {
+        format!("{}:{}", self.provider_id, self.model_id)
+    }
+}
+
+/// Number of model rows visible at once in the picker's scroll window.
+const UTILITY_MODEL_WINDOW: usize = 10;
+
+/// The utility-model picker overlay. Two modes:
+///   - **List** — navigate the configured models (grouped by provider),
+///     plus the synthetic `[clear]` and `[custom…]` actions.
+///   - **Custom** — a free-text field for a `provider:model-id` not in
+///     any provider's list (the fallback the spec requires).
+///
+/// Opens in Custom mode when there are no models to list, so the field
+/// still works with an empty/unfetched config.
+pub(super) struct UtilityModelPicker {
+    /// Configured models in provider-grouped natural order.
+    pub(super) entries: Vec<UtilityModelEntry>,
+    /// `provider:model-id` currently stored, if any. Indicated in the
+    /// list and pre-filled into the custom field.
+    pub(super) current: Option<String>,
+    pub(super) mode: PickerMode,
+}
+
+pub(super) enum PickerMode {
+    /// Navigating the list. `cursor` indexes the synthetic navigable
+    /// list (`[clear]`, `[custom…]`, then the model entries); `scroll`
+    /// is the top of the visible window over the *model* entries.
+    List { cursor: usize, scroll: usize },
+    /// Typing a custom `provider:model-id`.
+    Custom { buf: TextField },
+}
+
+/// Synthetic action rows that precede the model entries in List mode.
+/// `[clear]` unsets the value; `[custom…]` switches to free-text entry.
+const PICKER_ACTION_ROWS: usize = 2;
+const PICKER_CLEAR_ROW: usize = 0;
+const PICKER_CUSTOM_ROW: usize = 1;
+
+impl UtilityModelPicker {
+    /// Build the picker from the configured providers. Models are listed
+    /// in provider order (the config's `BTreeMap` iteration), each
+    /// provider's models in their stored order — no sort/rank. With no
+    /// models configured the picker opens straight into free-text entry
+    /// (pre-filled with the current value) so the field still works.
+    pub(super) fn new(config: &ProvidersConfig, current: Option<String>) -> Self {
+        let mut entries: Vec<UtilityModelEntry> = Vec::new();
+        for (pid, entry) in &config.providers {
+            for model in &entry.models {
+                entries.push(UtilityModelEntry {
+                    provider_id: pid.clone(),
+                    model_id: model.id.clone(),
+                    display_name: model.name.clone(),
+                });
+            }
+        }
+        let mode = if entries.is_empty() {
+            PickerMode::Custom {
+                buf: TextField::new(current.clone().unwrap_or_default()),
+            }
+        } else {
+            // Pre-select the row matching the current value, if any;
+            // otherwise land on the first model row (past the actions).
+            let cursor = current
+                .as_ref()
+                .and_then(|cur| entries.iter().position(|e| &e.value() == cur))
+                .map(|i| i + PICKER_ACTION_ROWS)
+                .unwrap_or(PICKER_ACTION_ROWS);
+            let scroll = crate::tui::app::windowed_scroll(
+                cursor.saturating_sub(PICKER_ACTION_ROWS),
+                0,
+                entries.len(),
+                UTILITY_MODEL_WINDOW,
+            );
+            PickerMode::List { cursor, scroll }
+        };
+        Self {
+            entries,
+            current,
+            mode,
+        }
+    }
 }
 
 /// `/settings → UI → Instructions File` state. Edits the
@@ -78,6 +182,15 @@ pub(super) struct GrabState {
 /// display-awake, name, packages dir, utility model, plan branch root,
 /// loop-guard threshold, instructions file).
 pub(super) const UI_ROWS: usize = 14;
+
+/// Recompute the model-entry scroll offset from a List-mode `cursor`
+/// that includes the two synthetic action rows. The action rows live
+/// above the window and never scroll; only the model entries do. When
+/// the cursor is on an action row, the window stays pinned to the top.
+fn picker_scroll(cursor: usize, scroll: usize, entries: usize) -> usize {
+    let selected = cursor.saturating_sub(PICKER_ACTION_ROWS);
+    crate::tui::app::windowed_scroll(selected, scroll, entries, UTILITY_MODEL_WINDOW)
+}
 
 pub(super) fn bool_label(on: bool, on_label: &str, off_label: &str) -> String {
     if on {
@@ -130,6 +243,7 @@ impl SettingsDialog {
             editing: None,
             buf: TextField::default(),
             status: None,
+            utility_picker: None,
             pending_mouse_capture: None,
         });
         let mut page = std::mem::replace(&mut self.page, placeholder);
@@ -152,6 +266,10 @@ impl SettingsDialog {
     }
 
     fn handle_ui_page_key(&mut self, key: KeyEvent, p: &mut UiPage) -> Nav {
+        if p.utility_picker.is_some() {
+            self.handle_utility_picker_key(key, p);
+            return Nav::Stay;
+        }
         if let Some(field) = p.editing {
             match key.code {
                 KeyCode::Enter => {
@@ -166,10 +284,6 @@ impl SettingsDialog {
                             } else {
                                 Some(PathBuf::from(new))
                             };
-                        }
-                        UiField::UtilityModel => {
-                            self.extended.utility_model =
-                                if new.is_empty() { None } else { Some(new) };
                         }
                         UiField::PlanBranchRoot => {
                             // A blank value resets to the default rather
@@ -276,8 +390,14 @@ impl SettingsDialog {
                     p.editing = Some(UiField::PackagesDir);
                 }
                 10 => {
-                    p.buf = TextField::new(self.extended.utility_model.clone().unwrap_or_default());
-                    p.editing = Some(UiField::UtilityModel);
+                    p.utility_picker = Some(Box::new(UtilityModelPicker::new(
+                        &self.config,
+                        self.extended
+                            .utility_model
+                            .clone()
+                            .filter(|s| !s.is_empty()),
+                    )));
+                    p.status = None;
                 }
                 11 => {
                     p.buf = TextField::new(self.extended.plan_branch_root.clone());
@@ -302,7 +422,97 @@ impl SettingsDialog {
         Nav::Stay
     }
 
+    /// Key handling while the utility-model picker overlay is open.
+    /// Closes the overlay (returning to the page) on commit/clear/cancel.
+    fn handle_utility_picker_key(&mut self, key: KeyEvent, p: &mut UiPage) {
+        let Some(picker) = p.utility_picker.as_mut() else {
+            return;
+        };
+        match &mut picker.mode {
+            PickerMode::Custom { buf } => match key.code {
+                KeyCode::Enter => {
+                    let new = buf.text().trim().to_string();
+                    // A blank custom entry clears the value (unset).
+                    let value = if new.is_empty() { None } else { Some(new) };
+                    self.commit_utility_model(p, value);
+                }
+                KeyCode::Esc => {
+                    // From Custom mode, Esc backs out to the list when one
+                    // exists; otherwise it closes the picker unchanged.
+                    if picker.entries.is_empty() {
+                        p.utility_picker = None;
+                    } else {
+                        let current = picker.current.clone();
+                        let cursor = current
+                            .as_ref()
+                            .and_then(|cur| picker.entries.iter().position(|e| &e.value() == cur))
+                            .map(|i| i + PICKER_ACTION_ROWS)
+                            .unwrap_or(PICKER_ACTION_ROWS);
+                        let scroll = crate::tui::app::windowed_scroll(
+                            cursor.saturating_sub(PICKER_ACTION_ROWS),
+                            0,
+                            picker.entries.len(),
+                            UTILITY_MODEL_WINDOW,
+                        );
+                        picker.mode = PickerMode::List { cursor, scroll };
+                    }
+                }
+                _ => {
+                    buf.handle_key(key);
+                }
+            },
+            PickerMode::List { cursor, scroll } => {
+                // List mode is a non-typing list: arrows and j/k navigate.
+                let nav_len = PICKER_ACTION_ROWS + picker.entries.len();
+                match key.code {
+                    KeyCode::Esc => {
+                        p.utility_picker = None;
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        *cursor = crate::tui::nav::wrap_prev(*cursor, nav_len);
+                        *scroll = picker_scroll(*cursor, *scroll, picker.entries.len());
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        *cursor = crate::tui::nav::wrap_next(*cursor, nav_len);
+                        *scroll = picker_scroll(*cursor, *scroll, picker.entries.len());
+                    }
+                    KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => match *cursor {
+                        PICKER_CLEAR_ROW => self.commit_utility_model(p, None),
+                        PICKER_CUSTOM_ROW => {
+                            let prefill = picker.current.clone().unwrap_or_default();
+                            picker.mode = PickerMode::Custom {
+                                buf: TextField::new(prefill),
+                            };
+                        }
+                        idx => {
+                            let value = picker
+                                .entries
+                                .get(idx - PICKER_ACTION_ROWS)
+                                .map(|e| e.value());
+                            if let Some(value) = value {
+                                self.commit_utility_model(p, Some(value));
+                            }
+                        }
+                    },
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// Persist the chosen utility model (or `None` to unset) and close
+    /// the picker, reflecting saved status like every other UI-page edit.
+    fn commit_utility_model(&mut self, p: &mut UiPage, value: Option<String>) {
+        self.extended.utility_model = value;
+        p.utility_picker = None;
+        p.status = save_status(self.save_extended());
+    }
+
     pub(super) fn render_ui_page(&self, frame: &mut Frame, area: Rect, p: &UiPage) {
+        if let Some(picker) = &p.utility_picker {
+            self.render_utility_picker(frame, area, picker);
+            return;
+        }
         let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
         let yellow = Style::default().fg(Color::Yellow);
         let mut lines: Vec<Line<'static>> = Vec::new();
@@ -443,7 +653,6 @@ impl SettingsDialog {
             let prompt = match field {
                 UiField::Name => "name: ",
                 UiField::PackagesDir => "packages dir: ",
-                UiField::UtilityModel => "utility model (provider:model-id): ",
                 UiField::PlanBranchRoot => "plan branch root: ",
                 UiField::LoopGuardThreshold => "loop-guard threshold (>= 2): ",
             };
@@ -458,6 +667,133 @@ impl SettingsDialog {
         if let Some(status) = &p.status {
             lines.push(Line::default());
             lines.push(Line::from(Span::styled(status.clone(), yellow)));
+        }
+
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+    }
+
+    /// Render the utility-model picker overlay (replaces the page body).
+    fn render_utility_picker(&self, frame: &mut Frame, area: Rect, picker: &UtilityModelPicker) {
+        let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+        let yellow = Style::default().fg(Color::Yellow);
+        let mut lines: Vec<Line<'static>> = Vec::new();
+
+        lines.push(Line::from(Span::styled(
+            "Utility model — picks the cheap background model".to_string(),
+            Style::default().add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::default());
+
+        match &picker.mode {
+            PickerMode::Custom { buf } => {
+                lines.push(Line::from(Span::styled(
+                    "custom provider:model-id".to_string(),
+                    muted,
+                )));
+                lines.push(Line::from(vec![
+                    Span::styled("› ".to_string(), muted),
+                    Span::styled(buf.text().to_string(), Style::default().fg(Color::White)),
+                    Span::styled("▎".to_string(), Style::default().fg(Color::Yellow)),
+                ]));
+                lines.push(Line::default());
+                if picker.entries.is_empty() {
+                    // No-models path: hint where the list comes from.
+                    lines.push(Line::from(Span::styled(
+                        "No models fetched yet — type a provider:model-id, or fetch \
+                         models from the Providers page."
+                            .to_string(),
+                        muted,
+                    )));
+                }
+                lines.push(Line::from(Span::styled(
+                    "enter: accept (blank clears)  esc: back".to_string(),
+                    muted,
+                )));
+            }
+            PickerMode::List { cursor, scroll } => {
+                let cur_label = |value: &str| -> &'static str {
+                    if picker.current.as_deref() == Some(value) {
+                        "  (current)"
+                    } else {
+                        ""
+                    }
+                };
+                // Synthetic action rows.
+                let clear_active = *cursor == PICKER_CLEAR_ROW;
+                let custom_active = *cursor == PICKER_CUSTOM_ROW;
+                let action_style = |active: bool| {
+                    if active {
+                        yellow.add_modifier(Modifier::BOLD)
+                    } else {
+                        muted
+                    }
+                };
+                let clear_suffix = if picker.current.is_none() {
+                    "  (current)"
+                } else {
+                    ""
+                };
+                lines.push(Line::from(vec![
+                    Span::raw(if clear_active { "▸ " } else { "  " }),
+                    Span::styled(
+                        format!("[clear — unset]{clear_suffix}"),
+                        action_style(clear_active),
+                    ),
+                ]));
+                lines.push(Line::from(vec![
+                    Span::raw(if custom_active { "▸ " } else { "  " }),
+                    Span::styled(
+                        "[custom provider:model-id…]".to_string(),
+                        action_style(custom_active),
+                    ),
+                ]));
+
+                // Model entries, grouped by provider in natural order,
+                // with a one-row scroll window.
+                let mut last_provider: Option<&str> = None;
+                for (i, e) in picker
+                    .entries
+                    .iter()
+                    .enumerate()
+                    .skip(*scroll)
+                    .take(UTILITY_MODEL_WINDOW)
+                {
+                    if last_provider != Some(e.provider_id.as_str()) {
+                        lines.push(Line::from(Span::styled(
+                            e.provider_id.clone(),
+                            muted.add_modifier(Modifier::ITALIC),
+                        )));
+                        last_provider = Some(e.provider_id.as_str());
+                    }
+                    let active = *cursor == i + PICKER_ACTION_ROWS;
+                    let marker = if active { "▸ " } else { "  " };
+                    let label_style = if active {
+                        yellow.add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::White)
+                    };
+                    let value = e.value();
+                    let mut spans = vec![
+                        Span::raw(marker.to_string()),
+                        Span::styled(value.clone(), label_style),
+                    ];
+                    if let Some(name) = &e.display_name {
+                        spans.push(Span::raw("  "));
+                        spans.push(Span::styled(name.clone(), muted));
+                    }
+                    let suffix = cur_label(&value);
+                    if !suffix.is_empty() {
+                        spans.push(Span::styled(suffix.to_string(), yellow));
+                    }
+                    lines.push(Line::from(spans));
+                }
+
+                lines.push(Line::default());
+                lines.push(Line::from(Span::styled(
+                    "↑/↓  enter: select  esc: cancel".to_string(),
+                    muted,
+                )));
+            }
         }
 
         frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
@@ -537,6 +873,7 @@ impl SettingsDialog {
                     editing: None,
                     buf: TextField::default(),
                     status: None,
+                    utility_picker: None,
                     pending_mouse_capture: None,
                 }));
             }

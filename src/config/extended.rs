@@ -684,6 +684,14 @@ impl ExtendedConfigDoc {
                 obj.insert(k, v);
             }
         }
+        // `utility_model` is `skip_serializing_if = none`, so clearing it
+        // (Some → None) would otherwise leave the stale key on disk: the
+        // merge above only overwrites keys present in the serialized map.
+        // Mirror `ConfigDoc::write`'s explicit-remove pattern so the field
+        // can be unset (the /settings picker's "clear" action).
+        if cfg.utility_model.is_none() {
+            obj.remove("utility_model");
+        }
         let pretty =
             serde_json::to_string_pretty(&self.raw).context("serializing extended-config.json")?;
         if let Some(parent) = self.path.parent() {
@@ -775,6 +783,40 @@ mod tests {
         );
         assert_eq!(cfg2.system_prompt.time_injection_interval_minutes, 10);
         assert!(!cfg2.tui.banner.enabled);
+    }
+
+    #[test]
+    fn clearing_utility_model_removes_the_key_from_disk() {
+        // The /settings utility-model picker can clear the value back to
+        // unset. Because `utility_model` is skip-if-none, the merge in
+        // `write` won't overwrite a previously-stored value — the explicit
+        // remove must drop it so the clear actually persists.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("extended-config.json");
+        std::fs::write(&path, "{}").unwrap();
+        let mut doc = ExtendedConfigDoc::load(&path).unwrap();
+        let mut cfg = doc.config();
+        cfg.utility_model = Some("anthropic:opus".into());
+        doc.write(&cfg).unwrap();
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("utility_model")
+        );
+
+        // Reload, clear, write — the key must be gone on disk and on reload.
+        let mut doc = ExtendedConfigDoc::load(&path).unwrap();
+        let mut cfg = doc.config();
+        cfg.utility_model = None;
+        doc.write(&cfg).unwrap();
+        assert!(
+            !std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("utility_model"),
+            "cleared utility_model must not linger on disk"
+        );
+        let cfg2 = ExtendedConfigDoc::load(&path).unwrap().config();
+        assert_eq!(cfg2.utility_model, None);
     }
 
     #[test]
