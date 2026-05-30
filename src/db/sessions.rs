@@ -633,6 +633,70 @@ impl Db {
         })
     }
 
+    /// Assemble the `/sessions` browser rows for one level, the single
+    /// source of truth shared by the daemon's `ListSessions` handler and
+    /// the TUI's daemonless direct-DB fallback. The level selection
+    /// mirrors the RPC contract:
+    ///
+    /// - `parent_session_id = Some(p)` → the direct forks of `p`
+    ///   (project scope is implied by the parent and ignored).
+    /// - `project_id = Some(pid)`, no parent → root sessions in `pid`.
+    /// - both `None` → every open session across projects.
+    ///
+    /// Each row carries the DB-derived fork counts, read/unread inputs
+    /// (`latest_activity_at`), and open-interrupt count. Live-only fields
+    /// (running/processing) are *not* part of this method — callers
+    /// attach them separately (the daemon from its registry, the TUI
+    /// daemonless path not at all). A per-row auxiliary-query miss
+    /// degrades that field to its empty default rather than failing the
+    /// whole list, matching the daemon handler's best-effort behavior.
+    pub fn list_session_summaries(
+        &self,
+        project_id: Option<&str>,
+        parent_session_id: Option<Uuid>,
+        limit: u32,
+    ) -> Result<Vec<crate::daemon::proto::SessionSummary>> {
+        let rows = match (project_id, parent_session_id) {
+            (_, Some(parent)) => self.list_forks(parent)?,
+            (Some(pid), None) => self.list_root_sessions(pid, limit)?,
+            (None, None) => self.list_sessions(true, limit)?,
+        };
+        let mut summaries = Vec::with_capacity(rows.len());
+        for row in rows {
+            let fork_count = self.count_forks_for(row.session_id).unwrap_or(0);
+            // Full subtree descendant count for the archive/delete cascade
+            // statement (GOALS §17h) — direct forks plus their descendants.
+            let descendant_count = self.count_descendants(row.session_id).unwrap_or(0);
+            // Read/unread + pending-question inputs for the browser's tiers
+            // 3-4 (GOALS §17f). Best-effort: a query miss degrades to "no
+            // activity / no open question" rather than failing the list.
+            let latest_activity_at = self.latest_agent_activity_at(row.session_id).ok().flatten();
+            let open_interrupts = self
+                .list_open_interrupts(row.session_id)
+                .map(|v| v.len() as u32)
+                .unwrap_or(0);
+            summaries.push(crate::daemon::proto::SessionSummary {
+                session_id: row.session_id,
+                short_id: row.short_id,
+                project_root: row.project_root,
+                project_id: row.project_id,
+                started_at: row.started_at,
+                last_active_at: row.last_active_at,
+                turns: 0, // wire up when we track turn count
+                active_agent: row.active_agent,
+                title: row.title,
+                parent_session_id: row.parent_session_id,
+                fork_count,
+                descendant_count,
+                last_viewed_at: row.last_viewed_at,
+                latest_activity_at,
+                open_interrupts,
+                archived_at: row.archived_at,
+            });
+        }
+        Ok(summaries)
+    }
+
     /// Most recently active session for a given project. Used by
     /// `cockpit -c` ("continue") when the user is back in the same
     /// project.
@@ -961,6 +1025,52 @@ mod tests {
                 .archived_at
                 .is_none()
         );
+    }
+
+    #[test]
+    fn list_session_summaries_scopes_orders_and_groups_forks() {
+        // The factored query is the single source of truth for the
+        // `/sessions` browser (daemon RPC + TUI daemonless). Assert the
+        // three level selections produce the same shape the daemon handler
+        // used: project-scoped roots newest-first, forks grouped under a
+        // parent, fork/descendant counts, and the all-projects fallback.
+        let db = Db::open_in_memory().unwrap();
+        let root_a = db.create_session("pid", "/proj", "coder").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let root_b = db.create_session("pid", "/proj", "coder").unwrap();
+        // A session in a different project must not leak into `pid` scope.
+        let _other = db.create_session("pid2", "/other", "coder").unwrap();
+        // Two forks under root_a (one of them with its own descendant).
+        let fork_1 = db.create_fork(root_a.session_id, None).unwrap();
+        let _grandchild = db.create_fork(fork_1.session_id, None).unwrap();
+
+        // Project-scoped roots: only `pid` roots, newest (`root_b`) first.
+        let roots = db.list_session_summaries(Some("pid"), None, 100).unwrap();
+        let root_ids: Vec<_> = roots.iter().map(|s| s.session_id).collect();
+        assert_eq!(root_ids, vec![root_b.session_id, root_a.session_id]);
+        // root_a has 2 direct forks and 3 descendants (2 forks + 1 grand).
+        let a = roots
+            .iter()
+            .find(|s| s.session_id == root_a.session_id)
+            .unwrap();
+        assert_eq!(a.fork_count, 1, "one direct fork under root_a");
+        assert_eq!(a.descendant_count, 2, "fork + grandchild are descendants");
+        assert_eq!(a.project_id, "pid");
+
+        // Fork grouping: parent = root_a → its direct forks only.
+        let forks = db
+            .list_session_summaries(None, Some(root_a.session_id), 100)
+            .unwrap();
+        assert_eq!(forks.len(), 1);
+        assert_eq!(forks[0].session_id, fork_1.session_id);
+        assert_eq!(forks[0].parent_session_id, Some(root_a.session_id));
+
+        // All-projects fallback (both args None) spans every project.
+        let all = db.list_session_summaries(None, None, 100).unwrap();
+        let project_ids: std::collections::HashSet<_> =
+            all.iter().map(|s| s.project_id.as_str()).collect();
+        assert!(project_ids.contains("pid"));
+        assert!(project_ids.contains("pid2"));
     }
 
     #[test]

@@ -941,57 +941,15 @@ fn list_sessions(
     project_id: Option<String>,
     parent_session_id: Option<Uuid>,
 ) -> std::result::Result<Response, ErrorPayload> {
-    let rows = match (project_id.as_deref(), parent_session_id) {
-        (_, Some(parent)) => ctx.db.list_forks(parent).map_err(internal)?,
-        (Some(pid), None) => ctx.db.list_root_sessions(pid, 100).map_err(internal)?,
-        (None, None) => ctx.db.list_sessions(true, 100).map_err(internal)?,
-    };
-    let mut sessions = Vec::with_capacity(rows.len());
-    for row in rows {
-        let fork_count = ctx
-            .db
-            .count_forks_for(row.session_id)
-            .map_err(internal)
-            .unwrap_or(0);
-        // Full subtree descendant count for the archive/delete cascade
-        // statement (GOALS §17h) — direct forks plus their descendants.
-        let descendant_count = ctx
-            .db
-            .count_descendants(row.session_id)
-            .map_err(internal)
-            .unwrap_or(0);
-        // Read/unread + pending-question inputs for the browser's tiers
-        // 3-4 (GOALS §17f). Best-effort: a query miss degrades to "no
-        // activity / no open question" rather than failing the list.
-        let latest_activity_at = ctx
-            .db
-            .latest_agent_activity_at(row.session_id)
-            .ok()
-            .flatten();
-        let open_interrupts = ctx
-            .db
-            .list_open_interrupts(row.session_id)
-            .map(|v| v.len() as u32)
-            .unwrap_or(0);
-        sessions.push(proto::SessionSummary {
-            session_id: row.session_id,
-            short_id: row.short_id,
-            project_root: row.project_root,
-            project_id: row.project_id,
-            started_at: row.started_at,
-            last_active_at: row.last_active_at,
-            turns: 0, // wire up when we track turn count
-            active_agent: row.active_agent,
-            title: row.title,
-            parent_session_id: row.parent_session_id,
-            fork_count,
-            descendant_count,
-            last_viewed_at: row.last_viewed_at,
-            latest_activity_at,
-            open_interrupts,
-            archived_at: row.archived_at,
-        });
-    }
+    // The row assembly (level selection, fork counts, read/unread inputs)
+    // lives in one place — `Db::list_session_summaries` — so the daemon
+    // and the TUI's daemonless direct-DB fallback produce the same shape
+    // (ordering / scoping / fork-grouping). Live status is layered on by
+    // the client via `SessionLiveStatus`, not here.
+    let sessions = ctx
+        .db
+        .list_session_summaries(project_id.as_deref(), parent_session_id, 100)
+        .map_err(internal)?;
     Ok(Response::Sessions { sessions })
 }
 

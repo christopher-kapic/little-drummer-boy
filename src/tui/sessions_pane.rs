@@ -18,9 +18,20 @@
 //!   `last_viewed_at` for read/unread, and `open_interrupts` for the
 //!   pending-question split.
 //!
-//! The pane is a socket client: every fetch / archive / delete is a
-//! blocking daemon request through [`crate::tui::agent_runner`]. The
-//! resume action is *not* performed here — `handle_key` returns a
+//! Two data paths, chosen by `daemon_connected` at [`SessionsPane::open`]:
+//!
+//! - **Daemon-connected:** the pane is a socket client — fetch / archive /
+//!   delete are blocking daemon requests through
+//!   [`crate::tui::agent_runner`], and live status (tiers 1-2) is intact.
+//! - **Daemonless:** the list is read straight from the session DB
+//!   read-only ([`crate::db::Db::open_default`], same as `/stats`) via the
+//!   shared [`crate::db::Db::list_session_summaries`] the daemon also calls,
+//!   so ordering / scoping / fork-grouping match. Live status is absent
+//!   (every session falls to its DB-derived tier — never an error), and the
+//!   mutating actions (resume / archive / delete / unarchive) are disabled
+//!   with a non-error hint rather than spawning a daemon or writing the DB.
+//!
+//! The resume action is *not* performed here — `handle_key` returns a
 //! [`SessionsOutcome`] the `App` acts on, reusing the existing
 //! session-switch path (`attach_to_session`).
 
@@ -33,8 +44,20 @@ use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 use uuid::Uuid;
 
 use crate::daemon::proto::SessionSummary;
+use crate::db::Db;
 use crate::tui::agent_runner;
 use crate::tui::theme::{ACCENT_BLUE_INDEX, MUTED_COLOR_INDEX};
+
+/// Root-session row cap for the daemonless direct-DB list — matches the
+/// daemon `ListSessions` handler's `100` so both modes show the same set.
+const DAEMONLESS_LIST_LIMIT: u32 = 100;
+
+/// Non-error status shown daemonless when the user tries an action that
+/// needs a live daemon (resume, archive/delete, unarchive). Browsing is
+/// read-only; running or mutating a session requires the agent loop /
+/// single-writer that only the daemon hosts.
+const DAEMONLESS_HINT: &str =
+    "no daemon — browse only. Start one with `cockpit daemon` to resume or archive.";
 
 /// Tier a session sorts into, top (lowest discriminant) to bottom. Within
 /// a tier, sessions sort by `last_active_at` descending. GOALS §17f.
@@ -195,8 +218,22 @@ pub struct SessionsPane {
     /// Breadcrumb stack of fork levels; `levels[0]` is the root list.
     levels: Vec<Level>,
     step: Step,
-    /// Last-loaded error (daemon unreachable, etc.), shown inline.
+    /// Last-loaded error (a real failure: a connected daemon's list call
+    /// errored, or — daemonless — the DB couldn't be opened), shown
+    /// inline in red.
     error: Option<String>,
+    /// Transient non-error status line (e.g. the daemonless "browse only"
+    /// hint after a resume/archive/delete attempt), shown inline in a
+    /// muted style. Never an error state.
+    notice: Option<String>,
+    /// `true` when a daemon is connected at open: the pane fetches via the
+    /// RPC path (live status intact). `false` daemonless: it reads
+    /// [`Self::db`] directly and disables resume/archive/delete.
+    daemon_connected: bool,
+    /// Read-only session DB handle, opened only in the daemonless case so
+    /// the browser can list without a daemon. `None` when daemon-connected
+    /// (the RPC path is used) or when the DB couldn't be opened.
+    db: Option<Db>,
     /// Rendered body height + content rows at last draw (scroll clamp).
     last_body_height: usize,
     last_content_rows: usize,
@@ -206,12 +243,27 @@ impl SessionsPane {
     /// Open the browser for `cwd`. Resolves the project scope and loads
     /// the root level. A load failure (daemon down) is non-fatal — the
     /// pane shows an inline message rather than refusing to open.
-    pub fn open(cwd: &std::path::Path) -> Self {
+    ///
+    /// `daemon_connected` selects the data path: connected → the RPC list
+    /// (live status intact); daemonless → a read-only direct DB read
+    /// ([`Db::open_default`], same as `/stats`), with resume / archive /
+    /// delete disabled. A daemonless DB-open failure surfaces as an inline
+    /// error, not a crash, and the pane still opens (empty list).
+    pub fn open(cwd: &std::path::Path, daemon_connected: bool) -> Self {
         let project_id = resolve_project_id(cwd);
         let scope = if project_id.is_some() {
             Scope::Project
         } else {
             Scope::All
+        };
+        // Daemonless: open the DB read-only up front (WAL → concurrent
+        // readers are safe; the startup probe already established no daemon
+        // is writing). Daemon-connected: the RPC path is used, so no direct
+        // handle is needed.
+        let db = if daemon_connected {
+            None
+        } else {
+            Db::open_default().ok()
         };
         let mut pane = Self {
             project_id,
@@ -220,6 +272,9 @@ impl SessionsPane {
             levels: Vec::new(),
             step: Step::Browse,
             error: None,
+            notice: None,
+            daemon_connected,
+            db,
             last_body_height: 0,
             last_content_rows: 0,
         };
@@ -246,20 +301,36 @@ impl SessionsPane {
     /// Fetch + tier-sort one level: root sessions (`parent = None`) or the
     /// direct forks of `parent`. Filters archived per the toggle and
     /// attaches live status. Records (clears) the error on success.
+    ///
+    /// Data path: daemon-connected → the RPC list + per-session live
+    /// status; daemonless → a read-only direct DB read with live status
+    /// uniformly absent (every session degrades to its DB-derived tier).
     fn fetch_level(
         &mut self,
         project_id: Option<String>,
         parent: Option<Uuid>,
     ) -> Vec<(SessionSummary, Tier)> {
-        match agent_runner::list_sessions_blocking(project_id, parent) {
+        let listed = if self.daemon_connected {
+            agent_runner::list_sessions_blocking(project_id, parent)
+        } else {
+            self.list_sessions_daemonless(project_id.as_deref(), parent)
+        };
+        match listed {
             Ok(mut sessions) => {
                 self.error = None;
                 // Archive filter (GOALS §17h): hidden by default.
                 if !self.show_archived {
                     sessions.retain(|s| s.archived_at.is_none());
                 }
-                let ids: Vec<Uuid> = sessions.iter().map(|s| s.session_id).collect();
-                let live = agent_runner::session_live_status_blocking(ids);
+                // Live status only exists with a daemon. Daemonless, every
+                // session falls to its DB-derived tier (`None` live), which
+                // `classify` handles without error.
+                let live = if self.daemon_connected {
+                    let ids: Vec<Uuid> = sessions.iter().map(|s| s.session_id).collect();
+                    agent_runner::session_live_status_blocking(ids)
+                } else {
+                    std::collections::HashMap::new()
+                };
                 let pairs: Vec<_> = sessions
                     .into_iter()
                     .map(|s| {
@@ -274,6 +345,23 @@ impl SessionsPane {
                 Vec::new()
             }
         }
+    }
+
+    /// Daemonless list path: read the level straight from the read-only DB
+    /// handle via the same `Db::list_session_summaries` the daemon uses, so
+    /// ordering / scoping / fork-grouping match. `Err` only when the DB
+    /// couldn't be opened (handle is `None`) or the query itself failed —
+    /// both surface as the pane's inline error, never a crash.
+    fn list_sessions_daemonless(
+        &self,
+        project_id: Option<&str>,
+        parent: Option<Uuid>,
+    ) -> Result<Vec<SessionSummary>, String> {
+        let Some(db) = self.db.as_ref() else {
+            return Err("could not open the session database".to_string());
+        };
+        db.list_session_summaries(project_id, parent, DAEMONLESS_LIST_LIMIT)
+            .map_err(|e| e.to_string())
     }
 
     /// Reload the current level in place, preserving scope/breadcrumb and
@@ -323,12 +411,21 @@ impl SessionsPane {
         if matches!(self.step, Step::Confirm { .. }) {
             return self.handle_confirm_key(key);
         }
+        // Any keystroke clears the transient daemonless hint; gated actions
+        // below re-set it, so it shows for exactly one action and then
+        // dismisses on the next key.
+        self.notice = None;
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => return Some(SessionsOutcome::Close),
             KeyCode::Up | KeyCode::Char('k') => self.move_cursor(-1),
             KeyCode::Down | KeyCode::Char('j') => self.move_cursor(1),
             KeyCode::Enter => {
-                if let Some(s) = self.selected() {
+                // Resume needs the daemon (agent loop + locks + single
+                // writer live there). Daemonless we must NOT auto-spawn one
+                // — show a non-error hint and stay in the browser.
+                if !self.daemon_connected {
+                    self.notice = Some(DAEMONLESS_HINT.to_string());
+                } else if let Some(s) = self.selected() {
                     return Some(SessionsOutcome::Resume(s.session_id));
                 }
             }
@@ -418,6 +515,13 @@ impl SessionsPane {
     /// Open the Archive/Delete/Cancel confirm for the highlighted session,
     /// stating the cascade count and whether the target is live.
     fn open_confirm(&mut self) {
+        // Archive/delete are daemon-only (no direct-DB write path).
+        // Daemonless, surface the non-error hint instead of opening the
+        // confirm dialog.
+        if !self.daemon_connected {
+            self.notice = Some(DAEMONLESS_HINT.to_string());
+            return;
+        }
         let Some(s) = self.selected().cloned() else {
             return;
         };
@@ -508,6 +612,11 @@ impl SessionsPane {
     }
 
     fn unarchive_selected(&mut self) {
+        // Unarchive is a DB write — daemon-only, same as archive/delete.
+        if !self.daemon_connected {
+            self.notice = Some(DAEMONLESS_HINT.to_string());
+            return;
+        }
         let Some(s) = self.selected().cloned() else {
             return;
         };
@@ -619,9 +728,18 @@ impl SessionsPane {
         } else {
             ""
         };
-        Line::from(format!(
-            "q quit  ↑/↓ move  enter resume  →/l forks  ←/h back  {scope_hint}a archived  u unarchive  d archive/delete"
-        ))
+        // Daemonless the mutating actions (resume / archive / delete /
+        // unarchive) are disabled, so the help line drops them and states
+        // browse-only rather than advertising keys that only show a hint.
+        if self.daemon_connected {
+            Line::from(format!(
+                "q quit  ↑/↓ move  enter resume  →/l forks  ←/h back  {scope_hint}a archived  u unarchive  d archive/delete"
+            ))
+        } else {
+            Line::from(format!(
+                "q quit  ↑/↓ move  →/l forks  ←/h back  {scope_hint}a archived  (browse only — no daemon)"
+            ))
+        }
     }
 
     /// Assemble every body row as owned [`Line`]s. Pure aside from reading
@@ -630,9 +748,25 @@ impl SessionsPane {
     fn body_lines(&self, width: usize) -> Vec<Line<'static>> {
         let mut lines: Vec<Line<'static>> = Vec::new();
         if let Some(e) = &self.error {
+            // Daemon-connected, a list error means the daemon went away
+            // ("daemon unavailable"). Daemonless, the only error is a
+            // DB-open/query failure — phrase it plainly, never as "daemon
+            // unavailable" (the absent daemon is the expected case).
+            let prefix = if self.daemon_connected {
+                "daemon unavailable: "
+            } else {
+                ""
+            };
             lines.push(Line::from(Span::styled(
-                format!("daemon unavailable: {e}"),
+                format!("{prefix}{e}"),
                 Style::default().fg(Color::Red),
+            )));
+            lines.push(Line::default());
+        }
+        if let Some(n) = &self.notice {
+            lines.push(Line::from(Span::styled(
+                n.clone(),
+                Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
             )));
             lines.push(Line::default());
         }
@@ -1266,6 +1400,12 @@ mod tests {
     }
 
     fn test_pane(cards: Vec<(SessionSummary, Tier)>) -> SessionsPane {
+        test_pane_mode(cards, true)
+    }
+
+    /// Build a pane with a fixed root level, choosing the daemon-connected
+    /// mode. No daemon/DB interaction either way (the level is seeded).
+    fn test_pane_mode(cards: Vec<(SessionSummary, Tier)>, daemon_connected: bool) -> SessionsPane {
         SessionsPane {
             project_id: Some("pid".into()),
             scope: Scope::Project,
@@ -1278,8 +1418,88 @@ mod tests {
             }],
             step: Step::Browse,
             error: None,
+            notice: None,
+            daemon_connected,
+            db: None,
             last_body_height: 100,
             last_content_rows: 0,
         }
+    }
+
+    #[test]
+    fn daemonless_enter_does_not_resume_and_shows_hint() {
+        // Daemonless: Enter on a highlighted card must NOT return Resume
+        // (no daemon to spawn) — it sets a non-error notice and stays open.
+        let id = Uuid::new_v4();
+        let mut pane = test_pane_mode(vec![(summary(id, 100), Tier::Idle)], false);
+        let outcome = pane.handle_key(press(KeyCode::Enter));
+        assert!(
+            outcome.is_none(),
+            "daemonless Enter must not resume / close the pane"
+        );
+        assert!(pane.error.is_none(), "the hint is a notice, not an error");
+        let notice = pane.notice.as_deref().unwrap_or_default();
+        assert!(
+            notice.contains("daemon"),
+            "the hint mentions the missing daemon"
+        );
+    }
+
+    #[test]
+    fn daemonless_archive_and_unarchive_are_gated() {
+        // Daemonless: `d` (archive/delete) never opens the confirm dialog,
+        // and `u` (unarchive) is a no-op; both surface the same hint.
+        let id = Uuid::new_v4();
+        let mut pane = test_pane_mode(vec![(summary(id, 100), Tier::Idle)], false);
+        pane.handle_key(press(KeyCode::Char('d')));
+        assert_eq!(pane.step, Step::Browse, "no confirm dialog daemonless");
+        assert!(pane.notice.is_some(), "archive shows the daemonless hint");
+        pane.handle_key(press(KeyCode::Char('u')));
+        assert_eq!(pane.step, Step::Browse);
+        assert!(pane.notice.is_some(), "unarchive shows the daemonless hint");
+        assert!(pane.error.is_none(), "gating is never an error state");
+    }
+
+    #[test]
+    fn daemonless_notice_clears_on_next_key() {
+        // The hint shows for one action then dismisses on the next key.
+        let mut pane = test_pane_mode(vec![(summary(Uuid::new_v4(), 1), Tier::Idle)], false);
+        pane.handle_key(press(KeyCode::Enter));
+        assert!(pane.notice.is_some());
+        pane.handle_key(press(KeyCode::Down));
+        assert!(pane.notice.is_none(), "navigation clears the hint");
+    }
+
+    #[test]
+    fn daemonless_open_with_unopenable_db_lists_empty_no_crash() {
+        // Open daemonless against a pane whose DB handle is `None` (the
+        // DB-unopenable case): the list is empty and an inline error is
+        // set, never a crash. Drive the daemonless fetch directly.
+        let mut pane = test_pane_mode(vec![], false);
+        pane.db = None;
+        let cards = pane.fetch_level(Some("pid".into()), None);
+        assert!(cards.is_empty(), "no cards when the DB can't be opened");
+        assert!(
+            pane.error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("database"),
+            "DB-unopenable surfaces a clear inline error"
+        );
+    }
+
+    #[test]
+    fn daemonless_lists_from_the_db() {
+        // The factored `Db::list_session_summaries` populates the daemonless
+        // list: open an in-memory DB, seed a root session, and confirm the
+        // pane's daemonless fetch returns it tier-classified.
+        let db = Db::open_in_memory().unwrap();
+        let root = db.create_session("pid", "/proj", "coder").unwrap();
+        let mut pane = test_pane_mode(vec![], false);
+        pane.db = Some(db);
+        let cards = pane.fetch_level(Some("pid".into()), None);
+        assert_eq!(cards.len(), 1, "the seeded root session is listed");
+        assert_eq!(cards[0].0.session_id, root.session_id);
+        assert!(pane.error.is_none(), "a successful list clears the error");
     }
 }

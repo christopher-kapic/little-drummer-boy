@@ -3717,8 +3717,12 @@ impl App {
                 return false;
             }
             "sessions" | "resume" => {
+                // Daemon-connected → RPC list (live status intact);
+                // daemonless → read-only direct-DB browse (resume/archive
+                // disabled). The pane picks the path off this flag.
                 self.sessions_pane = Some(crate::tui::sessions_pane::SessionsPane::open(
                     &self.launch.cwd,
+                    self.daemon_connected,
                 ));
                 return false;
             }
