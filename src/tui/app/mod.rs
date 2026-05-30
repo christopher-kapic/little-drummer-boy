@@ -726,6 +726,11 @@ pub struct App {
     /// event so it stays in sync across all clients (incl. until-idle
     /// auto-off). Not client-owned: the assertion lives in the daemon.
     pub(super) caffeinate_active: bool,
+    /// Daemon is draining for a graceful shutdown
+    /// (`daemon-graceful-drain-shutdown.md`). Set from the daemon-global
+    /// `DaemonDraining` event. While set, the composer refuses new
+    /// submissions with a short notice — new work is rejected, not queued.
+    pub(super) daemon_draining: bool,
 }
 
 /// A live async job tracked by the TUI for the jobs strip / `/jobs`.
@@ -942,6 +947,7 @@ impl App {
             ctrl_c_armed_at: None,
             no_sandbox,
             caffeinate_active: false,
+            daemon_draining: false,
         };
         // First-run convenience: if the daemon prompt doesn't gate
         // startup, open the Add-Provider wizard immediately when no
@@ -2591,6 +2597,22 @@ impl App {
                         ToastKind::Info
                     };
                     self.show_toast(message, kind);
+                }
+            }
+            TurnEvent::DaemonDraining { forced } => {
+                // Daemon-global drain notice
+                // (`daemon-graceful-drain-shutdown.md`). Flip the flag so the
+                // composer refuses new submissions, and surface a toast. The
+                // `forced` escalation reads as a warning so a truncated turn
+                // isn't mistaken for a clean finish.
+                self.daemon_draining = true;
+                if forced {
+                    self.show_toast(
+                        "daemon shutdown forced — in-flight work was aborted",
+                        ToastKind::Error,
+                    );
+                } else {
+                    self.show_toast("finishing in-flight work, shutting down…", ToastKind::Info);
                 }
             }
         }

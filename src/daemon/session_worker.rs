@@ -222,7 +222,7 @@ pub fn spawn(
     model: Arc<Model>,
     project_root: PathBuf,
     client_no_sandbox: bool,
-) -> SessionWorkerHandle {
+) -> (SessionWorkerHandle, tokio::task::JoinHandle<()>) {
     let session_id = session.id;
     // Resolve the new-session sandbox default (highest wins):
     //   (a) daemon launched `--no-sandbox` → OFF for ALL sessions.
@@ -250,7 +250,12 @@ pub fn spawn(
         session: session.clone(),
     };
 
-    tokio::spawn(run_worker(
+    // Return the worker's `JoinHandle` so the registry can *await* it on a
+    // graceful drain (`daemon-graceful-drain-shutdown.md`) — today's
+    // `shutdown_all` fires `Shutdown` and forgets, with no way to know the
+    // in-flight turn finished. The handle also lets the force path
+    // `abort()` a worker whose provider call hung past the grace deadline.
+    let join = tokio::spawn(run_worker(
         session,
         locks,
         redact,
@@ -262,7 +267,7 @@ pub fn spawn(
         interactive_clients,
     ));
 
-    handle
+    (handle, join)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -777,6 +782,10 @@ fn turn_event_to_proto(event: TurnEvent, session_id: Uuid) -> Vec<proto::Event> 
         // `proto::Event::CaffeinateState` over the global bus directly.
         // The engine never emits this; the arm is for exhaustiveness.
         TurnEvent::CaffeinateState { .. } => vec![],
+        // The drain notice is daemon-global, broadcast by the daemon's
+        // graceful-shutdown path directly (`server::request_shutdown`); the
+        // engine never emits it. This arm is for exhaustiveness only.
+        TurnEvent::DaemonDraining { .. } => vec![],
     }
 }
 

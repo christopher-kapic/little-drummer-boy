@@ -741,6 +741,15 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         message: Option<String>,
     },
+
+    /// The daemon began (or escalated) a graceful shutdown
+    /// (`daemon-graceful-drain-shutdown.md`). **Daemon-global**: carries no
+    /// `session_id` and is broadcast to *every* connected client so each
+    /// TUI shows the drain notice and stops offering new input. `forced` is
+    /// `false` when the drain just began (in-flight work is finishing) and
+    /// `true` once the grace deadline was hit with work still outstanding,
+    /// so a truncated turn isn't mistaken for a clean finish.
+    DaemonDraining { forced: bool },
 }
 
 // ---- Errors ----------------------------------------------------------------

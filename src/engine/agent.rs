@@ -227,6 +227,13 @@ pub enum TurnEvent {
         lid_close_guaranteed: bool,
         message: Option<String>,
     },
+
+    /// The daemon began (or escalated) a graceful shutdown
+    /// (`daemon-graceful-drain-shutdown.md`). Daemon-global. The TUI shows
+    /// the drain notice and refuses new input; `forced` distinguishes the
+    /// initial drain (in-flight work finishing) from the force-deadline
+    /// case (work was aborted — a truncated turn isn't a clean finish).
+    DaemonDraining { forced: bool },
 }
 
 /// Outcome of one [`turn`] call. The driver loops on the result.

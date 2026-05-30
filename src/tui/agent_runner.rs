@@ -478,7 +478,7 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         | SandboxState { session_id, .. } => *session_id,
         // Daemon-global events carry no session_id: they reach every
         // client regardless of attachment.
-        CaffeinateState { .. } => return None,
+        CaffeinateState { .. } | DaemonDraining { .. } => return None,
     })
 }
 
@@ -638,6 +638,7 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
             lid_close_guaranteed,
             message,
         },
+        DaemonDraining { forced } => TurnEvent::DaemonDraining { forced },
         InterruptRaised { .. } | InterruptResolved { .. } | SessionEnded { .. } => return None,
         // The chrome's active-agent slot is updated directly in
         // `update_active_agent`; the swap needs no history-stream entry.

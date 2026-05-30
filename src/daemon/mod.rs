@@ -28,6 +28,7 @@ pub mod proto;
 pub mod registry;
 pub mod server;
 pub mod session_worker;
+pub mod shutdown;
 
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
@@ -283,15 +284,24 @@ pub const EPHEMERAL_IDLE_GRACE: Duration = Duration::from_secs(30);
 
 /// Run the daemon's accept loop in the current process. Blocks until
 /// SIGINT/SIGTERM. Boots the DB + lock manager, registers a shutdown
-/// watcher, and runs the [`server::run_accept_loop`].
+/// watcher, and runs the [`server::run_accept_loop`]. Uses the production
+/// idle ([`EPHEMERAL_IDLE_GRACE`]) and drain
+/// ([`shutdown::SHUTDOWN_DRAIN_GRACE`]) graces.
 pub async fn run_foreground(paths: DaemonPaths) -> Result<()> {
-    run_foreground_inner(paths, EPHEMERAL_IDLE_GRACE).await
+    run_foreground_inner(paths, EPHEMERAL_IDLE_GRACE, shutdown::SHUTDOWN_DRAIN_GRACE).await
 }
 
-/// Like [`run_foreground`] but with an injectable idle-grace duration so
-/// tests can exercise the ephemeral watchdog (Layer C) without sleeping
-/// the full 30s of wall-clock.
-pub async fn run_foreground_inner(paths: DaemonPaths, idle_grace: Duration) -> Result<()> {
+/// Like [`run_foreground`] but with injectable idle- and drain-grace
+/// durations so tests can exercise the ephemeral watchdog (Layer C) and the
+/// graceful drain (`daemon-graceful-drain-shutdown.md`) without sleeping the
+/// full 30s of wall-clock. `idle_grace` bounds the ephemeral idle watchdog;
+/// `drain_grace` bounds how long teardown awaits in-flight work before
+/// force-aborting it.
+pub async fn run_foreground_inner(
+    paths: DaemonPaths,
+    idle_grace: Duration,
+    drain_grace: Duration,
+) -> Result<()> {
     if matches!(probe(&paths).await, DaemonStatus::Running) {
         anyhow::bail!(
             "another daemon is already running (socket: {})",
@@ -308,56 +318,99 @@ pub async fn run_foreground_inner(paths: DaemonPaths, idle_grace: Duration) -> R
 
     let ctx = std::sync::Arc::new(server::boot(paths.clone())?);
 
-    // `shutdown` is a watch channel: every long-running task (accept
-    // loop, per-client tasks via the registry's broadcast) can observe
-    // and stop cleanly.
-    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel::<bool>(false);
-
+    // Signal task: SIGINT/SIGTERM (or Ctrl-C / console-close on Windows)
+    // route into the single graceful-shutdown path. The **first** signal
+    // begins the drain; a **second** signal while still draining shortens
+    // to an immediate force-exit (`request_shutdown`'s begin → force
+    // promotion). The task therefore loops rather than firing once.
     let signal_task = {
-        let shutdown_tx = shutdown_tx.clone();
+        let ctx = ctx.clone();
         tokio::spawn(async move {
             #[cfg(unix)]
             {
                 use tokio::signal::unix::{SignalKind, signal};
                 let mut int = signal(SignalKind::interrupt()).ok();
                 let mut term = signal(SignalKind::terminate()).ok();
-                tokio::select! {
-                    _ = async { if let Some(s) = int.as_mut() { s.recv().await; } } => {}
-                    _ = async { if let Some(s) = term.as_mut() { s.recv().await; } } => {}
+                loop {
+                    tokio::select! {
+                        _ = async { if let Some(s) = int.as_mut() { s.recv().await; } else { std::future::pending::<()>().await } } => {}
+                        _ = async { if let Some(s) = term.as_mut() { s.recv().await; } else { std::future::pending::<()>().await } } => {}
+                    }
+                    server::request_shutdown(&ctx);
+                    if ctx.shutdown_signal().is_forced() {
+                        break;
+                    }
                 }
             }
             #[cfg(not(unix))]
             {
-                tokio::signal::ctrl_c().await.ok();
+                // Windows has no SIGTERM; `ctrl_c` covers Ctrl-C and the
+                // console-close control events, consistent with the rest of
+                // the codebase's non-unix signal handling. A second Ctrl-C
+                // during drain shortens to force, same as unix.
+                loop {
+                    if tokio::signal::ctrl_c().await.is_err() {
+                        break;
+                    }
+                    server::request_shutdown(&ctx);
+                    if ctx.shutdown_signal().is_forced() {
+                        break;
+                    }
+                }
             }
-            let _ = shutdown_tx.send(true);
         })
     };
 
-    // Layer C: ephemeral-only self-reaping watchdog. The persistent
-    // daemon must never self-exit on idle, so the watchdog is armed only
-    // when this daemon owns an ephemeral path set (Layer B's flag). It
-    // shares the same `shutdown_tx` as the signal handler, so a fired
-    // timer drives the identical clean-shutdown path.
+    // Layer C: ephemeral-only self-reaping watchdog. The persistent daemon
+    // must never self-exit on idle, so the watchdog is armed only when this
+    // daemon owns an ephemeral path set (Layer B's flag). It routes through
+    // the same `request_shutdown` path, so a fired timer drains in-flight
+    // work before reaping (an *in-flight* ephemeral daemon drains; only an
+    // *idle* one is reaped promptly).
     let watchdog_task = if paths.ephemeral {
-        let shutdown_tx = shutdown_tx.clone();
+        let ctx = ctx.clone();
         let client_presence = ctx.client_presence();
         Some(tokio::spawn(async move {
-            idle_watchdog(client_presence, idle_grace, shutdown_tx).await;
+            idle_watchdog(client_presence, idle_grace, move || {
+                server::request_shutdown(&ctx);
+            })
+            .await;
         }))
     } else {
         None
     };
 
-    let accept = server::run_accept_loop(ctx.clone(), listener, shutdown_rx);
+    let accept = server::run_accept_loop(ctx.clone(), listener);
     let result = accept.await;
 
-    // The accept loop has stopped (shutdown fired). Drain the workers,
-    // then remove our own socket + pid files. For an ephemeral daemon
+    // The accept loop has stopped (a drain began). Ensure the drain is
+    // marked even on the (impossible-by-construction, but defensive) path
+    // where the loop broke without `request_shutdown` having run, so the
+    // new-request gate is definitely closed before we await workers.
+    server::request_shutdown(&ctx);
+
+    // Bounded grace, then force: arm a timer that escalates the central
+    // gate to `Forced` once the grace elapses (also broadcasting the forced
+    // notice), so a hung provider request can't block shutdown past the
+    // deadline. `drain_all` awaits the workers up to the same grace and
+    // aborts whatever remains.
+    spawn_force_timer(ctx.clone(), drain_grace);
+    let drained_clean = ctx.registry.drain_all(drain_grace).await;
+    if !drained_clean {
+        // Make sure the forced state + notice are set even if the timer
+        // hadn't fired yet (e.g. all workers wedged right at the deadline).
+        if !ctx.shutdown_signal().is_forced() {
+            ctx.shutdown_signal().force();
+            ctx.broadcast_global(proto::Event::DaemonDraining { forced: true });
+        }
+        tracing::warn!("daemon: forced shutdown — in-flight work aborted at grace deadline");
+    }
+
+    // Cleanup on every path: remove our own socket + pid files whether we
+    // drained cleanly or hit the force deadline. For an ephemeral daemon
     // these are the unique `cockpit-eph-<pid>` files; for the canonical
-    // daemon they're the shared persistent files — either way, the
-    // process that bound them is the one cleaning them up.
-    ctx.registry.shutdown_all().await;
+    // daemon they're the shared persistent files — either way, the process
+    // that bound them is the one cleaning them up.
     let _ = std::fs::remove_file(&paths.socket);
     let _ = std::fs::remove_file(&paths.pid_file);
 
@@ -368,17 +421,38 @@ pub async fn run_foreground_inner(paths: DaemonPaths, idle_grace: Duration) -> R
     result
 }
 
-/// Ephemeral self-reaping watchdog (Layer C). Watches `presence` (a
-/// live count of connected clients). Whenever the count drops to zero,
-/// it starts an `idle_grace` countdown; if a client reconnects before
-/// the timer fires, the countdown is cancelled and the daemon keeps
-/// running; if the timer fires with still no client, it signals
-/// shutdown via `shutdown_tx`. Idempotent: re-entry just re-reads the
-/// latest count.
+/// Arm the bounded-grace force timer for a graceful drain
+/// (`daemon-graceful-drain-shutdown.md`). Once `grace` elapses, it
+/// escalates the central gate to `Forced` and broadcasts the forced
+/// notice — so even if `drain_all`'s own timeout is somehow still pending,
+/// the gate reflects "forced" for any late observer. Detached; the process
+/// exits shortly after `drain_all` returns regardless.
+fn spawn_force_timer(ctx: std::sync::Arc<server::DaemonContext>, grace: Duration) {
+    tokio::spawn(async move {
+        tokio::time::sleep(grace).await;
+        if !ctx.shutdown_signal().is_forced() {
+            ctx.shutdown_signal().force();
+            ctx.broadcast_global(proto::Event::DaemonDraining { forced: true });
+        }
+    });
+}
+
+/// Ephemeral self-reaping watchdog (Layer C). Watches `presence` (a live
+/// count of connected clients). Whenever the count drops to zero, it starts
+/// an `idle_grace` countdown; if a client reconnects before the timer
+/// fires, the countdown is cancelled and the daemon keeps running; if the
+/// timer fires with still no client, it routes into the single graceful
+/// drain via [`server::request_shutdown`]. Idempotent: re-entry just
+/// re-reads the latest count.
+///
+/// Note the drain still runs to completion afterwards — an ephemeral daemon
+/// whose last UI detached *mid-inference* drains the in-flight work (same
+/// grace/force bound) before the process exits; only an *idle* one reaps
+/// with nothing to wait on.
 async fn idle_watchdog(
     mut presence: tokio::sync::watch::Receiver<usize>,
     idle_grace: Duration,
-    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    mut on_reap: impl FnMut(),
 ) {
     loop {
         // Block until there are no connected clients.
@@ -397,7 +471,7 @@ async fn idle_watchdog(
                 // in the same tick the timer fired.
                 if *presence.borrow() == 0 {
                     tracing::info!("ephemeral daemon idle past grace; self-reaping");
-                    let _ = shutdown_tx.send(true);
+                    on_reap();
                     return;
                 }
             }
@@ -546,19 +620,24 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn watchdog_reaps_after_idle_grace() {
         let (presence_tx, presence_rx) = tokio::sync::watch::channel(0usize);
-        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        let reaped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let grace = Duration::from_secs(30);
 
-        let task = tokio::spawn(idle_watchdog(presence_rx, grace, shutdown_tx));
+        let reaped_c = reaped.clone();
+        let task = tokio::spawn(idle_watchdog(presence_rx, grace, move || {
+            reaped_c.store(true, std::sync::atomic::Ordering::SeqCst);
+        }));
 
         // Advance past the grace window. With paused time this is
         // deterministic and instant — no wall-clock sleep.
         tokio::time::advance(grace + Duration::from_secs(1)).await;
-
-        shutdown_rx.changed().await.expect("shutdown signalled");
-        assert!(*shutdown_rx.borrow());
-        drop(presence_tx);
         let _ = task.await;
+
+        assert!(
+            reaped.load(std::sync::atomic::Ordering::SeqCst),
+            "watchdog should have reaped after idle grace"
+        );
+        drop(presence_tx);
     }
 
     /// Layer C: a client reconnecting inside the grace window cancels the
@@ -566,10 +645,13 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn watchdog_reconnect_cancels_countdown() {
         let (presence_tx, presence_rx) = tokio::sync::watch::channel(0usize);
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let reaped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let grace = Duration::from_secs(30);
 
-        let task = tokio::spawn(idle_watchdog(presence_rx, grace, shutdown_tx));
+        let reaped_c = reaped.clone();
+        let task = tokio::spawn(idle_watchdog(presence_rx, grace, move || {
+            reaped_c.store(true, std::sync::atomic::Ordering::SeqCst);
+        }));
 
         // A client connects partway through the grace window.
         tokio::time::advance(grace / 2).await;
@@ -579,7 +661,10 @@ mod tests {
         // client is connected.
         tokio::time::advance(grace * 2).await;
         tokio::task::yield_now().await;
-        assert!(!*shutdown_rx.borrow(), "watchdog reaped despite a client");
+        assert!(
+            !reaped.load(std::sync::atomic::Ordering::SeqCst),
+            "watchdog reaped despite a client"
+        );
 
         drop(presence_tx);
         let _ = task.await;
@@ -612,7 +697,8 @@ mod tests {
             ephemeral: true,
         };
         let eph_clone = eph.clone();
-        let eph_task = tokio::spawn(async move { run_foreground_inner(eph_clone, grace).await });
+        let eph_task =
+            tokio::spawn(async move { run_foreground_inner(eph_clone, grace, grace).await });
 
         // Wait for it to come up.
         wait_until(|| eph.socket.exists(), Duration::from_secs(2)).await;
@@ -634,7 +720,7 @@ mod tests {
         };
         let persistent_clone = persistent.clone();
         let persist_task =
-            tokio::spawn(async move { run_foreground_inner(persistent_clone, grace).await });
+            tokio::spawn(async move { run_foreground_inner(persistent_clone, grace, grace).await });
         wait_until(|| persistent.socket.exists(), Duration::from_secs(2)).await;
 
         // Past several grace windows with no client: still alive.

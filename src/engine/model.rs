@@ -86,6 +86,22 @@ pub fn is_cancelled(err: &anyhow::Error) -> bool {
     err.downcast_ref::<InferenceCancelled>().is_some()
 }
 
+/// Sentinel returned at the inference-dispatch chokepoint when the daemon
+/// has begun draining (`daemon-graceful-drain-shutdown.md`): no *new*
+/// provider request may go out once shutdown starts. In-flight calls that
+/// already passed the gate run to completion; this only blocks calls that
+/// would start after the drain began. Distinct from a transport failure so
+/// the driver unwinds the turn cleanly rather than logging a real error.
+#[derive(Debug, thiserror::Error)]
+#[error("inference refused: daemon is shutting down")]
+pub struct InferenceGated;
+
+/// Returns `true` when `err`'s chain carries an [`InferenceGated`] sentinel
+/// — i.e. the call was refused because the daemon began draining.
+pub fn is_gated(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<InferenceGated>().is_some()
+}
+
 /// Sentinel embedded in a [`rig::completion::CompletionError`] when a
 /// retry *attempt* is aborted by ctrl+c (as opposed to a transport
 /// failure). It is wrapped in `RequestError`, which the retry taxonomy
@@ -127,10 +143,38 @@ pub enum Model {
     OpenAi {
         client: OpenAiCompatClient,
         model_id: String,
+        /// Daemon-wide graceful-shutdown gate
+        /// (`daemon-graceful-drain-shutdown.md`). Every outbound provider
+        /// request consults it; once the daemon begins draining it refuses
+        /// new dispatches with [`InferenceGated`]. A model built outside the
+        /// daemon (tests, the auto-title / skill-select utility paths) gets
+        /// the default never-draining gate. The registry installs the
+        /// daemon's shared gate via [`Model::with_shutdown_gate`].
+        gate: crate::daemon::shutdown::ShutdownSignal,
     },
 }
 
 impl Model {
+    /// The shared inference-dispatch gate for this model. The single seam
+    /// both [`Self::complete_captured`] and [`Self::text_completion`]
+    /// consult before any provider round-trip.
+    fn gate(&self) -> &crate::daemon::shutdown::ShutdownSignal {
+        match self {
+            Model::OpenAi { gate, .. } => gate,
+        }
+    }
+
+    /// Install the daemon's shared shutdown gate, replacing the default
+    /// never-draining one. Called by the registry when it builds a worker's
+    /// model so the model dispatches through the daemon's central drain
+    /// authority. Consuming-builder style so the registry can wrap the
+    /// model in an `Arc` immediately after.
+    pub fn with_shutdown_gate(mut self, signal: crate::daemon::shutdown::ShutdownSignal) -> Self {
+        match &mut self {
+            Model::OpenAi { gate, .. } => *gate = signal,
+        }
+        self
+    }
     /// Resolve the active model from the user's config + credentials and
     /// build a concrete `Model`. Returns a descriptive error when nothing
     /// is configured or the env var that holds the key isn't set.
@@ -166,8 +210,15 @@ impl Model {
     /// text response, trimmed.
     pub async fn text_completion(&self, prompt: &str) -> Result<String> {
         use rig::completion::Prompt;
+        // Inference-dispatch chokepoint: refuse a *new* provider request once
+        // the daemon has begun draining (`daemon-graceful-drain-shutdown.md`).
+        if self.gate().is_draining() {
+            return Err(anyhow::Error::new(InferenceGated));
+        }
         match self {
-            Model::OpenAi { client, model_id } => {
+            Model::OpenAi {
+                client, model_id, ..
+            } => {
                 let agent = client.agent(model_id).build();
                 let response = agent
                     .prompt(prompt)
@@ -258,6 +309,16 @@ impl Model {
             return Err(anyhow::Error::new(InferenceCancelled));
         }
 
+        // Inference-dispatch chokepoint (`daemon-graceful-drain-shutdown.md`):
+        // once the daemon begins draining, no *new* provider request goes
+        // out. A request already past this gate keeps streaming; this refuses
+        // only the ones that would start after the drain began. Checked here,
+        // before any client work, so the gate is the single real seam — not
+        // an advisory flag each call site must remember.
+        if self.gate().is_draining() {
+            return Err(anyhow::Error::new(InferenceGated));
+        }
+
         // Build a connectivity probe from the provider base URL so a
         // backoff wait short-circuits the moment the link returns. `None`
         // (unparseable URL) falls back to plain backoff — never fatal.
@@ -281,7 +342,9 @@ impl Model {
         // the final state to the `InferenceCancelled` sentinel below.
         let attempt = || async {
             match self {
-                Model::OpenAi { client, model_id } => {
+                Model::OpenAi {
+                    client, model_id, ..
+                } => {
                     let agent = build_agent(client, model_id, system, tools, &params);
 
                     let mut req = agent.completion(prompt.clone(), history.clone()).await?;
@@ -439,6 +502,9 @@ fn build_openai_model(provider_id: &str, entry: &ProviderEntry, model_id: &str) 
     Ok(Model::OpenAi {
         client,
         model_id: model_id.to_string(),
+        // Default never-draining gate; the registry swaps in the daemon's
+        // shared gate via `Model::with_shutdown_gate` for worker models.
+        gate: crate::daemon::shutdown::ShutdownSignal::new(),
     })
 }
 
@@ -633,6 +699,61 @@ mod tests {
         let model = build_openai_model("lmstudio", &entry, "local-model")
             .expect("keyless provider must build");
         assert_eq!(model.model_id(), "local-model");
+    }
+
+    /// New-request gate after drain (`daemon-graceful-drain-shutdown.md`):
+    /// once the daemon's shared gate reports draining, the inference-
+    /// dispatch chokepoint refuses *new* provider requests with the
+    /// `InferenceGated` sentinel — before any client work. Asserted on both
+    /// dispatch entry points (`text_completion` and `complete_captured`).
+    #[tokio::test]
+    async fn draining_gate_refuses_new_requests() {
+        use crate::daemon::shutdown::ShutdownSignal;
+
+        let entry = ProviderEntry {
+            url: "http://localhost:1234/v1".into(),
+            headers: vec![],
+            ..ProviderEntry::default()
+        };
+        let gate = ShutdownSignal::new();
+        let model = build_openai_model("lmstudio", &entry, "local-model")
+            .expect("keyless provider must build")
+            .with_shutdown_gate(gate.clone());
+
+        // Before drain: the gate permits dispatch (we don't actually round-
+        // trip — no server — but the gate must not be the thing refusing).
+        assert!(!gate.is_draining());
+
+        // Begin draining: the chokepoint now refuses both entry points.
+        assert!(gate.begin_drain());
+
+        let err = model
+            .text_completion("hi")
+            .await
+            .expect_err("text_completion must be gated while draining");
+        assert!(
+            crate::engine::model::is_gated(&err),
+            "text_completion refusal must carry the InferenceGated sentinel, got: {err:#}"
+        );
+
+        let (tx, _rx) = mpsc::channel(8);
+        let err = model
+            .complete_captured(
+                "system",
+                &[],
+                Message::user("hi"),
+                &[],
+                ModelParams::default(),
+                "Build",
+                &tx,
+                &CancellationToken::new(),
+            )
+            .await
+            .expect_err("complete_captured must be gated while draining");
+        assert!(
+            crate::engine::model::is_gated(&err),
+            "complete_captured refusal must carry the InferenceGated sentinel, got: {err:#}"
+        );
     }
 
     /// A trailing `Message::System` (the live instructions-file diff

@@ -1392,6 +1392,15 @@ impl Driver {
                     tracing::info!(agent = %agent.name, "turn cancelled by user");
                     return Ok(());
                 }
+                // The daemon began draining (`daemon-graceful-drain-shutdown.md`):
+                // the inference-dispatch chokepoint refused this *new* round-
+                // trip. Unwind cleanly back to idle exactly like a cancel —
+                // the worker proceeds to its `Shutdown`/drain teardown rather
+                // than logging a real error.
+                Err(e) if crate::engine::model::is_gated(&e) => {
+                    tracing::info!(agent = %agent.name, "turn refused: daemon draining");
+                    return Ok(());
+                }
                 Err(e) => return Err(e),
             };
 

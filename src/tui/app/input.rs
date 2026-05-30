@@ -1145,6 +1145,18 @@ impl App {
     }
 
     pub(super) fn submit_input(&mut self) -> bool {
+        // Daemon draining (`daemon-graceful-drain-shutdown.md`): refuse new
+        // input with a short notice rather than dropping or queuing it. The
+        // composer keeps the user's text so they can copy it out before the
+        // process exits.
+        if self.daemon_draining {
+            self.show_toast(
+                "daemon is shutting down — not accepting new messages",
+                super::ToastKind::Error,
+            );
+            return false;
+        }
+
         // The *displayed* message keeps the composer's exact text,
         // including paste-block placeholders (wire/user split — the user
         // sees `[Pasted text #1, …]`, the model gets the expansion).

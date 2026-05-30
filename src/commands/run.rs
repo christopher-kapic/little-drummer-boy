@@ -371,9 +371,9 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         | Pruned { session_id, .. }
         | CompactReady { session_id, .. }
         | SandboxState { session_id, .. } => *session_id,
-        // Daemon-global event (no session_id) — irrelevant to a headless
-        // one-shot run, so it's filtered out by the session check.
-        CaffeinateState { .. } => return None,
+        // Daemon-global events (no session_id) — irrelevant to a headless
+        // one-shot run, so they're filtered out by the session check.
+        CaffeinateState { .. } | DaemonDraining { .. } => return None,
     })
 }
 

@@ -54,11 +54,22 @@ pub struct DaemonContext {
     /// self-reaping watchdog (Layer C) watches the receiver side for
     /// "no clients" transitions; the persistent daemon ignores it.
     client_count: tokio::sync::watch::Sender<usize>,
+    /// Daemon-wide graceful-shutdown gate
+    /// (`daemon-graceful-drain-shutdown.md`). Shared with the registry
+    /// (installed into worker models). New `SendUserMessage` requests are
+    /// refused while it reports draining.
+    shutdown: crate::daemon::shutdown::ShutdownSignal,
 }
 
 impl DaemonContext {
     pub fn new(db: Db, locks: Arc<LockManager>, paths: DaemonPaths) -> Self {
-        let registry = SessionRegistry::new(db.clone(), locks.clone());
+        // The daemon-wide graceful-shutdown gate
+        // (`daemon-graceful-drain-shutdown.md`) — the central drain
+        // authority. Built here and shared into the registry (which installs
+        // it into every worker's model) so the inference-dispatch chokepoint,
+        // the new-user-work gate, and teardown all read one state.
+        let shutdown = crate::daemon::shutdown::ShutdownSignal::new();
+        let registry = SessionRegistry::new(db.clone(), locks.clone(), shutdown.clone());
         let (client_count, _) = tokio::sync::watch::channel(0usize);
         let (global_events, _) = broadcast::channel(GLOBAL_EVENT_CAPACITY);
         Self {
@@ -70,7 +81,14 @@ impl DaemonContext {
             caffeinate: Arc::new(crate::daemon::caffeinate::CaffeineController::new()),
             global_events,
             client_count,
+            shutdown,
         }
+    }
+
+    /// The daemon's graceful-shutdown gate. New-user-work rejection and the
+    /// single drain path both read it.
+    pub fn shutdown_signal(&self) -> &crate::daemon::shutdown::ShutdownSignal {
+        &self.shutdown
     }
 
     /// Subscribe to the daemon-global event bus. Every client task holds
@@ -127,20 +145,28 @@ pub fn boot(paths: DaemonPaths) -> Result<DaemonContext> {
     Ok(DaemonContext::new(db, locks, paths))
 }
 
-/// Bind the Unix socket and run the accept loop until `shutdown`
-/// fires. Each accepted connection spawns a detached client task.
-pub async fn run_accept_loop(
-    ctx: Arc<DaemonContext>,
-    listener: UnixListener,
-    mut shutdown: tokio::sync::watch::Receiver<bool>,
-) -> Result<()> {
+/// Bind the Unix socket and run the accept loop until the daemon's
+/// graceful-shutdown gate leaves `Running`. Each accepted connection spawns
+/// a detached client task. Breaking the loop hands control back to
+/// [`crate::daemon::run_foreground_inner`], which drains the workers.
+pub async fn run_accept_loop(ctx: Arc<DaemonContext>, listener: UnixListener) -> Result<()> {
     set_socket_perms(&ctx.paths.socket);
+
+    let mut shutdown = ctx.shutdown.subscribe();
+    // A drain may already have begun before we subscribed (begin_drain on a
+    // very fast StopDaemon); break immediately if so.
+    if ctx.shutdown.is_draining() {
+        return Ok(());
+    }
 
     loop {
         tokio::select! {
-            _ = shutdown.changed() => {
-                if *shutdown.borrow() {
-                    tracing::info!("daemon: shutdown signal received, closing accept loop");
+            changed = shutdown.changed() => {
+                // Any transition out of `Running` (drain begun) closes the
+                // accept loop; `changed()` only errs if the sender dropped,
+                // which also means we should stop accepting.
+                if changed.is_err() || ctx.shutdown.is_draining() {
+                    tracing::info!("daemon: drain begun, closing accept loop");
                     break;
                 }
             }
@@ -380,6 +406,16 @@ async fn handle_request(
         ),
 
         Request::SendUserMessage { text, images } => {
+            // New-user-work gate (`daemon-graceful-drain-shutdown.md`): once
+            // a drain begins, reject new turns with a short notice rather
+            // than silently dropping or queuing them. In-flight turns keep
+            // running; this only stops *new* work from starting.
+            if ctx.shutdown.is_draining() {
+                return Err(ErrorPayload {
+                    code: ErrorCode::Shutdown,
+                    message: "daemon is shutting down; not accepting new messages".into(),
+                });
+            }
             let att = require_attached(state)?;
             att.handle
                 .send_work(SessionWork::UserMessage(
@@ -655,16 +691,41 @@ async fn handle_request(
 
         Request::StopDaemon => {
             tracing::info!("StopDaemon requested via client");
-            // The shutdown watcher in `run_accept_loop` is signalled
-            // by the daemon's external SIGTERM path; we honor that
-            // path by sending SIGTERM to ourselves, which the existing
-            // signal handler picks up cleanly.
-            #[cfg(unix)]
-            unsafe {
-                libc::kill(std::process::id() as libc::pid_t, libc::SIGTERM);
-            }
+            // Route through the single graceful-shutdown path
+            // (`daemon-graceful-drain-shutdown.md`): the same begin-drain /
+            // shorten-to-force transition SIGINT/SIGTERM and the ephemeral
+            // teardown use. A second `StopDaemon` while already draining
+            // shortens to an immediate force-exit instead of starting a
+            // second drain or resetting the deadline.
+            request_shutdown(ctx);
             Ok(Response::Ack)
         }
+    }
+}
+
+// ---- shutdown -------------------------------------------------------------
+
+/// The single entry point every stop trigger (SIGINT/SIGTERM, explicit
+/// `StopDaemon`, the ephemeral last-client/owner-exit teardown) routes
+/// through (`daemon-graceful-drain-shutdown.md`).
+///
+/// First call begins the drain: it broadcasts the `DaemonDraining { forced:
+/// false }` notice (TUIs show "finishing in-flight work, shutting down…"
+/// and start refusing new input) and flips the central gate so the
+/// inference-dispatch chokepoint refuses new provider requests. A *second*
+/// call while already draining **shortens** to an immediate force-exit —
+/// it promotes the gate to `Forced` and broadcasts `DaemonDraining { forced:
+/// true }`. Both transitions are monotonic/idempotent, so a redundant
+/// trigger never starts a second drain, resets the deadline, or deadlocks.
+pub fn request_shutdown(ctx: &Arc<DaemonContext>) {
+    if ctx.shutdown.begin_drain() {
+        tracing::info!("daemon: graceful drain begun");
+        ctx.broadcast_global(proto::Event::DaemonDraining { forced: false });
+    } else if !ctx.shutdown.is_forced() {
+        // Already draining and a second trigger arrived: shorten to force.
+        ctx.shutdown.force();
+        tracing::warn!("daemon: second stop request during drain; forcing exit");
+        ctx.broadcast_global(proto::Event::DaemonDraining { forced: true });
     }
 }
 
@@ -1211,4 +1272,75 @@ fn load_configs(cwd: &Path) -> Result<(ProvidersConfig, ExtendedConfig)> {
         }
     }
     Ok((providers, extended))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::daemon::shutdown::ShutdownPhase;
+
+    fn test_ctx() -> Arc<DaemonContext> {
+        let db = Db::open_in_memory().expect("in-memory db");
+        let locks = Arc::new(LockManager::from_db(db.clone()).expect("locks"));
+        let paths = DaemonPaths {
+            socket: std::path::PathBuf::from("/tmp/cockpit-test.sock"),
+            pid_file: std::path::PathBuf::from("/tmp/cockpit-test.pid"),
+            ephemeral: true,
+        };
+        Arc::new(DaemonContext::new(db, locks, paths))
+    }
+
+    /// The single graceful-shutdown path
+    /// (`daemon-graceful-drain-shutdown.md`): the first `request_shutdown`
+    /// begins the drain and broadcasts the (non-forced) notice; a **second**
+    /// one while still draining **shortens** to force and broadcasts the
+    /// forced notice — never a second drain or a reset deadline.
+    #[tokio::test]
+    async fn second_stop_request_shortens_to_force() {
+        let ctx = test_ctx();
+        let mut events = ctx.subscribe_global();
+        assert_eq!(ctx.shutdown.phase(), ShutdownPhase::Running);
+
+        // First request: begin drain + non-forced notice.
+        request_shutdown(&ctx);
+        assert_eq!(ctx.shutdown.phase(), ShutdownPhase::Draining);
+        match events.recv().await.expect("drain notice") {
+            proto::Event::DaemonDraining { forced } => assert!(!forced),
+            other => panic!("expected DaemonDraining, got {other:?}"),
+        }
+
+        // Second request mid-drain: shorten to force + forced notice.
+        request_shutdown(&ctx);
+        assert_eq!(ctx.shutdown.phase(), ShutdownPhase::Forced);
+        match events.recv().await.expect("forced notice") {
+            proto::Event::DaemonDraining { forced } => assert!(forced),
+            other => panic!("expected forced DaemonDraining, got {other:?}"),
+        }
+
+        // A third request is a no-op — already forced, no further events.
+        request_shutdown(&ctx);
+        assert_eq!(ctx.shutdown.phase(), ShutdownPhase::Forced);
+    }
+
+    /// New-user-work gate: once draining, `SendUserMessage` is refused with
+    /// the `Shutdown` error code rather than dropped or queued.
+    #[tokio::test]
+    async fn send_user_message_refused_while_draining() {
+        let ctx = test_ctx();
+        let mut state = ClientState { attached: None };
+
+        ctx.shutdown.begin_drain();
+
+        let err = handle_request(
+            Request::SendUserMessage {
+                text: "hi".into(),
+                images: vec![],
+            },
+            &mut state,
+            &ctx,
+        )
+        .await
+        .expect_err("draining daemon must refuse new user messages");
+        assert_eq!(err.code, ErrorCode::Shutdown);
+    }
 }
