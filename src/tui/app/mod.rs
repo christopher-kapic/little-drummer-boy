@@ -2248,8 +2248,58 @@ impl App {
                 }
                 let _ = r.record_tx.try_send(req);
             }
+            // Refresh the fresh-chat guidance estimate from the daemon now
+            // that one is guaranteed up (lazy spawn / attach just completed).
+            // The launch-time figure was a local raw-cl100k fallback computed
+            // before any daemon existed; the daemon answers with the active
+            // model's calibrated tokenizer and the same file-resolution the
+            // engine then injects, so the indicator matches what's actually
+            // sent. Best-effort: a daemon that can't answer leaves the
+            // launch-time estimate in place (no regression). Targets the
+            // runner's own socket so it reaches an owned per-pid ephemeral
+            // daemon (daemonless / auto-spawn), not just the canonical one —
+            // reuses the just-established daemon, no new spawn, one request.
+            self.refresh_guidance_estimate_from_daemon(&r.socket);
         }
         self.agent_runner = Some(runner);
+    }
+
+    /// Re-fetch the fresh-chat guidance estimate from the daemon at `socket`
+    /// (the attached runner's own socket) and adopt it when it carries a
+    /// resolved file or a non-zero system-prompt size. Called once the lazy
+    /// daemon spawn/attach completes so the indicator reflects the daemon's
+    /// calibrated figure rather than staying stuck on the launch-time local
+    /// fallback (which is computed before any daemon exists). A daemon that
+    /// can't answer, or a degenerate all-zero/no-file reply, is ignored so a
+    /// transient miss never blanks a correct local estimate. Touches only the
+    /// indicator — never the cached system prompt — so the prompt cache is
+    /// undisturbed.
+    fn refresh_guidance_estimate_from_daemon(&mut self, socket: &Path) {
+        let (provider, model) = match &self.launch.active_model {
+            Some((p, m)) => (Some(p.clone()), Some(m.clone())),
+            None => (None, None),
+        };
+        let resp = agent_runner::daemon_request_at_blocking(
+            socket,
+            crate::daemon::proto::Request::GuidanceEstimate {
+                project_root: self.launch.cwd.to_string_lossy().into_owned(),
+                provider,
+                model,
+            },
+        );
+        if let Ok(crate::daemon::proto::Response::GuidanceEstimate {
+            file,
+            tokens,
+            system_tokens,
+        }) = resp
+            && (file.is_some() || system_tokens > 0)
+        {
+            self.guidance_estimate = Some(agent_runner::GuidanceEstimate {
+                file,
+                guidance_tokens: tokens,
+                system_tokens,
+            });
+        }
     }
 
     /// Record one accepted autocomplete pick: bump the in-memory count

@@ -397,6 +397,30 @@ pub fn daemon_request_blocking(req: Request) -> Result<Response, String> {
     })
 }
 
+/// Run one blocking request against the daemon at a *known* `socket` —
+/// the socket the attached [`AgentRunner`] is already bound to. Unlike
+/// [`daemon_request_blocking`], this never re-resolves the canonical path,
+/// so it reaches an owned per-pid ephemeral daemon (the daemonless and
+/// auto-spawn paths) whose socket env is set only in the daemon child, not
+/// in this client process. Connects only — never spawns. `Err(String)` on
+/// any transport/typed failure.
+pub fn daemon_request_at_blocking(socket: &Path, req: Request) -> Result<Response, String> {
+    let runtime =
+        tokio::runtime::Handle::try_current().map_err(|_| "no tokio runtime".to_string())?;
+    let socket = socket.to_path_buf();
+    tokio::task::block_in_place(|| {
+        runtime.block_on(async {
+            let client = crate::daemon::client::DaemonClient::connect(&socket)
+                .await
+                .map_err(|e| format!("daemon connect: {e}"))?;
+            client
+                .request_ok(req)
+                .await
+                .map_err(|e| format!("daemon request: {e}"))
+        })
+    })
+}
+
 /// List sessions for the `/sessions` browser. `project_id = Some(p)` +
 /// `parent = None` → root sessions in `p`; `parent = Some(s)` → direct
 /// forks of `s`; both `None` → every open session (all-projects scope).
@@ -713,5 +737,60 @@ pub fn first_line(s: &str, max_chars: usize) -> String {
         format!("{truncated}…")
     } else {
         first.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Daemonless / pre-spawn resolution: the local fallback (the only
+    /// source feeding the fresh-chat indicator before any daemon exists)
+    /// must detect a guidance file sitting in `cwd` and report its basename
+    /// plus a non-zero body size. `AGENTS.md` is in the shipped default
+    /// `agent_guidance_files`, so this resolves regardless of any host
+    /// override that only *adds* names (e.g. `CLAUDE.md`). Pins the
+    /// no-daemon launch state against silent regression.
+    #[test]
+    fn local_guidance_estimate_detects_file_in_cwd() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("AGENTS.md"), "PROJECT RULES\nmore lines\n").unwrap();
+
+        let est = local_guidance_estimate(tmp.path());
+        assert_eq!(
+            est.file.as_deref(),
+            Some("AGENTS.md"),
+            "local fallback must detect the guidance file by basename"
+        );
+        assert!(
+            est.guidance_tokens > 0,
+            "a non-empty guidance body must size to a non-zero token count"
+        );
+        // The full composed system prompt is always non-empty (role prompt +
+        // identity lines), so the baseline the running estimate folds in is
+        // never zero — the refresh-on-connect adopt-guard relies on this.
+        assert!(
+            est.system_tokens > 0,
+            "system prompt baseline must be non-zero"
+        );
+    }
+
+    /// No guidance file present anywhere on the walk: the local fallback
+    /// reports `file = None` (the indicator falls through to the usual
+    /// context form) while still sizing the system-prompt baseline. Walks
+    /// from a tempdir that has no `AGENTS.md`/`CLAUDE.md`.
+    #[test]
+    fn local_guidance_estimate_none_when_no_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sub = tmp.path().join("empty-project");
+        std::fs::create_dir(&sub).unwrap();
+
+        let est = local_guidance_estimate(&sub);
+        assert!(
+            est.file.is_none(),
+            "no guidance file should resolve to None"
+        );
+        assert_eq!(est.guidance_tokens, 0);
+        assert!(est.system_tokens > 0);
     }
 }

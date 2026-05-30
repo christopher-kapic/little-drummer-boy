@@ -1301,4 +1301,44 @@ mod tests {
         .expect_err("draining daemon must refuse new user messages");
         assert_eq!(err.code, ErrorCode::Shutdown);
     }
+
+    /// Refresh-on-daemon-connect (daemon side): the `GuidanceEstimate`
+    /// request the TUI fires once a daemon comes up must resolve the project
+    /// guidance file at `project_root` and return its basename plus non-zero
+    /// sizes. This is the calibrated answer the indicator adopts in place of
+    /// the launch-time local fallback, so it must never come back empty when
+    /// a guidance file is present. `AGENTS.md` is in the shipped default
+    /// list, so this holds independent of any host config override.
+    #[tokio::test]
+    async fn guidance_estimate_resolves_file_at_project_root() {
+        let ctx = test_ctx();
+        let mut state = ClientState { attached: None };
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("AGENTS.md"), "PROJECT RULES\n").unwrap();
+
+        let resp = handle_request(
+            Request::GuidanceEstimate {
+                project_root: tmp.path().to_string_lossy().into_owned(),
+                provider: None,
+                model: None,
+            },
+            &mut state,
+            &ctx,
+        )
+        .await
+        .expect("guidance estimate must answer without an attached session");
+
+        match resp {
+            Response::GuidanceEstimate {
+                file,
+                tokens,
+                system_tokens,
+            } => {
+                assert_eq!(file.as_deref(), Some("AGENTS.md"));
+                assert!(tokens > 0, "non-empty guidance body sizes to > 0 tokens");
+                assert!(system_tokens > 0, "system prompt baseline is non-zero");
+            }
+            other => panic!("expected GuidanceEstimate, got {other:?}"),
+        }
+    }
 }
