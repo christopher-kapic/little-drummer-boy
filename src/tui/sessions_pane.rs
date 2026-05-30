@@ -653,7 +653,6 @@ impl SessionsPane {
                 show_project,
                 width,
             ));
-            lines.push(Line::default());
         }
         lines
     }
@@ -780,8 +779,12 @@ pub fn card_lines(
         border_style,
     ));
 
-    // Row 2: absolute most-recent-event time + (optional) project label.
-    let mut meta: Vec<Span<'static>> = vec![Span::styled(fmt_time(s.last_active_at), muted)];
+    // Row 2: relative + absolute most-recent-event time + (optional) project
+    // label.
+    let mut meta: Vec<Span<'static>> = vec![Span::styled(
+        fmt_time_with_relative(s.last_active_at),
+        muted,
+    )];
     if show_project {
         meta.push(Span::raw("  "));
         meta.push(Span::styled(
@@ -860,6 +863,47 @@ fn fmt_time(epoch: i64) -> String {
         Some(dt) => dt.format("%Y-%m-%d %H:%M").to_string(),
         None => "—".to_string(),
     }
+}
+
+/// `<relative> · <absolute>` for `last_active_at`, computed against the
+/// current wall clock.
+fn fmt_time_with_relative(epoch: i64) -> String {
+    let elapsed = chrono::Utc::now().timestamp() - epoch;
+    format!("{} · {}", relative_time(elapsed), fmt_time(epoch))
+}
+
+/// Hand-rolled coarse "time ago" string from an elapsed duration in seconds
+/// (`now - last_active_at`). Buckets per spec; future timestamps (negative
+/// elapsed) clamp to `just now`. 30-day months, 365-day years.
+fn relative_time(elapsed_secs: i64) -> String {
+    fn unit(n: i64, singular: &str) -> String {
+        if n == 1 {
+            format!("1 {singular} ago")
+        } else {
+            format!("{n} {singular}s ago")
+        }
+    }
+
+    if elapsed_secs < 60 {
+        // Includes the future-timestamp (negative) clamp.
+        return "just now".to_string();
+    }
+    let minutes = elapsed_secs / 60;
+    if minutes < 60 {
+        return unit(minutes, "minute");
+    }
+    let hours = elapsed_secs / 3_600;
+    if hours < 48 {
+        return unit(hours, "hour");
+    }
+    let days = elapsed_secs / 86_400;
+    if days < 30 {
+        return unit(days, "day");
+    }
+    if days < 365 {
+        return unit(days / 30, "month");
+    }
+    unit(days / 365, "year")
 }
 
 /// Last path component of a project root, for the all-projects card label.
@@ -1175,6 +1219,50 @@ mod tests {
         assert_eq!(pane.current().cursor, 0);
         pane.handle_key(press(KeyCode::Up));
         assert_eq!(pane.current().cursor, 0);
+    }
+
+    #[test]
+    fn relative_time_buckets() {
+        const MIN: i64 = 60;
+        const HOUR: i64 = 3_600;
+        const DAY: i64 = 86_400;
+
+        // `just now` covers everything under a minute, including the
+        // exact boundary just below.
+        assert_eq!(relative_time(0), "just now");
+        assert_eq!(relative_time(59), "just now");
+
+        // Future timestamps (negative elapsed) clamp to `just now`.
+        assert_eq!(relative_time(-5), "just now");
+        assert_eq!(relative_time(-DAY), "just now");
+
+        // Minutes, singular vs plural, up to 59.
+        assert_eq!(relative_time(MIN), "1 minute ago");
+        assert_eq!(relative_time(2 * MIN), "2 minutes ago");
+        assert_eq!(relative_time(59 * MIN), "59 minutes ago");
+
+        // 60 min crosses into hours; hours run up to 47.
+        assert_eq!(relative_time(60 * MIN), "1 hour ago");
+        assert_eq!(relative_time(2 * HOUR), "2 hours ago");
+        assert_eq!(relative_time(47 * HOUR), "47 hours ago");
+
+        // 48h switches to days (NOT at 24h).
+        assert_eq!(relative_time(24 * HOUR), "24 hours ago");
+        assert_eq!(relative_time(48 * HOUR), "2 days ago");
+        assert_eq!(relative_time(29 * DAY), "29 days ago");
+
+        // 30 days crosses into months (30-day months), up to 11 months.
+        assert_eq!(relative_time(30 * DAY), "1 month ago");
+        assert_eq!(relative_time(59 * DAY), "1 month ago");
+        assert_eq!(relative_time(60 * DAY), "2 months ago");
+        // 11 months: 11*30 = 330 days, still < 365.
+        assert_eq!(relative_time(360 * DAY), "12 months ago");
+        assert_eq!(relative_time(364 * DAY), "12 months ago");
+
+        // 365 days crosses into years (365-day years).
+        assert_eq!(relative_time(365 * DAY), "1 year ago");
+        assert_eq!(relative_time(729 * DAY), "1 year ago");
+        assert_eq!(relative_time(730 * DAY), "2 years ago");
     }
 
     fn test_pane(cards: Vec<(SessionSummary, Tier)>) -> SessionsPane {
