@@ -223,8 +223,12 @@ impl App {
                     // ephemeral daemon (isolated from the canonical daemon
                     // and from any other TUI's), spawned on the first attach
                     // and reaped when this TUI exits. Flip the lifecycle flag
-                    // and mark "connected" so `ensure_session_for_display`
-                    // proceeds to spawn it.
+                    // and mark "connected" — the latter so daemon-aware UI
+                    // (e.g. the `/sessions` pane's live-RPC path) treats this
+                    // window as connected. The eager display attach
+                    // deliberately skips daemonless mode, so this does *not*
+                    // spawn the owned ephemeral daemon just to show an id; the
+                    // short id appears once the first message brings it up.
                     self.daemonless = true;
                     self.daemon_connected = true;
                     self.history.push(HistoryEntry::Plain {

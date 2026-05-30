@@ -107,6 +107,42 @@ pub(super) fn decide_ctrl_c(
     (action, Some(now))
 }
 
+/// Pure gate for the eager display attach (session-id-shown-before-first-
+/// message). Decides whether [`App::ensure_session_for_display`] should
+/// attach a deferred session now so the welcome box can show its short id
+/// before any message is sent. Factored out of [`App`] so the precedence is
+/// unit-testable without a live daemon or terminal.
+///
+/// `probe_when` is the (costly) "is the canonical daemon reachable right
+/// now?" check; it is invoked lazily — only when the cheap struct-only gates
+/// all pass — so a tick that can't attach for any other reason never pays for
+/// a socket probe.
+///
+/// All of these must hold:
+/// - no runner exists yet (`!has_runner`) — a live runner already shows the
+///   id, and a poisoned `Some(Err)` from a *first-message* attempt is left
+///   alone (it was already surfaced to the user);
+/// - the "daemon not running" prompt is closed (`!prompt_open`) — never spawn
+///   a daemon out from under the user's pending choice;
+/// - not daemonless (`!daemonless`) — eager-attaching there would spawn the
+///   owned ephemeral daemon purely to display an id (a deliberate non-goal);
+/// - we believe a daemon should be reachable (`daemon_connected`); and
+/// - the canonical daemon actually answers right now (`probe_when()`) — so we
+///   don't fire against the not-yet-bound socket in the "Start and connect"
+///   startup gap.
+fn should_attempt_display_attach(
+    has_runner: bool,
+    prompt_open: bool,
+    daemonless: bool,
+    daemon_connected: bool,
+    probe_when: impl FnOnce() -> bool,
+) -> bool {
+    if has_runner || prompt_open || daemonless || !daemon_connected {
+        return false;
+    }
+    probe_when()
+}
+
 /// Max suggestion rows the slash / @ autocomplete popup ever takes.
 /// When fewer matches exist, the popup pads with blank lines so the
 /// composer doesn't visibly shift as the user types and the candidate
@@ -2513,14 +2549,54 @@ impl App {
     /// startup graphic can show its id (session-id-display-and-lazy-persist).
     /// The attach creates a deferred (un-persisted) session in the daemon;
     /// the first user message is what writes the `sessions` row. Runs each
-    /// event-loop tick but is a no-op once a runner exists or while the
-    /// "daemon not running" prompt is still open (we don't want to spawn a
-    /// daemon out from under the user's choice).
+    /// event-loop tick.
+    ///
+    /// Gates (all must hold):
+    /// - No live runner yet. A successful attach (`Some(Ok)`) stops the
+    ///   eager loop; a poisoned `Some(Err)` from a *previous first-message*
+    ///   attempt would too, so this also short-circuits then — only the
+    ///   `None` state retries here.
+    /// - The "daemon not running" prompt is closed — we don't spawn a
+    ///   daemon out from under the user's choice.
+    /// - Not daemonless. In daemonless mode there is no daemon to merely
+    ///   *show* an id for; eager-attaching would spawn the owned ephemeral
+    ///   daemon purely for display. The short id appears once a daemon comes
+    ///   up on its own (the first message). `daemon_connected` stays true in
+    ///   that mode (the `/sessions` pane needs it), so it can't be the gate.
+    /// - The canonical daemon is actually reachable *right now*. After
+    ///   "Start and connect" the just-spawned socket isn't bound for a beat;
+    ///   attaching then would either block the loop on `wait_for_daemon` or
+    ///   race a second auto-promoted daemon onto the same socket. A cheap
+    ///   probe lets us wait quietly and attach the instant it's up.
     pub(super) fn ensure_session_for_display(&mut self) {
-        if self.agent_runner.is_some() || self.daemon_prompt.is_some() || !self.daemon_connected {
-            return;
+        // Evaluate the cheap struct-only gates first; the daemon probe is
+        // the only costly check, so only run it when everything else already
+        // permits an attach (`probe_when` is lazy for exactly this reason).
+        let attach = should_attempt_display_attach(
+            self.agent_runner.is_some(),
+            self.daemon_prompt.is_some(),
+            self.daemonless,
+            self.daemon_connected,
+            || self.canonical_daemon_running(),
+        );
+        if attach {
+            self.try_attach_for_display();
         }
-        self.ensure_agent_runner();
+    }
+
+    /// Cheap "is the canonical daemon answering right now?" probe, used to
+    /// gate the eager display attach so it never fires against a socket that
+    /// isn't bound yet (the "Start and connect" startup gap). Any resolution
+    /// or probe failure reads as "not reachable" — we simply retry next tick.
+    fn canonical_daemon_running(&self) -> bool {
+        crate::daemon::DaemonPaths::resolve()
+            .map(|paths| {
+                matches!(
+                    crate::daemon::probe_blocking(&paths),
+                    crate::daemon::DaemonStatus::Running
+                )
+            })
+            .unwrap_or(false)
     }
 
     /// The daemon lifecycle this TUI attaches with. Daemonless mode owns a
@@ -2555,12 +2631,29 @@ impl App {
         self.daemon_guard = Some(guard);
     }
 
+    /// Spawn (or attach to) the daemon and **latch** the result —
+    /// including a failure. The first-message path
+    /// (`src/tui/app/input.rs`) calls this: a user-initiated submit must
+    /// surface a spawn error in history, and storing `Some(Err)` keeps it
+    /// visible. The opportunistic display attach uses
+    /// [`Self::try_attach_for_display`] instead, which never latches an
+    /// error.
     pub(super) fn ensure_agent_runner(&mut self) {
-        if self.agent_runner.is_some() {
+        if matches!(self.agent_runner, Some(Ok(_))) {
             return;
         }
         let runner =
             agent_runner::try_spawn(&self.launch.cwd, self.no_sandbox, self.lifecycle_mode());
+        self.adopt_runner(runner);
+    }
+
+    /// Adopt a freshly-spawned runner: on success, record its identity
+    /// (session id + short id for the startup graphic), seed the usage
+    /// tallies, flush buffered usage records, and refresh the guidance
+    /// estimate from the now-live daemon. Always stores the result (`Ok`
+    /// or `Err`) so the caller's latch semantics hold. Shared by the
+    /// first-message path and the eager display attach.
+    fn adopt_runner(&mut self, runner: Result<AgentRunner, String>) {
         if let Ok(r) = &runner {
             // In daemonless mode this runner spawned our own ephemeral
             // daemon; arm the ownership guard so it's reaped on exit.
@@ -2608,6 +2701,26 @@ impl App {
             self.refresh_guidance_estimate_from_daemon(&r.socket);
         }
         self.agent_runner = Some(runner);
+    }
+
+    /// Opportunistic display attach: attach a deferred session so the
+    /// welcome box can show its short id before the first message, but —
+    /// unlike [`Self::ensure_agent_runner`] — **never latch a failure**. A
+    /// transient `try_spawn` error (e.g. the just-started daemon's socket
+    /// isn't bound yet) leaves `agent_runner = None` so the next event-loop
+    /// tick retries, rather than poisoning the runner to `Some(Err)` and
+    /// permanently disabling the eager display. On success the runner is
+    /// the same one the first-message path then reuses (it early-returns on
+    /// `is_some()`), so the id shown in the welcome box is exactly the
+    /// session persisted on first message.
+    fn try_attach_for_display(&mut self) {
+        let runner =
+            agent_runner::try_spawn(&self.launch.cwd, self.no_sandbox, self.lifecycle_mode());
+        if runner.is_ok() {
+            self.adopt_runner(runner);
+        }
+        // On `Err`, drop it silently: leave `agent_runner` as `None` so a
+        // later tick can retry once the daemon is actually reachable.
     }
 
     /// Re-fetch the fresh-chat guidance estimate from the daemon at `socket`
@@ -5135,6 +5248,94 @@ mod windowed_scroll_tests {
         // Coming back up to index 4 from a scrolled offset keeps a row
         // above visible.
         assert_eq!(windowed_scroll(4, 4, 10, W), 3);
+    }
+}
+
+#[cfg(test)]
+mod display_attach_gate_tests {
+    use super::should_attempt_display_attach;
+    use std::cell::Cell;
+
+    /// The happy path: no runner, prompt closed, not daemonless, believed
+    /// connected, and the daemon answers → attach.
+    #[test]
+    fn attaches_when_daemon_reachable() {
+        assert!(should_attempt_display_attach(
+            false,
+            false,
+            false,
+            true,
+            || true
+        ));
+    }
+
+    /// A runner already exists → no attach, and the probe is never run
+    /// (cheap struct gates short-circuit before the costly probe).
+    #[test]
+    fn skips_when_runner_exists_without_probing() {
+        let probed = Cell::new(false);
+        let attach = should_attempt_display_attach(true, false, false, true, || {
+            probed.set(true);
+            true
+        });
+        assert!(!attach);
+        assert!(!probed.get(), "must not probe once a runner exists");
+    }
+
+    /// The "daemon not running" prompt is still open → don't spawn a daemon
+    /// out from under the user's choice; probe is skipped.
+    #[test]
+    fn skips_while_prompt_open() {
+        let probed = Cell::new(false);
+        let attach = should_attempt_display_attach(false, true, false, true, || {
+            probed.set(true);
+            true
+        });
+        assert!(!attach);
+        assert!(!probed.get());
+    }
+
+    /// Daemonless ("continue without daemon") → never eager-spawn the owned
+    /// ephemeral daemon purely to display an id (deliberate non-goal). Probe
+    /// is skipped even though `daemon_connected` is true in this mode.
+    #[test]
+    fn skips_in_daemonless_mode() {
+        let probed = Cell::new(false);
+        let attach = should_attempt_display_attach(false, false, true, true, || {
+            probed.set(true);
+            true
+        });
+        assert!(!attach);
+        assert!(
+            !probed.get(),
+            "daemonless must not probe/attach for display"
+        );
+    }
+
+    /// `daemon_connected` is false → no attach, no probe.
+    #[test]
+    fn skips_when_not_connected() {
+        let probed = Cell::new(false);
+        let attach = should_attempt_display_attach(false, false, false, false, || {
+            probed.set(true);
+            true
+        });
+        assert!(!attach);
+        assert!(!probed.get());
+    }
+
+    /// All cheap gates pass but the just-started daemon's socket isn't bound
+    /// yet (probe returns false) → wait quietly; retry on a later tick. This
+    /// is the "Start and connect" startup gap that previously double-spawned.
+    #[test]
+    fn waits_when_socket_not_yet_bound() {
+        assert!(!should_attempt_display_attach(
+            false,
+            false,
+            false,
+            true,
+            || false
+        ));
     }
 }
 
