@@ -1317,6 +1317,7 @@ impl App {
             // wheel-scroll path handles in-app scrollback instead.
             self.maybe_service_new_session(terminal)?;
             self.maybe_service_external_edit(terminal)?;
+            self.maybe_service_agent_file_edit(terminal)?;
             terminal.draw(|frame| self.render(frame))?;
             self.sync_cursor_shape();
 
@@ -1662,6 +1663,55 @@ impl App {
             }
         }
         let _ = std::fs::remove_file(&path);
+        Ok(())
+    }
+
+    /// The `/settings → Agents` page asked to edit an agent file in
+    /// `$EDITOR` (`prompts/settings-agents-management.md`). The page can't
+    /// suspend the TUI from inside a key handler, so it records the path
+    /// and we service it here: suspend ratatui, run `$EDITOR <file>`, then
+    /// hand the outcome back so the page re-reads + re-parses the file
+    /// (surfacing a parse error inline, never silently accepting a broken
+    /// agent). External-process failure leaves the file untouched and is
+    /// reported inline. Reuses the same raw-mode/alt-screen toggle dance as
+    /// the composer's Ctrl+G handoff.
+    pub(super) fn maybe_service_agent_file_edit(
+        &mut self,
+        terminal: &mut DefaultTerminal,
+    ) -> Result<()> {
+        let Some(path) = self.dialog.take_pending_agent_edit() else {
+            return Ok(());
+        };
+
+        let Some(editor) = std::env::var_os("EDITOR") else {
+            // Env shifted between the page deciding to defer and now; the
+            // page only defers when EDITOR was set, so this is defensive.
+            self.dialog
+                .finish_agent_edit(Some("$EDITOR is no longer set".to_string()));
+            return Ok(());
+        };
+
+        use crossterm::terminal::{
+            EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+        };
+        let _ = crossterm::execute!(stdout(), LeaveAlternateScreen);
+        let _ = disable_raw_mode();
+
+        let status = std::process::Command::new(&editor).arg(&path).status();
+
+        let _ = enable_raw_mode();
+        let _ = crossterm::execute!(stdout(), EnterAlternateScreen);
+        terminal.clear()?;
+
+        let editor_error = match status {
+            Ok(s) if s.success() => None,
+            Ok(s) => Some(format!("editor exited with {s} — file left unchanged")),
+            Err(e) => Some(format!(
+                "invoking `{}`: {e} — file left unchanged",
+                editor.to_string_lossy()
+            )),
+        };
+        self.dialog.finish_agent_edit(editor_error);
         Ok(())
     }
 

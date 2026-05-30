@@ -23,6 +23,7 @@
 //! page's `r`=refetch action) use [`FetchHandle`] — a shared cell the
 //! background task writes into and the event loop reads on each tick.
 
+mod agent_editor;
 mod agents_page;
 mod auth;
 mod providers;
@@ -254,6 +255,37 @@ impl Dialog {
             return None;
         };
         p.pending_mouse_capture.take()
+    }
+
+    /// Drain a pending external-editor (`$EDITOR`) request from the Agents
+    /// page, if any. Returns the on-disk agent file the event loop should
+    /// open `$EDITOR` against; the loop owns the terminal suspend/restore
+    /// (the page handler can't), then calls [`Self::finish_agent_edit`] to
+    /// re-read + re-parse the file. `None` unless the user just chose to
+    /// edit an agent and `$EDITOR` is set.
+    pub fn take_pending_agent_edit(&mut self) -> Option<PathBuf> {
+        let Dialog::Settings(s) = self else {
+            return None;
+        };
+        let Page::Agents(p) = &mut s.page else {
+            return None;
+        };
+        p.pending_external_edit.take()
+    }
+
+    /// Apply the result of an external-editor session the event loop ran on
+    /// behalf of the Agents page: re-read the file from disk, re-parse it,
+    /// surface any parse error inline, and refresh the row markers/model.
+    /// `editor_error` carries an external-process failure (non-zero exit /
+    /// missing binary) so the page reports it and leaves the file as-is.
+    pub fn finish_agent_edit(&mut self, editor_error: Option<String>) {
+        let Dialog::Settings(s) = self else {
+            return;
+        };
+        let cwd = s.agents_cwd();
+        if let Page::Agents(p) = &mut s.page {
+            p.finish_external_edit(&cwd, editor_error);
+        }
     }
 
     /// Called by the event loop each tick so async fetches can apply
@@ -684,13 +716,7 @@ impl SettingsDialog {
                     "↑/↓  enter: open  esc: close"
                 }
             }
-            Page::Agents(p) => {
-                if p.confirm_reset {
-                    "y: confirm reset-all  n/esc: cancel"
-                } else {
-                    "↑/↓  enter/e: eject built-in  R: reset all to default  h: back  esc: close"
-                }
-            }
+            Page::Agents(p) => p.help_text(),
             Page::Instructions(p) => {
                 if p.grabbed.is_some() {
                     "type to rename  ↑/↓: reorder  enter: drop & save  esc: cancel"
