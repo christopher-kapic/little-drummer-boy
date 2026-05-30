@@ -38,6 +38,19 @@ impl Tool for GlobTool {
         "List files matching a glob pattern within the package root, gitignore-aware"
     }
 
+    fn defensive_description(&self) -> Option<String> {
+        Some(
+            "List the files in this package whose paths match a glob pattern, respecting \
+             `.gitignore`. With no shell available, this is how you discover which files exist \
+             and where — use it to find the entry points, modules, or file types of the \
+             dependency you're inspecting before reading them. The walk is hard-confined to the \
+             package root. Use patterns like `**/*.rs` (all Rust files at any depth) or `src/**` \
+             (everything under src); scope the walk with `path` when you only care about a \
+             subtree."
+                .to_string(),
+        )
+    }
+
     fn parameters(&self) -> Value {
         serde_json::json!({
             "type": "object",
@@ -47,6 +60,17 @@ impl Tool for GlobTool {
             },
             "required": ["pattern"]
         })
+    }
+
+    fn defensive_parameters(&self) -> Option<Value> {
+        Some(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "pattern": { "type": "string", "description": "The glob pattern to match file paths against, e.g. `**/*.rs` for all Rust files or `src/**` for everything under src" },
+                "path":    { "type": "string", "x-cockpit-kind": "path", "description": "Optional subdirectory under the package root to limit the walk to; omit to walk the whole package. Cannot point outside the root" }
+            },
+            "required": ["pattern"]
+        }))
     }
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {

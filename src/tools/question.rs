@@ -38,6 +38,21 @@ impl Tool for QuestionTool {
         "Ask the user questions and wait for answers; batch every question you need into this one call."
     }
 
+    fn defensive_description(&self) -> Option<String> {
+        Some(
+            "Stop and ask the human one or more questions, then block until they answer. Use this \
+             whenever you are genuinely uncertain about scope, intent, or a decision you cannot \
+             safely make alone — it is better to ask than to guess wrong. Put EVERY question you \
+             currently have into this single call (the `questions` array); do not fire off \
+             several separate `question` calls in a row, which makes the user answer one popup \
+             after another. For each question choose `select` (pick one of your proposed \
+             options), `multiselect` (pick any number), or `text` (free-form). Offer concrete \
+             options when you can so the user just clicks. Don't ask about things you can find \
+             out yourself by reading code or running a command."
+                .to_string(),
+        )
+    }
+
     fn parameters(&self) -> Value {
         serde_json::json!({
             "type": "object",
@@ -70,6 +85,40 @@ impl Tool for QuestionTool {
             },
             "required": ["questions"]
         })
+    }
+
+    fn defensive_parameters(&self) -> Option<Value> {
+        Some(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "questions": {
+                    "type": "array",
+                    "description": "Every question to ask the user in this one call. Batch them all here rather than calling the tool repeatedly",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "type":   { "type": "string", "enum": ["select", "multiselect", "text"], "description": "How the user answers: `select` = pick exactly one of `options`; `multiselect` = pick any number of `options`; `text` = type a free-form answer (no options needed)" },
+                            "prompt": { "type": "string", "description": "The question text shown to the user; phrase it so it is answerable on its own" },
+                            "options": {
+                                "type": "array",
+                                "description": "The choices to offer for a `select`/`multiselect` question; omit for a `text` question",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "id":    { "type": "string", "description": "A short stable identifier for this option, returned to you as the answer" },
+                                        "label": { "type": "string", "description": "The human-readable label shown for this option" },
+                                        "description": { "type": "string", "description": "Optional one-line elaboration shown under the label" }
+                                    },
+                                    "required": ["id", "label"]
+                                }
+                            }
+                        },
+                        "required": ["type", "prompt"]
+                    }
+                }
+            },
+            "required": ["questions"]
+        }))
     }
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {

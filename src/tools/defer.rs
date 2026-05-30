@@ -26,6 +26,18 @@ impl Tool for DeferTool {
         "Record an out-of-scope request for the orchestrator and keep doing your assigned work."
     }
 
+    fn defensive_description(&self) -> Option<String> {
+        Some(
+            "Hand a request that is OUTSIDE your assigned subtask back to the orchestrator that \
+             delegated to you, without abandoning your own job. Use this when, while doing your \
+             narrow task, you notice something that needs doing but isn't yours to do — record it \
+             here in one message and keep working on what you were asked to do. The orchestrator \
+             collects every deferred note when you finish and decides what to do with it. This \
+             does not pause you or ask anyone a question; it just files the note for later."
+                .to_string(),
+        )
+    }
+
     fn parameters(&self) -> Value {
         serde_json::json!({
             "type": "object",
@@ -37,6 +49,19 @@ impl Tool for DeferTool {
             },
             "required": ["message"]
         })
+    }
+
+    fn defensive_parameters(&self) -> Option<Value> {
+        Some(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "message": {
+                    "type": "string",
+                    "description": "A self-contained description of the out-of-scope work or observation to hand back to the orchestrator; write it so the orchestrator understands it without your context"
+                }
+            },
+            "required": ["message"]
+        }))
     }
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {

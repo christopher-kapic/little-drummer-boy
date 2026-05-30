@@ -19,6 +19,17 @@ impl Tool for UnlockTool {
         "Release the lock on a file without writing"
     }
 
+    fn defensive_description(&self) -> Option<String> {
+        Some(
+            "Release a lock you took with `readlock` WITHOUT saving any changes — use this when \
+             you decided not to edit the file after all, so the lock doesn't stay held. If you \
+             DO want to save changes, use `writeunlock` or `editunlock` instead (they release \
+             the lock as part of saving); `unlock` discards nothing on disk but throws away the \
+             right to write that you were holding."
+                .to_string(),
+        )
+    }
+
     fn parameters(&self) -> Value {
         serde_json::json!({
             "type": "object",
@@ -27,6 +38,16 @@ impl Tool for UnlockTool {
             },
             "required": ["path"]
         })
+    }
+
+    fn defensive_parameters(&self) -> Option<Value> {
+        Some(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "Path to the file whose lock to release, absolute or relative to the session working directory; must be a file you currently hold a lock on" }
+            },
+            "required": ["path"]
+        }))
     }
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {

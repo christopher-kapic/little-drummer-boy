@@ -549,6 +549,15 @@ async fn handle_request(
             Ok(Response::Ack)
         }
 
+        Request::SetLlmMode { mode } => {
+            let att = require_attached(state)?;
+            att.handle
+                .send_work(SessionWork::SetLlmMode { mode })
+                .await
+                .map_err(internal)?;
+            Ok(Response::Ack)
+        }
+
         Request::SetCaffeinate { mode } => set_caffeinate(state, ctx, mode),
 
         Request::CancelJob { job_id } => {

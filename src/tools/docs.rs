@@ -84,8 +84,23 @@ impl Tool for ListPackagesTool {
         "List registered dependency packages available to the docs answerer"
     }
 
+    fn defensive_description(&self) -> Option<String> {
+        Some(
+            "List the dependency packages already registered (source cloned locally) and \
+             available to answer questions about. Call this FIRST: if the package you need is \
+             already listed, it's ready to use and you don't need to clone it again. Only when \
+             the package is missing from this list should you register it with `add-package`. \
+             Takes no arguments."
+                .to_string(),
+        )
+    }
+
     fn parameters(&self) -> Value {
         serde_json::json!({ "type": "object", "properties": {} })
+    }
+
+    fn defensive_parameters(&self) -> Option<Value> {
+        Some(serde_json::json!({ "type": "object", "properties": {} }))
     }
 
     async fn call(&self, _args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
@@ -135,6 +150,19 @@ impl Tool for AddPackageTool {
         "Clone a dependency's source from its official registry-declared repo and register it"
     }
 
+    fn defensive_description(&self) -> Option<String> {
+        Some(
+            "Register a dependency by cloning its source code from the repository its official \
+             package registry declares — crates.io for `cargo`, npm for `npm`, PyPI for `pip`. \
+             Use this when the package you need is NOT already in `list-packages`. Give the \
+             package's published name and its ecosystem; the source repo is resolved from \
+             registry metadata only (never a guessed URL), so a package whose registry declares \
+             no source repo cannot be cloned. After this succeeds the package is available to \
+             answer questions about."
+                .to_string(),
+        )
+    }
+
     fn parameters(&self) -> Value {
         serde_json::json!({
             "type": "object",
@@ -144,6 +172,17 @@ impl Tool for AddPackageTool {
             },
             "required": ["name", "ecosystem"]
         })
+    }
+
+    fn defensive_parameters(&self) -> Option<Value> {
+        Some(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name":      { "type": "string", "description": "The package's name exactly as published to its registry, e.g. `tokio` (cargo), `requests` (pip)" },
+                "ecosystem": { "type": "string", "description": "Which registry to resolve the source repository from: `cargo` (crates.io), `npm`, or `pip` (PyPI)", "enum": ["cargo", "npm", "pip"] }
+            },
+            "required": ["name", "ecosystem"]
+        }))
     }
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {

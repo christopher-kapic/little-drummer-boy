@@ -67,6 +67,16 @@ impl Tool for TreeTool {
     fn description(&self) -> &str {
         "List indexed files with language, size, line count, and symbol count"
     }
+    fn defensive_description(&self) -> Option<String> {
+        Some(
+            "Get a map of the codebase: every indexed source file with its language, size, line \
+             count, and number of symbols. Use this first when you're new to a repo to see how \
+             it's laid out and where the big/important files are, before diving in with `read`. \
+             Pass `path` to limit the listing to one subtree. This reads cockpit's on-demand \
+             code index, so it is faster and quieter than shelling out to `ls`/`find`."
+                .to_string(),
+        )
+    }
     fn parameters(&self) -> Value {
         serde_json::json!({
             "type": "object",
@@ -74,6 +84,14 @@ impl Tool for TreeTool {
                 "path": { "type": "string", "x-cockpit-kind": "path", "description": "Subtree path filter relative to project root" }
             }
         })
+    }
+    fn defensive_parameters(&self) -> Option<Value> {
+        Some(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "x-cockpit-kind": "path", "description": "Optional subtree to restrict the listing to, relative to the project root; omit to list the whole indexed tree" }
+            }
+        }))
     }
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
@@ -136,6 +154,17 @@ impl Tool for OutlineTool {
     fn description(&self) -> &str {
         "Show a file's symbols and imports in line order; regex fallback for unknown languages"
     }
+    fn defensive_description(&self) -> Option<String> {
+        Some(
+            "Get a structural outline of one file: its functions, types, methods, and imports \
+             listed in source order with their line numbers — without reading the whole file. \
+             Use this to understand what a file contains and jump straight to the right line \
+             with a ranged `read`, instead of paging through it. Cheaper than reading the file \
+             when you only need its shape. Falls back to a regex scan for languages cockpit \
+             can't fully parse."
+                .to_string(),
+        )
+    }
     fn parameters(&self) -> Value {
         serde_json::json!({
             "type": "object",
@@ -144,6 +173,15 @@ impl Tool for OutlineTool {
             },
             "required": ["path"]
         })
+    }
+    fn defensive_parameters(&self) -> Option<Value> {
+        Some(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "x-cockpit-kind": "path", "description": "Path to the single source file to outline, relative to the project root or absolute" }
+            },
+            "required": ["path"]
+        }))
     }
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
@@ -249,6 +287,17 @@ impl Tool for SymbolFindTool {
     fn description(&self) -> &str {
         "Find symbol definitions by name (exact or prefix), optionally filtered by kind"
     }
+    fn defensive_description(&self) -> Option<String> {
+        Some(
+            "Find where a symbol is DEFINED — function, struct, class, method, etc. — by name, \
+             across the whole indexed codebase, and get the file + line of each definition. Use \
+             this to answer \"where is X defined?\" instead of grepping: it returns definitions \
+             only, not every mention. By default it matches `name` as a prefix (good for \
+             discovery); set `exact` for an exact name, and `kind` to narrow to one symbol kind. \
+             To find every USE of a name instead of its definition, use `word`."
+                .to_string(),
+        )
+    }
     fn parameters(&self) -> Value {
         serde_json::json!({
             "type": "object",
@@ -259,6 +308,17 @@ impl Tool for SymbolFindTool {
             },
             "required": ["name"]
         })
+    }
+    fn defensive_parameters(&self) -> Option<Value> {
+        Some(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name":   { "type": "string", "description": "The symbol name (or, by default, name prefix) to find the definition of" },
+                "exact":  { "type": "boolean", "description": "When true, match `name` exactly instead of as a prefix; defaults to prefix matching for discovery" },
+                "kind":   { "type": "string", "description": "Optional symbol-kind filter, e.g. `function`, `struct`, `class`, `method`; omit to match any kind" }
+            },
+            "required": ["name"]
+        }))
     }
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
@@ -306,6 +366,17 @@ impl Tool for WordTool {
     fn description(&self) -> &str {
         "List files and lines where an identifier token appears, from the index"
     }
+    fn defensive_description(&self) -> Option<String> {
+        Some(
+            "Find every place an identifier TOKEN appears across the codebase — all uses, not \
+             just the definition — and get the file + line of each. Use this to trace where a \
+             function/variable/type is called or referenced before you change it. It matches \
+             whole identifier tokens from the index (not arbitrary substrings or regex); for a \
+             general-text or regex search use `search`, and to find only the definition use \
+             `symbol_find`. Set `case_insensitive` to ignore case."
+                .to_string(),
+        )
+    }
     fn parameters(&self) -> Value {
         serde_json::json!({
             "type": "object",
@@ -315,6 +386,16 @@ impl Tool for WordTool {
             },
             "required": ["token"]
         })
+    }
+    fn defensive_parameters(&self) -> Option<Value> {
+        Some(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "token":            { "type": "string", "description": "The exact identifier token to find uses of; matched as a whole word, not a substring" },
+                "case_insensitive": { "type": "boolean", "description": "When true, match the token regardless of letter case; defaults to case-sensitive" }
+            },
+            "required": ["token"]
+        }))
     }
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
@@ -362,6 +443,17 @@ impl Tool for DepsTool {
     fn description(&self) -> &str {
         "Show a file's resolved import dependencies forward/reverse within a hop limit"
     }
+    fn defensive_description(&self) -> Option<String> {
+        Some(
+            "See how one file connects to the rest of the codebase through imports: `forward` = \
+             the files it depends on, `reverse` = the files that depend on it, `both` = both \
+             directions. Use `reverse` to find everything you might break before changing a \
+             file, and `forward` to learn what a file relies on. `hops` walks the graph that \
+             many levels deep (1 = direct neighbours only). Imports are resolved through \
+             cockpit's index, so this is more accurate than grepping for import lines."
+                .to_string(),
+        )
+    }
     fn parameters(&self) -> Value {
         serde_json::json!({
             "type": "object",
@@ -372,6 +464,17 @@ impl Tool for DepsTool {
             },
             "required": ["path"]
         })
+    }
+    fn defensive_parameters(&self) -> Option<Value> {
+        Some(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path":      { "type": "string", "x-cockpit-kind": "path", "description": "Path to the file whose import dependency graph to walk, relative to the project root or absolute" },
+                "direction": { "type": "string", "description": "Which way to walk: `forward` (files this one imports), `reverse` (files that import this one), or `both`; defaults to `both`" },
+                "hops":      { "type": "integer", "description": "How many levels deep to follow the graph, 1-10; defaults to 1 (direct neighbours only)" }
+            },
+            "required": ["path"]
+        }))
     }
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
@@ -496,6 +599,15 @@ impl Tool for HotTool {
     fn description(&self) -> &str {
         "List the most recently modified tracked files by mtime"
     }
+    fn defensive_description(&self) -> Option<String> {
+        Some(
+            "List the files that were edited most recently, newest first, by modification time. \
+             Use this to orient on a task quickly — recently-touched files are usually where the \
+             active work is — or to find what changed last. `limit` caps how many to return. \
+             This is a ranking by recency, not a snapshot of any one file."
+                .to_string(),
+        )
+    }
     fn parameters(&self) -> Value {
         serde_json::json!({
             "type": "object",
@@ -503,6 +615,14 @@ impl Tool for HotTool {
                 "limit": { "type": "integer", "description": "Max files (default 20)" }
             }
         })
+    }
+    fn defensive_parameters(&self) -> Option<Value> {
+        Some(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "limit": { "type": "integer", "description": "Maximum number of recently-modified files to return; defaults to 20" }
+            }
+        }))
     }
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
@@ -564,8 +684,21 @@ impl Tool for CircularTool {
     fn description(&self) -> &str {
         "Detect import cycles via strongly-connected components of the dependency graph"
     }
+    fn defensive_description(&self) -> Option<String> {
+        Some(
+            "Find import cycles in the codebase: groups of files that depend on each other \
+             directly or transitively. Use this when you suspect a circular-dependency problem, \
+             or before a refactor that moves code between modules, to see which files are \
+             tangled together. Takes no arguments — it analyses the whole project dependency \
+             graph and reports each cycle it finds."
+                .to_string(),
+        )
+    }
     fn parameters(&self) -> Value {
         serde_json::json!({ "type": "object", "properties": {} })
+    }
+    fn defensive_parameters(&self) -> Option<Value> {
+        Some(serde_json::json!({ "type": "object", "properties": {} }))
     }
 
     async fn call(&self, _args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
@@ -707,6 +840,19 @@ impl Tool for SearchTool {
     fn description(&self) -> &str {
         "Budgeted structured regex search across the repo (ripgrep-backed)"
     }
+    fn defensive_description(&self) -> Option<String> {
+        Some(
+            "Search the repository's text for a regular expression and get back matching \
+             file:line locations, ripgrep-backed and budget-capped so the result stays small. \
+             This is the general-purpose search: use it for arbitrary text, comments, strings, \
+             or patterns that aren't a single identifier. When you're looking specifically for \
+             where a symbol is DEFINED use `symbol_find`, and for whole-token USES use `word` — \
+             those are more precise. Narrow the search with `path`/`glob` and add `context` \
+             lines to see surrounding code. Prefer this over `bash` + raw `rg` so the output \
+             stays budgeted."
+                .to_string(),
+        )
+    }
     fn parameters(&self) -> Value {
         serde_json::json!({
             "type": "object",
@@ -719,6 +865,19 @@ impl Tool for SearchTool {
             },
             "required": ["pattern"]
         })
+    }
+    fn defensive_parameters(&self) -> Option<Value> {
+        Some(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "pattern":          { "type": "string", "description": "The regular expression to search for across file contents" },
+                "path":             { "type": "string", "x-cockpit-kind": "path", "description": "Optional path to restrict the search to, relative to the project root; omit to search the whole repo" },
+                "ignore_case":      { "type": "boolean", "description": "When true, match case-insensitively; defaults to case-sensitive" },
+                "context":          { "type": "integer", "description": "Number of lines of surrounding context to include around each match; defaults to none" },
+                "glob":             { "type": "string", "description": "Optional glob to include only matching files, e.g. `*.rs` or `src/**`" }
+            },
+            "required": ["pattern"]
+        }))
     }
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {

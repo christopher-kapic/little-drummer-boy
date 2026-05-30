@@ -37,6 +37,18 @@ impl Tool for SessionReadTool {
         "Read a past session's turns by short id; optional query windows around matches, paginated by seq"
     }
 
+    fn defensive_description(&self) -> Option<String> {
+        Some(
+            "Read the actual conversation turns of a PAST session by its short id (find the id \
+             first with `session_search`). Use this to recover details from earlier work — what \
+             was decided, what code was touched, why. Pass a `query` to center the result on the \
+             turns about that topic instead of reading from the top, and `offset` to page through \
+             a long session. This reads a different, finished conversation; it does not affect \
+             the current one."
+                .to_string(),
+        )
+    }
+
     fn parameters(&self) -> Value {
         serde_json::json!({
             "type": "object",
@@ -47,6 +59,18 @@ impl Tool for SessionReadTool {
             },
             "required": ["short_id"]
         })
+    }
+
+    fn defensive_parameters(&self) -> Option<Value> {
+        Some(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "short_id": { "type": "string", "description": "The short id (or full UUID) of the past session to read, as returned by `session_search`" },
+                "query":    { "type": "string", "description": "Optional topic to center the returned window on; the read shows turns around the best match instead of starting at the top" },
+                "offset":   { "type": "integer", "description": "Optional turn sequence number to start reading from, for paging through a long session" }
+            },
+            "required": ["short_id"]
+        }))
     }
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {

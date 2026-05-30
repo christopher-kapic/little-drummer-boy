@@ -41,6 +41,10 @@ pub struct Agent {
     pub tools: ToolBox,
     pub model: Arc<Model>,
     pub params: ModelParams,
+    /// The active LLM-strength mode this agent was spawned under
+    /// (`prompts/llm-modes-defensive-normal.md`). Drives tool-description
+    /// verbosity at [`ToolBox::definitions`] time — the one rendering seam.
+    pub llm_mode: crate::config::extended::LlmMode,
 }
 
 /// Events the agent emits during a turn. The driver forwards these to
@@ -128,6 +132,13 @@ pub enum TurnEvent {
     /// `Plan`, `/build` → `Build`, `plan.md §4.6.d`). Emitted by the driver
     /// so the client chrome's active-agent slot tracks the new primary.
     PrimarySwapped { name: String },
+    /// The active `llm_mode` was switched live (`/llm-mode`,
+    /// `prompts/llm-modes-defensive-normal.md`). The client tracks `mode` so
+    /// its `/llm-mode` toggle + cache-break warning resolve against the
+    /// authoritative current value.
+    LlmModeChanged {
+        mode: crate::config::extended::LlmMode,
+    },
 
     /// A `question` tool raised an interrupt (GOALS §3b): the agent is
     /// blocked until the user answers. The TUI opens the answering
@@ -311,7 +322,7 @@ pub async fn turn(
     deferred_log: crate::engine::deferred::DeferredLog,
     tx: &mpsc::Sender<TurnEvent>,
 ) -> Result<TurnOutcome> {
-    let tools = agent.tools.definitions();
+    let tools = agent.tools.definitions(agent.llm_mode);
 
     // Tell the TUI we've called the model — `Thinking…` shows until the
     // first AssistantTextDelta arrives.

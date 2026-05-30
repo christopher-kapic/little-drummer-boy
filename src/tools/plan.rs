@@ -197,6 +197,19 @@ impl Tool for CreatePlanTool {
         "Create an empty plan (a DAG of steps) with a slug, title, branch policy, and isolation mode"
     }
 
+    fn defensive_description(&self) -> Option<String> {
+        Some(
+            "Start a new plan — an empty, dependency-ordered list of steps that will be filled \
+             in with `add_step`. Call this once at the beginning of planning a feature, giving \
+             it a unique `slug` (a short handle you'll reference later) and a human `title`. Add \
+             a one-line `description` so the plan's fit can be judged at a glance, and set the \
+             branch policy (`base_branch` work forks from, `target_branch` it lands on) and \
+             `isolation_mode` if you know them now — they can also be set later with \
+             `plan_set_branches`. This creates the container only; the steps come next."
+                .to_string(),
+        )
+    }
+
     fn parameters(&self) -> Value {
         serde_json::json!({
             "type": "object",
@@ -214,6 +227,25 @@ impl Tool for CreatePlanTool {
             },
             "required": ["slug", "title"]
         })
+    }
+
+    fn defensive_parameters(&self) -> Option<Value> {
+        Some(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "slug": { "type": "string", "description": "A short unique handle for this plan that you'll pass to `add_step`/`plan_set_branches` later; lowercase-with-hyphens is conventional" },
+                "title": { "type": "string", "description": "A human-readable title summarizing what the plan accomplishes" },
+                "description": { "type": "string", "description": "One-line summary used to judge whether the plan fits the request; keep it concise" },
+                "base_branch": { "type": "string", "description": "The git branch the plan's work forks from; optional now, settable later via `plan_set_branches`" },
+                "target_branch": { "type": "string", "description": "The git branch the finished plan lands on; optional now, settable later" },
+                "isolation_mode": {
+                    "type": "string",
+                    "description": "How each step is isolated on disk: `worktree` (each step in its own git worktree) or `shared_tree` (all steps share one tree)",
+                    "enum": ["worktree", "shared_tree"]
+                }
+            },
+            "required": ["slug", "title"]
+        }))
     }
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
@@ -288,6 +320,20 @@ impl Tool for AddStepTool {
         "Add a step to a plan with a TaskPacket, dependency references, and tests; rejects cycles and unknown references"
     }
 
+    fn defensive_description(&self) -> Option<String> {
+        Some(
+            "Add one step to an existing plan. A step is a self-contained unit of work described \
+             by a `feature_description` TaskPacket — its objective, the files/modules in scope, \
+             the acceptance tests that prove it's done, and the commit/reporting/escalation \
+             policy the executor follows. Wire ordering with `depends_on`, listing the steps \
+             that must finish first (by title or id); the tool rejects unknown references and \
+             any edge that would create a cycle, so the plan stays a valid DAG. Attach per-step \
+             `tests` to run after the step (or once the branch is stable). Call this once per \
+             step; keep each step narrow enough to hand to a single executor."
+                .to_string(),
+        )
+    }
+
     fn parameters(&self) -> Value {
         serde_json::json!({
             "type": "object",
@@ -341,6 +387,61 @@ impl Tool for AddStepTool {
             },
             "required": ["plan", "title", "feature_description"]
         })
+    }
+
+    fn defensive_parameters(&self) -> Option<Value> {
+        Some(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "plan": { "type": "string", "description": "The plan to add the step to, by its slug or id" },
+                "title": { "type": "string", "description": "A short title for this step, used to reference it from other steps' `depends_on`" },
+                "feature_description": {
+                    "type": "object",
+                    "description": "The TaskPacket fully describing this step's work — everything the executor needs to do it without further context",
+                    "properties": {
+                        "objective": { "type": "string", "description": "What this step must accomplish, stated as a concrete goal" },
+                        "scope": { "type": "string", "description": "The files or modules this step is allowed to touch; keep it bounded" },
+                        "acceptance_tests": {
+                            "type": "array",
+                            "description": "The criteria that prove the step is done; each entry is one checkable condition",
+                            "items": { "type": "string" }
+                        },
+                        "commit_policy": { "type": "string", "description": "How and when the executor should commit its work" },
+                        "reporting_contract": { "type": "string", "description": "The shape of the report the executor returns on completion" },
+                        "escalation_policy": { "type": "string", "description": "What the executor should do when it gets stuck or hits an out-of-scope blocker" }
+                    },
+                    "required": ["objective", "scope", "acceptance_tests", "commit_policy", "reporting_contract", "escalation_policy"]
+                },
+                "depends_on": {
+                    "type": "array",
+                    "description": "Titles or ids of steps in this plan that must complete before this one; unknown references and cycle-creating edges are rejected",
+                    "items": { "type": "string" }
+                },
+                "tests": {
+                    "type": "array",
+                    "description": "Tests to run for this step",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "command": { "type": "string", "description": "The shell command that runs the test" },
+                            "phase": {
+                                "type": "string",
+                                "description": "When to run it: `post_step` (right after this step) or `branch_stable` (once the whole branch is stable)",
+                                "enum": ["post_step", "branch_stable"]
+                            },
+                            "concurrency": {
+                                "type": "string",
+                                "description": "Whether this test may run alongside others across worktrees (`parallel`) or needs exclusive access (`exclusive`)",
+                                "enum": ["parallel", "exclusive"]
+                            },
+                            "resource_key": { "type": "string", "description": "An exclusive-resource key shared by tests that must not run concurrently" }
+                        },
+                        "required": ["command"]
+                    }
+                }
+            },
+            "required": ["plan", "title", "feature_description"]
+        }))
     }
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
@@ -413,6 +514,17 @@ impl Tool for AddDependencyTool {
         "Add a dependency edge between two steps in a plan; rejects edges that would create a cycle"
     }
 
+    fn defensive_description(&self) -> Option<String> {
+        Some(
+            "Add an ordering constraint between two EXISTING steps of a plan: make `step` depend \
+             on `depends_on`, so the prerequisite must finish first. Use this to wire up ordering \
+             you didn't already capture in `add_step`'s `depends_on`. The edge is rejected if it \
+             would create a cycle, keeping the plan a valid DAG. Both steps must already exist in \
+             the plan (reference them by title or id)."
+                .to_string(),
+        )
+    }
+
     fn parameters(&self) -> Value {
         serde_json::json!({
             "type": "object",
@@ -423,6 +535,18 @@ impl Tool for AddDependencyTool {
             },
             "required": ["plan", "step", "depends_on"]
         })
+    }
+
+    fn defensive_parameters(&self) -> Option<Value> {
+        Some(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "plan": { "type": "string", "description": "The plan containing both steps, by slug or id" },
+                "step": { "type": "string", "description": "The dependent step (the one that must wait), by title or id" },
+                "depends_on": { "type": "string", "description": "The prerequisite step (the one that must finish first), by title or id" }
+            },
+            "required": ["plan", "step", "depends_on"]
+        }))
     }
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
@@ -466,6 +590,16 @@ impl Tool for SetBranchesTool {
         "Set a plan's base and target branch policy after authoring"
     }
 
+    fn defensive_description(&self) -> Option<String> {
+        Some(
+            "Set or update a plan's git branch policy after it's been authored: `base_branch` is \
+             the branch its work forks from, `target_branch` is the branch it lands on. Use this \
+             when you didn't set the branches at `plan_create` time, or to change them. Supply at \
+             least one of the two; the other is left unchanged."
+                .to_string(),
+        )
+    }
+
     fn parameters(&self) -> Value {
         serde_json::json!({
             "type": "object",
@@ -476,6 +610,18 @@ impl Tool for SetBranchesTool {
             },
             "required": ["plan"]
         })
+    }
+
+    fn defensive_parameters(&self) -> Option<Value> {
+        Some(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "plan": { "type": "string", "description": "The plan to update, by slug or id" },
+                "base_branch": { "type": "string", "description": "The git branch the plan's work forks from; omit to leave it unchanged" },
+                "target_branch": { "type": "string", "description": "The git branch the plan lands on; omit to leave it unchanged" }
+            },
+            "required": ["plan"]
+        }))
     }
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
@@ -525,8 +671,23 @@ impl Tool for ListPlansTool {
         "List pending and in-progress plans with title, status, branch, description, and step count"
     }
 
+    fn defensive_description(&self) -> Option<String> {
+        Some(
+            "List the plans that are currently pending or in progress, each with its title, \
+             status, branch, one-line description, and step count. Use this to see what plans \
+             already exist before creating a new one, or to find a plan's slug/id to pass to \
+             `add_step`/`plan_set_branches`. Takes no arguments; completed and abandoned plans \
+             are not shown."
+                .to_string(),
+        )
+    }
+
     fn parameters(&self) -> Value {
         serde_json::json!({ "type": "object", "properties": {} })
+    }
+
+    fn defensive_parameters(&self) -> Option<Value> {
+        Some(serde_json::json!({ "type": "object", "properties": {} }))
     }
 
     async fn call(&self, _args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {

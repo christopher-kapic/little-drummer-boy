@@ -65,14 +65,25 @@ pub struct AgentDef {
     #[serde(default)]
     pub permission: Option<serde_json::Value>,
     /// Body of the markdown file (the agent's system prompt). Resolved
-    /// through [`AgentDef::resolved_prompt`] rather than read directly so
-    /// a future per-`llm_mode` body variant can thread through one path
-    /// (forward-compat, `prompts/user-definable-agents.md`).
+    /// through [`AgentDef::resolved_prompt`] / [`AgentDef::resolved_prompt_for`]
+    /// rather than read directly so the per-`llm_mode` body variant threads
+    /// through one path (`prompts/llm-modes-defensive-normal.md`). For a
+    /// flat-file agent (single-mode) this is *the* body, used for every mode.
+    /// For a per-mode directory agent it holds the body that was selected at
+    /// load time (and [`Self::prompt_variants`] carries the per-mode bodies).
     #[serde(skip)]
     pub prompt: String,
-    /// Path the definition was loaded from (`<dir>/<name>.md`), or empty
-    /// for an embedded default. Used for diagnostics and override
-    /// detection.
+    /// Per-`llm_mode` prompt bodies for a directory-form agent
+    /// (`<dir>/<name>/<mode>.md`). Empty for a flat-file or embedded agent
+    /// (single-mode — [`Self::prompt`] applies to every mode). When present,
+    /// [`Self::resolved_prompt_for`] selects the body matching the active
+    /// mode, falling back to [`Self::prompt`] (the flat body) when the
+    /// requested mode's file was absent.
+    #[serde(skip)]
+    pub prompt_variants: std::collections::HashMap<crate::config::extended::LlmMode, String>,
+    /// Path the definition was loaded from (`<dir>/<name>.md` or the
+    /// `<dir>/<name>/` directory), or empty for an embedded default. Used
+    /// for diagnostics and override detection.
     #[serde(skip)]
     pub source: PathBuf,
 }
@@ -105,12 +116,20 @@ impl AgentMode {
 }
 
 impl AgentDef {
-    /// The agent's effective system prompt. Funneled through this
-    /// accessor (rather than reading `self.prompt` at call sites) so a
-    /// future per-`llm_mode` body variant can be selected here without
-    /// touching every consumer (forward-compat).
-    pub fn resolved_prompt(&self) -> &str {
-        &self.prompt
+    /// The agent's effective system prompt for the active `llm_mode`
+    /// (`prompts/llm-modes-defensive-normal.md`). For a directory-form agent
+    /// this is the body of `<name>/<mode>.md`; when that mode's file was
+    /// absent we fall back to the flat body in [`Self::prompt`] — which, for
+    /// a directory agent, is the flat `<name>.md` sibling if it exists (the
+    /// "fall back to flat" rule). A flat-file or embedded agent has no
+    /// variants, so this is always [`Self::prompt`] (single-mode agents
+    /// behave identically in both modes). Resolution funnels here rather
+    /// than reading `self.prompt` at scattered sites.
+    pub fn resolved_prompt_for(&self, mode: crate::config::extended::LlmMode) -> &str {
+        self.prompt_variants
+            .get(&mode)
+            .map(String::as_str)
+            .unwrap_or(&self.prompt)
     }
 
     /// Serialize back to the on-disk `<name>.md` form: YAML frontmatter
@@ -230,6 +249,7 @@ pub fn parse_agent(text: &str, name: &str, source: PathBuf) -> Result<AgentDef> 
         // body and any trailing newline, so the stored prompt matches the
         // embedded-default form (the composer re-adds a single newline).
         prompt: body.trim_start_matches('\n').trim_end().to_string(),
+        prompt_variants: std::collections::HashMap::new(),
         source,
     })
 }
@@ -245,6 +265,75 @@ pub fn load_from_file(path: &Path) -> Result<AgentDef> {
     let def = parse_agent(&text, &name, path.to_path_buf())?;
     validate_invariants(&def)?;
     Ok(def)
+}
+
+/// Load a per-`llm_mode` directory-form agent
+/// (`prompts/llm-modes-defensive-normal.md`): `<dir>/<name>/<mode>.md`,
+/// one file per mode. Each mode file is a full agent markdown with
+/// frontmatter and body. Frontmatter (description / mode / tools / model /
+/// temperature) is read from whichever mode file resolves first in
+/// canonical order — the per-mode split is for the **prompt body**, not the
+/// grant; the invariant validation runs once on the resulting def. The
+/// per-mode bodies land in [`AgentDef::prompt_variants`];
+/// [`AgentDef::prompt`] is set to the flat `<dir>/<name>.md` sibling when one
+/// exists (the "fall back to flat" source), else to a present mode body so a
+/// partial directory still loads.
+///
+/// `dir` is the search directory, `name` the agent name; the directory
+/// `<dir>/<name>/` must exist (caller checks).
+fn load_from_dir(dir: &Path, name: &str) -> Result<AgentDef> {
+    use crate::config::extended::LlmMode;
+    let agent_dir = dir.join(name);
+
+    // Read each mode file present. Canonical order: defensive then normal —
+    // the default mode leads so the frontmatter source is stable.
+    let modes = [LlmMode::Defensive, LlmMode::Normal];
+    let mut variants: std::collections::HashMap<LlmMode, String> = std::collections::HashMap::new();
+    let mut frontmatter_def: Option<AgentDef> = None;
+    for mode in modes {
+        let mode_path = agent_dir.join(mode.prompt_file());
+        if !mode_path.is_file() {
+            continue;
+        }
+        let text = std::fs::read_to_string(&mode_path)
+            .map_err(|e| anyhow::anyhow!("reading agent file {}: {e}", mode_path.display()))?;
+        let parsed = parse_agent(&text, name, mode_path.clone())?;
+        variants.insert(mode, parsed.prompt.clone());
+        if frontmatter_def.is_none() {
+            frontmatter_def = Some(parsed);
+        }
+    }
+
+    // The flat `<dir>/<name>.md` sibling — the fall-back body for any mode
+    // whose file is absent from the directory.
+    let flat_path = dir.join(format!("{name}.md"));
+    let flat_def = if flat_path.is_file() {
+        Some(load_from_file(&flat_path)?)
+    } else {
+        None
+    };
+
+    // A directory with no mode files at all and no flat sibling is an
+    // empty/malformed agent: error naming it (the user created `<name>/`
+    // but populated no resolvable prompt).
+    let mut base = match (frontmatter_def, flat_def.clone()) {
+        (Some(def), _) => def,
+        (None, Some(def)) => def,
+        (None, None) => bail!(
+            "agent `{name}` ({}) has no `normal.md`/`defensive.md` and no flat `{name}.md` sibling",
+            agent_dir.display()
+        ),
+    };
+
+    base.source = agent_dir;
+    base.prompt_variants = variants;
+    // The mode-agnostic flat body: the flat sibling when present (the
+    // explicit fall-back source), else the frontmatter file's own body.
+    if let Some(flat) = flat_def {
+        base.prompt = flat.prompt;
+    }
+    validate_invariants(&base)?;
+    Ok(base)
 }
 
 /// Extract the agent name from a path. For the flat-file form that is the
@@ -284,25 +373,20 @@ pub fn agent_search_dirs(cwd: &Path) -> Vec<PathBuf> {
 }
 
 /// Resolve the on-disk path an agent named `name` would resolve to in
-/// `dir`, **without** requiring it to exist. Accepts the flat-file form
-/// (`<dir>/<name>.md`); structured so the future per-`llm_mode` directory
-/// form (`<dir>/<name>/`) can be added here without a rewrite. Returns the
-/// existing form when one is present, else the flat-file path (the form
-/// eject writes).
+/// `dir`, **without** requiring it to exist. The per-`llm_mode` directory
+/// form (`<dir>/<name>/`, holding `normal.md`/`defensive.md`) takes
+/// precedence when present — it is the richer multi-mode source and
+/// internally falls back to the flat `<dir>/<name>.md` sibling for any
+/// absent mode (`prompts/llm-modes-defensive-normal.md`). Otherwise the
+/// flat-file form (`<dir>/<name>.md`, the form eject writes) is returned;
+/// when neither exists the flat path is returned as the canonical default.
 pub fn agent_path_in(dir: &Path, name: &str) -> PathBuf {
-    let flat = dir.join(format!("{name}.md"));
-    if flat.is_file() {
-        return flat;
-    }
-    // Forward-compat seam: a `<dir>/<name>/` directory will hold the
-    // per-mode files once LLM modes land. We don't read it yet, but the
-    // resolver must not assume a name always maps to exactly one `.md`
-    // file — so we surface the directory when it exists.
+    // The per-mode directory form wins when it exists.
     let dir_form = dir.join(name);
     if dir_form.is_dir() {
         return dir_form;
     }
-    flat
+    dir.join(format!("{name}.md"))
 }
 
 /// Find the first existing on-disk override file for `name`, scanning
@@ -326,15 +410,16 @@ pub fn find_override(cwd: &Path, name: &str) -> Option<PathBuf> {
 /// (naming its `source`) rather than silently falling back to the
 /// embedded default — that would hide the user's mistake.
 pub fn resolve(cwd: &Path, name: &str) -> Result<Option<AgentDef>> {
-    if let Some(path) = find_override(cwd, name) {
-        // Flat-file form only is read today; the dir form is reserved.
-        if path.is_dir() {
-            bail!(
-                "agent `{name}` ({}) uses the per-mode directory form, which is not supported yet",
-                path.display()
-            );
+    for dir in agent_search_dirs(cwd) {
+        let candidate = agent_path_in(&dir, name);
+        if candidate.is_dir() {
+            // Per-`llm_mode` directory form: load every mode file present,
+            // falling back to the flat sibling per mode.
+            return Ok(Some(load_from_dir(&dir, name)?));
         }
-        return Ok(Some(load_from_file(&path)?));
+        if candidate.is_file() {
+            return Ok(Some(load_from_file(&candidate)?));
+        }
     }
     Ok(embedded_default(name))
 }
@@ -380,10 +465,7 @@ pub fn list_all(cwd: &Path) -> Vec<AgentListing> {
             }
             seen.insert(name.clone());
             let def = if path.is_dir() {
-                Err(anyhow::anyhow!(
-                    "agent `{name}` ({}) uses the per-mode directory form, which is not supported yet",
-                    path.display()
-                ))
+                load_from_dir(&dir, &name)
             } else {
                 load_from_file(&path)
             };

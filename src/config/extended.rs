@@ -100,6 +100,82 @@ pub struct ExtendedConfig {
     /// `"cockpit-plan"`.
     #[serde(rename = "planBranchRoot", default = "default_plan_branch_root")]
     pub plan_branch_root: String,
+
+    /// The LLM-strength steering axis (`prompts/llm-modes-defensive-normal.md`).
+    /// `defensive` (the default) renders explicit, steering tool/parameter
+    /// descriptions, selects `defensive.md` per-mode agent prompts, and routes
+    /// multi-part work through interactive subagents — tuned for the weak-model
+    /// target (GOALS §1). `normal` keeps the terse token-economy descriptions,
+    /// `normal.md` prompts, and episode-sequencing delegation. Distinct from
+    /// [`crate::agents::AgentMode`] (`primary`/`subagent`/`all` reachability) —
+    /// not auto-inferred from model identity. An unknown value is rejected with
+    /// the offending value backticked and the valid set listed.
+    #[serde(default, deserialize_with = "deserialize_llm_mode")]
+    pub llm_mode: LlmMode,
+}
+
+/// The LLM-strength steering axis (`prompts/llm-modes-defensive-normal.md`).
+/// The only thing called a *mode* in cockpit's agent surface; `Plan` and
+/// `Build` are agents, not modes.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum LlmMode {
+    /// Cheaper/weaker ~120k-context models (the default, GOALS §1 target):
+    /// explicit steering descriptions, `defensive.md` prompts, interactive-
+    /// subagent decomposition.
+    #[default]
+    Defensive,
+    /// Strong/expensive models: terse descriptions, `normal.md` prompts,
+    /// episode-sequencing delegation.
+    Normal,
+}
+
+impl LlmMode {
+    /// The on-disk per-mode agent-prompt file name (`<name>/<mode>.md`).
+    pub fn prompt_file(self) -> &'static str {
+        match self {
+            LlmMode::Defensive => "defensive.md",
+            LlmMode::Normal => "normal.md",
+        }
+    }
+
+    /// The lowercase config/serde spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LlmMode::Defensive => "defensive",
+            LlmMode::Normal => "normal",
+        }
+    }
+
+    /// Flip between the two values — the `/llm-mode toggle` action.
+    pub fn toggled(self) -> Self {
+        match self {
+            LlmMode::Defensive => LlmMode::Normal,
+            LlmMode::Normal => LlmMode::Defensive,
+        }
+    }
+}
+
+/// Reject an unknown `llm_mode` with the offending value backticked and
+/// the valid set listed — mirrors [`deserialize_vim_mode_setting`]'s
+/// error style.
+fn deserialize_llm_mode<'de, D>(d: D) -> Result<LlmMode, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    let v = serde_json::Value::deserialize(d)?;
+    match v {
+        serde_json::Value::Null => Ok(LlmMode::default()),
+        serde_json::Value::String(s) => match s.as_str() {
+            "defensive" => Ok(LlmMode::Defensive),
+            "normal" => Ok(LlmMode::Normal),
+            other => Err(D::Error::custom(format!(
+                "unknown llm_mode `{other}` (expected defensive|normal)"
+            ))),
+        },
+        _ => Err(D::Error::custom("llm_mode must be a string")),
+    }
 }
 
 fn default_plan_branch_root() -> String {
@@ -570,6 +646,7 @@ impl Default for ExtendedConfig {
             dialog: DialogConfig::default(),
             skills: SkillsConfig::default(),
             plan_branch_root: default_plan_branch_root(),
+            llm_mode: LlmMode::default(),
         }
     }
 }
@@ -906,6 +983,57 @@ mod tests {
         assert!(on_disk.contains("\"planBranchRoot\""), "{on_disk}");
         let doc2 = ExtendedConfigDoc::load(&path).unwrap();
         assert_eq!(doc2.config().plan_branch_root, "wip");
+    }
+
+    #[test]
+    fn llm_mode_defaults_to_defensive() {
+        let cfg = ExtendedConfig::default();
+        assert_eq!(cfg.llm_mode, LlmMode::Defensive);
+        // A config that omits the field still reads the default.
+        let parsed: ExtendedConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(parsed.llm_mode, LlmMode::Defensive);
+    }
+
+    #[test]
+    fn llm_mode_parses_both_values() {
+        let d: ExtendedConfig = serde_json::from_str(r#"{"llm_mode":"defensive"}"#).unwrap();
+        assert_eq!(d.llm_mode, LlmMode::Defensive);
+        let n: ExtendedConfig = serde_json::from_str(r#"{"llm_mode":"normal"}"#).unwrap();
+        assert_eq!(n.llm_mode, LlmMode::Normal);
+    }
+
+    #[test]
+    fn llm_mode_unknown_value_is_rejected_with_backtick_and_valid_set() {
+        let err = serde_json::from_str::<ExtendedConfig>(r#"{"llm_mode":"yolo"}"#)
+            .expect_err("unknown llm_mode must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("`yolo`"),
+            "offending value must be backticked: {msg}"
+        );
+        assert!(msg.contains("defensive"), "valid set must be listed: {msg}");
+        assert!(msg.contains("normal"), "valid set must be listed: {msg}");
+    }
+
+    #[test]
+    fn llm_mode_toggled_flips() {
+        assert_eq!(LlmMode::Defensive.toggled(), LlmMode::Normal);
+        assert_eq!(LlmMode::Normal.toggled(), LlmMode::Defensive);
+    }
+
+    #[test]
+    fn llm_mode_round_trips_through_extended_doc() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("extended-config.json");
+        std::fs::write(&path, "{}").unwrap();
+        let mut doc = ExtendedConfigDoc::load(&path).unwrap();
+        let mut cfg = doc.config();
+        cfg.llm_mode = LlmMode::Normal;
+        doc.write(&cfg).unwrap();
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(on_disk.contains("\"llm_mode\""), "{on_disk}");
+        let doc2 = ExtendedConfigDoc::load(&path).unwrap();
+        assert_eq!(doc2.config().llm_mode, LlmMode::Normal);
     }
 
     #[test]

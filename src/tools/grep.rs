@@ -45,6 +45,18 @@ impl Tool for GrepTool {
         "Regex content search confined to the package root; returns budgeted file:line matches"
     }
 
+    fn defensive_description(&self) -> Option<String> {
+        Some(
+            "Search file contents for a regular expression within this package's source tree and \
+             get back budgeted file:line matches. You have no shell here, so this is how you find \
+             code: use it to locate where a symbol, string, or pattern appears in the dependency \
+             you're inspecting. The search is hard-confined to the package root — you cannot \
+             reach outside it. Narrow with `path` to one subdirectory or file when you can, and \
+             then `read` the interesting matches for context."
+                .to_string(),
+        )
+    }
+
     fn parameters(&self) -> Value {
         serde_json::json!({
             "type": "object",
@@ -55,6 +67,18 @@ impl Tool for GrepTool {
             },
             "required": ["pattern"]
         })
+    }
+
+    fn defensive_parameters(&self) -> Option<Value> {
+        Some(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "pattern":          { "type": "string", "description": "The regular expression to search file contents for" },
+                "path":             { "type": "string", "x-cockpit-kind": "path", "description": "Optional subdirectory or file under the package root to restrict the search to; omit to search the whole package. Cannot point outside the root" },
+                "case_insensitive": { "type": "boolean", "description": "When true, match case-insensitively; defaults to case-sensitive" }
+            },
+            "required": ["pattern"]
+        }))
     }
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {

@@ -38,7 +38,7 @@ You are a reviewer. Be terse.\n";
         def.tools,
         Some(vec!["read".into(), "bash".into(), "search".into()])
     );
-    assert_eq!(def.resolved_prompt(), "You are a reviewer. Be terse.");
+    assert_eq!(def.prompt, "You are a reviewer. Be terse.");
 }
 
 #[test]
@@ -85,7 +85,7 @@ fn to_markdown_round_trips_through_parse() {
     assert_eq!(parsed.description, def.description);
     assert_eq!(parsed.mode, def.mode);
     assert_eq!(parsed.tools, def.tools);
-    assert_eq!(parsed.resolved_prompt(), def.resolved_prompt());
+    assert_eq!(parsed.prompt, def.prompt);
 }
 
 // ── Invariant validation ─────────────────────────────────────────────────
@@ -100,6 +100,7 @@ fn def_with_tools(name: &str, tools: &[&str]) -> AgentDef {
         tools: Some(tools.iter().map(|s| s.to_string()).collect()),
         permission: None,
         prompt: "body".into(),
+        prompt_variants: std::collections::HashMap::new(),
         source: "x.md".into(),
     }
 }
@@ -223,7 +224,7 @@ fn resolve_prefers_on_disk_override() {
     let def = resolve(tmp.path(), "coder").unwrap().unwrap();
     assert!(!def.source.as_os_str().is_empty(), "override has a source");
     assert_eq!(def.description, "edited coder");
-    assert_eq!(def.resolved_prompt(), "NEW BODY");
+    assert_eq!(def.prompt, "NEW BODY");
     assert_eq!(def.tools, Some(vec!["read".to_string()]));
 }
 
@@ -319,7 +320,7 @@ fn eject_writes_faithful_file() {
     let embedded = embedded_default("coder").unwrap();
     assert_eq!(parsed.description, embedded.description);
     assert_eq!(parsed.tools, embedded.tools);
-    assert_eq!(parsed.resolved_prompt(), embedded.resolved_prompt());
+    assert_eq!(parsed.prompt, embedded.prompt);
     // And the ejected file is now the resolved override.
     let resolved = resolve(tmp.path(), "coder").unwrap().unwrap();
     assert!(!resolved.source.as_os_str().is_empty());
@@ -422,12 +423,133 @@ fn agent_path_in_surfaces_dir_form_when_present() {
 }
 
 #[test]
-fn dir_form_override_fails_until_supported() {
-    // The resolver surfaces the dir form but the loader rejects it (only
-    // the flat form ships) — and does so without a panic, naming the path.
+fn agent_path_in_prefers_dir_form_over_flat() {
+    // When both a flat `<name>.md` and a per-mode `<name>/` directory exist,
+    // the richer directory form wins — it falls back to the flat sibling
+    // internally for any absent mode.
+    let tmp = tempfile::tempdir().unwrap();
+    fs::write(tmp.path().join("rev.md"), "x").unwrap();
+    let dir = tmp.path().join("rev");
+    fs::create_dir_all(&dir).unwrap();
+    assert_eq!(agent_path_in(tmp.path(), "rev"), dir);
+}
+
+// ── Per-`llm_mode` directory-form resolution ──────────────────────────────
+
+use crate::config::extended::LlmMode;
+
+/// Write a per-mode agent markdown file (frontmatter + body) into
+/// `<agents>/<name>/<mode>.md`.
+fn write_mode_file(agents: &Path, name: &str, mode: LlmMode, body: &str) {
+    let dir = agents.join(name);
+    fs::create_dir_all(&dir).unwrap();
+    let text = format!("---\ndescription: A custom agent.\nmode: subagent\n---\n\n{body}\n");
+    fs::write(dir.join(mode.prompt_file()), text).unwrap();
+}
+
+#[test]
+fn dir_form_selects_per_mode_prompt() {
     let tmp = tempfile::tempdir().unwrap();
     let agents = project_agents_dir(tmp.path());
-    fs::create_dir_all(agents.join("coder")).unwrap();
-    let err = resolve(tmp.path(), "coder").unwrap_err();
-    assert!(format!("{err}").contains("directory form"));
+    write_mode_file(&agents, "rev", LlmMode::Normal, "NORMAL BODY");
+    write_mode_file(&agents, "rev", LlmMode::Defensive, "DEFENSIVE BODY");
+
+    let def = resolve(tmp.path(), "rev").unwrap().expect("agent resolves");
+    assert_eq!(def.resolved_prompt_for(LlmMode::Normal), "NORMAL BODY");
+    assert_eq!(
+        def.resolved_prompt_for(LlmMode::Defensive),
+        "DEFENSIVE BODY"
+    );
+}
+
+#[test]
+fn dir_form_missing_mode_falls_back_to_flat_sibling() {
+    // The directory has only `defensive.md`; the flat `<name>.md` sibling is
+    // the fallback for the absent `normal` mode.
+    let tmp = tempfile::tempdir().unwrap();
+    let agents = project_agents_dir(tmp.path());
+    write_mode_file(&agents, "rev", LlmMode::Defensive, "DEFENSIVE BODY");
+    fs::write(
+        agents.join("rev.md"),
+        "---\ndescription: Flat fallback.\nmode: subagent\n---\n\nFLAT BODY\n",
+    )
+    .unwrap();
+
+    let def = resolve(tmp.path(), "rev").unwrap().expect("agent resolves");
+    assert_eq!(
+        def.resolved_prompt_for(LlmMode::Defensive),
+        "DEFENSIVE BODY"
+    );
+    // `normal.md` is absent → fall back to the flat sibling body.
+    assert_eq!(def.resolved_prompt_for(LlmMode::Normal), "FLAT BODY");
+}
+
+#[test]
+fn dir_form_missing_mode_no_flat_errors_naming_agent_and_mode() {
+    // Only `defensive.md` and no flat sibling: resolving still works (the
+    // present mode body is the flat fallback), and the absent mode falls
+    // back to that present body rather than erroring — a partial directory
+    // still loads. The hard error is the empty-directory case below.
+    let tmp = tempfile::tempdir().unwrap();
+    let agents = project_agents_dir(tmp.path());
+    write_mode_file(&agents, "rev", LlmMode::Defensive, "DEFENSIVE BODY");
+    let def = resolve(tmp.path(), "rev").unwrap().expect("agent resolves");
+    assert_eq!(
+        def.resolved_prompt_for(LlmMode::Defensive),
+        "DEFENSIVE BODY"
+    );
+    assert_eq!(def.resolved_prompt_for(LlmMode::Normal), "DEFENSIVE BODY");
+}
+
+#[test]
+fn dir_form_empty_directory_errors_naming_agent() {
+    // A `<name>/` directory with no mode files and no flat sibling is
+    // malformed: error naming the agent.
+    let tmp = tempfile::tempdir().unwrap();
+    let agents = project_agents_dir(tmp.path());
+    fs::create_dir_all(agents.join("rev")).unwrap();
+    let err = resolve(tmp.path(), "rev").unwrap_err();
+    let msg = format!("{err}");
+    assert!(msg.contains("rev"), "names the agent: {msg}");
+    assert!(
+        msg.contains("normal.md") || msg.contains("defensive.md"),
+        "names the missing mode files: {msg}"
+    );
+}
+
+#[test]
+fn flat_file_agent_is_single_mode_in_both_modes() {
+    // A flat-file agent has no per-mode variants — the same body serves
+    // every mode.
+    let tmp = tempfile::tempdir().unwrap();
+    let agents = project_agents_dir(tmp.path());
+    fs::write(
+        agents.join("rev.md"),
+        "---\ndescription: Single mode.\nmode: subagent\n---\n\nONE BODY\n",
+    )
+    .unwrap();
+    let def = resolve(tmp.path(), "rev").unwrap().expect("agent resolves");
+    assert_eq!(def.resolved_prompt_for(LlmMode::Normal), "ONE BODY");
+    assert_eq!(def.resolved_prompt_for(LlmMode::Defensive), "ONE BODY");
+    assert!(def.prompt_variants.is_empty());
+}
+
+#[test]
+fn dir_form_preserves_single_writer_invariant() {
+    // The single-writer rule holds regardless of mode: a non-`coder`
+    // per-mode agent that grants a write/lock tool is rejected at load.
+    let tmp = tempfile::tempdir().unwrap();
+    let agents = project_agents_dir(tmp.path());
+    let dir = agents.join("rev");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("defensive.md"),
+        "---\ndescription: x\nmode: subagent\ntools: [read, writeunlock]\n---\n\nB\n",
+    )
+    .unwrap();
+    let err = resolve(tmp.path(), "rev").unwrap_err();
+    assert!(
+        format!("{err}").contains("single-writer"),
+        "single-writer invariant must hold in the dir form: {err}"
+    );
 }

@@ -575,6 +575,7 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         | InterruptResolved { session_id, .. }
         | AgentIdle { session_id, .. }
         | PrimarySwapped { session_id, .. }
+        | LlmModeChanged { session_id, .. }
         | SessionEnded { session_id, .. }
         | JobStarted { session_id, .. }
         | JobProgress { session_id, .. }
@@ -751,6 +752,10 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
         // The chrome's active-agent slot is updated directly in
         // `update_active_agent`; the swap needs no history-stream entry.
         PrimarySwapped { .. } => return None,
+        // The live `/llm-mode` switch: surfaced to the app so it tracks the
+        // authoritative current mode (its `/llm-mode` toggle + cache-break
+        // warning resolve against it).
+        LlmModeChanged { mode, .. } => TurnEvent::LlmModeChanged { mode },
     })
 }
 

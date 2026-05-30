@@ -191,6 +191,11 @@ pub enum SessionWork {
     SetAgent {
         name: String,
     },
+    /// Switch the active `llm_mode` live (`/llm-mode`,
+    /// `prompts/llm-modes-defensive-normal.md`). `mode = None` toggles.
+    SetLlmMode {
+        mode: Option<crate::config::extended::LlmMode>,
+    },
     /// Cancel a live async job (loop / timer / background, GOALS §22) by
     /// id, on behalf of the **human** ("stop checking the deploy" /
     /// `/jobs cancel <id>`). Routed to the driver's single async-job
@@ -284,6 +289,10 @@ async fn run_worker(
 ) {
     let session_id = session.id;
 
+    // The active LLM mode (`prompts/llm-modes-defensive-normal.md`) is
+    // resolved from the layered `extended-config.json` at session start; the
+    // live `/llm-mode` switch overrides it in place via `DriverControl`.
+    let llm_mode = crate::config::extended::load_for_cwd(&project_root).llm_mode;
     let spawn_args = SpawnArgs {
         model,
         params: ModelParams::default(),
@@ -292,6 +301,7 @@ async fn run_worker(
         // The daemon root is always the user-facing interactive agent —
         // it gets the cross-session recall tools.
         interactive: true,
+        llm_mode,
     };
     // Root primary: the session's stored active agent (so a resume restarts
     // on `Plan` after a `/plan` swap, `plan.md §4.6.d`), falling back to
@@ -524,6 +534,27 @@ async fn run_worker(
                     tracing::warn!(session_id = %session_id, "driver control channel closed");
                 }
             }
+            SessionWork::SetLlmMode { mode } => {
+                // Resolve toggle against the current config value (the
+                // single source of truth shared with `/settings` + the
+                // config file), persist the resolved value so a resume keeps
+                // it, then route the explicit mode to the driver to rebuild
+                // the root agent in place.
+                let current = crate::config::extended::load_for_cwd(&project_root).llm_mode;
+                let resolved = mode.unwrap_or_else(|| current.toggled());
+                if let Err(e) = persist_llm_mode(&project_root, resolved) {
+                    tracing::warn!(error = %e, "persisting llm_mode failed");
+                }
+                if driver_control_tx
+                    .send(crate::engine::driver::DriverControl::SetLlmMode {
+                        mode: Some(resolved),
+                    })
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!(session_id = %session_id, "driver control channel closed");
+                }
+            }
             SessionWork::CancelJob { job_id } => {
                 if job_cmd_tx
                     .send(crate::engine::jobs::JobCommand::Cancel { job_id })
@@ -693,6 +724,9 @@ fn turn_event_to_proto(event: TurnEvent, session_id: Uuid) -> Vec<proto::Event> 
         TurnEvent::PrimarySwapped { name } => {
             vec![proto::Event::PrimarySwapped { session_id, name }]
         }
+        TurnEvent::LlmModeChanged { mode } => {
+            vec![proto::Event::LlmModeChanged { session_id, mode }]
+        }
         // Engine→proto direction never produces this — the `question`
         // tool emits `proto::Event::InterruptRaised` directly through
         // the interrupt hub, and the TUI-client direction
@@ -794,6 +828,31 @@ fn turn_event_to_proto(event: TurnEvent, session_id: Uuid) -> Vec<proto::Event> 
 /// constants and event-translation helpers stay in one module.
 pub(crate) fn initial_active_agent() -> &'static str {
     "Build"
+}
+
+/// Persist a live `/llm-mode` switch to the layered config so a resume
+/// keeps it (`prompts/llm-modes-defensive-normal.md`). Writes to the
+/// highest-precedence existing `extended-config.json` on the discovered
+/// path (the layer `load_for_cwd` would read), or — when none exists yet —
+/// scaffolds one in the project `.cockpit/` so `/settings` + the config
+/// file + `/llm-mode` all resolve to the same value. Round-trips through
+/// [`ExtendedConfigDoc`] so unknown keys survive.
+fn persist_llm_mode(
+    project_root: &std::path::Path,
+    mode: crate::config::extended::LlmMode,
+) -> anyhow::Result<()> {
+    use crate::config::dirs::discover_config_dirs;
+    use crate::config::extended::ExtendedConfigDoc;
+    let target = discover_config_dirs(project_root)
+        .into_iter()
+        .map(|d| d.path.join("extended-config.json"))
+        .find(|p| p.exists())
+        .unwrap_or_else(|| project_root.join(".cockpit").join("extended-config.json"));
+    let mut doc = ExtendedConfigDoc::load(&target)?;
+    let mut cfg = doc.config();
+    cfg.llm_mode = mode;
+    doc.write(&cfg)?;
+    Ok(())
 }
 
 /// Env var the daemon sets at boot when launched with `--no-sandbox`

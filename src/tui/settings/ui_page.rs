@@ -19,7 +19,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 
-use crate::config::extended::{ThinkingDisplay, VimModeSetting};
+use crate::config::extended::{LlmMode, ThinkingDisplay, VimModeSetting};
 use crate::config::providers::ProvidersConfig;
 use crate::tui::textfield::TextField;
 use crate::tui::theme::MUTED_COLOR_INDEX;
@@ -177,11 +177,15 @@ pub(super) struct GrabState {
     pub(super) original_name: Option<String>,
 }
 
-/// Rows on the UI page (vim mode, thinking, render-agent-markdown,
+/// Rows on the UI page (vim mode, thinking, llm mode, render-agent-markdown,
 /// render-user-markdown, mouse, rich-text-copy, emojis, caffeinate
 /// display-awake, name, packages dir, utility model, plan branch root,
 /// loop-guard threshold, instructions file).
-pub(super) const UI_ROWS: usize = 14;
+pub(super) const UI_ROWS: usize = 15;
+
+/// Cursor index of the `instructions file` drill-in row (the last row). The
+/// instructions sub-page's back-nav returns the UI cursor here.
+pub(super) const UI_INSTRUCTIONS_ROW: usize = UI_ROWS - 1;
 
 /// Recompute the model-entry scroll offset from a List-mode `cursor`
 /// that includes the two synthetic action rows. The action rows live
@@ -229,6 +233,21 @@ pub(super) fn thinking_label(t: ThinkingDisplay) -> &'static str {
         ThinkingDisplay::Condensed => "condensed (default — chip, ctrl+j expands every block)",
         ThinkingDisplay::Hidden => "hidden (only `Thinking…` while in flight; nothing after)",
         ThinkingDisplay::Verbose => "verbose (always show reasoning inline)",
+    }
+}
+
+fn cycle_llm_mode(m: LlmMode) -> LlmMode {
+    m.toggled()
+}
+
+pub(super) fn llm_mode_label(m: LlmMode) -> &'static str {
+    match m {
+        LlmMode::Defensive => {
+            "defensive (default — explicit tool steering, more decomposition; for weaker models)"
+        }
+        LlmMode::Normal => {
+            "normal (terse tool descriptions, episode sequencing; for strong models)"
+        }
     }
 }
 
@@ -348,38 +367,42 @@ impl SettingsDialog {
                     p.status = save_status(self.save_extended());
                 }
                 2 => {
+                    self.extended.llm_mode = cycle_llm_mode(self.extended.llm_mode);
+                    p.status = save_status(self.save_extended());
+                }
+                3 => {
                     self.extended.tui.render_agent_markdown =
                         !self.extended.tui.render_agent_markdown;
                     p.status = save_status(self.save_extended());
                 }
-                3 => {
+                4 => {
                     self.extended.tui.render_user_markdown =
                         !self.extended.tui.render_user_markdown;
                     p.status = save_status(self.save_extended());
                 }
-                4 => {
+                5 => {
                     self.extended.tui.mouse_capture = !self.extended.tui.mouse_capture;
                     p.pending_mouse_capture = Some(self.extended.tui.mouse_capture);
                     p.status = save_status(self.save_extended());
                 }
-                5 => {
+                6 => {
                     self.extended.tui.rich_text_copy = !self.extended.tui.rich_text_copy;
                     p.status = save_status(self.save_extended());
                 }
-                6 => {
+                7 => {
                     self.extended.tui.use_emojis = !self.extended.tui.use_emojis;
                     p.status = save_status(self.save_extended());
                 }
-                7 => {
+                8 => {
                     self.extended.tui.caffeinate_display_awake =
                         !self.extended.tui.caffeinate_display_awake;
                     p.status = save_status(self.save_extended());
                 }
-                8 => {
+                9 => {
                     p.buf = TextField::new(self.extended.name.clone().unwrap_or_default());
                     p.editing = Some(UiField::Name);
                 }
-                9 => {
+                10 => {
                     let cur = self
                         .extended
                         .packages_directory
@@ -389,7 +412,7 @@ impl SettingsDialog {
                     p.buf = TextField::new(cur);
                     p.editing = Some(UiField::PackagesDir);
                 }
-                10 => {
+                11 => {
                     p.utility_picker = Some(Box::new(UtilityModelPicker::new(
                         &self.config,
                         self.extended
@@ -399,16 +422,16 @@ impl SettingsDialog {
                     )));
                     p.status = None;
                 }
-                11 => {
+                12 => {
                     p.buf = TextField::new(self.extended.plan_branch_root.clone());
                     p.editing = Some(UiField::PlanBranchRoot);
                 }
-                12 => {
+                13 => {
                     p.buf =
                         TextField::new(self.extended.loop_guard.effective_threshold().to_string());
                     p.editing = Some(UiField::LoopGuardThreshold);
                 }
-                13 => {
+                14 => {
                     return Nav::Replace(Page::Instructions(InstructionsPage {
                         cursor: 0,
                         grabbed: None,
@@ -523,7 +546,7 @@ impl SettingsDialog {
         )));
         lines.push(Line::default());
 
-        let rows: [(&str, String); 14] = [
+        let rows: [(&str, String); 15] = [
             (
                 "vim mode",
                 vim_label(self.extended.tui.vim_mode).to_string(),
@@ -531,6 +554,10 @@ impl SettingsDialog {
             (
                 "thinking",
                 thinking_label(self.extended.tui.thinking).to_string(),
+            ),
+            (
+                "llm mode",
+                llm_mode_label(self.extended.llm_mode).to_string(),
             ),
             (
                 "render agent markdown",
@@ -869,7 +896,7 @@ impl SettingsDialog {
             KeyCode::Esc | KeyCode::Char('q') => return Nav::Close,
             KeyCode::Left | KeyCode::Backspace | KeyCode::Char('h') => {
                 return Nav::Replace(Page::Ui(UiPage {
-                    cursor: 13,
+                    cursor: UI_INSTRUCTIONS_ROW,
                     editing: None,
                     buf: TextField::default(),
                     status: None,

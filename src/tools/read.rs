@@ -24,6 +24,18 @@ impl Tool for ReadTool {
         "Snapshot-read a file; line-numbered output, 2000-line/8KB cap, no lock"
     }
 
+    fn defensive_description(&self) -> Option<String> {
+        Some(
+            "Read the contents of one existing file and return them with line numbers. This is \
+             a snapshot read: it does NOT lock the file, so use it for understanding code, not \
+             before editing — to edit, lock first with `readlock`. Output is capped at 2000 \
+             lines / 8KB; for a large file, page through it with `offset`+`limit` or target a \
+             span with `start_line`+`end_line` instead of re-reading the whole file. Give a \
+             single concrete file path, not a directory or a glob."
+                .to_string(),
+        )
+    }
+
     fn parameters(&self) -> Value {
         serde_json::json!({
             "type": "object",
@@ -36,6 +48,20 @@ impl Tool for ReadTool {
             },
             "required": ["path"]
         })
+    }
+
+    fn defensive_parameters(&self) -> Option<Value> {
+        Some(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path":       { "type": "string", "x-cockpit-kind": "path", "description": "Path to the single file to read, absolute or relative to the session working directory; must be a real file, not a directory or glob" },
+                "offset":     { "type": "integer", "description": "1-indexed line number to start reading from; defaults to 1 (the top of the file). Use with `limit` to page through a long file" },
+                "limit":      { "type": "integer", "description": "Maximum number of lines to return from `offset`; defaults to 2000. Lower it to keep the result small when you only need a slice" },
+                "start_line": { "type": "integer", "description": "1-indexed first line of an inclusive range to read; pair with `end_line` to read exactly that span instead of paging" },
+                "end_line":   { "type": "integer", "description": "1-indexed last line of the inclusive range to read; pair with `start_line`" }
+            },
+            "required": ["path"]
+        }))
     }
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {

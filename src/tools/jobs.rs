@@ -41,8 +41,16 @@ use crate::engine::tool::{Tool, ToolCtx, ToolOutput, invalid_input};
 /// `tools_array_is_byte_stable` test in [`crate::engine::driver`].
 pub const JOBS_DESCRIPTION: &str = "Schedule async work: loop.start (set limit=1 for a one-shot timer), loop.cancel, background.start, background.tail, background.cancel, list";
 
+/// The defensive (`LlmMode::Defensive`) `jobs` description
+/// (`prompts/llm-modes-defensive-normal.md`): explicit steering for the
+/// weak-model target. Same fixed `action`+`args` schema — only the prose
+/// is richer.
+pub const JOBS_DESCRIPTION_DEFENSIVE: &str = "Run work in the background or on a recurring schedule so the conversation isn't blocked waiting. Pick the kind of job with `action`: `loop.start` runs a prompt repeatedly on an interval (set `limit=1` for a single delayed/one-shot timer), `loop.cancel` stops a running loop, `background.start` launches a long task that runs detached, `background.tail` shows that task's latest output, `background.cancel` stops it, and `list` shows the jobs currently running. Put the per-action details in `args`. Use this for things like polling a build, watching for a condition, or kicking off something slow you'll check later — not for ordinary step-by-step work, which you should just do directly.";
+
 /// Build the `jobs` meta-tool's JSON schema. Kept in a free function so
-/// the byte-stability test can assert on it directly.
+/// the byte-stability test can assert on it directly. The schema is
+/// byte-stable for cache safety regardless of `llm_mode`; see
+/// [`jobs_parameters_defensive`] for the verbose-description variant.
 pub fn jobs_parameters() -> Value {
     serde_json::json!({
         "type": "object",
@@ -54,6 +62,26 @@ pub fn jobs_parameters() -> Value {
             "args": {
                 "type": "object",
                 "description": "Per-action arguments"
+            }
+        },
+        "required": ["action"]
+    })
+}
+
+/// The defensive (`LlmMode::Defensive`) parameter schema for the `jobs`
+/// meta-tool: identical shape + required set to [`jobs_parameters`], with
+/// explicit parameter descriptions.
+pub fn jobs_parameters_defensive() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "description": "Which job operation to perform: `loop.start`, `loop.cancel`, `background.start`, `background.tail`, `background.cancel`, or `list`"
+            },
+            "args": {
+                "type": "object",
+                "description": "The arguments for the chosen `action` (e.g. the prompt + interval for `loop.start`, the job id for a cancel/tail); omit for `list`"
             }
         },
         "required": ["action"]
@@ -75,8 +103,16 @@ impl Tool for JobsTool {
         JOBS_DESCRIPTION
     }
 
+    fn defensive_description(&self) -> Option<String> {
+        Some(JOBS_DESCRIPTION_DEFENSIVE.to_string())
+    }
+
     fn parameters(&self) -> Value {
         jobs_parameters()
+    }
+
+    fn defensive_parameters(&self) -> Option<Value> {
+        Some(jobs_parameters_defensive())
     }
 
     async fn call(&self, _args: Value, _ctx: &ToolCtx) -> Result<ToolOutput> {
@@ -176,6 +212,17 @@ impl Tool for NoteTool {
         "Surface a progress note to the human now; it reaches the main conversation only at loop end"
     }
 
+    fn defensive_description(&self) -> Option<String> {
+        Some(
+            "Send a short progress note to the human while you run inside a background loop. The \
+             note is shown to the user live, but it does NOT enter the main conversation until \
+             the loop finishes — at which point your notes are bundled with the final result. \
+             Use it to report what each iteration found or did. This is your only channel back \
+             to the main conversation from inside a fork; you cannot start new jobs from here."
+                .to_string(),
+        )
+    }
+
     fn parameters(&self) -> Value {
         serde_json::json!({
             "type": "object",
@@ -184,6 +231,16 @@ impl Tool for NoteTool {
             },
             "required": ["text"]
         })
+    }
+
+    fn defensive_parameters(&self) -> Option<Value> {
+        Some(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "text": { "type": "string", "description": "The progress note to surface to the human; keep it short and specific to this iteration" }
+            },
+            "required": ["text"]
+        }))
     }
 
     async fn call(&self, args: Value, _ctx: &ToolCtx) -> Result<ToolOutput> {
@@ -229,8 +286,16 @@ impl Tool for ForkJobTool {
         JOBS_DESCRIPTION
     }
 
+    fn defensive_description(&self) -> Option<String> {
+        Some(JOBS_DESCRIPTION_DEFENSIVE.to_string())
+    }
+
     fn parameters(&self) -> Value {
         jobs_parameters()
+    }
+
+    fn defensive_parameters(&self) -> Option<Value> {
+        Some(jobs_parameters_defensive())
     }
 
     async fn call(&self, args: Value, _ctx: &ToolCtx) -> Result<ToolOutput> {
@@ -288,7 +353,9 @@ mod tests {
         // The tools array a conversation carries (here: just `jobs`; the
         // real primary agent adds more, but they're equally immutable).
         let toolbox = ToolBox::new().with(Arc::new(JobsTool));
-        let before = serde_json::to_string(&toolbox.definitions()).unwrap();
+        let before =
+            serde_json::to_string(&toolbox.definitions(crate::config::extended::LlmMode::Normal))
+                .unwrap();
 
         // Simulate "enabling every branch": the meta-tool's schema is the
         // same object regardless of action. Re-derive it for each branch
@@ -305,7 +372,10 @@ mod tests {
             // cache-safe acceptance half of enabling a branch.
             assert!(parse_action(action).is_ok());
             // The tool definition is unchanged after "enabling" it.
-            let after = serde_json::to_string(&toolbox.definitions()).unwrap();
+            let after = serde_json::to_string(
+                &toolbox.definitions(crate::config::extended::LlmMode::Normal),
+            )
+            .unwrap();
             assert_eq!(
                 before, after,
                 "tools array changed after enabling `{action}`"

@@ -255,6 +255,10 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "Open lazygit in an embedded pane",
     },
     SlashCommand {
+        name: "llm-mode",
+        description: "Switch LLM steering mode (arg: toggle/defend/normal; bare = toggle)",
+    },
+    SlashCommand {
         name: "model",
         description: "Switch the active model",
     },
@@ -676,6 +680,11 @@ pub struct App {
     /// the daemon's cache-cold predicate). Drives the `/prune` confirm's
     /// hot-vs-cold warning. Defaults true (no warm cache to lose).
     pub(super) cache_cold: bool,
+    /// The active LLM-strength mode (`prompts/llm-modes-defensive-normal.md`).
+    /// Resolved from the layered config at launch and tracked live off the
+    /// daemon's `LlmModeChanged` event so the `/llm-mode` toggle + cache-break
+    /// warning resolve against the authoritative current value.
+    pub(super) llm_mode: crate::config::extended::LlmMode,
     /// The live set of wire-side elided tool-result `call_id`s on the
     /// foreground agent (from the daemon's `Pruned` event). The scrollback
     /// renderer dims any boxed tool call whose `call_id` is in here —
@@ -878,6 +887,9 @@ impl App {
     pub fn new(project: Option<&Path>, no_sandbox: bool) -> Self {
         let launch = welcome::load(project);
         let tui_cfg = load_tui_config(&launch.cwd);
+        // The active LLM mode (`prompts/llm-modes-defensive-normal.md`),
+        // resolved from the same layered config the daemon root reads.
+        let llm_mode = crate::config::extended::load_for_cwd(&launch.cwd).llm_mode;
         let vim_setting = tui_cfg.vim_mode;
         let thinking_setting = tui_cfg.thinking;
         let markdown_opts = MarkdownOpts {
@@ -982,6 +994,7 @@ impl App {
             guidance_estimate: None,
             prunable_tokens: 0,
             cache_cold: true,
+            llm_mode,
             elided_event_ids: std::collections::HashSet::new(),
             pending_compact: None,
             pending_prune_confirm: false,
@@ -1909,6 +1922,91 @@ impl App {
     /// the driver as a live root-frame swap at the idle boundary; the chrome
     /// updates off the daemon's `PrimarySwapped` event. A no-op message when
     /// no runner is connected yet.
+    /// `/llm-mode [toggle|defend|defensive|normal]` — switch the active
+    /// LLM-strength steering mode live (`prompts/llm-modes-defensive-normal.md`).
+    /// No argument or `toggle` flips between `normal`/`defensive` (the default
+    /// action); `defend` (advertised, shorter to type) and its silent alias
+    /// `defensive` select defensive; `normal` selects normal. Switching busts
+    /// the cached system prefix, so we surface the shared cache-break warning
+    /// (suppressed on a no-cache provider). The actual rebuild happens
+    /// daemon-side; the `LlmModeChanged` event confirms it.
+    pub(super) fn handle_llm_mode_command(&mut self, arg: &str) {
+        let requested = match parse_llm_mode_arg(arg) {
+            Ok(r) => r,
+            Err(usage) => {
+                self.history.push(HistoryEntry::Plain { line: usage });
+                return;
+            }
+        };
+        // Resolve the target (for the no-op check + warning), against the
+        // tracked authoritative value. The daemon re-resolves a toggle too,
+        // so a stale client value can't desync the outcome.
+        let target = requested.unwrap_or_else(|| self.llm_mode.toggled());
+        if target == self.llm_mode {
+            self.history.push(HistoryEntry::Plain {
+                line: format!("Already in `{}` LLM mode", target.as_str()),
+            });
+            return;
+        }
+        let sent =
+            self.send_daemon_request(crate::daemon::proto::Request::SetLlmMode { mode: requested });
+        if !sent {
+            self.history.push(HistoryEntry::Plain {
+                line: "Send a message first to start a session, then switch LLM mode".to_string(),
+            });
+            return;
+        }
+        // Cache-break warning via the shared helper (silent on no-cache).
+        if let Some(warning) = self.cache_break_warning() {
+            self.history.push(HistoryEntry::Plain { line: warning });
+        }
+        // The `LlmModeChanged` event pushes the "Switched to …" confirmation
+        // once the daemon applies it.
+    }
+
+    /// Shared cache-break warning helper. Returns the one-line warning to
+    /// show when an action busts the cached system prefix (a `/llm-mode`
+    /// switch today; the shift+tab agent cycle and `/agent` — specced
+    /// elsewhere — reuse this verbatim). Returns `None` when the warning is
+    /// meaningless because the active model/provider does not cache: reuses
+    /// the pruning-policy no-cache predicate
+    /// ([`crate::engine::prune::cache_state`] →
+    /// [`crate::engine::prune::ColdReason::NoCacheProvider`]) rather than
+    /// re-deriving "does this provider cache."
+    pub(super) fn cache_break_warning(&self) -> Option<String> {
+        if self.active_provider_caches() {
+            Some(
+                "Heads up: switching busts the prompt cache — the next call re-sends the \
+                 full prefix uncached."
+                    .to_string(),
+            )
+        } else {
+            // No-cache provider: nothing to bust, so no warning.
+            None
+        }
+    }
+
+    /// Whether the active model/provider has a prompt cache at all. Reuses
+    /// the pruning-policy no-cache predicate: the resolved
+    /// [`crate::config::providers::CacheConfig`] is fed to
+    /// [`crate::engine::prune::cache_state`]; a `NoCacheProvider` cold reason
+    /// means it never caches. Best-effort — an unresolvable model is treated
+    /// as caching so the warning errs on the side of showing.
+    fn active_provider_caches(&self) -> bool {
+        let Some((provider, model)) = self.launch.active_model.as_ref() else {
+            return true;
+        };
+        let providers = crate::config::dirs::discover_config_dirs(&self.launch.cwd)
+            .into_iter()
+            .find_map(|d| {
+                crate::config::providers::ConfigDoc::load(&d.path.join("config.json")).ok()
+            })
+            .map(|d| d.providers())
+            .unwrap_or_default();
+        let cache = providers.resolve_cache(provider, model);
+        cache_config_caches(&cache)
+    }
+
     pub(super) fn swap_primary_agent(&mut self, name: &str) {
         let sent = self.send_daemon_request(crate::daemon::proto::Request::SetAgent {
             name: name.to_string(),
@@ -2816,6 +2914,15 @@ impl App {
                 // `PrimarySwapped` → `update_active_agent`; this arm keeps
                 // `apply_event` exhaustive and covers any in-process path.
                 self.launch.agent_name = name;
+            }
+            TurnEvent::LlmModeChanged { mode } => {
+                // The live `/llm-mode` switch landed (daemon-authoritative).
+                // Track it so the next toggle + cache-break warning resolve
+                // against the true value, and confirm it in the history.
+                self.llm_mode = mode;
+                self.history.push(HistoryEntry::Plain {
+                    line: format!("Switched to `{}` LLM mode", mode.as_str()),
+                });
             }
             TurnEvent::InterruptRaised {
                 interrupt_id,
@@ -3969,6 +4076,10 @@ impl App {
                 self.toggle_mouse_capture_inline();
                 return false;
             }
+            "llm-mode" => {
+                self.handle_llm_mode_command(&slash_args(&raw));
+                return false;
+            }
             "jobs" => {
                 self.handle_jobs_command(&slash_args(&raw));
                 return false;
@@ -4578,6 +4689,38 @@ fn slash_args(raw: &str) -> String {
     match rest.find(char::is_whitespace) {
         Some(idx) => rest[idx..].trim().to_string(),
         None => String::new(),
+    }
+}
+
+/// Whether a resolved [`crate::config::providers::CacheConfig`] means the
+/// provider/model actually caches. Reuses the pruning-policy no-cache
+/// predicate ([`crate::engine::prune::cache_state`]): the only way it
+/// reports [`crate::engine::prune::ColdReason::NoCacheProvider`] for a
+/// freshly-sent, non-busting prefix is `cache.mode = none`. Pure over its
+/// input so the cache-break-warning suppression is unit-testable without
+/// constructing an `App`.
+fn cache_config_caches(cache: &crate::config::providers::CacheConfig) -> bool {
+    use crate::engine::prune::{CacheState, ColdReason, cache_state};
+    !matches!(
+        cache_state(cache, Some(0), false),
+        CacheState::Cold(ColdReason::NoCacheProvider)
+    )
+}
+
+/// Parse the `/llm-mode` argument (`prompts/llm-modes-defensive-normal.md`).
+/// Returns `Ok(None)` for the toggle action (no argument or `toggle`),
+/// `Ok(Some(mode))` for an explicit target, or `Err(usage)` for an
+/// unrecognized argument. `defend` is the advertised short form for
+/// defensive; `defensive` is accepted as a silent alias.
+fn parse_llm_mode_arg(arg: &str) -> Result<Option<crate::config::extended::LlmMode>, String> {
+    use crate::config::extended::LlmMode;
+    match arg.trim().to_ascii_lowercase().as_str() {
+        "" | "toggle" => Ok(None),
+        "defend" | "defensive" => Ok(Some(LlmMode::Defensive)),
+        "normal" => Ok(Some(LlmMode::Normal)),
+        other => Err(format!(
+            "Usage: `/llm-mode [toggle|defend|normal]` (got `{other}`)"
+        )),
     }
 }
 
@@ -5275,8 +5418,8 @@ mod working_msg_tests {
 #[cfg(test)]
 mod local_cmd_tests {
     use super::{
-        GIT_AGENT_TOKEN_CAP, PaneSide, cap_tokens, parse_pane_side, parse_sandbox_arg, slash_args,
-        strip_ansi, xml_escape,
+        GIT_AGENT_TOKEN_CAP, PaneSide, cache_config_caches, cap_tokens, parse_llm_mode_arg,
+        parse_pane_side, parse_sandbox_arg, slash_args, strip_ansi, xml_escape,
     };
 
     #[test]
@@ -5318,6 +5461,51 @@ mod local_cmd_tests {
         assert_eq!(parse_sandbox_arg("off"), Ok(Some(false)));
         assert_eq!(parse_sandbox_arg("Off"), Ok(Some(false)));
         assert_eq!(parse_sandbox_arg("maybe"), Err("maybe".to_string()));
+    }
+
+    #[test]
+    fn parse_llm_mode_arg_toggle_default_and_aliases() {
+        use crate::config::extended::LlmMode;
+        // No arg or `toggle` → toggle (None).
+        assert_eq!(parse_llm_mode_arg(""), Ok(None));
+        assert_eq!(parse_llm_mode_arg("  "), Ok(None));
+        assert_eq!(parse_llm_mode_arg("toggle"), Ok(None));
+        assert_eq!(parse_llm_mode_arg("TOGGLE"), Ok(None));
+        // `defend` is the advertised form; `defensive` is a silent alias.
+        assert_eq!(parse_llm_mode_arg("defend"), Ok(Some(LlmMode::Defensive)));
+        assert_eq!(
+            parse_llm_mode_arg("defensive"),
+            Ok(Some(LlmMode::Defensive))
+        );
+        assert_eq!(parse_llm_mode_arg(" Defend "), Ok(Some(LlmMode::Defensive)));
+        // `normal` selects normal.
+        assert_eq!(parse_llm_mode_arg("normal"), Ok(Some(LlmMode::Normal)));
+        // Anything else is a usage error.
+        assert!(parse_llm_mode_arg("yolo").is_err());
+    }
+
+    #[test]
+    fn cache_break_warning_suppressed_on_no_cache_provider() {
+        use crate::config::providers::{CacheConfig, CacheMode};
+        // No-cache provider → the predicate says it doesn't cache, so the
+        // warning is suppressed.
+        let none = CacheConfig {
+            mode: CacheMode::None,
+            ttl_secs: 300,
+        };
+        assert!(
+            !cache_config_caches(&none),
+            "a no-cache provider must report no caching (warning suppressed)"
+        );
+        // Caching provider → the warning fires.
+        let ephemeral = CacheConfig {
+            mode: CacheMode::Ephemeral,
+            ttl_secs: 300,
+        };
+        assert!(
+            cache_config_caches(&ephemeral),
+            "a caching provider must report caching (warning fires)"
+        );
     }
 
     #[test]

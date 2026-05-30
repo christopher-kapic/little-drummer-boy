@@ -278,6 +278,18 @@ pub enum Request {
     /// Swap which built-in or user agent owns the conversation.
     SetAgent { name: String },
 
+    /// Switch the active `llm_mode` for the attached session live
+    /// (`/llm-mode`, `prompts/llm-modes-defensive-normal.md`). `mode = None`
+    /// toggles between `normal`/`defensive` against the daemon's
+    /// authoritative current value; `Some(_)` sets it explicitly. Busts the
+    /// cached system prefix (the client shows the cache-break warning, unless
+    /// the provider doesn't cache). Acked with the resulting mode via
+    /// [`Event::LlmModeChanged`].
+    SetLlmMode {
+        #[serde(default)]
+        mode: Option<crate::config::extended::LlmMode>,
+    },
+
     /// Set (or toggle) filesystem sandboxing for the attached session at
     /// runtime (`/sandbox`, sandboxing part 2). `enabled = None` toggles
     /// the current state; `Some(true)`/`Some(false)` set it explicitly.
@@ -662,6 +674,15 @@ pub enum Event {
     /// `Plan`, `/build` → `Build`, `plan.md §4.6.d`). The client chrome's
     /// active-agent slot tracks `name`.
     PrimarySwapped { session_id: Uuid, name: String },
+
+    /// The active `llm_mode` was switched live (`/llm-mode`,
+    /// `prompts/llm-modes-defensive-normal.md`). The client tracks `mode`
+    /// so its `/llm-mode` toggle + cache-break warning resolve against the
+    /// authoritative current value.
+    LlmModeChanged {
+        session_id: Uuid,
+        mode: crate::config::extended::LlmMode,
+    },
 
     /// The session ended (user requested, daemon shutting down,
     /// crash recovery couldn't restore it, …).

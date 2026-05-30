@@ -24,6 +24,19 @@ impl Tool for ReadlockTool {
         "Acquire exclusive lock on a file and read it; release with writeunlock/editunlock/unlock"
     }
 
+    fn defensive_description(&self) -> Option<String> {
+        Some(
+            "Take an exclusive lock on one file AND read its current contents in a single step. \
+             Do this BEFORE you change a file: the lock proves no one else is editing it and \
+             records the exact bytes you are about to modify, which `writeunlock`/`editunlock` \
+             require. Always read-lock immediately before writing — never write a file you have \
+             not just locked-and-read. You hold the lock until you release it with `writeunlock` \
+             (save changes), `editunlock` (save a search/replace), or `unlock` (abandon with no \
+             change). Output is line-numbered and capped like `read`."
+                .to_string(),
+        )
+    }
+
     fn parameters(&self) -> Value {
         serde_json::json!({
             "type": "object",
@@ -34,6 +47,18 @@ impl Tool for ReadlockTool {
             },
             "required": ["path"]
         })
+    }
+
+    fn defensive_parameters(&self) -> Option<Value> {
+        Some(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path":   { "type": "string", "x-cockpit-kind": "path", "description": "Path to the single file to lock and read, absolute or relative to the session working directory; the file must already exist" },
+                "offset": { "type": "integer", "description": "1-indexed line number to start reading from; defaults to 1. The lock always covers the whole file regardless of which lines you read" },
+                "limit":  { "type": "integer", "description": "Maximum number of lines to return from `offset`; defaults to 2000" }
+            },
+            "required": ["path"]
+        }))
     }
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {

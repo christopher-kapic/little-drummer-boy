@@ -35,6 +35,19 @@ impl Tool for SessionSearchTool {
         "Search past sessions' titles and messages by relevance; returns ranked threads with snippets"
     }
 
+    fn defensive_description(&self) -> Option<String> {
+        Some(
+            "Search your earlier conversations (past sessions) by keyword and get back the most \
+             relevant threads, each with its short id and a matching snippet. Use this when the \
+             user refers to prior work — \"like we did before\", \"the bug from last week\" — to \
+             find which session it was; then read it in full with `session_read`. Searches the \
+             current project by default; set `all_projects` to widen it. Narrow large result \
+             sets with `since` (only sessions active after a date). This is recall of past \
+             conversations, not a code or web search."
+                .to_string(),
+        )
+    }
+
     fn parameters(&self) -> Value {
         serde_json::json!({
             "type": "object",
@@ -46,6 +59,19 @@ impl Tool for SessionSearchTool {
             },
             "required": ["query"]
         })
+    }
+
+    fn defensive_parameters(&self) -> Option<Value> {
+        Some(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "query":      { "type": "string", "description": "The keywords to search past sessions for (SQLite FTS5 syntax); match titles and message text" },
+                "all_projects": { "type": "boolean", "description": "When true, search sessions across all projects; defaults to the current project only" },
+                "limit":      { "type": "integer", "description": "Maximum number of matching threads to return; defaults to 10, maximum 50" },
+                "since":      { "type": "string", "description": "Optional lower bound on last activity (RFC3339 timestamp or `YYYY-MM-DD`); only sessions active after this are returned" }
+            },
+            "required": ["query"]
+        }))
     }
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {

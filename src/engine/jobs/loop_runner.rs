@@ -249,6 +249,9 @@ fn build_fork_agent(
         tools,
         model: parent.model.clone(),
         params: parent.params.clone(),
+        // The fork inherits the parent's LLM mode so its tool descriptions
+        // render identically (`prompts/llm-modes-defensive-normal.md`).
+        llm_mode: parent.llm_mode,
     }
 }
 

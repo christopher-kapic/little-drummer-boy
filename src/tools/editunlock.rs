@@ -45,6 +45,20 @@ impl Tool for EditunlockTool {
         "Replace old_string with new_string in a file (8-stage match cascade) and release the lock"
     }
 
+    fn defensive_description(&self) -> Option<String> {
+        Some(
+            "Make a targeted change to a locked file: find `old_string` and replace it with \
+             `new_string`, then release the lock. This is the preferred way to edit — you only \
+             state the snippet that changes, not the whole file. `old_string` must match the \
+             current file text closely (the tool tolerates minor whitespace differences via a \
+             match cascade); copy it verbatim from a recent read, and include enough surrounding \
+             context that it appears EXACTLY once, or the edit is rejected as ambiguous. To \
+             change every occurrence on purpose, set `replace_all`. You must have locked the \
+             file (`readlock`) first. To delete text, make `new_string` empty."
+                .to_string(),
+        )
+    }
+
     fn parameters(&self) -> Value {
         serde_json::json!({
             "type": "object",
@@ -56,6 +70,19 @@ impl Tool for EditunlockTool {
             },
             "required": ["path", "old_string", "new_string"]
         })
+    }
+
+    fn defensive_parameters(&self) -> Option<Value> {
+        Some(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path":        { "type": "string", "x-cockpit-kind": "path", "description": "Path to the locked file to edit, absolute or relative to the session working directory" },
+                "old_string":  { "type": "string", "description": "The exact existing text to find and replace, copied verbatim from the current file with enough surrounding context that it is unique. Must occur exactly once unless `replace_all` is set" },
+                "new_string":  { "type": "string", "description": "The replacement text that takes the place of `old_string`. Leave empty to delete the matched text" },
+                "replace_all": { "type": "boolean", "description": "When true, replace every occurrence of `old_string` instead of requiring a single unique match; defaults to false" }
+            },
+            "required": ["path", "old_string", "new_string"]
+        }))
     }
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {

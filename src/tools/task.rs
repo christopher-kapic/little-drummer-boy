@@ -19,7 +19,13 @@ use crate::engine::tool::{Tool, ToolCtx, ToolOutput};
 
 pub struct TaskTool {
     description: String,
+    /// The explicit, steering [`LlmMode::Defensive`] description, built
+    /// from the same subagent list (`prompts/llm-modes-defensive-normal.md`).
+    defensive_description: String,
     parameters: Value,
+    /// The defensive parameter schema — same shape + `enum` + required set
+    /// as `parameters`, with explicit parameter descriptions.
+    defensive_parameters: Value,
 }
 
 impl TaskTool {
@@ -37,6 +43,22 @@ impl TaskTool {
         let list = agents.join("/");
         let description = format!(
             "Delegate a scoped piece of work to a subagent ({list}); an interactive subagent takes over the conversation, others run noninteractively"
+        );
+        // Defensive (`LlmMode::Defensive`) steering: decompose harder and
+        // route narrow pieces through subagents so each does one focused job
+        // in its own context and returns a small report
+        // (`prompts/llm-modes-defensive-normal.md`). Single-writer +
+        // leaf-termination are unchanged — they hold in both modes.
+        let defensive_description = format!(
+            "Hand a single, well-scoped piece of work to a subagent ({list}) instead of doing it \
+             yourself inline. Prefer this for any non-trivial sub-task: break the work into \
+             narrow pieces and delegate each one, so the subagent does its focused job in its \
+             own context and returns just a short report — keeping your own context lean. Write \
+             `prompt` as a complete, standalone brief: the goal, the constraints, the exact \
+             files involved, and what \"done\" looks like — the subagent does NOT see your \
+             conversation. An interactive subagent (e.g. the writer or the planning interviewer) \
+             takes over the conversation with the user; the others run on their own and report \
+             back. Only `coder` may write files, in either case."
         );
         let parameters = serde_json::json!({
             "type": "object",
@@ -58,9 +80,31 @@ impl TaskTool {
             },
             "required": ["agent", "prompt"]
         });
+        let defensive_parameters = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "agent":  {
+                    "type": "string",
+                    "description": "The subagent to delegate to; must be one of the listed names",
+                    "enum": agents
+                },
+                "prompt": {
+                    "type": "string",
+                    "description": "A complete, standalone brief for the subagent: its goal, the constraints, the exact files in scope, and what \"done\" looks like. The subagent cannot see this conversation, so include everything it needs"
+                },
+                "mode": {
+                    "type": "string",
+                    "description": "Optional override of the subagent's default interactivity: `subagent` runs it noninteractively (it reports back), `subagent_interactive` lets it take over the conversation with the user. Omit to use the subagent's default",
+                    "enum": ["subagent", "subagent_interactive"]
+                }
+            },
+            "required": ["agent", "prompt"]
+        });
         Self {
             description,
+            defensive_description,
             parameters,
+            defensive_parameters,
         }
     }
 }
@@ -75,8 +119,16 @@ impl Tool for TaskTool {
         &self.description
     }
 
+    fn defensive_description(&self) -> Option<String> {
+        Some(self.defensive_description.clone())
+    }
+
     fn parameters(&self) -> Value {
         self.parameters.clone()
+    }
+
+    fn defensive_parameters(&self) -> Option<Value> {
+        Some(self.defensive_parameters.clone())
     }
 
     async fn call(&self, _args: Value, _ctx: &ToolCtx) -> Result<ToolOutput> {

@@ -56,6 +56,13 @@ pub struct SpawnArgs {
     /// [`crate::engine::interrupt::InterruptHub::is_interactive_attached`]
     /// gate — the existing interactive-mode signal, not a new one.
     pub interactive: bool,
+    /// The active LLM-strength mode (`prompts/llm-modes-defensive-normal.md`).
+    /// Threaded onto every spawned [`Agent`] so the centralized tool-
+    /// description rendering seam ([`ToolBox::definitions`]) and the per-mode
+    /// agent-prompt resolution ([`crate::agents::AgentDef::resolved_prompt_for`])
+    /// both read one value. Resolved from the layered `extended-config.json`
+    /// at session start; live-switched via `/llm-mode`.
+    pub llm_mode: crate::config::extended::LlmMode,
 }
 
 /// Append the cross-session recall tools (`session_search` /
@@ -398,6 +405,7 @@ mod tests {
             cwd: cwd.to_path_buf(),
             session_short_id: String::new(),
             interactive: true,
+            llm_mode: crate::config::extended::LlmMode::default(),
         }
     }
 
@@ -659,10 +667,15 @@ fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) -> Agent {
 
     Agent {
         name: def.name.clone(),
-        system: compose_system_prompt(def.resolved_prompt(), &args.session_short_id, &args.cwd),
+        system: compose_system_prompt(
+            def.resolved_prompt_for(args.llm_mode),
+            &args.session_short_id,
+            &args.cwd,
+        ),
         tools: tb,
         model,
         params,
+        llm_mode: args.llm_mode,
     }
 }
 
@@ -870,6 +883,7 @@ pub fn build(args: &SpawnArgs) -> Agent {
         tools,
         model: args.model.clone(),
         params: args.params.clone(),
+        llm_mode: args.llm_mode,
     }
 }
 
@@ -910,6 +924,7 @@ pub fn coder(args: &SpawnArgs) -> Agent {
         tools,
         model: args.model.clone(),
         params: args.params.clone(),
+        llm_mode: args.llm_mode,
     }
 }
 
@@ -944,6 +959,7 @@ pub fn explore(args: &SpawnArgs) -> Agent {
         tools,
         model: args.model.clone(),
         params: args.params.clone(),
+        llm_mode: args.llm_mode,
     }
 }
 
@@ -990,6 +1006,7 @@ pub fn plan(args: &SpawnArgs) -> Agent {
         tools,
         model: args.model.clone(),
         params: args.params.clone(),
+        llm_mode: args.llm_mode,
     }
 }
 
@@ -1022,6 +1039,7 @@ pub fn plan_author(args: &SpawnArgs) -> Agent {
         tools,
         model: args.model.clone(),
         params: args.params.clone(),
+        llm_mode: args.llm_mode,
     }
 }
 
@@ -1056,6 +1074,7 @@ pub fn docs_resolver(
         tools,
         model: args.model.clone(),
         params: args.params.clone(),
+        llm_mode: args.llm_mode,
     }
 }
 
@@ -1077,5 +1096,6 @@ pub fn docs_answerer(args: &SpawnArgs) -> Agent {
         tools,
         model: args.model.clone(),
         params: args.params.clone(),
+        llm_mode: args.llm_mode,
     }
 }

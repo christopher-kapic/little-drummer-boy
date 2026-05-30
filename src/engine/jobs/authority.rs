@@ -567,6 +567,7 @@ mod tests {
             tools: crate::engine::tool::ToolBox::new(),
             model,
             params: crate::engine::model::ModelParams::default(),
+            llm_mode: crate::config::extended::LlmMode::default(),
         });
 
         let (event_tx, event_rx) = mpsc::channel(64);

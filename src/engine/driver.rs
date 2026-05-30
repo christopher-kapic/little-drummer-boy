@@ -48,6 +48,19 @@ pub enum DriverControl {
     /// surface + system prompt. A no-op when an interactive subagent holds
     /// the foreground (stack depth > 1) or the name is already active.
     SwapPrimary { name: String },
+    /// Switch the active `llm_mode` live (`/llm-mode`,
+    /// `prompts/llm-modes-defensive-normal.md`). Rebuilds the root-frame
+    /// agent so its tool-description verbosity + per-mode prompt re-render;
+    /// busts the cached system prefix (the TUI shows the cache-break warning
+    /// via the shared helper, suppressed on a no-cache provider). Root
+    /// history is preserved — same conversation, new steering. A no-op when
+    /// an interactive subagent holds the foreground or the mode is unchanged.
+    /// `mode = None` toggles against the driver's authoritative current value
+    /// (the `/llm-mode` / `toggle` default action); `Some(_)` sets it
+    /// explicitly.
+    SetLlmMode {
+        mode: Option<crate::config::extended::LlmMode>,
+    },
 }
 
 /// Maximum number of queued user messages to fold into a single
@@ -527,6 +540,9 @@ impl Driver {
             DriverControl::SwapPrimary { name } => {
                 self.swap_primary(&name, tx).await;
             }
+            DriverControl::SetLlmMode { mode } => {
+                self.set_llm_mode(mode, tx).await;
+            }
         }
     }
 
@@ -567,6 +583,55 @@ impl Driver {
             }
             Err(e) => {
                 tracing::warn!(error = %e, requested = %name, "primary swap failed to load agent");
+            }
+        }
+    }
+
+    /// Switch the active `llm_mode` live (`/llm-mode`). Rebuilds the
+    /// root-frame agent under the new mode so its tool-description verbosity
+    /// and per-mode prompt re-render, preserving the root history (same
+    /// conversation, new steering). Busts the cached system prefix — the
+    /// client warns the user (suppressed on a no-cache provider via the
+    /// shared cache-break helper) before sending the switch. Only the root
+    /// frame at idle is touched; a deeper interactive subagent frame is left
+    /// alone. No-op when the mode is unchanged or a subagent holds the
+    /// foreground.
+    async fn set_llm_mode(
+        &mut self,
+        requested: Option<crate::config::extended::LlmMode>,
+        tx: &mpsc::Sender<TurnEvent>,
+    ) {
+        // Resolve the target: an explicit mode, or a toggle against the
+        // authoritative current value (the `/llm-mode` default action).
+        let current = self.stack[0].agent.llm_mode;
+        let mode = requested.unwrap_or_else(|| current.toggled());
+        if self.stack.len() != 1 {
+            tracing::warn!(
+                requested = %mode.as_str(),
+                "llm_mode switch ignored: an interactive subagent holds the foreground"
+            );
+            return;
+        }
+        if current == mode {
+            return;
+        }
+        let name = self.stack[0].agent.name.clone();
+        // Spawn args carry the *new* mode (read from the root agent inside
+        // `spawn_args`), so set it on the root first, then reload.
+        let mut args = self.spawn_args(true);
+        args.llm_mode = mode;
+        match crate::engine::builtin::load(&name, &args) {
+            Ok(agent) => {
+                self.stack[0].agent = Arc::new(agent);
+                // Rebind the job authority's fork context to the rebuilt
+                // primary (single-authority rule), same as `swap_primary`.
+                self.jobs.set_agent(self.stack[0].agent.clone());
+                tracing::info!(mode = %mode.as_str(), "llm_mode switched");
+                let _ = tx.send(TurnEvent::LlmModeChanged { mode }).await;
+                self.emit_context_projection(tx).await;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, requested = %mode.as_str(), "llm_mode switch failed to reload agent");
             }
         }
     }
@@ -1783,6 +1848,9 @@ impl Driver {
             cwd: self.cwd.clone(),
             session_short_id: self.session.short_id.clone(),
             interactive,
+            // The active LLM mode rides on the root agent; child spawns
+            // inherit it so the whole invocation tree renders one mode.
+            llm_mode: self.stack[0].agent.llm_mode,
         }
     }
 }
@@ -2015,6 +2083,7 @@ mod tests {
             tools: crate::engine::tool::ToolBox::new(),
             model,
             params: crate::engine::model::ModelParams::default(),
+            llm_mode: crate::config::extended::LlmMode::default(),
         });
         let driver = Driver::with_max_jobs(session, locks, redact, root, agent, max_jobs);
         (driver, tmp)

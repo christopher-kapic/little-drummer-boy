@@ -1193,6 +1193,39 @@ mod tests {
         assert!(on_root_page(&d), "Left from Providers should land on Root");
     }
 
+    #[test]
+    fn ui_page_llm_mode_row_toggles_and_persists() {
+        use crate::config::extended::{ExtendedConfigDoc, LlmMode};
+        use ui_page::UiPage;
+        let tmp = TempDir::new().unwrap();
+        let mut d = fresh_dialog(&tmp);
+        // Default is defensive.
+        assert_eq!(d.extended.llm_mode, LlmMode::Defensive);
+        // Open the UI page with the cursor on the `llm mode` row (index 2,
+        // right after vim/thinking).
+        d.page = Page::Ui(UiPage {
+            cursor: 2,
+            editing: None,
+            buf: crate::tui::textfield::TextField::default(),
+            status: None,
+            utility_picker: None,
+            pending_mouse_capture: None,
+        });
+        d.handle_key(press(KeyCode::Enter));
+        assert_eq!(
+            d.extended.llm_mode,
+            LlmMode::Normal,
+            "toggling the llm mode row flips defensive→normal"
+        );
+        // It persisted to disk (the same value the config file + `/llm-mode`
+        // resolve to).
+        let reloaded = ExtendedConfigDoc::load(&d.extended_path).unwrap().config();
+        assert_eq!(reloaded.llm_mode, LlmMode::Normal);
+        // Toggling again flips back.
+        d.handle_key(press(KeyCode::Enter));
+        assert_eq!(d.extended.llm_mode, LlmMode::Defensive);
+    }
+
     fn dialog_with_one_provider(tmp: &TempDir) -> SettingsDialog {
         let path = tmp.path().join("config.json");
         std::fs::write(
@@ -1450,10 +1483,10 @@ mod tests {
         }
     }
 
-    /// Move to the utility-model row (idx 10) and open the picker.
+    /// Move to the utility-model row (idx 11) and open the picker.
     fn open_utility_picker(d: &mut SettingsDialog) {
         enter_ui_from_root(d);
-        for _ in 0..10 {
+        for _ in 0..11 {
             d.handle_key(press(KeyCode::Char('j')));
         }
         d.handle_key(press(KeyCode::Enter)); // open picker
@@ -1674,16 +1707,15 @@ mod tests {
 
     #[test]
     fn enter_on_instructions_row_in_ui_opens_instructions_page() {
-        // UI page row 12 (instructions file) + Enter should land on the
-        // Instructions page. Rows 0-3 are vim/thinking/markdown, 4-5 are
-        // mouse/rich-text-copy (T8.c/T8.g), 6 is emojis, 7 is caffeinate
-        // display-awake, 8-9 are name/packages, 10 is utility model, 11 is
-        // the plan branch root, 12 is the loop-guard threshold, 13 is
-        // instructions.
+        // The instructions-file row is the last UI row + Enter lands on the
+        // Instructions page. Rows: 0 vim, 1 thinking, 2 llm mode, 3-4
+        // markdown, 5-6 mouse/rich-text-copy, 7 emojis, 8 caffeinate
+        // display-awake, 9-10 name/packages, 11 utility model, 12 plan
+        // branch root, 13 loop-guard threshold, 14 instructions.
         let tmp = TempDir::new().unwrap();
         let mut d = fresh_dialog(&tmp);
         enter_ui_from_root(&mut d);
-        for _ in 0..13 {
+        for _ in 0..ui_page::UI_INSTRUCTIONS_ROW {
             d.handle_key(press(KeyCode::Char('j')));
         }
         d.handle_key(press(KeyCode::Enter));
@@ -1779,10 +1811,9 @@ mod tests {
     fn fresh_instructions_dialog(tmp: &TempDir) -> SettingsDialog {
         let mut d = fresh_dialog(tmp);
         enter_ui_from_root(&mut d);
-        // Move cursor to the instructions row (idx 13: utility model at
-        // 10, plan branch root at 11, and the loop-guard threshold at 12
-        // push instructions to the last position) and Enter to nav.
-        for _ in 0..13 {
+        // Move cursor to the instructions row (the last UI row) and Enter
+        // to nav.
+        for _ in 0..ui_page::UI_INSTRUCTIONS_ROW {
             d.handle_key(press(KeyCode::Char('j')));
         }
         d.handle_key(press(KeyCode::Enter));

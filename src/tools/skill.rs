@@ -27,6 +27,18 @@ impl Tool for SkillTool {
         "Load a named skill's instructions into context"
     }
 
+    fn defensive_description(&self) -> Option<String> {
+        Some(
+            "Pull a named skill's full instructions into your context on demand. Skills are \
+             reusable, task-specific playbooks the user has installed; the system prompt lists \
+             each available skill by name and one-line summary, but NOT its body. When a task \
+             matches a listed skill, call this with that skill's exact name to load its detailed \
+             steps before you proceed — don't guess the procedure. Only names shown in the \
+             available-skills list will load."
+                .to_string(),
+        )
+    }
+
     fn parameters(&self) -> Value {
         serde_json::json!({
             "type": "object",
@@ -35,6 +47,16 @@ impl Tool for SkillTool {
             },
             "required": ["name"]
         })
+    }
+
+    fn defensive_parameters(&self) -> Option<Value> {
+        Some(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string", "description": "The exact name of the skill to load, as shown in the available-skills list in your context; unknown names do not load" }
+            },
+            "required": ["name"]
+        }))
     }
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {

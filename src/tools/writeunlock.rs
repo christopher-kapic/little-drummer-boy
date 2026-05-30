@@ -23,6 +23,19 @@ impl Tool for WriteunlockTool {
         "Overwrite a file with full content and release its lock; requires a prior read of the file"
     }
 
+    fn defensive_description(&self) -> Option<String> {
+        Some(
+            "Replace a file's ENTIRE contents with the text you supply, then release the lock. \
+             `content` must be the complete new file from first line to last — anything you omit \
+             is deleted, so include every line you want to keep, not just your changes. You must \
+             have `readlock`-ed (or read) this exact file first; the write is rejected otherwise, \
+             to guard against blind overwrites. For a small change to a large file prefer \
+             `editunlock` (targeted search/replace) so you don't have to restate the whole file. \
+             Creates the file if it does not exist."
+                .to_string(),
+        )
+    }
+
     fn parameters(&self) -> Value {
         serde_json::json!({
             "type": "object",
@@ -32,6 +45,17 @@ impl Tool for WriteunlockTool {
             },
             "required": ["path", "content"]
         })
+    }
+
+    fn defensive_parameters(&self) -> Option<Value> {
+        Some(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path":    { "type": "string", "x-cockpit-kind": "path", "description": "Path to the file to overwrite, absolute or relative to the session working directory; must be the same file you previously locked/read" },
+                "content": { "type": "string", "description": "The complete new contents of the file from the first line to the last. This REPLACES everything; any existing line you do not include here is lost" }
+            },
+            "required": ["path", "content"]
+        }))
     }
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {

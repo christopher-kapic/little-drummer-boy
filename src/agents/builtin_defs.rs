@@ -59,6 +59,9 @@ fn def(name: &str, description: &str, mode: AgentMode, tools: &[&str], prompt: &
         // embedded default and the same agent re-parsed from its ejected
         // file compare byte-equal (eject faithfulness).
         prompt: prompt.trim_end().to_string(),
+        // Embedded defaults are single-mode (the same body for every
+        // `llm_mode`) — no per-mode variants.
+        prompt_variants: std::collections::HashMap::new(),
         // Embedded defaults have no on-disk source.
         source: PathBuf::new(),
     }

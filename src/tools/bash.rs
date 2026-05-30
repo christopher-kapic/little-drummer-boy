@@ -41,6 +41,10 @@ static WINDOWS_NOTICE_SHOWN: std::sync::atomic::AtomicBool =
 /// macOS `sed → gsed` alias).
 pub struct BashTool {
     description: String,
+    /// The explicit, steering [`LlmMode::Defensive`] description
+    /// (`prompts/llm-modes-defensive-normal.md`). Built at construction
+    /// alongside `description` so it carries the same PATH-probe hints.
+    defensive_description: String,
     prelude: String,
 }
 
@@ -81,6 +85,22 @@ impl BashTool {
             "Execute a shell command; returns stdout/stderr/exit (8 KB cap, 120s default timeout){search_hint}{sed_hint}"
         );
 
+        // The defensive, explicitly-steering form (`prompts/llm-modes-
+        // defensive-normal.md`). Same PATH-probe hints, more guidance.
+        let defensive_description = format!(
+            "Run a single shell command in the session working directory and get back its \
+             combined stdout, stderr, and exit code. Use this for everything the file/intel \
+             tools don't cover: building, running tests, git, listing or searching files, \
+             inspecting binaries. Prefer dedicated tools over shelling out when one exists — \
+             `read` to read a file, the intel tools for structured code search — but reach for \
+             `bash` freely for real work. Each call is its own shell: `cd` and environment \
+             changes do NOT carry over between calls, so combine dependent steps with `&&` or \
+             set `cwd`. Output is capped at 8 KB (head+tail kept); redirect verbose output to a \
+             file and read the part you need. Never use this to edit files you intend to keep — \
+             go through `readlock`+`writeunlock`/`editunlock` so the change is tracked and \
+             locked.{search_hint}{sed_hint}"
+        );
+
         // Prepend a `sed` shell function on macOS so the model can use
         // its standard Linux-style flags without having to remember to
         // type `gsed` itself. `command gsed` bypasses the function on
@@ -93,6 +113,7 @@ impl BashTool {
 
         Self {
             description,
+            defensive_description,
             prelude,
         }
     }
@@ -108,6 +129,10 @@ impl Tool for BashTool {
         &self.description
     }
 
+    fn defensive_description(&self) -> Option<String> {
+        Some(self.defensive_description.clone())
+    }
+
     fn parameters(&self) -> Value {
         serde_json::json!({
             "type": "object",
@@ -118,6 +143,18 @@ impl Tool for BashTool {
             },
             "required": ["command"]
         })
+    }
+
+    fn defensive_parameters(&self) -> Option<Value> {
+        Some(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "command":    { "type": "string", "description": "The shell command line to run. May be a pipeline; chain dependent steps with `&&` since each call is a fresh shell with no carried-over state" },
+                "cwd":        { "type": "string", "description": "Directory to run the command in; defaults to the session working directory. Use this instead of a leading `cd`, which does not persist to later calls" },
+                "timeout_ms": { "type": "integer", "description": "Hard wall-clock timeout in milliseconds before the command is killed; defaults to 120000, maximum 600000. Raise it for long builds/test runs" }
+            },
+            "required": ["command"]
+        }))
     }
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
