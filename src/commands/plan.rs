@@ -54,6 +54,11 @@ async fn run_plan(slug: &str, ephemeral: bool) -> Result<()> {
     let repo = crate::git::find_worktree_root(&std::env::current_dir()?)
         .context("not inside a git repository (plan execution needs a git worktree)")?;
 
+    // Project this plan belongs to (scopes the plan-status chrome slot). The
+    // repo root is the plan's working tree, so its project id matches the
+    // authoring session's (`plan-status-chrome-and-resolver.md`).
+    let project_id = crate::session::project_id_for(&repo);
+
     let executor = Executor::new(db.clone());
     // Single execution slot per project: claim it, or report the plan queued.
     if !executor.try_claim_slot(plan.id)? {
@@ -62,6 +67,9 @@ async fn run_plan(slug: &str, ephemeral: bool) -> Result<()> {
         );
         return Ok(());
     }
+    // The plan just flipped Pending → InProgress; nudge any running daemon to
+    // re-broadcast the chrome state (the transition happens out-of-process).
+    notify_plan_status(&project_id).await;
 
     // One-time serialized git op before the run: fetch (best-effort offline).
     let _ = crate::git::fetch(&repo);
@@ -86,6 +94,9 @@ async fn run_plan(slug: &str, ephemeral: bool) -> Result<()> {
         .execute(plan.id, &repo, &runner, &hooks)
         .await
         .context("executing plan")?;
+    // The run may have completed (→ Done) or paused; either way the counts
+    // moved, so refresh the chrome state one final time.
+    notify_plan_status(&project_id).await;
 
     println!(
         "plan `{slug}`: {} merged, {} failed, {} awaiting human; branch_stable runs: {}",
@@ -105,6 +116,31 @@ async fn run_plan(slug: &str, ephemeral: bool) -> Result<()> {
         println!("plan `{slug}` paused (failures or human-waiting steps remain).");
     }
     Ok(())
+}
+
+/// Best-effort poke to a running daemon to recompute + broadcast the
+/// plan-status chrome state for `project_id` after an out-of-process plan
+/// transition (`plan-status-chrome-and-resolver.md`). Connect-only — never
+/// spawns a daemon; a missing/unreachable daemon is a no-op (a TUI that opens
+/// later re-syncs from its attach). Failures are swallowed so plan execution
+/// never depends on chrome delivery.
+async fn notify_plan_status(project_id: &str) {
+    use crate::daemon::proto::Request;
+    use crate::daemon::{DaemonPaths, DaemonStatus, client::DaemonClient, probe};
+
+    let Ok(paths) = DaemonPaths::resolve() else {
+        return;
+    };
+    if !matches!(probe(&paths).await, DaemonStatus::Running) {
+        return;
+    }
+    if let Ok(client) = DaemonClient::connect(&paths.socket).await {
+        let _ = client
+            .request_ok(Request::RefreshPlanStatus {
+                project_id: project_id.to_string(),
+            })
+            .await;
+    }
 }
 
 fn status(slug: &str) -> Result<()> {
@@ -437,6 +473,9 @@ fn duplicate(
             target_branch: target_branch.as_deref(),
             model: model.as_deref(),
             isolation_mode: source.isolation_mode,
+            // A duplicate belongs to the source's project, so it scopes to the
+            // same repo's chrome slot.
+            project_id: source.project_id.as_deref(),
             title: &source.title,
             description: &source.description,
         },
@@ -708,6 +747,7 @@ mod tests {
                 slug: "s".into(),
                 title: "S".into(),
                 description: String::new(),
+                project_id: None,
                 base_branch: Some("main".into()),
                 target_branch: Some("cockpit-plan/s".into()),
                 isolation_mode: IsolationMode::Worktree,

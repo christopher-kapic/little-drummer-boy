@@ -355,6 +355,14 @@ impl App {
                 Some(crate::tui::plans_pane::PlansOutcome::Close) => {
                     self.plans_pane = None;
                 }
+                // The needs-attention resolver picked an item to answer: close
+                // the pane and open the (reused) question dialog over the
+                // composer; its submit/cancel resolves the interrupt back to
+                // the daemon (`plan-status-chrome-and-resolver.md`).
+                Some(crate::tui::plans_pane::PlansOutcome::Answer(item)) => {
+                    self.plans_pane = None;
+                    self.open_attention_dialog(*item);
+                }
                 None => {}
             }
             return false;

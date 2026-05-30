@@ -195,6 +195,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0017_sessions_ephemeral.sql"),
     include_str!("migrations/0018_plan_model.sql"),
     include_str!("migrations/0019_plan_run_metrics.sql"),
+    include_str!("migrations/0020_plan_project_and_attention_context.sql"),
 ];
 
 fn migrate(conn: &Connection) -> Result<()> {

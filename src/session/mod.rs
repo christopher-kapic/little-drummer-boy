@@ -278,6 +278,18 @@ impl Session {
         *self.plan_context.lock().unwrap() = Some((plan_id, step_id));
     }
 
+    /// The `(plan_id, step_id)` this session runs on behalf of, parsed back to
+    /// UUIDs, or `None` for an ordinary session (or if either id is somehow
+    /// unparseable). Consumed by the `question` tool so a plan-step interrupt
+    /// is stamped with its plan/step for the needs-attention resolver
+    /// (`plan-status-chrome-and-resolver.md`).
+    pub fn plan_context(&self) -> Option<(uuid::Uuid, uuid::Uuid)> {
+        let (plan_id, step_id) = self.plan_context.lock().unwrap().clone()?;
+        let plan_id = uuid::Uuid::parse_str(&plan_id).ok()?;
+        let step_id = uuid::Uuid::parse_str(&step_id).ok()?;
+        Some((plan_id, step_id))
+    }
+
     /// Whether filesystem sandboxing is active for this session right now
     /// (sandboxing part 2). Read per tool call.
     pub fn sandbox_enabled(&self) -> bool {

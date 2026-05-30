@@ -77,14 +77,38 @@ impl Db {
         description: &str,
         questions: &InterruptQuestionSet,
     ) -> Result<Uuid> {
+        self.raise_interrupt_questions_for_plan(session_id, agent_id, description, questions, None)
+    }
+
+    /// Persist a multi-question interrupt, stamping the `(plan_id, step_id)`
+    /// the raising session is running on behalf of when present
+    /// (`plan-status-chrome-and-resolver.md`). The `question` tool passes the
+    /// session's plan-context (`plan-run-metrics`) so the needs-attention
+    /// resolver can show *which plan, which step* per item and the chrome slot
+    /// can scope interruptions to a project's unfinished plans. `plan_context
+    /// = None` behaves exactly as [`Self::raise_interrupt_questions`] (an
+    /// ordinary, non-plan interrupt).
+    pub fn raise_interrupt_questions_for_plan(
+        &self,
+        session_id: Uuid,
+        agent_id: &str,
+        description: &str,
+        questions: &InterruptQuestionSet,
+        plan_context: Option<(Uuid, Uuid)>,
+    ) -> Result<Uuid> {
         let interrupt_id = Uuid::new_v4();
         let raised_at = Utc::now().timestamp();
         let questions_json = serde_json::to_string(questions).context("serializing questions")?;
+        let (plan_id, step_id) = match plan_context {
+            Some((p, s)) => (Some(p.to_string()), Some(s.to_string())),
+            None => (None, None),
+        };
         self.with_conn(|conn| {
             conn.execute(
                 "INSERT INTO needs_attention
-                 (interrupt_id, session_id, agent_id, description, questions_json, raised_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                 (interrupt_id, session_id, agent_id, description, questions_json, raised_at,
+                  plan_id, step_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     interrupt_id.to_string(),
                     session_id.to_string(),
@@ -92,6 +116,8 @@ impl Db {
                     description,
                     questions_json,
                     raised_at,
+                    plan_id,
+                    step_id,
                 ],
             )
             .context("inserting needs_attention (questions)")?;

@@ -842,6 +842,13 @@ pub struct App {
     /// event so it stays in sync across all clients (incl. until-idle
     /// auto-off). Not client-owned: the assertion lives in the daemon.
     pub(super) caffeinate_active: bool,
+    /// Daemon-broadcast plan-status counts for *this* project
+    /// (`plan-status-chrome-and-resolver.md`). Drives the additive plan-status
+    /// chrome slot; set from the daemon-global `PlanStatusState` event (only
+    /// when its `project_id` matches this session's), so a reconnecting /
+    /// late-opened TUI shows the correct state — not TUI-local bookkeeping.
+    /// Default-zero (slot absent) until the first broadcast.
+    pub(super) plan_status: crate::db::plans::PlanStatusCounts,
     /// An open `/side` side conversation, or `None` in the main session. While
     /// `Some`, the TUI is bound to an ephemeral throwaway fork: the chrome
     /// shows the side indicator, `/side end` and the empty-composer Esc exit
@@ -1077,6 +1084,7 @@ impl App {
             ctrl_c_armed_at: None,
             no_sandbox,
             caffeinate_active: false,
+            plan_status: crate::db::plans::PlanStatusCounts::default(),
             side_conversation: None,
             daemon_draining: false,
         };
@@ -2288,6 +2296,30 @@ impl App {
         }
     }
 
+    /// Open the question dialog for a needs-attention resolver item
+    /// (`plan-status-chrome-and-resolver.md`). Reuses the exact dialog the
+    /// daemon-pushed `InterruptRaised` uses (no second dialog): it carries the
+    /// item's `interrupt_id`, so the submit/cancel routes through
+    /// [`Self::resolve_question_dialog`] → `ResolveInterrupt`, resuming the
+    /// paused plan step without blocking its siblings. A single-question
+    /// (`question`) item wraps to a one-element set, wire-equivalent to a
+    /// batch of one. An item with no question payload (defensive) is a no-op.
+    pub(super) fn open_attention_dialog(&mut self, item: crate::daemon::proto::AttentionItemWire) {
+        use crate::daemon::proto::InterruptQuestionSet;
+        let set = match (item.questions, item.question) {
+            (Some(set), _) => set,
+            (None, Some(q)) => InterruptQuestionSet { questions: vec![q] },
+            (None, None) => return,
+        };
+        let lockout = Duration::from_millis(load_dialog_config(&self.launch.cwd).lockout_ms);
+        self.question_dialog = Some(crate::tui::dialog::question::QuestionDialog::new(
+            item.interrupt_id,
+            item.description,
+            set,
+            lockout,
+        ));
+    }
+
     /// Send the answering dialog's outcome back to the daemon (GOALS
     /// §3b). Both submit and cancel become a `ResolveInterrupt` — cancel
     /// carries `ResolveResponse::Cancel`, which the worker fans out to a
@@ -3423,6 +3455,24 @@ impl App {
                     self.show_toast(message, kind);
                 }
             }
+            TurnEvent::PlanStatusState {
+                project_id,
+                ready,
+                in_progress,
+                interruptions,
+            } => {
+                // Daemon-global but project-scoped: apply only when it's our
+                // own project (the event carries `project_id` so one bus can
+                // serve every client). A TUI not yet attached has no
+                // `project_id`; it picks up the state on its next attach-sync.
+                if self.project_id.as_deref() == Some(project_id.as_str()) {
+                    self.plan_status = crate::db::plans::PlanStatusCounts {
+                        ready,
+                        in_progress,
+                        interruptions,
+                    };
+                }
+            }
             TurnEvent::DaemonDraining { forced } => {
                 // Daemon-global drain notice
                 // (`daemon-graceful-drain-shutdown.md`). Flip the flag so the
@@ -4489,7 +4539,16 @@ impl App {
                 return false;
             }
             "plans" => {
-                self.plans_pane = Some(crate::tui::plans_pane::PlansPane::open());
+                // `/plans answer` opens straight into the needs-attention
+                // resolver; `/plans` opens the read-only browser (the resolver
+                // is reachable from it via the `a` button)
+                // (`plan-status-chrome-and-resolver.md`).
+                let args = slash_args(&raw);
+                self.plans_pane = Some(if args.trim() == "answer" {
+                    crate::tui::plans_pane::PlansPane::open_resolver(self.project_id.clone())
+                } else {
+                    crate::tui::plans_pane::PlansPane::open(self.project_id.clone())
+                });
                 return false;
             }
             "permissions" => {

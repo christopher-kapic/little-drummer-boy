@@ -137,6 +137,56 @@ pub fn side_glyph_spans(active: bool) -> Vec<Span<'static>> {
     )]
 }
 
+/// Plan-yellow (`#f8d749`) used by the plan-status chrome slot. Distinct from
+/// the branch pill's xterm-220 *filled* badge: this slot is unfilled colored
+/// glyph+number text, so hue alone never has to disambiguate the two.
+const PLAN_YELLOW: Color = Color::Rgb(0xf8, 0xd7, 0x49);
+
+/// Additive plan-status indicator (`plan-status-chrome-and-resolver.md`).
+/// Rendered **only** when this project has something unfinished — additive to
+/// the fixed chrome (cwd + branch + context + active agent, GOALS §1a), never
+/// displacing a slot, the same pattern as the `☕` caffeinate glyph. Up to
+/// three segments, each omitted when its count is zero; an all-zero state
+/// returns an empty vec so a normal coding session stays uncluttered.
+///
+///   - **ready** `⧖N` — queued (`Pending`) plans.
+///   - **in-progress** `▶N` — the executing plan (≤1 per project).
+///   - **interruptions** `?N` — open `needs_attention` items blocking
+///     progress; the actionable, attention-grabbing segment (rendered last so
+///     it reads as the thing to act on, and bold to stand out).
+///
+/// Driven by daemon-broadcast state, so a reconnecting / late-opened TUI shows
+/// the correct counts. Returns the spans to prepend to the right-hand status
+/// line (a trailing space separates the slot from what follows), or an empty
+/// vec when nothing is unfinished.
+pub fn plan_status_spans(counts: crate::db::plans::PlanStatusCounts) -> Vec<Span<'static>> {
+    if counts.is_empty() {
+        return Vec::new();
+    }
+    let plain = Style::default().fg(PLAN_YELLOW);
+    let actionable = Style::default()
+        .fg(PLAN_YELLOW)
+        .add_modifier(ratatui::style::Modifier::BOLD);
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let push = |text: String, style: Style, spans: &mut Vec<Span<'static>>| {
+        if !spans.is_empty() {
+            spans.push(Span::styled(" ".to_string(), plain));
+        }
+        spans.push(Span::styled(text, style));
+    };
+    if counts.ready > 0 {
+        push(format!("⧖{}", counts.ready), plain, &mut spans);
+    }
+    if counts.in_progress > 0 {
+        push(format!("▶{}", counts.in_progress), plain, &mut spans);
+    }
+    if counts.interruptions > 0 {
+        push(format!("?{}", counts.interruptions), actionable, &mut spans);
+    }
+    spans.push(Span::styled(" ".to_string(), plain));
+    spans
+}
+
 pub fn repo_counts(repo: &RepoStatus) -> String {
     let mut parts = Vec::new();
     if repo.staged > 0 {
@@ -154,6 +204,46 @@ pub fn repo_counts(repo: &RepoStatus) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plan_status_absent_when_all_zero_and_omits_zero_segments() {
+        use crate::db::plans::PlanStatusCounts;
+        // Nothing unfinished → the whole slot is absent.
+        assert!(plan_status_spans(PlanStatusCounts::default()).is_empty());
+
+        // Only in-progress + interruptions: the ready segment is omitted, and
+        // the interruptions glyph is present (bold/actionable).
+        let counts = PlanStatusCounts {
+            ready: 0,
+            in_progress: 1,
+            interruptions: 2,
+        };
+        let text: String = plan_status_spans(counts)
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(text.contains("▶1"), "in-progress segment: {text}");
+        assert!(text.contains("?2"), "interruptions segment: {text}");
+        assert!(!text.contains("⧖"), "zero ready segment omitted: {text}");
+    }
+
+    #[test]
+    fn plan_status_uses_plan_yellow_unfilled() {
+        use crate::db::plans::PlanStatusCounts;
+        let spans = plan_status_spans(PlanStatusCounts {
+            ready: 3,
+            in_progress: 0,
+            interruptions: 0,
+        });
+        // Plan-yellow foreground, no background fill (distinct from the
+        // branch pill's filled badge).
+        let glyph = spans
+            .iter()
+            .find(|s| s.content.contains("⧖"))
+            .expect("ready segment present");
+        assert_eq!(glyph.style.fg, Some(PLAN_YELLOW));
+        assert_eq!(glyph.style.bg, None, "unfilled — no background");
+    }
 
     #[test]
     fn side_glyph_present_only_when_active() {

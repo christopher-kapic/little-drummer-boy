@@ -251,7 +251,10 @@ fn try_spawn_inner(
                 // Daemon-global events (caffeinate) carry no session_id and
                 // must reach this client regardless of which session it's
                 // attached to — so they bypass the per-session filter.
-                let is_global = matches!(event, proto::Event::CaffeinateState { .. });
+                let is_global = matches!(
+                    event,
+                    proto::Event::CaffeinateState { .. } | proto::Event::PlanStatusState { .. }
+                );
                 if !is_global && event_session(&event) != Some(session_id) {
                     continue;
                 }
@@ -510,6 +513,18 @@ pub fn list_plans_blocking() -> Result<Vec<proto::PlanSummaryWire>, String> {
     }
 }
 
+/// Fetch `project_id`'s open needs-attention items for the resolver
+/// (`plan-status-chrome-and-resolver.md`). `Err(String)` on a daemon/transport
+/// failure; an empty vec when nothing is pending.
+pub fn list_attention_blocking(
+    project_id: String,
+) -> Result<Vec<proto::AttentionItemWire>, String> {
+    match daemon_request_blocking(Request::ListAttention { project_id })? {
+        Response::Attention { items } => Ok(items),
+        other => Err(format!("unexpected list_attention response: {other:?}")),
+    }
+}
+
 /// Fetch one plan's full detail (steps + dependency prerequisites + tests)
 /// for the `/plans` drill-in. `Err(String)` on a daemon/transport failure
 /// or an unknown plan id.
@@ -604,7 +619,7 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         | SandboxState { session_id, .. } => *session_id,
         // Daemon-global events carry no session_id: they reach every
         // client regardless of attachment.
-        CaffeinateState { .. } | DaemonDraining { .. } => return None,
+        CaffeinateState { .. } | DaemonDraining { .. } | PlanStatusState { .. } => return None,
     })
 }
 
@@ -765,6 +780,17 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
             message,
         },
         DaemonDraining { forced } => TurnEvent::DaemonDraining { forced },
+        PlanStatusState {
+            project_id,
+            ready,
+            in_progress,
+            interruptions,
+        } => TurnEvent::PlanStatusState {
+            project_id,
+            ready,
+            in_progress,
+            interruptions,
+        },
         InterruptRaised { .. } | InterruptResolved { .. } | SessionEnded { .. } => return None,
         // The chrome's active-agent slot is updated directly in
         // `update_active_agent`; the swap needs no history-stream entry.

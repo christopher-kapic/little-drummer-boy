@@ -1336,7 +1336,12 @@ impl App {
         // Side-conversation indicator (`/side`) leads the right-hand chrome
         // while a throwaway side conversation is open, ahead of the ☕ glyph.
         // Additive to the fixed cwd + branch chrome — never displaces it.
-        let mut right = chrome::side_glyph_spans(self.side_conversation.is_some());
+        // Plan-status indicator (`plan-status-chrome-and-resolver.md`) leads
+        // the right-hand chrome when this project has unfinished plans, driven
+        // by daemon-broadcast state. Additive to the fixed cwd + branch chrome
+        // (GOALS §1a) — never displaces it, the same pattern as the ☕ glyph.
+        let mut right = chrome::plan_status_spans(self.plan_status);
+        right.extend(chrome::side_glyph_spans(self.side_conversation.is_some()));
         right.extend(chrome::caffeinate_glyph_spans(self.caffeinate_active));
         right.extend(chrome::status_line_spans(&self.launch));
         let mut left = chrome::left_status_spans(&self.launch);

@@ -831,6 +831,11 @@ fn turn_event_to_proto(event: TurnEvent, session_id: Uuid) -> Vec<proto::Event> 
         // graceful-shutdown path directly (`server::request_shutdown`); the
         // engine never emits it. This arm is for exhaustiveness only.
         TurnEvent::DaemonDraining { .. } => vec![],
+        // The plan-status chrome state is daemon-global, computed + broadcast
+        // by the daemon's `broadcast_plan_status` directly (on attach,
+        // interrupt raise/resolve, and the executor's `RefreshPlanStatus`); the
+        // engine never emits it. This arm is for exhaustiveness only.
+        TurnEvent::PlanStatusState { .. } => vec![],
     }
 }
 

@@ -34,16 +34,23 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
-use crate::daemon::proto::{PlanMetricsWire, PlanStepWire, PlanSummaryWire};
+use crate::daemon::proto::{AttentionItemWire, PlanMetricsWire, PlanStepWire, PlanSummaryWire};
 use crate::tui::agent_runner;
 use crate::tui::theme::{ACCENT_BLUE_INDEX, MUTED_COLOR_INDEX};
 
-/// What the pane asks the `App` to do after a key. v1 only closes; this is
-/// the integration seam for later execution controls (start/pause/status),
-/// which slot in as extra variants without touching the rest of the pane.
+/// What the pane asks the `App` to do after a key. v1's browser closes; the
+/// needs-attention resolver (`plan-status-chrome-and-resolver.md`) adds
+/// `Answer`, which hands the chosen item back to the `App` to open the (reused)
+/// question dialog. Later execution controls (start/pause/status) slot in as
+/// extra variants without touching the rest of the pane.
+#[derive(Debug)]
 pub enum PlansOutcome {
     /// Close the pane back to chat.
     Close,
+    /// Answer this open needs-attention item — the `App` opens the question
+    /// dialog from it and sends the resolution back as `ResolveInterrupt`.
+    /// Boxed because the item carries the full question payload.
+    Answer(Box<AttentionItemWire>),
 }
 
 /// Which level of the browser is showing.
@@ -64,10 +71,22 @@ enum View {
         metrics: Box<PlanMetricsWire>,
         scroll: usize,
     },
+    /// The needs-attention resolver: this project's open interrupts, each
+    /// showing its plan/step + the blocker text. Reached via `/plans answer`
+    /// and the list-level `a` button (`plan-status-chrome-and-resolver.md`).
+    Resolver {
+        items: Vec<AttentionItemWire>,
+        cursor: usize,
+        scroll: usize,
+    },
 }
 
 pub struct PlansPane {
     view: View,
+    /// Project the pane is scoped to (the open session's repo). The resolver
+    /// fetches/filters its items by this, matching the chrome counter scope.
+    /// `None` when no project is attached (resolver shows an empty state).
+    project_id: Option<String>,
     /// Last-loaded error (daemon unreachable, unknown plan, …), shown inline.
     error: Option<String>,
     /// Rendered body height + content rows at last draw (scroll clamp).
@@ -78,8 +97,9 @@ pub struct PlansPane {
 impl PlansPane {
     /// Open the browser, loading the plan list. A load failure (daemon
     /// down) is non-fatal — the pane shows an inline message rather than
-    /// refusing to open, matching `/sessions` and `/skills`.
-    pub fn open() -> Self {
+    /// refusing to open, matching `/sessions` and `/skills`. `project_id`
+    /// scopes the needs-attention resolver reachable from here.
+    pub fn open(project_id: Option<String>) -> Self {
         let (plans, error) = match agent_runner::list_plans_blocking() {
             Ok(plans) => (plans, None),
             Err(e) => (Vec::new(), Some(e)),
@@ -90,10 +110,55 @@ impl PlansPane {
                 cursor: 0,
                 scroll: 0,
             },
+            project_id,
             error,
             last_body_height: 0,
             last_content_rows: 0,
         }
+    }
+
+    /// Open straight into the needs-attention resolver (`/plans answer`),
+    /// loading this project's open interrupts
+    /// (`plan-status-chrome-and-resolver.md`). The browser's `a` button reaches
+    /// the same view via [`Self::open_resolver_view`].
+    pub fn open_resolver(project_id: Option<String>) -> Self {
+        let mut pane = Self {
+            view: View::List {
+                plans: Vec::new(),
+                cursor: 0,
+                scroll: 0,
+            },
+            project_id,
+            error: None,
+            last_body_height: 0,
+            last_content_rows: 0,
+        };
+        pane.open_resolver_view();
+        pane
+    }
+
+    /// Load this project's open needs-attention items and switch to the
+    /// resolver view. A fetch failure records the error inline (the resolver
+    /// still opens, showing the message), matching the rest of the pane.
+    fn open_resolver_view(&mut self) {
+        let items = match &self.project_id {
+            Some(pid) => match agent_runner::list_attention_blocking(pid.clone()) {
+                Ok(items) => {
+                    self.error = None;
+                    items
+                }
+                Err(e) => {
+                    self.error = Some(e);
+                    Vec::new()
+                }
+            },
+            None => Vec::new(),
+        };
+        self.view = View::Resolver {
+            items,
+            cursor: 0,
+            scroll: 0,
+        };
     }
 
     /// The highlighted plan on the list level, if any. The seam later
@@ -102,15 +167,17 @@ impl PlansPane {
         match &self.view {
             View::List { plans, cursor, .. } => plans.get(*cursor),
             View::Detail { plan, .. } => Some(plan),
+            View::Resolver { .. } => None,
         }
     }
 
-    /// Handle a key. Returns `Some(outcome)` for close; `None` keeps the
-    /// pane open. Always consumed by `App` (the modal rule).
+    /// Handle a key. Returns `Some(outcome)` for close / answer; `None` keeps
+    /// the pane open. Always consumed by `App` (the modal rule).
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<PlansOutcome> {
         match &mut self.view {
             View::List { .. } => self.handle_list_key(key),
             View::Detail { .. } => self.handle_detail_key(key),
+            View::Resolver { .. } => self.handle_resolver_key(key),
         }
     }
 
@@ -121,9 +188,48 @@ impl PlansPane {
             KeyCode::Down | KeyCode::Char('j') => self.move_cursor(1),
             // Drill into the highlighted plan's steps.
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => self.drill_in(),
+            // The needs-attention resolver button (the second `/plans answer`
+            // entry point) — open it over the same overlay.
+            KeyCode::Char('a') => self.open_resolver_view(),
             _ => {}
         }
         None
+    }
+
+    /// Resolver keys: navigate the open-interrupt list, Enter answers the
+    /// highlighted item (handing it to the `App` to open the question dialog),
+    /// Esc/q/← backs out to the plan list.
+    fn handle_resolver_key(&mut self, key: KeyEvent) -> Option<PlansOutcome> {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Left | KeyCode::Char('h') => {
+                self.drill_out();
+            }
+            KeyCode::Up | KeyCode::Char('k') => self.move_resolver_cursor(-1),
+            KeyCode::Down | KeyCode::Char('j') => self.move_resolver_cursor(1),
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                if let View::Resolver { items, cursor, .. } = &self.view
+                    && let Some(item) = items.get(*cursor)
+                {
+                    return Some(PlansOutcome::Answer(Box::new(item.clone())));
+                }
+            }
+            _ => {}
+        }
+        None
+    }
+
+    fn move_resolver_cursor(&mut self, delta: isize) {
+        if let View::Resolver { items, cursor, .. } = &mut self.view {
+            let len = items.len();
+            if len == 0 {
+                return;
+            }
+            *cursor = if delta < 0 {
+                crate::tui::nav::wrap_prev(*cursor, len)
+            } else {
+                crate::tui::nav::wrap_next(*cursor, len)
+            };
+        }
     }
 
     fn handle_detail_key(&mut self, key: KeyEvent) -> Option<PlansOutcome> {
@@ -234,6 +340,7 @@ impl PlansPane {
         match &mut self.view {
             View::Detail { scroll, .. } => *scroll = scroll.saturating_sub(1),
             View::List { scroll, .. } => *scroll = scroll.saturating_sub(1),
+            View::Resolver { scroll, .. } => *scroll = scroll.saturating_sub(1),
         }
     }
 
@@ -242,6 +349,7 @@ impl PlansPane {
         match &mut self.view {
             View::Detail { scroll, .. } => *scroll = (*scroll + 1).min(max),
             View::List { scroll, .. } => *scroll = (*scroll + 1).min(max),
+            View::Resolver { scroll, .. } => *scroll = (*scroll + 1).min(max),
         }
     }
 
@@ -249,6 +357,7 @@ impl PlansPane {
         let title = match &self.view {
             View::List { .. } => Line::from(" /plans "),
             View::Detail { plan, .. } => Line::from(format!(" /plans › {} ", plan_display(plan))),
+            View::Resolver { .. } => Line::from(" /plans › answer "),
         };
         let block = Block::default().borders(Borders::ALL).title(title);
         let inner = block.inner(area);
@@ -272,20 +381,25 @@ impl PlansPane {
 
     fn current_scroll(&self) -> usize {
         match &self.view {
-            View::List { scroll, .. } | View::Detail { scroll, .. } => *scroll,
+            View::List { scroll, .. }
+            | View::Detail { scroll, .. }
+            | View::Resolver { scroll, .. } => *scroll,
         }
     }
 
     fn set_scroll(&mut self, v: usize) {
         match &mut self.view {
-            View::List { scroll, .. } | View::Detail { scroll, .. } => *scroll = v,
+            View::List { scroll, .. }
+            | View::Detail { scroll, .. }
+            | View::Resolver { scroll, .. } => *scroll = v,
         }
     }
 
     fn help_line(&self) -> Line<'static> {
         let text = match self.view {
-            View::List { .. } => "q quit  ↑/↓ move  enter/→ open plan",
+            View::List { .. } => "q quit  ↑/↓ move  enter/→ open plan  a answer questions",
             View::Detail { .. } => "←/q back  ↑/↓ scroll  g/G top/bottom",
+            View::Resolver { .. } => "←/q back  ↑/↓ move  enter/→ answer",
         };
         Line::from(text.to_string())
     }
@@ -323,6 +437,9 @@ impl PlansPane {
                 ..
             } => {
                 lines.extend(detail_lines(plan, steps, metrics));
+            }
+            View::Resolver { items, cursor, .. } => {
+                lines.extend(resolver_lines(items, *cursor));
             }
         }
         lines
@@ -656,6 +773,74 @@ fn metrics_lines(metrics: &PlanMetricsWire) -> Vec<Line<'static>> {
     out
 }
 
+/// Assemble the needs-attention resolver body: one card per open interrupt,
+/// each showing its plan slug, the step it was raised on, and the
+/// question/blocker text (`plan-status-chrome-and-resolver.md`). Empty-state
+/// when this project has nothing pending.
+fn resolver_lines(items: &[AttentionItemWire], cursor: usize) -> Vec<Line<'static>> {
+    let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+    let mut out: Vec<Line<'static>> = Vec::new();
+    if items.is_empty() {
+        out.push(Line::from(Span::styled(
+            "  No questions waiting. Background plan agents will raise any here.".to_string(),
+            muted,
+        )));
+        return out;
+    }
+    for (i, item) in items.iter().enumerate() {
+        let selected = i == cursor;
+        let marker_style = if selected {
+            Style::default().fg(Color::Indexed(ACCENT_BLUE_INDEX))
+        } else {
+            muted
+        };
+        // Row 1: which plan, which step.
+        let step = item.step_title.as_deref().unwrap_or("(step gone)");
+        out.push(Line::from(vec![
+            Span::styled(if selected { "▸ " } else { "  " }.to_string(), marker_style),
+            Span::styled(
+                format!("{} › {step}", item.plan_slug),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled(format!("[{}]", item.agent_id), muted),
+        ]));
+        // Row 2: the blocker text — the interrupt description, falling back to
+        // the first question's prompt when the agent gave no description.
+        let text = attention_text(item);
+        out.push(Line::from(Span::styled(format!("    {text}"), muted)));
+        out.push(Line::default());
+    }
+    out
+}
+
+/// The line of text to show for an attention item: its interrupt-level
+/// description, or the first question's prompt when the description is empty.
+fn attention_text(item: &AttentionItemWire) -> String {
+    if !item.description.trim().is_empty() {
+        return item.description.clone();
+    }
+    if let Some(set) = &item.questions
+        && let Some(q) = set.questions.first()
+    {
+        return question_prompt_text(q).to_string();
+    }
+    if let Some(q) = &item.question {
+        return question_prompt_text(q).to_string();
+    }
+    "(no prompt)".to_string()
+}
+
+/// The prompt string of a wire question, regardless of kind.
+fn question_prompt_text(q: &crate::daemon::proto::InterruptQuestion) -> &str {
+    use crate::daemon::proto::InterruptQuestion::*;
+    match q {
+        Single { prompt, .. } | Multi { prompt, .. } | Freetext { prompt } => prompt,
+    }
+}
+
 /// Token count: `1.2K`, `3.4M`, or the raw number below 1000.
 fn fmt_count(n: i64) -> String {
     let n_abs = n.unsigned_abs();
@@ -731,6 +916,21 @@ mod tests {
                 cursor: 0,
                 scroll: 0,
             },
+            project_id: Some("proj".into()),
+            error: None,
+            last_body_height: 100,
+            last_content_rows: 0,
+        }
+    }
+
+    fn resolver_pane(items: Vec<AttentionItemWire>) -> PlansPane {
+        PlansPane {
+            view: View::Resolver {
+                items,
+                cursor: 0,
+                scroll: 0,
+            },
+            project_id: Some("proj".into()),
             error: None,
             last_body_height: 100,
             last_content_rows: 0,
@@ -980,6 +1180,75 @@ mod tests {
         let p = plan("empty", "Empty", "pending", 0);
         let text = detail_text(&p, &[]);
         assert!(text.contains("no steps yet"));
+    }
+
+    fn attention_item(plan: &str, step: Option<&str>, prompt: &str) -> AttentionItemWire {
+        use crate::daemon::proto::{InterruptQuestion, InterruptQuestionSet};
+        AttentionItemWire {
+            interrupt_id: Uuid::new_v4(),
+            agent_id: "coder".into(),
+            description: String::new(),
+            plan_slug: plan.into(),
+            step_title: step.map(|s| s.to_string()),
+            raised_at: 0,
+            question: None,
+            questions: Some(InterruptQuestionSet {
+                questions: vec![InterruptQuestion::Freetext {
+                    prompt: prompt.into(),
+                }],
+            }),
+        }
+    }
+
+    #[test]
+    fn resolver_lists_plan_step_and_blocker_text() {
+        let pane = resolver_pane(vec![attention_item(
+            "feat",
+            Some("wire it"),
+            "which migration order?",
+        )]);
+        let text = pane
+            .body_lines(80)
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("feat"), "plan slug: {text}");
+        assert!(text.contains("wire it"), "step title: {text}");
+        assert!(text.contains("which migration order?"), "blocker: {text}");
+    }
+
+    #[test]
+    fn resolver_enter_answers_selected_item() {
+        let item = attention_item("p", Some("s"), "q?");
+        let iid = item.interrupt_id;
+        let mut pane = resolver_pane(vec![item]);
+        match pane.handle_key(press(KeyCode::Enter)) {
+            Some(PlansOutcome::Answer(got)) => assert_eq!(got.interrupt_id, iid),
+            other => panic!("expected Answer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolver_empty_state_when_nothing_pending() {
+        let pane = resolver_pane(Vec::new());
+        let text = pane
+            .body_lines(80)
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("No questions waiting"), "empty state: {text}");
     }
 
     #[test]

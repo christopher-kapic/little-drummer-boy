@@ -299,6 +299,10 @@ impl Tool for CreatePlanTool {
             slug,
             title,
             description,
+            // Scope the plan to the authoring session's project so the
+            // plan-status chrome slot counts it for this repo
+            // (`plan-status-chrome-and-resolver.md`).
+            project_id: Some(ctx.session.project_id.clone()),
             base_branch,
             target_branch,
             isolation_mode,

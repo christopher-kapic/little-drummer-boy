@@ -102,6 +102,26 @@ impl DaemonContext {
         let _ = self.global_events.send(event);
     }
 
+    /// Recompute `project_id`'s plan-status counts and broadcast them as a
+    /// daemon-global [`proto::Event::PlanStatusState`]
+    /// (`plan-status-chrome-and-resolver.md`). Every client receives it; each
+    /// renders the additive chrome slot only when the `project_id` matches its
+    /// own. Called on the events the daemon observes that move the counts
+    /// (interrupt raised/resolved) and on a client's initial attach (sync).
+    /// Best-effort: a DB read failure logs and skips the broadcast rather than
+    /// failing the triggering request.
+    pub fn broadcast_plan_status(&self, project_id: &str) {
+        match self.db.project_plan_status_counts(project_id) {
+            Ok(counts) => self.broadcast_global(proto::Event::PlanStatusState {
+                project_id: project_id.to_string(),
+                ready: counts.ready,
+                in_progress: counts.in_progress,
+                interruptions: counts.interruptions,
+            }),
+            Err(e) => tracing::warn!(error = %e, project_id, "plan-status count failed"),
+        }
+    }
+
     /// Subscribe to the live connected-client count. Used by the
     /// ephemeral idle watchdog (Layer C).
     pub fn client_presence(&self) -> tokio::sync::watch::Receiver<usize> {
@@ -321,6 +341,23 @@ async fn handle_client(stream: UnixStream, ctx: Arc<DaemonContext>) -> Result<()
             event = event_branch => {
                 match event {
                     Some(Ok(ev)) => {
+                        // A raised/resolved interrupt moves the project's
+                        // interruptions count, so re-broadcast the plan-status
+                        // chrome state for this session's project
+                        // (`plan-status-chrome-and-resolver.md`). The worker
+                        // emits these over the per-session bus; the server is
+                        // the `ctx`-bearing chokepoint that owns the
+                        // daemon-global plan-status broadcast (the recompute is
+                        // a cheap DB read; a redundant fire across clients is
+                        // harmless).
+                        if matches!(
+                            ev,
+                            proto::Event::InterruptRaised { .. }
+                                | proto::Event::InterruptResolved { .. }
+                        ) && let Some(att) = state.attached.as_ref()
+                        {
+                            ctx.broadcast_plan_status(&att.handle.project_id());
+                        }
                         if let Err(e) = proto.send(&Envelope::event(ev)).await {
                             tracing::debug!(error = ?e, "client disconnected during event send");
                             return Ok(());
@@ -530,6 +567,7 @@ async fn handle_request(
             Ok(Response::Skills { skills })
         }
         Request::ListPlans => list_plans(ctx),
+        Request::ListAttention { project_id } => list_attention(ctx, &project_id),
         Request::PlanDetail { plan_id } => plan_detail(ctx, plan_id),
 
         Request::ListAgents => Err(not_implemented("ListAgents")),
@@ -616,6 +654,15 @@ async fn handle_request(
             active_sessions: ctx.registry.active_session_ids().len() as u32,
             socket_path: ctx.paths.socket.display().to_string(),
         }),
+
+        Request::RefreshPlanStatus { project_id } => {
+            // The out-of-process plan executor transitioned a plan's status;
+            // recompute + broadcast the project's chrome state so every client
+            // (incl. a TUI not attached to any plan session) refreshes
+            // (`plan-status-chrome-and-resolver.md`).
+            ctx.broadcast_plan_status(&project_id);
+            Ok(Response::Ack)
+        }
 
         Request::RefreshEnv { vars } => {
             // SAFETY: `std::env::set_var` mutates process-global state.
@@ -963,6 +1010,14 @@ fn attach(
         Err(_) => Vec::new(),
     };
 
+    // Sync the plan-status chrome slot for this client's project on attach
+    // (`plan-status-chrome-and-resolver.md`): a late-opened / reconnecting TUI
+    // must show the correct ready / in-progress / interruption counts without
+    // TUI-local bookkeeping. Broadcast (not a direct send) so it also refreshes
+    // any other client already attached to the same project — the event carries
+    // `project_id` and every client filters on its own.
+    ctx.broadcast_plan_status(&project_id);
+
     Ok(Response::Attached {
         session_id,
         short_id,
@@ -996,6 +1051,32 @@ fn list_plans(ctx: &DaemonContext) -> std::result::Result<Response, ErrorPayload
     let summaries = ctx.db.list_all_plan_summaries().map_err(internal)?;
     let plans = summaries.into_iter().map(plan_summary_wire).collect();
     Ok(Response::Plans { plans })
+}
+
+/// The needs-attention resolver's item list for `project_id`
+/// (`plan-status-chrome-and-resolver.md`): open interrupts tied to an
+/// unfinished plan in this project, oldest first, each flattened to the wire.
+fn list_attention(
+    ctx: &DaemonContext,
+    project_id: &str,
+) -> std::result::Result<Response, ErrorPayload> {
+    let items = ctx
+        .db
+        .list_project_attention_items(project_id)
+        .map_err(internal)?
+        .into_iter()
+        .map(|i| proto::AttentionItemWire {
+            interrupt_id: i.interrupt_id,
+            agent_id: i.agent_id,
+            description: i.description,
+            plan_slug: i.plan_slug,
+            step_title: i.step_title,
+            raised_at: i.raised_at,
+            question: i.question,
+            questions: i.questions,
+        })
+        .collect();
+    Ok(Response::Attention { items })
 }
 
 /// Full detail of one plan: its steps with dependency prerequisites

@@ -111,6 +111,25 @@ the chrome.
   (and clears, including on `until-idle` auto-off) on **every**
   connected client in lockstep. Never displaces the always-on
   cwd/branch/context/agent slots — it's prepended to the cwd line.
+- plan-status indicator: an **additive**, **project-scoped** slot shown
+  only when this repo has unfinished plans (`plan.md §4.1`). Three
+  segments, each omitted when zero, the whole slot absent when all zero:
+  ready `⧖N` (queued/`Pending` plans), in-progress `▶N` (the executing
+  plan, ≤1 per project), and interruptions `?N` (open `needs_attention`
+  items across the project's unfinished plans — the actionable,
+  attention-grabbing segment). Plan-yellow `#f8d749`, distinguished from
+  the branch pill by **fill** (the branch is a filled badge; this is
+  unfilled colored glyph+number text), not hue. Driven by
+  daemon-broadcast state (`proto::Event::PlanStatusState`, the same
+  pattern as `☕`) so a reconnecting / late-opened client shows the
+  correct counts and the v2 remote dashboard gets it for free — never
+  TUI-local bookkeeping. Never displaces the always-on slots; prepended
+  to the cwd line. The **needs-attention resolver** (`/plans answer`, or
+  the `a` button in the `/plans` browser — a slice of `/plans`, not a new
+  surface) lists this project's pending items with plan/step/blocker text
+  and answers them by **reusing the `question` dialog** (§3b); answering
+  resolves the paused step. There is **no new interrupt tool** —
+  background plan agents raise these via the existing `question` tool.
 
 #### `/caffeinate` — keep the machine awake during agent runs
 

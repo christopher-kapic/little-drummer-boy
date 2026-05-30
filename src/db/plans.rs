@@ -144,6 +144,12 @@ pub struct PlanRow {
     pub title: String,
     pub description: String,
     pub status: PlanStatus,
+    /// Project (repo) the plan was authored in — the 12-char hash from
+    /// [`crate::session::project_id_for`], matching `sessions.project_id`.
+    /// Scopes the plan-status chrome slot to the open TUI's repo
+    /// (`plan-status-chrome-and-resolver.md`). `None` for plans authored
+    /// before migration 0020.
+    pub project_id: Option<String>,
     pub base_branch: Option<String>,
     pub target_branch: Option<String>,
     pub isolation_mode: IsolationMode,
@@ -168,6 +174,7 @@ impl PlanRow {
             title: row.get("title")?,
             description: row.get("description")?,
             status: PlanStatus::from_str(&status),
+            project_id: row.get("project_id")?,
             base_branch: row.get("base_branch")?,
             target_branch: row.get("target_branch")?,
             isolation_mode: IsolationMode::from_str(&isolation),
@@ -268,6 +275,10 @@ pub struct NewPlan {
     pub slug: String,
     pub title: String,
     pub description: String,
+    /// Project (repo) the plan is authored in — the project hash from
+    /// [`crate::session::project_id_for`]. Scopes the plan-status chrome
+    /// slot; `None` for plans created outside any project context.
+    pub project_id: Option<String>,
     pub base_branch: Option<String>,
     pub target_branch: Option<String>,
     pub isolation_mode: IsolationMode,
@@ -290,6 +301,9 @@ pub struct DuplicateSpec<'a> {
     pub model: Option<&'a str>,
     /// Isolation mode (copied from the source).
     pub isolation_mode: IsolationMode,
+    /// Project the duplicate belongs to (copied from the source so the
+    /// duplicate scopes to the same repo's chrome slot).
+    pub project_id: Option<&'a str>,
     /// Title (copied from the source).
     pub title: &'a str,
     /// Description (copied from the source).
@@ -303,9 +317,91 @@ pub struct PlanSummary {
     pub step_count: i64,
 }
 
+/// Project-scoped counts driving the plan-status chrome slot
+/// (`plan-status-chrome-and-resolver.md`). Each segment is omitted when its
+/// count is zero; the whole slot is absent when all three are zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PlanStatusCounts {
+    /// Queued (`Pending`) plans — the prompt's "ready" segment.
+    pub ready: i64,
+    /// Executing (`InProgress`) plan(s) — ≤1 per project.
+    pub in_progress: i64,
+    /// Open `needs_attention` items across this project's unfinished plans.
+    pub interruptions: i64,
+}
+
+impl PlanStatusCounts {
+    /// Whether the chrome slot should appear at all — false when there is
+    /// nothing unfinished to show.
+    pub fn is_empty(self) -> bool {
+        self.ready == 0 && self.in_progress == 0 && self.interruptions == 0
+    }
+}
+
+/// One open interrupt for the needs-attention resolver, joined to its plan
+/// slug + step title (`plan-status-chrome-and-resolver.md`).
+#[derive(Debug, Clone)]
+pub struct AttentionItem {
+    pub interrupt_id: Uuid,
+    pub agent_id: String,
+    /// Interrupt-level context (`raise_interrupt(description, …)`).
+    pub description: String,
+    /// Legacy single-question payload (mutually exclusive with `questions`).
+    pub question: Option<crate::daemon::proto::InterruptQuestion>,
+    /// Multi-question batch (the `question` tool's shape).
+    pub questions: Option<crate::daemon::proto::InterruptQuestionSet>,
+    pub raised_at: i64,
+    /// Plan the raising step belongs to.
+    pub plan_slug: String,
+    /// Step the agent was running when it raised the interrupt; `None` if the
+    /// step row is gone (defensive) — the plan is still named.
+    pub step_title: Option<String>,
+}
+
 fn parse_uuid(s: &str) -> rusqlite::Result<Uuid> {
     Uuid::parse_str(s).map_err(|e| {
         rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+    })
+}
+
+/// Decode one [`AttentionItem`] from the resolver's joined query.
+fn decode_attention_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<AttentionItem> {
+    let from_json = |v: Option<String>| -> rusqlite::Result<Option<serde_json::Value>> {
+        match v {
+            Some(s) => serde_json::from_str(&s).map(Some).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            }),
+            None => Ok(None),
+        }
+    };
+    let interrupt_id: String = row.get("interrupt_id")?;
+    let question_json: Option<String> = row.get("question_json")?;
+    let questions_json: Option<String> = row.get("questions_json")?;
+    let question = match from_json(question_json)? {
+        Some(v) => Some(serde_json::from_value(v).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+        })?),
+        None => None,
+    };
+    let questions = match from_json(questions_json)? {
+        Some(v) => Some(serde_json::from_value(v).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+        })?),
+        None => None,
+    };
+    Ok(AttentionItem {
+        interrupt_id: parse_uuid(&interrupt_id)?,
+        agent_id: row.get("agent_id")?,
+        description: row.get("description")?,
+        question,
+        questions,
+        raised_at: row.get("raised_at")?,
+        plan_slug: row.get("plan_slug")?,
+        step_title: row.get("step_title")?,
     })
 }
 
@@ -317,14 +413,15 @@ impl Db {
         self.with_conn(|conn| {
             conn.execute(
                 "INSERT INTO plans \
-                 (id, slug, title, description, status, base_branch, target_branch, \
+                 (id, slug, title, description, status, project_id, base_branch, target_branch, \
                   isolation_mode, model, created_at, updated_at) \
-                 VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, ?7, ?8, ?9, ?9)",
+                 VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, ?7, ?8, ?9, ?10, ?10)",
                 params![
                     id.to_string(),
                     plan.slug,
                     plan.title,
                     plan.description,
+                    plan.project_id,
                     plan.base_branch,
                     plan.target_branch,
                     plan.isolation_mode.as_str(),
@@ -341,6 +438,7 @@ impl Db {
             title: plan.title.clone(),
             description: plan.description.clone(),
             status: PlanStatus::Pending,
+            project_id: plan.project_id.clone(),
             base_branch: plan.base_branch.clone(),
             target_branch: plan.target_branch.clone(),
             isolation_mode: plan.isolation_mode,
@@ -444,6 +542,85 @@ impl Db {
         })
     }
 
+    /// Project-scoped counts for the plan-status chrome slot
+    /// (`plan-status-chrome-and-resolver.md`). For `project_id`'s unfinished
+    /// plans: how many are queued (`Pending`), how many are executing
+    /// (`InProgress`, ≤1 per project), and how many `needs_attention` items
+    /// are still open across those plans. `Done` plans count toward nothing.
+    ///
+    /// The prompt's planning-mode design named a `ready` plan status; the
+    /// planning mode that landed has only `Pending` / `InProgress` / `Done`
+    /// (see [`PlanStatus`]), so the prompt's **"ready"** segment maps to
+    /// **`Pending`** (authored + queued for the single execution slot) and
+    /// **"in-progress"** to **`InProgress`**. There is no `ready` / `draft`
+    /// status to add or exclude — only `Done` is never shown.
+    pub fn project_plan_status_counts(&self, project_id: &str) -> Result<PlanStatusCounts> {
+        self.with_conn(|conn| {
+            // ready = Pending plans in this project; in_progress = InProgress
+            // plans in this project (≤1, but COUNT keeps the query uniform).
+            let (ready, in_progress): (i64, i64) = conn
+                .query_row(
+                    "SELECT \
+                       COALESCE(SUM(status = 'pending'), 0), \
+                       COALESCE(SUM(status = 'in_progress'), 0) \
+                     FROM plans WHERE project_id = ?1",
+                    params![project_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .context("counting project plan statuses")?;
+            // interruptions = open needs_attention rows tied to an unfinished
+            // plan in this project (the actionable, blocking segment).
+            let interruptions: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM needs_attention na \
+                       JOIN plans p ON p.id = na.plan_id \
+                      WHERE na.resolved_at IS NULL \
+                        AND p.project_id = ?1 \
+                        AND p.status != 'done'",
+                    params![project_id],
+                    |row| row.get(0),
+                )
+                .context("counting project interruptions")?;
+            Ok(PlanStatusCounts {
+                ready,
+                in_progress,
+                interruptions,
+            })
+        })
+    }
+
+    /// Open (unresolved) interrupts tied to an unfinished plan in
+    /// `project_id`, oldest first — the needs-attention resolver's item list
+    /// (`plan-status-chrome-and-resolver.md`). Each row carries the raising
+    /// session/agent, the question payload, and the plan slug + step title so
+    /// the resolver shows *which plan, which step* without a second lookup.
+    pub fn list_project_attention_items(&self, project_id: &str) -> Result<Vec<AttentionItem>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT na.interrupt_id, na.agent_id, na.description, \
+                            na.question_json, na.questions_json, na.raised_at, \
+                            p.slug AS plan_slug, s.title AS step_title \
+                       FROM needs_attention na \
+                       JOIN plans p ON p.id = na.plan_id \
+                       LEFT JOIN plan_steps s ON s.id = na.step_id \
+                      WHERE na.resolved_at IS NULL \
+                        AND p.project_id = ?1 \
+                        AND p.status != 'done' \
+                      ORDER BY na.raised_at ASC",
+                )
+                .context("preparing list_project_attention_items")?;
+            let rows = stmt
+                .query_map(params![project_id], decode_attention_item)
+                .context("querying attention items")?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r.context("decoding attention item")?);
+            }
+            Ok(out)
+        })
+    }
+
     /// Set a plan's status.
     pub fn set_plan_status(&self, id: Uuid, status: PlanStatus) -> Result<()> {
         let now = Utc::now().timestamp();
@@ -510,6 +687,7 @@ impl Db {
             target_branch,
             model,
             isolation_mode,
+            project_id,
             title,
             description,
         } = *spec;
@@ -537,14 +715,15 @@ impl Db {
 
             tx.execute(
                 "INSERT INTO plans \
-                 (id, slug, title, description, status, base_branch, target_branch, \
+                 (id, slug, title, description, status, project_id, base_branch, target_branch, \
                   isolation_mode, model, created_at, updated_at) \
-                 VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, ?7, ?8, ?9, ?9)",
+                 VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, ?7, ?8, ?9, ?10, ?10)",
                 params![
                     new_plan_id.to_string(),
                     new_slug,
                     title,
                     description,
+                    project_id,
                     base_branch,
                     target_branch,
                     isolation_mode.as_str(),
@@ -621,6 +800,7 @@ impl Db {
             title: title.to_string(),
             description: description.to_string(),
             status: PlanStatus::Pending,
+            project_id: project_id.map(str::to_string),
             base_branch: base_branch.map(str::to_string),
             target_branch: target_branch.map(str::to_string),
             isolation_mode,
@@ -1089,10 +1269,18 @@ mod tests {
             slug: slug.to_string(),
             title: format!("Plan {slug}"),
             description: "one-liner".to_string(),
+            project_id: None,
             base_branch: Some("main".to_string()),
             target_branch: Some("cockpit-plan/feature".to_string()),
             isolation_mode: IsolationMode::Worktree,
             model: None,
+        }
+    }
+
+    fn plan_in_project(slug: &str, project_id: &str) -> NewPlan {
+        NewPlan {
+            project_id: Some(project_id.to_string()),
+            ..sample_plan(slug)
         }
     }
 
@@ -1316,6 +1504,7 @@ mod tests {
                     target_branch: Some("cockpit-plan/orig-2"),
                     model: Some("anthropic/claude-opus-4-8"),
                     isolation_mode: IsolationMode::Worktree,
+                    project_id: None,
                     title: "Plan orig",
                     description: "one-liner",
                 },
@@ -1435,6 +1624,7 @@ mod tests {
                     target_branch: None,
                     model: None,
                     isolation_mode: IsolationMode::Worktree,
+                    project_id: None,
                     title: "t",
                     description: "d",
                 },
@@ -1443,5 +1633,114 @@ mod tests {
         );
         // The failed duplicate left nothing behind (still just the two plans).
         assert_eq!(db.list_all_plan_summaries().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn project_counts_scope_and_omit_done() {
+        let db = Db::open_in_memory().unwrap();
+        // Project A: one pending, one in-progress; project B: one pending,
+        // one done (done counts toward nothing).
+        db.create_plan(&plan_in_project("a-ready", "projA"))
+            .unwrap();
+        let a_run = db.create_plan(&plan_in_project("a-run", "projA")).unwrap();
+        db.set_plan_status(a_run.id, PlanStatus::InProgress)
+            .unwrap();
+        db.create_plan(&plan_in_project("b-ready", "projB"))
+            .unwrap();
+        let b_done = db.create_plan(&plan_in_project("b-done", "projB")).unwrap();
+        db.set_plan_status(b_done.id, PlanStatus::Done).unwrap();
+
+        let a = db.project_plan_status_counts("projA").unwrap();
+        assert_eq!((a.ready, a.in_progress, a.interruptions), (1, 1, 0));
+        let b = db.project_plan_status_counts("projB").unwrap();
+        assert_eq!((b.ready, b.in_progress, b.interruptions), (1, 0, 0));
+        // A project with no plans yields an empty (absent) slot.
+        let none = db.project_plan_status_counts("projC").unwrap();
+        assert!(none.is_empty());
+    }
+
+    #[test]
+    fn interruptions_count_and_resolver_join_plan_and_step() {
+        use crate::daemon::proto::InterruptQuestionSet;
+        let db = Db::open_in_memory().unwrap();
+        let plan = db.create_plan(&plan_in_project("feat", "projX")).unwrap();
+        let step = db.add_step(plan.id, "wire it", "{}", &[], &[]).unwrap();
+        db.set_plan_status(plan.id, PlanStatus::InProgress).unwrap();
+        // A plan-executor coder session raises an interrupt stamped with the
+        // plan/step it was running (the resolver's join target).
+        let sess = db.create_session("projX", "/x", "coder").unwrap();
+        let set = InterruptQuestionSet {
+            questions: vec![crate::daemon::proto::InterruptQuestion::Freetext {
+                prompt: "which migration order?".into(),
+            }],
+        };
+        let iid = db
+            .raise_interrupt_questions_for_plan(
+                sess.session_id,
+                "coder",
+                "blocked on ordering",
+                &set,
+                Some((plan.id, step.id)),
+            )
+            .unwrap();
+
+        let counts = db.project_plan_status_counts("projX").unwrap();
+        assert_eq!(counts.interruptions, 1, "open interrupt counted");
+
+        let items = db.list_project_attention_items("projX").unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].interrupt_id, iid);
+        assert_eq!(items[0].plan_slug, "feat");
+        assert_eq!(items[0].step_title.as_deref(), Some("wire it"));
+        assert!(items[0].questions.is_some());
+
+        // Resolving it drops the count + the resolver row.
+        db.resolve_interrupt(
+            iid,
+            &crate::daemon::proto::ResolveResponse::Freetext {
+                text: "schema first".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            db.project_plan_status_counts("projX")
+                .unwrap()
+                .interruptions,
+            0
+        );
+        assert!(db.list_project_attention_items("projX").unwrap().is_empty());
+    }
+
+    #[test]
+    fn done_plan_interrupts_excluded_from_resolver() {
+        use crate::daemon::proto::InterruptQuestionSet;
+        let db = Db::open_in_memory().unwrap();
+        let plan = db
+            .create_plan(&plan_in_project("shipped", "projY"))
+            .unwrap();
+        let step = db.add_step(plan.id, "s", "{}", &[], &[]).unwrap();
+        let sess = db.create_session("projY", "/x", "coder").unwrap();
+        let set = InterruptQuestionSet {
+            questions: vec![crate::daemon::proto::InterruptQuestion::Freetext {
+                prompt: "q".into(),
+            }],
+        };
+        db.raise_interrupt_questions_for_plan(
+            sess.session_id,
+            "coder",
+            "ctx",
+            &set,
+            Some((plan.id, step.id)),
+        )
+        .unwrap();
+        // Once the plan is Done it never shows in the slot or the resolver.
+        db.set_plan_status(plan.id, PlanStatus::Done).unwrap();
+        assert_eq!(
+            db.project_plan_status_counts("projY")
+                .unwrap()
+                .interruptions,
+            0
+        );
+        assert!(db.list_project_attention_items("projY").unwrap().is_empty());
     }
 }

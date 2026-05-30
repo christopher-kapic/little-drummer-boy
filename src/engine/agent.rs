@@ -245,6 +245,20 @@ pub enum TurnEvent {
     /// initial drain (in-flight work finishing) from the force-deadline
     /// case (work was aborted — a truncated turn isn't a clean finish).
     DaemonDraining { forced: bool },
+
+    /// Project-scoped plan-status snapshot for the additive chrome slot
+    /// (`plan-status-chrome-and-resolver.md`). Daemon-global (carries
+    /// `project_id`); the TUI applies it only when `project_id` matches its
+    /// own session's project, then renders the ready / in-progress /
+    /// interruptions segments (each omitted when zero, slot absent when all
+    /// zero). Driven by daemon broadcast, not TUI-local bookkeeping, so a
+    /// reconnecting / late-opened TUI shows the correct state.
+    PlanStatusState {
+        project_id: String,
+        ready: i64,
+        in_progress: i64,
+        interruptions: i64,
+    },
 }
 
 /// Outcome of one [`turn`] call. The driver loops on the result.

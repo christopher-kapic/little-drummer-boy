@@ -150,11 +150,16 @@ impl Tool for QuestionTool {
         // still find and answer the parked interrupt), then register the
         // wakeup, then emit the event. Registering before emitting
         // guarantees a fast client can't resolve before we're listening.
-        let interrupt_id = ctx.session.db.raise_interrupt_questions(
+        // Stamp the plan/step the session runs on behalf of (if any) so a
+        // background-plan interrupt is associated with its plan + step for the
+        // needs-attention resolver + the project-scoped chrome counter
+        // (`plan-status-chrome-and-resolver.md`). `None` for ordinary sessions.
+        let interrupt_id = ctx.session.db.raise_interrupt_questions_for_plan(
             ctx.session.id,
             &ctx.agent_id,
             &description,
             &set,
+            ctx.session.plan_context(),
         )?;
         let pending = ctx.interrupts.register(interrupt_id);
         ctx.interrupts.emit_raised(

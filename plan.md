@@ -1720,6 +1720,33 @@ each step's tests (phase + concurrency, e.g. an `exclusive: port:8080`
 badge). Authoring stays with `Plan`; plan *execution* controls
 (start/pause/status) land in a later cut via the pane's outcome seam.
 
+Ambient awareness of background plan execution rides in an **additive,
+project-scoped chrome slot** (GOALS §1a, alongside the `☕` caffeinate
+exception — never replacing a fixed cwd/branch/context/agent slot). It
+shows up to three segments, each omitted when zero and the whole slot
+absent when nothing is unfinished: ready `⧖N` (queued/`Pending` plans),
+in-progress `▶N` (the executing plan, ≤1 per project), and interruptions
+`?N` (open `needs_attention` items across the project's unfinished
+plans). Plan-yellow `#f8d749`, distinguished from the branch pill by
+*fill* not hue. It is driven by **daemon-broadcast state**
+(`proto::Event::PlanStatusState`, modeled on `CaffeinateState`) — the
+daemon recomputes + broadcasts the project's counts on attach (sync), on
+interrupt raise/resolve, and on the out-of-process executor's
+`RefreshPlanStatus` poke at a plan-status transition — so a reconnecting
+/ late-opened TUI shows the correct state and the v2 remote dashboard
+gets it for free. Plans carry a `project_id` (migration 0020) to scope
+ready/in-progress; interruptions are scoped by joining `needs_attention`
+→ its plan's `project_id`, with the raising step's `(plan_id, step_id)`
+stamped on the row from the session's plan-context.
+
+The **needs-attention resolver** (`/plans answer`, or the `a` button in
+the `/plans` browser — a *slice* of `/plans`, not a separate surface)
+lists this project's pending items with their plan/step/blocker text and
+answers each by **reusing the `question` dialog** (GOALS §3b); answering
+sends `ResolveInterrupt`, resuming the paused step without blocking its
+siblings. Decision: interruptions reuse the existing **`question` tool**
+— there is **no new interrupt tool**.
+
 **Evaluator-gated nodes** ([`features/oh-my-codex.md` §4](./features/oh-my-codex.md)).
 A graph node can declare an evaluator: a *plain shell command* that
 returns `{ pass: bool, score?: number }` JSON. The node runs in an

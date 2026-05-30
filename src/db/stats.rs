@@ -1329,6 +1329,7 @@ mod tests {
                 slug: "metrics".into(),
                 title: "Metrics".into(),
                 description: String::new(),
+                project_id: None,
                 base_branch: None,
                 target_branch: None,
                 isolation_mode: IsolationMode::Worktree,

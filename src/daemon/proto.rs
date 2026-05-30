@@ -275,6 +275,14 @@ pub enum Request {
     /// read-only `/plans` browser. Plans are global, so no project scope.
     ListPlans,
 
+    /// List `project_id`'s open `needs_attention` items tied to an unfinished
+    /// plan — the needs-attention resolver's item list
+    /// (`plan-status-chrome-and-resolver.md`, a slice of `/plans`). Scoped to
+    /// the same project as the chrome counter; each item carries the plan +
+    /// step it was raised on and the question payload so the resolver answers
+    /// it by reusing the question dialog.
+    ListAttention { project_id: String },
+
     /// Full detail of one plan for the `/plans` drill-in: its steps with
     /// dependency edges, per-step status, and each step's tests.
     PlanDetail { plan_id: Uuid },
@@ -391,6 +399,15 @@ pub enum Request {
         model: Option<String>,
     },
 
+    /// Recompute + broadcast the plan-status chrome state for `project_id`
+    /// (`plan-status-chrome-and-resolver.md`). Sent best-effort by the
+    /// out-of-process plan executor (`cockpit plan run`) when it transitions a
+    /// plan's status (`Pending → InProgress → Done`) — those transitions
+    /// happen outside the daemon, so the daemon can't observe them directly.
+    /// Acked immediately; the refreshed [`Event::PlanStatusState`] flows to
+    /// every client over the daemon-global bus.
+    RefreshPlanStatus { project_id: String },
+
     /// Request orderly shutdown. The daemon flushes in-flight writes
     /// (session DB, lock state) before exiting.
     StopDaemon,
@@ -473,6 +490,12 @@ pub enum Response {
     /// Answer to [`Request::ListPlans`]: every plan, active first.
     Plans {
         plans: Vec<PlanSummaryWire>,
+    },
+
+    /// Answer to [`Request::ListAttention`]: this project's open
+    /// needs-attention items, oldest first, for the resolver.
+    Attention {
+        items: Vec<AttentionItemWire>,
     },
 
     /// Answer to [`Request::PlanDetail`]: the plan plus its full step DAG
@@ -799,6 +822,24 @@ pub enum Event {
     /// `true` once the grace deadline was hit with work still outstanding,
     /// so a truncated turn isn't mistaken for a clean finish.
     DaemonDraining { forced: bool },
+
+    /// Project-scoped plan-status snapshot driving the additive plan-status
+    /// chrome slot (`plan-status-chrome-and-resolver.md`). Modeled on
+    /// [`Event::CaffeinateState`]: **daemon-global** (broadcast to *every*
+    /// connected client) but carries `project_id` so each client renders only
+    /// its own repo's counts — a TUI opened after a plan started, or
+    /// reconnected, syncs from this rather than TUI-local bookkeeping. Each
+    /// segment is omitted when zero and the slot is absent when all three are
+    /// zero; `ready` = queued (`Pending`) plans, `in_progress` = the executing
+    /// plan (≤1), `interruptions` = open `needs_attention` items across the
+    /// project's unfinished plans. The daemon re-broadcasts whenever the
+    /// counts change (interrupt raised/resolved, plan authored/transitioned).
+    PlanStatusState {
+        project_id: String,
+        ready: i64,
+        in_progress: i64,
+        interruptions: i64,
+    },
 }
 
 // ---- Errors ----------------------------------------------------------------
@@ -976,6 +1017,27 @@ pub struct PlanSummaryWire {
     pub target_branch: Option<String>,
     pub step_count: i64,
     pub created_at: i64,
+}
+
+/// One open `needs_attention` item for the resolver
+/// (`plan-status-chrome-and-resolver.md`): which plan, which step, the
+/// interrupt-level context, and the question payload the resolver feeds to the
+/// (reused) question dialog. `questions` is the modern batch shape; `question`
+/// is the legacy single-question shape — at most one is set.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttentionItemWire {
+    pub interrupt_id: Uuid,
+    pub agent_id: String,
+    /// Interrupt-level context (`raise_interrupt(description, …)`).
+    pub description: String,
+    pub plan_slug: String,
+    /// Step the agent was running; `None` if the step row is gone.
+    pub step_title: Option<String>,
+    pub raised_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question: Option<InterruptQuestion>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub questions: Option<InterruptQuestionSet>,
 }
 
 /// One step in a plan's DAG for the `/plans` drill-in. `depends_on` lists
@@ -1458,6 +1520,50 @@ mod tests {
             }
             other => panic!("expected CaffeinateState event, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn plan_status_state_round_trips_as_global_event() {
+        // The plan-status chrome event carries `project_id` (it's daemon-global
+        // but project-scoped) and the three segment counts.
+        let evt = Envelope::event(Event::PlanStatusState {
+            project_id: "abc123".into(),
+            ready: 2,
+            in_progress: 1,
+            interruptions: 3,
+        });
+        let back: Envelope = serde_json::from_str(&serde_json::to_string(&evt).unwrap()).unwrap();
+        match back.body {
+            Body::Event {
+                event:
+                    Event::PlanStatusState {
+                        project_id,
+                        ready,
+                        in_progress,
+                        interruptions,
+                    },
+            } => {
+                assert_eq!(project_id, "abc123");
+                assert_eq!((ready, in_progress, interruptions), (2, 1, 3));
+            }
+            other => panic!("expected PlanStatusState event, got {other:?}"),
+        }
+
+        // The resolver's RefreshPlanStatus request also survives the wire.
+        let req = Envelope::request(
+            Uuid::new_v4(),
+            Request::RefreshPlanStatus {
+                project_id: "p".into(),
+            },
+        );
+        let back: Envelope = serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
+        assert!(matches!(
+            back.body,
+            Body::Request {
+                request: Request::RefreshPlanStatus { .. },
+                ..
+            }
+        ));
     }
 
     #[test]
