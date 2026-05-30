@@ -148,6 +148,68 @@ pub(crate) fn default_chat_system_prompt(cwd: &Path, session_short_id: &str) -> 
     compose_system_prompt(BUILD_PROMPT, session_short_id, cwd)
 }
 
+/// Per-category token sizing of the composed chat system prompt, for the
+/// `/context` usage overlay. Splits the single composed block the engine
+/// sends into the three buckets that actually make it up, so the overlay
+/// can color them distinctly rather than reporting one opaque "system"
+/// number. Counts are cl100k_base (`crate::tokens::count`) — the same
+/// fallback the chrome's live context indicator uses pre-flight.
+///
+/// - `base_prompt`: the role/base system prompt (the `Build` agent's
+///   `build.md`), the fixed instruction surface.
+/// - `system_block`: the appended cached identity lines (harness +
+///   version + URLs + optional user name + OS + optional session id),
+///   GOALS §17g.
+/// - `guidance`: the injected project-guidance / memory file body
+///   (`AGENTS.md` / `CLAUDE.md` / …), or 0 when none was found.
+///
+/// Derived from the exact same assembly as [`compose_system_prompt`]
+/// (which appends the system block + guidance to the role prompt), so the
+/// three pieces sum to the same prompt the engine actually composes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SystemPromptBreakdown {
+    pub base_prompt: u64,
+    pub system_block: u64,
+    pub guidance: u64,
+}
+
+/// Compute the [`SystemPromptBreakdown`] for the user-facing chat agent
+/// (`Build`) at `cwd`. `session_short_id` is empty when no session id is
+/// resolved yet (matching what the engine sends on a fresh chat).
+pub(crate) fn chat_system_prompt_breakdown(
+    cwd: &Path,
+    session_short_id: &str,
+) -> SystemPromptBreakdown {
+    let cfg = load_extended_config(cwd);
+    // The full composed prompt, then the same prompt without the role
+    // body: the difference is the appended system block + guidance. We
+    // recompose with an empty role prompt to isolate the appended part,
+    // then split off the guidance body (counted independently) to get the
+    // cached identity block on its own. Reusing the real assembler keeps
+    // the buckets faithful to what the engine sends.
+    let base_prompt = crate::tokens::count(BUILD_PROMPT) as u64;
+    let guidance = find_agent_guidance(cwd, &cfg.agent_guidance_files)
+        .map(|(_, body)| crate::tokens::count(&body) as u64)
+        .unwrap_or(0);
+    let full = crate::tokens::count(&compose_system_prompt_with(
+        BUILD_PROMPT,
+        session_short_id,
+        cwd,
+        &cfg,
+    )) as u64;
+    // The composed block = base role prompt + cached identity lines +
+    // guidance body (plus a handful of separator newlines folded into the
+    // identity block). `system_block` is the remainder after removing the
+    // two independently-counted pieces; saturating so a tokenizer rounding
+    // quirk can never underflow.
+    let system_block = full.saturating_sub(base_prompt).saturating_sub(guidance);
+    SystemPromptBreakdown {
+        base_prompt,
+        system_block,
+        guidance,
+    }
+}
+
 /// Locate the first existing project-guidance file by name, searching
 /// `cwd` then its ancestors up to (and including) the git worktree root
 /// when there is one — otherwise stop at the filesystem root. Returns

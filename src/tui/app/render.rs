@@ -370,6 +370,16 @@ impl App {
                 p.render(frame, rects.body);
             }
             self.plans_pane = pane;
+        } else if self.context_pane.is_some() {
+            // Same take/render/restore as the other panes. Renders into
+            // `rects.body` so the fixed chrome (cwd + git branch + context
+            // + active agent) stays visible — the overlay is a view, not a
+            // chrome change.
+            let mut pane = self.context_pane.take();
+            if let Some(p) = pane.as_mut() {
+                p.render(frame, rects.body);
+            }
+            self.context_pane = pane;
         } else {
             // Carve the body for an embedded pane (GOALS §1i) when one
             // is open: fullscreen fills the body, splits divide it. The
@@ -1016,6 +1026,45 @@ impl App {
             tokens += crate::tokens::count(block);
         }
         tokens.min(u32::MAX as usize) as u32
+    }
+
+    /// cl100k_base token count of the conversation-message portion of the
+    /// live context: finalized history + the in-flight `pending` buffer +
+    /// any buffered `<git>` blocks riding the next user message. This is
+    /// exactly the part of [`Self::estimate_context_tokens`] *excluding*
+    /// the composed system prompt — the `messages` category of the
+    /// `/context` overlay.
+    pub(super) fn message_tokens(&self) -> u64 {
+        let mut tokens = self.history_estimate_tokens() as u64;
+        if let Some(p) = &self.pending {
+            tokens +=
+                crate::tokens::count(&p.text) as u64 + crate::tokens::count(&p.reasoning) as u64;
+        }
+        for block in &self.pending_git_blocks {
+            tokens += crate::tokens::count(block) as u64;
+        }
+        tokens
+    }
+
+    /// Capture an immutable snapshot of the live context composition for
+    /// the `/context` overlay. The system prompt is decomposed into its
+    /// real sub-buckets (base prompt + cached system block + guidance/
+    /// memory file) via the engine's own assembler, and the message
+    /// portion is sized the same cl100k_base way the chrome's indicator
+    /// uses. The window size is the active model's context limit (the same
+    /// `active_model_max_context` the chrome percentage uses); `None` there
+    /// drives the unknown-window path (no pct, no free segment).
+    pub(super) fn context_snapshot(&self) -> crate::tui::context_pane::ContextSnapshot {
+        let short_id = self.launch.session_short_id.as_deref().unwrap_or_default();
+        let breakdown =
+            crate::engine::builtin::chat_system_prompt_breakdown(&self.launch.cwd, short_id);
+        crate::tui::context_pane::ContextSnapshot::new(
+            breakdown.base_prompt,
+            breakdown.system_block,
+            breakdown.guidance,
+            self.message_tokens(),
+            self.launch.active_model_max_context,
+        )
     }
 
     /// cl100k_base count over finalized history only, memoized on a cheap

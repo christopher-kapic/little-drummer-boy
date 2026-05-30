@@ -177,6 +177,10 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "Compress the conversation to save context",
     },
     SlashCommand {
+        name: "context",
+        description: "Show a colored breakdown of how the context window is filled",
+    },
+    SlashCommand {
         name: "copy",
         description: "Copy the last response to the clipboard (arg: markdown/plain/rich)",
     },
@@ -420,6 +424,11 @@ pub struct App {
     /// other panes; reads plans from the daemon via `ListPlans` /
     /// `PlanDetail`.
     pub(super) plans_pane: Option<crate::tui::plans_pane::PlansPane>,
+    /// `/context` overlay — a read-only, dismissable snapshot of the live
+    /// context-window composition (colored per-category bar + legend).
+    /// `None` when closed. Routed input/render alongside the other panes;
+    /// the snapshot is captured once at open (not live-updating).
+    pub(super) context_pane: Option<crate::tui::context_pane::ContextPane>,
     /// "Daemon not running" prompt shown at startup. Once the user picks,
     /// this is taken and the prompt closes.
     pub(super) daemon_prompt: Option<crate::tui::daemon_prompt::DaemonPromptDialog>,
@@ -852,6 +861,7 @@ impl App {
             sessions_pane: None,
             skills_pane: None,
             plans_pane: None,
+            context_pane: None,
             daemon_prompt,
             question_dialog: None,
             daemon_connected,
@@ -2986,6 +2996,12 @@ impl App {
             }
             return;
         }
+        // `/context` overlay: a fixed-size snapshot (no scroll), so just
+        // eat every mouse event while it's open so nothing reaches the
+        // chat underneath.
+        if self.context_pane.is_some() {
+            return;
+        }
         // Embedded pane (GOALS §1i/§1e): divider drag-resize, click-to-
         // focus, and PTY mouse forwarding. Consumes the event when it
         // lands on the divider or inside the pane so the chat handlers
@@ -3534,6 +3550,11 @@ impl App {
             }
             "stats" => {
                 self.stats_pane = Some(crate::tui::stats_pane::StatsPane::open(&self.launch.cwd));
+                return false;
+            }
+            "context" => {
+                let snapshot = self.context_snapshot();
+                self.context_pane = Some(crate::tui::context_pane::ContextPane::open(snapshot));
                 return false;
             }
             "sessions" | "resume" => {

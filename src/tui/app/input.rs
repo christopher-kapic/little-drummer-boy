@@ -325,6 +325,16 @@ impl App {
             return false;
         }
 
+        // `/context` overlay (read-only snapshot). Same modal rule: route
+        // the key to the pane, close on its request (Esc / q), and always
+        // consume so nothing leaks into the composer underneath.
+        if let Some(pane) = self.context_pane.as_mut() {
+            if pane.handle_key(key) {
+                self.context_pane = None;
+            }
+            return false;
+        }
+
         // Ctrl+J toggles every agent reasoning block's expand/collapse
         // state. (See the doc comment on `toggle_recent_reasoning` for
         // why this is a keybind rather than a click handler.) Only
@@ -1318,6 +1328,7 @@ impl App {
             || self.sessions_pane.is_some()
             || self.skills_pane.is_some()
             || self.plans_pane.is_some()
+            || self.context_pane.is_some()
             || self.context_menu.is_some()
         {
             return;

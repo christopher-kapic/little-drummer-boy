@@ -18,3 +18,13 @@ pub const ACCENT_BLUE_INDEX: u8 = 33;
 /// Only the child name carries it; the parent name uses the default
 /// style.
 pub const SUBAGENT_ORANGE_INDEX: u8 = 208;
+
+/// Distinct 256-color palette indices for the `/context` usage overlay's
+/// per-category bar segments + legend swatches. One color per category;
+/// each is visually distinct from its neighbors so the colored bar — not
+/// the glyph — carries the category identity. Free space uses
+/// [`MUTED_COLOR_INDEX`] (dim) so the used portion reads as the figure.
+pub const CONTEXT_SYSTEM_INDEX: u8 = 33; // blue   — base system prompt
+pub const CONTEXT_BLOCK_INDEX: u8 = 213; // magenta — cached system block
+pub const CONTEXT_GUIDANCE_INDEX: u8 = 220; // yellow — guidance/memory files
+pub const CONTEXT_MESSAGES_INDEX: u8 = 41; // green  — conversation messages
