@@ -457,6 +457,22 @@ pub struct App {
     pub(super) question_dialog: Option<crate::tui::dialog::question::QuestionDialog>,
     /// True after we've successfully connected to (or started) the daemon.
     pub(super) daemon_connected: bool,
+    /// Daemonless mode (`DaemonChoice::ContinueWithout`): this TUI owns its
+    /// own per-pid *ephemeral* daemon, fully isolated from the canonical
+    /// persistent daemon and from any other TUI's ephemeral daemon. Set when
+    /// the user picks "Continue without daemon" at the launch prompt; it
+    /// flips the agent-runner lifecycle to `AlwaysEphemeral` so we spawn (and
+    /// own) a fresh daemon rather than auto-promoting the canonical one.
+    pub(super) daemonless: bool,
+    /// RAII guard that reaps the owned ephemeral daemon on every exit path
+    /// (clean quit, error, panic/unwind, SIGINT/SIGTERM) — the same
+    /// ownership contract `cockpit run` uses. `Some` only in daemonless mode
+    /// once the runner has spawned the owned daemon; `None` when attached to
+    /// a daemon we don't own.
+    pub(super) daemon_guard: Option<crate::daemon::ephemeral_guard::EphemeralDaemonGuard>,
+    /// Signal task that fires the guard's shutdown on SIGINT/SIGTERM. Held so
+    /// it can be aborted once the happy-path teardown has run.
+    pub(super) daemon_signal_task: Option<tokio::task::JoinHandle<()>>,
     /// Lines emitted by an in-flight `/fetch-models` task. The event
     /// loop drains this each tick and appends to history.
     pub(super) fetch_models_progress: Arc<Mutex<Vec<String>>>,
@@ -889,6 +905,9 @@ impl App {
             daemon_prompt,
             question_dialog: None,
             daemon_connected,
+            daemonless: false,
+            daemon_guard: None,
+            daemon_signal_task: None,
             fetch_models_progress: Arc::new(Mutex::new(Vec::new())),
             agent_runner: None,
             chat_area: None,
@@ -1059,6 +1078,23 @@ impl App {
         let result = self.event_loop(&mut terminal);
 
         refresh_handle.abort();
+
+        // Daemonless teardown (happy path): reap the owned ephemeral daemon
+        // and stop its signal watcher. The guard routes a synchronous
+        // `StopDaemon` through the daemon's single graceful drain path, so
+        // an in-flight ephemeral daemon drains before exiting. This fires on
+        // a clean quit *and* the error path below (the guard's `Drop` is the
+        // backstop if `run` returns early); SIGINT/SIGTERM are covered by the
+        // signal task. The self-reaping idle watchdog remains the backstop
+        // for an uncatchable death (SIGKILL). Reaping here is independent of
+        // whether a message was sent — a persisted session never keeps an
+        // owned ephemeral daemon alive past its owner's exit.
+        if let Some(task) = self.daemon_signal_task.take() {
+            task.abort();
+        }
+        if let Some(guard) = &self.daemon_guard {
+            guard.shutdown();
+        }
 
         // Build the exit-tail text while we still own the alt screen
         // (history is in memory; rendering is irrelevant — we want
@@ -1951,8 +1987,12 @@ impl App {
             &self.launch.cwd,
             pending.new_session_id,
             self.no_sandbox,
+            self.lifecycle_mode(),
         ) {
             Ok(runner) => {
+                // Daemonless: this re-attach reconnects to our owned
+                // ephemeral daemon; ensure the ownership guard is armed.
+                self.arm_daemon_guard(&runner);
                 // Fresh thread: clear the transcript view + queue + pending.
                 self.history.clear();
                 self.queue.clear();
@@ -2010,8 +2050,15 @@ impl App {
     /// attach (clearing its unread state). Mirrors `commit_compact`'s
     /// transcript reset; new agent output streams in live.
     pub(super) fn resume_session(&mut self, session_id: uuid::Uuid) {
-        match agent_runner::attach_to_session(&self.launch.cwd, session_id, self.no_sandbox) {
+        match agent_runner::attach_to_session(
+            &self.launch.cwd,
+            session_id,
+            self.no_sandbox,
+            self.lifecycle_mode(),
+        ) {
             Ok(runner) => {
+                // Daemonless: keep the ownership guard armed across resume.
+                self.arm_daemon_guard(&runner);
                 let short_id = runner.short_id.clone();
                 self.project_id = Some(runner.project_id.clone());
                 self.launch.session_id = Some(runner.session_id);
@@ -2130,12 +2177,48 @@ impl App {
         self.ensure_agent_runner();
     }
 
+    /// The daemon lifecycle this TUI attaches with. Daemonless mode owns a
+    /// fresh per-pid ephemeral daemon (`AlwaysEphemeral`); otherwise the TUI
+    /// attaches to the canonical daemon, auto-promoting a persistent one if
+    /// none is running.
+    pub(super) fn lifecycle_mode(&self) -> crate::daemon::client::LifecycleMode {
+        if self.daemonless {
+            // First attach spawns our owned per-pid ephemeral daemon; later
+            // re-attaches (`/compact`, `/sessions` resume, `/new`) reconnect
+            // to that same daemon instead of spawning a second one.
+            crate::daemon::client::LifecycleMode::AttachOwnEphemeral
+        } else {
+            crate::daemon::client::LifecycleMode::AttachOrAutoPromote
+        }
+    }
+
+    /// Build the ephemeral-daemon ownership guard (and arm its signal
+    /// handler) for a runner that just spawned an owned daemon. No-op when
+    /// the runner attached to a daemon we don't own or a guard already
+    /// exists. The signal handler hands control back to the TUI's own
+    /// restore path on SIGINT/SIGTERM rather than `exit`ing outright, so the
+    /// alt-screen teardown still runs.
+    fn arm_daemon_guard(&mut self, runner: &AgentRunner) {
+        if !runner.owns_daemon || self.daemon_guard.is_some() {
+            return;
+        }
+        let guard =
+            crate::daemon::ephemeral_guard::EphemeralDaemonGuard::new(runner.socket.clone());
+        self.daemon_signal_task =
+            crate::daemon::ephemeral_guard::spawn_signal_shutdown(Some(&guard), false);
+        self.daemon_guard = Some(guard);
+    }
+
     pub(super) fn ensure_agent_runner(&mut self) {
         if self.agent_runner.is_some() {
             return;
         }
-        let runner = agent_runner::try_spawn(&self.launch.cwd, self.no_sandbox);
+        let runner =
+            agent_runner::try_spawn(&self.launch.cwd, self.no_sandbox, self.lifecycle_mode());
         if let Ok(r) = &runner {
+            // In daemonless mode this runner spawned our own ephemeral
+            // daemon; arm the ownership guard so it's reaped on exit.
+            self.arm_daemon_guard(r);
             // Record the daemon-assigned session id so the startup graphic
             // shows it and `/new` re-renders with the fresh one
             // (session-id-display-and-lazy-persist).

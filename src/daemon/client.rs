@@ -229,6 +229,16 @@ pub enum LifecycleMode {
     /// "Always spawn a fresh ephemeral daemon, even if one is
     /// running." Used by `cockpit run --ephemeral`.
     AlwaysEphemeral,
+    /// "Attach to *my own* per-pid ephemeral daemon if it's already
+    /// running, otherwise spawn it." The daemonless TUI's mode
+    /// (`DaemonChoice::ContinueWithout`): the first attach spawns the
+    /// owned ephemeral daemon; every later re-attach in the same TUI
+    /// (`/compact`, `/sessions` resume, `/new`) reconnects to that *same*
+    /// per-pid daemon instead of spawning a second one. Keyed on the
+    /// caller's pid via [`crate::daemon::DaemonPaths::resolve_ephemeral`],
+    /// so it never touches the canonical socket and stays isolated from
+    /// any other TUI's ephemeral daemon. `owns_daemon = true`.
+    AttachOwnEphemeral,
 }
 
 /// Connect-or-spawn result: a ready-to-use client plus a flag the
@@ -260,6 +270,23 @@ pub async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemon> {
                 });
             }
         }
+        LifecycleMode::AttachOwnEphemeral => {
+            // The daemonless TUI re-attaching to its *own* per-pid ephemeral
+            // daemon: if it's already up (a `/compact` / resume / `/new`
+            // re-attach within the same TUI), reconnect to it rather than
+            // spawning a second one. We still own it (we spawned it the
+            // first time), so `owns_daemon = true`. Keyed on our pid, so it
+            // never touches the canonical socket.
+            let own = DaemonPaths::resolve_ephemeral(std::process::id())?;
+            if matches!(probe(&own).await, DaemonStatus::Running) {
+                let client = DaemonClient::connect(&own.socket).await?;
+                return Ok(ConnectedDaemon {
+                    client,
+                    owns_daemon: true,
+                    socket: own.socket,
+                });
+            }
+        }
         LifecycleMode::AlwaysEphemeral => {
             // Always spawn fresh on a unique per-pid ephemeral path
             // (Layer B). It never touches the canonical socket, so it
@@ -270,14 +297,16 @@ pub async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemon> {
 
     // No reachable daemon to attach to — spawn one.
     //
-    // `AttachOrAutoPromote` (the TUI) promotes a *persistent* daemon at
-    // the canonical path. The two ephemeral modes spawn a per-pid
+    // `AttachOrAutoPromote` (the canonical TUI) promotes a *persistent*
+    // daemon at the canonical path. The ephemeral modes spawn a per-pid
     // ephemeral daemon (Layer B): unique socket/pid the canonical
     // `daemon stop`/`status` never sees, with the self-reaping watchdog
     // armed (Layer C) so an uncatchable foreground death can't orphan it.
     let ephemeral = matches!(
         mode,
-        LifecycleMode::AttachOrEphemeral | LifecycleMode::AlwaysEphemeral
+        LifecycleMode::AttachOrEphemeral
+            | LifecycleMode::AlwaysEphemeral
+            | LifecycleMode::AttachOwnEphemeral
     );
 
     let (paths, pid) = if ephemeral {
@@ -329,5 +358,102 @@ async fn wait_for_daemon(socket: &Path) -> Result<DaemonClient> {
         }
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(Duration::from_millis(250));
+    }
+}
+
+#[cfg(test)]
+#[cfg(unix)]
+mod tests {
+    use super::*;
+    use crate::daemon::{DaemonPaths, run_foreground_inner};
+
+    /// Daemonless = own ephemeral daemon (`daemonless-tui-ephemeral-lifecycle.md`
+    /// §1). `LifecycleMode::AttachOwnEphemeral` attaches to *this process's*
+    /// per-pid ephemeral daemon when it's already up and reports
+    /// `owns_daemon = true` at that exact per-pid socket — i.e. a re-attach in
+    /// the same daemonless TUI (`/compact`, `/sessions` resume, `/new`)
+    /// reconnects to the owned daemon instead of spawning a second one. The
+    /// daemon is run in-process at the real per-pid path with isolated XDG
+    /// dirs, so the spawn branch (which would launch a child) is never taken.
+    #[tokio::test]
+    async fn attach_own_ephemeral_attaches_and_reports_ownership() {
+        // Isolate every path the lifecycle touches: runtime (socket), state
+        // (pid), and data (the daemon's DB). Save/restore to avoid disturbing
+        // sibling tests that read the same env.
+        let rt = tempfile::tempdir().expect("rt tempdir");
+        let state = tempfile::tempdir().expect("state tempdir");
+        let data = tempfile::tempdir().expect("data tempdir");
+        let prev_rt = std::env::var_os("XDG_RUNTIME_DIR");
+        let prev_state = std::env::var_os("XDG_STATE_HOME");
+        let prev_data = std::env::var_os("XDG_DATA_HOME");
+        // SAFETY: single-threaded test setup; restored at the end.
+        unsafe {
+            std::env::set_var("XDG_RUNTIME_DIR", rt.path());
+            std::env::set_var("XDG_STATE_HOME", state.path());
+            std::env::set_var("XDG_DATA_HOME", data.path());
+        }
+
+        // Stand up *our own* per-pid ephemeral daemon in-process — exactly the
+        // path `AttachOwnEphemeral` will probe (keyed on our pid).
+        let own = DaemonPaths::resolve_ephemeral(std::process::id()).expect("resolve own eph");
+        let own_clone = own.clone();
+        let grace = Duration::from_secs(3600); // never idle-reap during the test
+        let daemon = tokio::spawn(async move {
+            let _ = run_foreground_inner(own_clone, grace, grace).await;
+        });
+
+        // Wait for it to come up.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !own.socket.exists() {
+            assert!(std::time::Instant::now() < deadline, "daemon never bound");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // The daemonless re-attach path: attach to our own daemon, owns it.
+        let connected = probe_or_spawn(LifecycleMode::AttachOwnEphemeral)
+            .await
+            .expect("attach to own ephemeral");
+        assert!(
+            connected.owns_daemon,
+            "a daemonless TUI owns its per-pid ephemeral daemon"
+        );
+        assert_eq!(
+            connected.socket, own.socket,
+            "must reconnect to the same owned per-pid socket, not spawn a new one"
+        );
+        // Confirm it's live (handshake) and never the canonical socket.
+        let canonical = DaemonPaths::resolve_canonical().expect("canonical");
+        assert_ne!(
+            connected.socket, canonical.socket,
+            "daemonless never binds the canonical socket"
+        );
+        connected
+            .client
+            .request_ok(Request::DaemonStatus)
+            .await
+            .expect("owned daemon answers");
+
+        // Tear the in-process daemon down so the test leaves nothing behind.
+        drop(connected);
+        crate::daemon::ephemeral_guard::stop_daemon_blocking(&own.socket);
+        let _ = tokio::time::timeout(Duration::from_secs(3), daemon).await;
+        let _ = std::fs::remove_file(&own.socket);
+        let _ = std::fs::remove_file(&own.pid_file);
+
+        // SAFETY: restore env.
+        unsafe {
+            match prev_rt {
+                Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
+                None => std::env::remove_var("XDG_RUNTIME_DIR"),
+            }
+            match prev_state {
+                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
+                None => std::env::remove_var("XDG_STATE_HOME"),
+            }
+            match prev_data {
+                Some(v) => std::env::set_var("XDG_DATA_HOME", v),
+                None => std::env::remove_var("XDG_DATA_HOME"),
+            }
+        }
     }
 }

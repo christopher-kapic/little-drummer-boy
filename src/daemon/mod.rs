@@ -24,6 +24,7 @@
 
 pub mod caffeinate;
 pub mod client;
+pub mod ephemeral_guard;
 pub mod proto;
 pub mod registry;
 pub mod server;
@@ -747,6 +748,120 @@ mod tests {
                 None => std::env::remove_var("XDG_DATA_HOME"),
             }
         }
+    }
+
+    /// Lingering-daemon fix (`daemonless-tui-ephemeral-lifecycle.md` §2): a
+    /// **persisted** session must not, by itself, keep an *owned* ephemeral
+    /// daemon alive past its owner's exit. We stand up a real ephemeral
+    /// daemon, write a persisted `sessions` row into the very DB the daemon
+    /// opened (the exact effect the first user message has via
+    /// `persist_if_needed`), then trigger the owner-exit teardown
+    /// (`StopDaemon`, the same request the `EphemeralDaemonGuard` sends). The
+    /// daemon must drain and reap — removing its socket + pid — within the
+    /// grace, identically to the no-message case. A long idle grace is used
+    /// so the *only* thing that can reap it is the `StopDaemon`, not the idle
+    /// watchdog backstop.
+    #[tokio::test]
+    async fn owned_ephemeral_reaps_on_stop_even_with_persisted_session() {
+        use crate::daemon::ephemeral_guard::stop_daemon_blocking;
+        use crate::db::Db;
+        use crate::session::Session;
+
+        // Throwaway data dir so `Db::open_default` (used by both the daemon
+        // and this test) never touches real user state.
+        let data = tempfile::tempdir().expect("data tempdir");
+        let prev_data = std::env::var_os("XDG_DATA_HOME");
+        // SAFETY: single-threaded test setup; restored at the end.
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", data.path());
+        }
+
+        let sock_dir = tempfile::tempdir().expect("sock tempdir");
+        // Idle grace far longer than the test window: the watchdog can NOT be
+        // what reaps the daemon — only the `StopDaemon` teardown can.
+        let idle_grace = Duration::from_secs(3600);
+        let drain_grace = Duration::from_millis(300);
+
+        let eph = DaemonPaths {
+            socket: sock_dir.path().join("eph.sock"),
+            pid_file: sock_dir.path().join("eph.pid"),
+            ephemeral: true,
+        };
+        let eph_clone = eph.clone();
+        let eph_task =
+            tokio::spawn(
+                async move { run_foreground_inner(eph_clone, idle_grace, drain_grace).await },
+            );
+
+        wait_until(|| eph.socket.exists(), Duration::from_secs(2)).await;
+        assert!(eph.pid_file.exists(), "ephemeral pid file written");
+
+        // Persist a `sessions` row into the daemon's DB — the same DB effect
+        // the first user message has. This is what the (suspected) lingering
+        // bug pinned on; it must NOT keep the owned daemon alive.
+        {
+            let db = Db::open_default().expect("open daemon DB");
+            let session =
+                Session::create(db, std::env::temp_dir(), "Build").expect("persist a session row");
+            assert!(session.is_persisted(), "row is persisted");
+        }
+
+        // Owner exit: the same `StopDaemon` the guard fires synchronously.
+        // Run it off the runtime thread (mirrors the real blocking `Drop`).
+        let socket = eph.socket.clone();
+        tokio::task::spawn_blocking(move || stop_daemon_blocking(&socket))
+            .await
+            .unwrap();
+
+        // The daemon must drain and exit — despite the persisted session.
+        let reaped = tokio::time::timeout(Duration::from_secs(3), eph_task)
+            .await
+            .expect("owned ephemeral daemon did not reap on StopDaemon with a persisted session");
+        reaped.expect("join").expect("run_foreground_inner ok");
+        assert!(
+            !eph.socket.exists(),
+            "ephemeral socket removed on owner-exit teardown"
+        );
+        assert!(
+            !eph.pid_file.exists(),
+            "ephemeral pid removed on owner-exit teardown"
+        );
+
+        // SAFETY: restore env.
+        unsafe {
+            match prev_data {
+                Some(v) => std::env::set_var("XDG_DATA_HOME", v),
+                None => std::env::remove_var("XDG_DATA_HOME"),
+            }
+        }
+    }
+
+    /// Two daemonless TUIs are fully isolated: each owns a per-pid ephemeral
+    /// daemon (`DaemonPaths::resolve_ephemeral(pid)`), so two distinct TUIs
+    /// (distinct pids) resolve to distinct sockets/pid files and never the
+    /// canonical ones. Stale files from a prior crashed run of one TUI can't
+    /// belong to — or block — the other. This is the path-level isolation
+    /// guarantee `LifecycleMode::AttachOwnEphemeral` relies on.
+    #[test]
+    fn two_daemonless_tuis_resolve_distinct_owned_ephemeral_paths() {
+        // Two different TUI pids (a daemonless TUI keys on its own pid).
+        let tui_a = DaemonPaths::resolve_ephemeral(4242).expect("resolve eph a");
+        let tui_b = DaemonPaths::resolve_ephemeral(9001).expect("resolve eph b");
+        let canonical = DaemonPaths::resolve_canonical().expect("resolve canonical");
+
+        // Distinct sockets + pid files → two independent ephemeral daemons.
+        assert_ne!(tui_a.socket, tui_b.socket);
+        assert_ne!(tui_a.pid_file, tui_b.pid_file);
+
+        // Neither daemonless TUI binds the canonical (shared persistent)
+        // socket — they coexist with it and with `daemon stop`/`status`.
+        assert_ne!(tui_a.socket, canonical.socket);
+        assert_ne!(tui_b.socket, canonical.socket);
+
+        // Both are flagged ephemeral so the self-reaping idle watchdog
+        // (Layer C) is armed as the SIGKILL backstop.
+        assert!(tui_a.ephemeral && tui_b.ephemeral);
+        assert!(!canonical.ephemeral);
     }
 
     async fn wait_until(mut cond: impl FnMut() -> bool, timeout: Duration) {

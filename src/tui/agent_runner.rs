@@ -11,7 +11,7 @@
 //! talk to a daemon.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc;
@@ -57,6 +57,15 @@ pub struct AgentRunner {
     /// Frequency counts fetched at attach; the TUI seeds its in-memory
     /// maps from these once.
     pub usage: UsageCounts,
+    /// `true` when this TUI *spawned* the daemon it's attached to (the
+    /// daemonless `AlwaysEphemeral` path) and therefore owns its teardown
+    /// — the app builds an [`crate::daemon::ephemeral_guard::EphemeralDaemonGuard`]
+    /// from this. `false` when it attached to a pre-existing (canonical or
+    /// auto-promoted persistent) daemon, which it must never stop.
+    pub owns_daemon: bool,
+    /// The socket of the daemon this runner is attached to. Carried so an
+    /// owned ephemeral daemon can be reaped on exit via the guard.
+    pub socket: PathBuf,
 }
 
 /// Probe for the daemon (auto-promoting one if needed), attach a
@@ -65,8 +74,8 @@ pub struct AgentRunner {
 /// Returns `Err(String)` instead of `anyhow::Error` so `app.rs` can
 /// render the message in its fallback "input captured" stub without
 /// having to format an anyhow chain.
-pub fn try_spawn(cwd: &Path, no_sandbox: bool) -> Result<AgentRunner, String> {
-    try_spawn_inner(cwd, None, no_sandbox)
+pub fn try_spawn(cwd: &Path, no_sandbox: bool, mode: LifecycleMode) -> Result<AgentRunner, String> {
+    try_spawn_inner(cwd, None, no_sandbox, mode)
 }
 
 /// Re-attach to an existing session by id (the `/compact` commit path,
@@ -79,14 +88,16 @@ pub fn attach_to_session(
     cwd: &Path,
     session_id: uuid::Uuid,
     no_sandbox: bool,
+    mode: LifecycleMode,
 ) -> Result<AgentRunner, String> {
-    try_spawn_inner(cwd, Some(session_id), no_sandbox)
+    try_spawn_inner(cwd, Some(session_id), no_sandbox, mode)
 }
 
 fn try_spawn_inner(
     cwd: &Path,
     session_id: Option<uuid::Uuid>,
     no_sandbox: bool,
+    mode: LifecycleMode,
 ) -> Result<AgentRunner, String> {
     let runtime = tokio::runtime::Handle::try_current()
         .map_err(|_| "no tokio runtime — cockpit must be invoked from main".to_string())?;
@@ -97,9 +108,11 @@ fn try_spawn_inner(
     // use `block_in_place` to run a `block_on` without panicking.
     let attached = tokio::task::block_in_place(|| {
         runtime.block_on(async {
-            let daemon = probe_or_spawn(LifecycleMode::AttachOrAutoPromote)
+            let daemon = probe_or_spawn(mode)
                 .await
                 .map_err(|e| format!("daemon probe: {e}"))?;
+            let owns_daemon = daemon.owns_daemon;
+            let socket = daemon.socket.clone();
             // Push our env into the daemon before attaching so any vars
             // the user added to their shell rc since the daemon was
             // spawned (API keys, COPILOT_API_URL, etc.) become visible
@@ -163,10 +176,21 @@ fn try_spawn_inner(
                 active_agent_name,
                 project_id,
                 usage,
+                owns_daemon,
+                socket,
             ))
         })
     })?;
-    let (client, session_id, short_id, initial_active_agent, project_id, usage) = attached;
+    let (
+        client,
+        session_id,
+        short_id,
+        initial_active_agent,
+        project_id,
+        usage,
+        owns_daemon,
+        socket,
+    ) = attached;
 
     let (input_tx, mut input_rx) = mpsc::channel::<crate::engine::message::UserSubmission>(32);
     let (record_tx, mut record_rx) = mpsc::channel::<Request>(32);
@@ -242,6 +266,8 @@ fn try_spawn_inner(
         short_id,
         project_id,
         usage,
+        owns_daemon,
+        socket,
     })
 }
 

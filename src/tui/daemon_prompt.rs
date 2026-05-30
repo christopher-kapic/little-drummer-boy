@@ -3,10 +3,13 @@
 //! [`crate::daemon::probe`] returns anything other than `Running`.
 //!
 //! Choices:
-//!   - Start the daemon (spawns a detached child).
-//!   - Continue without it (TUI proceeds in standalone mode; some
-//!     features will be reduced when the daemon-backed session store
-//!     lands).
+//!   - Start a shared daemon (spawns a detached persistent child at the
+//!     canonical socket; survives this window and is managed with
+//!     `cockpit daemon {stop,status}`).
+//!   - Run a private daemon for this window only (daemonless mode): the
+//!     TUI owns a per-pid *ephemeral* daemon, isolated from the canonical
+//!     daemon and from any other TUI, that is torn down when this window
+//!     exits ([`DaemonChoice::ContinueWithout`]).
 //!   - Exit.
 //!
 //! The chosen action is returned to the caller via [`DaemonChoice`].
@@ -115,18 +118,22 @@ impl DaemonPromptDialog {
         )));
         lines.push(Line::default());
         lines.push(Line::from(Span::styled(
-            "The daemon is required for v2 features (multi-session ownership,".to_string(),
+            "Start a shared background daemon (persists across windows; stop".to_string(),
             muted,
         )));
         lines.push(Line::from(Span::styled(
-            "remote relay). v1 cockpit still runs standalone if you skip it.".to_string(),
+            "later with `cockpit daemon stop`), or run a private daemon just".to_string(),
+            muted,
+        )));
+        lines.push(Line::from(Span::styled(
+            "for this window that shuts down automatically when you exit.".to_string(),
             muted,
         )));
         lines.push(Line::default());
 
         let options = [
-            "Start the daemon and connect (Recommended)",
-            "Continue without daemon",
+            "Start a shared daemon and connect (Recommended)",
+            "Run a private daemon for this window only",
             "Exit",
         ];
         for (i, label) in options.iter().enumerate() {

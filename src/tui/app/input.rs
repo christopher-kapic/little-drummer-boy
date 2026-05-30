@@ -205,9 +205,17 @@ impl App {
                     }
                 }
                 Some(crate::tui::daemon_prompt::DaemonChoice::ContinueWithout) => {
+                    // Daemonless mode: this TUI owns its own per-pid
+                    // ephemeral daemon (isolated from the canonical daemon
+                    // and from any other TUI's), spawned on the first attach
+                    // and reaped when this TUI exits. Flip the lifecycle flag
+                    // and mark "connected" so `ensure_session_for_display`
+                    // proceeds to spawn it.
+                    self.daemonless = true;
+                    self.daemon_connected = true;
                     self.history.push(HistoryEntry::Plain {
                         line:
-                            "daemon: continuing without — features that need the daemon will be limited"
+                            "daemon: running a private daemon for this window only — it shuts down when you exit"
                                 .to_string(),
                     });
                     self.daemon_prompt = None;
