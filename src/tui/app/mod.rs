@@ -228,12 +228,12 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "Collapse superseded snapshot reads to reclaim context",
     },
     SlashCommand {
-        name: "resume",
-        description: "Browse and resume previous sessions (alias of /sessions)",
+        name: "rename",
+        description: "Rename the current session (arg: title)",
     },
     SlashCommand {
-        name: "session",
-        description: "Session subcommands (e.g. /session rename <title>)",
+        name: "resume",
+        description: "Browse and resume previous sessions (alias of /sessions)",
     },
     SlashCommand {
         name: "sandbox",
@@ -3257,9 +3257,9 @@ impl App {
                 "/fork: stub — the ForkSession RPC is live in the daemon; the TUI \
                  re-attach flow on top of it ships in a later cut."
             }
-            "session" => {
-                "/session: subcommand router not wired yet. `/session rename <title>` \
-                 will call the RenameSession RPC once the AgentRunner exposes it."
+            "rename" => {
+                self.handle_rename_command(&slash_args(&raw));
+                return false;
             }
             _ => return false,
         };
@@ -3267,6 +3267,50 @@ impl App {
             line: msg.to_string(),
         });
         false
+    }
+
+    /// `/rename <title>` — rename the current session. The title is the
+    /// trimmed remainder of the command line (spaces allowed); an empty
+    /// title shows usage only and changes nothing. The `RenameSession`
+    /// RPC sets `user_renamed = 1` in the DB, so auto-titling stops
+    /// overriding the name. The sessions browser reads titles fresh from
+    /// the daemon on open, so the new name shows without a restart.
+    pub(super) fn handle_rename_command(&mut self, arg: &str) {
+        let title = arg.trim();
+        if title.is_empty() {
+            self.history.push(HistoryEntry::Plain {
+                line: "Usage: `/rename <title>`".to_string(),
+            });
+            return;
+        }
+        // Authoritative current session: the live runner if attached,
+        // else the last-attached id tracked on launch info.
+        let session_id = match self.agent_runner.as_ref() {
+            Some(Ok(runner)) => Some(runner.session_id),
+            _ => self.launch.session_id,
+        };
+        let Some(session_id) = session_id else {
+            self.history.push(HistoryEntry::Plain {
+                line: "/rename: no active session yet — send a message first".to_string(),
+            });
+            return;
+        };
+        let req = crate::daemon::proto::Request::RenameSession {
+            session_id,
+            title: title.to_string(),
+        };
+        match agent_runner::daemon_request_blocking(req) {
+            Ok(_) => {
+                self.history.push(HistoryEntry::Plain {
+                    line: format!("Renamed session to `{title}`"),
+                });
+            }
+            Err(e) => {
+                self.history.push(HistoryEntry::Plain {
+                    line: format!("/rename: {e}"),
+                });
+            }
+        }
     }
 
     /// Re-read launch info (provider/model/favorite) from disk and
@@ -3976,6 +4020,25 @@ mod slash_rank_tests {
         assert!(
             SLASH_COMMANDS.iter().any(|c| c.name == "sandbox"),
             "/sandbox must be a registered slash command"
+        );
+    }
+
+    #[test]
+    fn rename_command_is_registered() {
+        // `/rename` (rename-current-session) must be dispatchable.
+        assert!(
+            SLASH_COMMANDS.iter().any(|c| c.name == "rename"),
+            "/rename must be a registered slash command"
+        );
+    }
+
+    #[test]
+    fn session_command_is_not_registered() {
+        // The dead `/session` subcommand stub was removed in favor of
+        // `/rename`; it must no longer appear in the menu or dispatch.
+        assert!(
+            !SLASH_COMMANDS.iter().any(|c| c.name == "session"),
+            "/session must not be a registered slash command"
         );
     }
 
