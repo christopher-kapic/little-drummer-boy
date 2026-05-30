@@ -161,6 +161,14 @@ pub enum Request {
         /// resume of an existing session. Defaults to `None`.
         #[serde(default)]
         model_override: Option<String>,
+        /// Plan/step this session runs on behalf of (`plan-run-metrics`): a
+        /// `(plan_id, step_id)` pair set by `cockpit run --plan-id/--step-id`
+        /// when the plan executor spawns a coder for a step. Stamped onto every
+        /// `inference_calls` row this session writes so per-model token totals
+        /// roll up per plan/step. `None` for ordinary sessions. Ignored on
+        /// resume of an existing session. Defaults to `None`.
+        #[serde(default)]
+        plan_context: Option<(Uuid, Uuid)>,
     },
 
     /// Send a user message into the currently attached session. The
@@ -472,6 +480,9 @@ pub enum Response {
     PlanDetail {
         plan: PlanSummaryWire,
         steps: Vec<PlanStepWire>,
+        /// Run metrics for this plan (`plan-run-metrics`): per-model token
+        /// usage + per-step timing + plan totals.
+        metrics: PlanMetricsWire,
     },
 
     Agents {
@@ -990,6 +1001,43 @@ pub struct PlanTestWire {
     pub phase: String,
     /// `"parallel"`, or `"exclusive: <resource-key>"`.
     pub concurrency: String,
+}
+
+/// One per-model token row for a plan's run metrics (`plan-run-metrics`),
+/// shown in the `/plans` detail view.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanModelUsageWire {
+    pub model: String,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cached_input_tokens: i64,
+    pub calls: i64,
+    /// Dollar cost when `prices.json` priced the model, else `None`.
+    pub cost_usd: Option<f64>,
+}
+
+/// One step's wall-clock timing for a plan's run metrics (`plan-run-metrics`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanStepTimingWire {
+    pub title: String,
+    pub impl_ms: Option<i64>,
+    pub test_ms: Option<i64>,
+    pub total_ms: Option<i64>,
+    /// Whether the step reached `Merged` (so `total_ms` is meaningful).
+    pub merged: bool,
+}
+
+/// A plan's run metrics for the `/plans` browser: per-model token usage,
+/// per-step timing, and the plan token totals (`plan-run-metrics`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanMetricsWire {
+    pub by_model: Vec<PlanModelUsageWire>,
+    pub steps: Vec<PlanStepTimingWire>,
+    pub total_input: i64,
+    pub total_output: i64,
+    pub total_cached: i64,
+    pub total_calls: i64,
+    pub total_cost_usd: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

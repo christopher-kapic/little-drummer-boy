@@ -34,7 +34,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
-use crate::daemon::proto::{PlanStepWire, PlanSummaryWire};
+use crate::daemon::proto::{PlanMetricsWire, PlanStepWire, PlanSummaryWire};
 use crate::tui::agent_runner;
 use crate::tui::theme::{ACCENT_BLUE_INDEX, MUTED_COLOR_INDEX};
 
@@ -58,6 +58,10 @@ enum View {
     Detail {
         plan: PlanSummaryWire,
         steps: Vec<PlanStepWire>,
+        /// Per-model token usage + per-step timing for this plan
+        /// (`plan-run-metrics`). Boxed so the `Detail` variant doesn't dwarf
+        /// `List` in size.
+        metrics: Box<PlanMetricsWire>,
         scroll: usize,
     },
 }
@@ -197,11 +201,12 @@ impl PlansPane {
             return;
         };
         match agent_runner::plan_detail_blocking(plan.plan_id) {
-            Ok((plan, steps)) => {
+            Ok((plan, steps, metrics)) => {
                 self.error = None;
                 self.view = View::Detail {
                     plan,
                     steps,
+                    metrics: Box::new(metrics),
                     scroll: 0,
                 };
             }
@@ -311,8 +316,13 @@ impl PlansPane {
                     lines.push(Line::default());
                 }
             }
-            View::Detail { plan, steps, .. } => {
-                lines.extend(detail_lines(plan, steps));
+            View::Detail {
+                plan,
+                steps,
+                metrics,
+                ..
+            } => {
+                lines.extend(detail_lines(plan, steps, metrics));
             }
         }
         lines
@@ -458,7 +468,11 @@ fn boxed_row(content: Vec<Span<'static>>, inner_w: usize, border: Style) -> Line
 /// Assemble the plan-detail body: a header (description + branches), then
 /// each step in DAG order with its status, dependency prerequisites, and
 /// tests (phase + concurrency badges).
-fn detail_lines(plan: &PlanSummaryWire, steps: &[PlanStepWire]) -> Vec<Line<'static>> {
+fn detail_lines(
+    plan: &PlanSummaryWire,
+    steps: &[PlanStepWire],
+    metrics: &PlanMetricsWire,
+) -> Vec<Line<'static>> {
     let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
     let mut out: Vec<Line<'static>> = Vec::new();
 
@@ -497,6 +511,7 @@ fn detail_lines(plan: &PlanSummaryWire, steps: &[PlanStepWire]) -> Vec<Line<'sta
             "  This plan has no steps yet.".to_string(),
             muted,
         )));
+        out.extend(metrics_lines(metrics));
         return out;
     }
 
@@ -553,7 +568,120 @@ fn detail_lines(plan: &PlanSummaryWire, steps: &[PlanStepWire]) -> Vec<Line<'sta
 
         out.push(Line::default());
     }
+    out.extend(metrics_lines(metrics));
     out
+}
+
+/// Render a plan's run metrics (`plan-run-metrics`): per-model token usage,
+/// per-step timing (impl/test/total), and plan totals — matching the detail
+/// view's muted chrome.
+fn metrics_lines(metrics: &PlanMetricsWire) -> Vec<Line<'static>> {
+    let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+    let accent = Style::default().fg(Color::Indexed(ACCENT_BLUE_INDEX));
+    let mut out: Vec<Line<'static>> = Vec::new();
+
+    out.push(Line::from(Span::styled(
+        "Run metrics".to_string(),
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD),
+    )));
+
+    // Per-model token usage — one row per model (multi-model never collapses).
+    if metrics.by_model.is_empty() {
+        out.push(Line::from(Span::styled(
+            "  no inference calls attributed to this plan".to_string(),
+            muted,
+        )));
+    } else {
+        for m in &metrics.by_model {
+            out.push(Line::from(vec![
+                Span::styled(format!("  {}", m.model), accent),
+                Span::raw("  "),
+                Span::styled(
+                    format!(
+                        "in {} / out {} / cached {} · {} call{}{}",
+                        fmt_count(m.input_tokens),
+                        fmt_count(m.output_tokens),
+                        fmt_count(m.cached_input_tokens),
+                        m.calls,
+                        if m.calls == 1 { "" } else { "s" },
+                        m.cost_usd
+                            .map(|c| format!(" · ${c:.2}"))
+                            .unwrap_or_default(),
+                    ),
+                    muted,
+                ),
+            ]));
+        }
+        out.push(Line::from(Span::styled(
+            format!(
+                "  total in {} / out {} / cached {} · {} call{}{}",
+                fmt_count(metrics.total_input),
+                fmt_count(metrics.total_output),
+                fmt_count(metrics.total_cached),
+                metrics.total_calls,
+                if metrics.total_calls == 1 { "" } else { "s" },
+                metrics
+                    .total_cost_usd
+                    .map(|c| format!(" · ${c:.2}"))
+                    .unwrap_or_default(),
+            ),
+            muted,
+        )));
+    }
+
+    // Per-step timing.
+    if !metrics.steps.is_empty() {
+        out.push(Line::default());
+        for s in &metrics.steps {
+            // Unmerged steps surface distinctly (settled edge case).
+            let tag = if s.merged { "" } else { " (unmerged)" };
+            out.push(Line::from(vec![
+                Span::styled(format!("  {}{tag}", s.title), muted),
+                Span::raw("  "),
+                Span::styled(
+                    format!(
+                        "impl {} / test {} / total {}",
+                        fmt_ms(s.impl_ms),
+                        fmt_ms(s.test_ms),
+                        fmt_ms(s.total_ms),
+                    ),
+                    Style::default().fg(Color::White),
+                ),
+            ]));
+        }
+    }
+
+    out
+}
+
+/// Token count: `1.2K`, `3.4M`, or the raw number below 1000.
+fn fmt_count(n: i64) -> String {
+    let n_abs = n.unsigned_abs();
+    if n_abs >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n_abs >= 1_000 {
+        format!("{:.1}K", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
+}
+
+/// Milliseconds as a compact human duration, `—` when unmeasured.
+fn fmt_ms(ms: Option<i64>) -> String {
+    match ms {
+        None => "—".to_string(),
+        Some(ms) if ms < 1000 => format!("{ms}ms"),
+        Some(ms) => {
+            let secs = ms as f64 / 1000.0;
+            if secs < 60.0 {
+                format!("{secs:.1}s")
+            } else {
+                format!("{:.1}m", secs / 60.0)
+            }
+        }
+    }
 }
 
 /// Exclusive tests get a warning tint (they serialize on a shared
@@ -569,7 +697,7 @@ fn concurrency_color(concurrency: &str) -> Color {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::daemon::proto::PlanTestWire;
+    use crate::daemon::proto::{PlanModelUsageWire, PlanStepTimingWire, PlanTestWire};
     use crossterm::event::{KeyEventKind, KeyEventState, KeyModifiers};
     use uuid::Uuid;
 
@@ -700,8 +828,28 @@ mod tests {
         }
     }
 
+    fn empty_metrics() -> PlanMetricsWire {
+        PlanMetricsWire {
+            by_model: Vec::new(),
+            steps: Vec::new(),
+            total_input: 0,
+            total_output: 0,
+            total_cached: 0,
+            total_calls: 0,
+            total_cost_usd: None,
+        }
+    }
+
     fn detail_text(plan: &PlanSummaryWire, steps: &[PlanStepWire]) -> String {
-        detail_lines(plan, steps)
+        detail_text_with(plan, steps, &empty_metrics())
+    }
+
+    fn detail_text_with(
+        plan: &PlanSummaryWire,
+        steps: &[PlanStepWire],
+        metrics: &PlanMetricsWire,
+    ) -> String {
+        detail_lines(plan, steps, metrics)
             .iter()
             .map(|l| {
                 l.spans
@@ -761,6 +909,70 @@ mod tests {
             text.contains("[exclusive: port:8080]"),
             "exclusive concurrency badge with the resource key"
         );
+    }
+
+    #[test]
+    fn detail_shows_per_model_usage_and_per_step_timing() {
+        let p = plan("m", "M", "in_progress", 2);
+        let steps = vec![
+            step("schema", "done", &[], vec![]),
+            step("tools", "in_progress", &["schema"], vec![]),
+        ];
+        let metrics = PlanMetricsWire {
+            by_model: vec![
+                PlanModelUsageWire {
+                    model: "anthropic/opus".into(),
+                    input_tokens: 12_000,
+                    output_tokens: 3_400,
+                    cached_input_tokens: 50_000,
+                    calls: 5,
+                    cost_usd: Some(0.42),
+                },
+                PlanModelUsageWire {
+                    model: "openai/gpt-5".into(),
+                    input_tokens: 800,
+                    output_tokens: 200,
+                    cached_input_tokens: 0,
+                    calls: 1,
+                    cost_usd: None,
+                },
+            ],
+            steps: vec![
+                PlanStepTimingWire {
+                    title: "schema".into(),
+                    impl_ms: Some(4200),
+                    test_ms: Some(1500),
+                    total_ms: Some(6000),
+                    merged: true,
+                },
+                PlanStepTimingWire {
+                    title: "tools".into(),
+                    impl_ms: Some(900),
+                    test_ms: None,
+                    total_ms: None,
+                    merged: false,
+                },
+            ],
+            total_input: 12_800,
+            total_output: 3_600,
+            total_cached: 50_000,
+            total_calls: 6,
+            total_cost_usd: Some(0.42),
+        };
+        let text = detail_text_with(&p, &steps, &metrics);
+        assert!(text.contains("Run metrics"));
+        // Per-model — each model its own row (never collapsed).
+        assert!(text.contains("anthropic/opus"));
+        assert!(text.contains("openai/gpt-5"));
+        assert!(text.contains("$0.42"), "priced model shows cost");
+        // Plan totals.
+        assert!(text.contains("total in 12.8K"));
+        // Per-step timing impl/test/total.
+        assert!(text.contains("impl 4.2s"));
+        assert!(text.contains("total 6.0s"));
+        // Unmerged step surfaces distinctly with em-dash timings.
+        assert!(text.contains("tools (unmerged)"));
+        assert!(text.contains("total —"));
     }
 
     #[test]

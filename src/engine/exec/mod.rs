@@ -102,6 +102,75 @@ pub struct PlanRunReport {
     pub completed: bool,
 }
 
+/// Wall-clock timing accumulator for one step run (`plan-run-metrics`).
+/// Derived from the scheduler's existing phase transitions — not a parallel
+/// bookkeeping system. `impl_ms` spans the `Running` phase; `test_ms`
+/// accumulates the `Testing` phase plus the `Merging` re-test; `total_ms` is
+/// the whole Pending→Merged wall clock, left `None` for a step that never
+/// merges (the consistently-applied never-merged rule).
+struct StepTiming {
+    started: std::time::Instant,
+    /// Marks the boundary that closes the current span (impl end / test start,
+    /// or merge start). Advanced as phases complete so `add_test_span` measures
+    /// only the elapsed slice.
+    span_start: std::time::Instant,
+    impl_ms: Option<i64>,
+    test_ms: i64,
+    total_ms: Option<i64>,
+}
+
+impl StepTiming {
+    /// Begin timing as the step leaves `Pending` (enters `Running`).
+    fn start() -> Self {
+        let now = std::time::Instant::now();
+        Self {
+            started: now,
+            span_start: now,
+            impl_ms: None,
+            test_ms: 0,
+            total_ms: None,
+        }
+    }
+
+    /// Close the implementing span: record `impl_ms`, reopen the span at the
+    /// Testing boundary.
+    fn finish_impl(&mut self) {
+        let now = std::time::Instant::now();
+        self.impl_ms = Some(elapsed_ms(self.span_start, now));
+        self.span_start = now;
+    }
+
+    /// Reopen the span at the Merging boundary so the rebase re-test counts as
+    /// test time (the span between Testing-end and here — worktree bookkeeping
+    /// — is intentionally not attributed to either phase).
+    fn mark_merge_start(&mut self) {
+        self.span_start = std::time::Instant::now();
+    }
+
+    /// Add the elapsed span since the last boundary to `test_ms` (the post-step
+    /// suite, then the merge re-test), reopening the span.
+    fn add_test_span(&mut self) {
+        let now = std::time::Instant::now();
+        self.test_ms += elapsed_ms(self.span_start, now);
+        self.span_start = now;
+    }
+
+    /// Record `total_ms` once the step reaches `Merged`.
+    fn finish_total(&mut self) {
+        self.total_ms = Some(elapsed_ms(self.started, std::time::Instant::now()));
+    }
+
+    /// `test_ms` as an `Option`, `None` when no test phase ran at all.
+    fn test_ms_opt(&self) -> Option<i64> {
+        (self.test_ms > 0).then_some(self.test_ms)
+    }
+}
+
+/// Milliseconds between two instants, saturating into `i64`.
+fn elapsed_ms(from: std::time::Instant, to: std::time::Instant) -> i64 {
+    to.saturating_duration_since(from).as_millis() as i64
+}
+
 /// A step's *intent* for the merge-resolver brief: its title plus the
 /// TaskPacket `objective` field when present (the resolver reasons over what
 /// each side was trying to do, not just the diff).
@@ -318,6 +387,12 @@ impl Executor {
         runner: &R,
         hooks: &H,
     ) -> Result<PlanRunReport> {
+        // Per-plan-not-per-run (`plan-run-metrics`): wipe the prior run's step
+        // timings and drop its inference-call attribution before this run
+        // stamps fresh metrics, so re-running never double-counts.
+        self.db
+            .reset_plan_metrics(plan_id)
+            .context("resetting plan metrics at run start")?;
         match self.isolation_of(plan_id)? {
             IsolationMode::Worktree => self.run_plan(plan_id, repo, runner, hooks).await,
             IsolationMode::SharedTree => {
@@ -363,6 +438,7 @@ impl Executor {
                 break;
             }
             for step_id in eligible {
+                let mut timing = StepTiming::start();
                 sched.set_state(step_id, StepState::Running);
                 self.persist_step_state(step_id, StepState::Running)?;
                 let outcome = runner
@@ -375,8 +451,10 @@ impl Executor {
                         repo,
                     )
                     .await?;
+                timing.finish_impl();
                 if outcome == StepImplOutcome::AwaitingHuman {
                     sched.set_state(step_id, StepState::AwaitingHuman);
+                    self.persist_step_timings(step_id, &timing)?;
                     report.awaiting_human.push(step_id);
                     continue;
                 }
@@ -385,9 +463,11 @@ impl Executor {
                     Some(t) => run_post_step_tests(t, repo, &locks, hooks).await?,
                     None => TestOutcome::Passed,
                 };
+                timing.add_test_span();
                 if let TestOutcome::Failed { .. } = post {
                     sched.set_state(step_id, StepState::Failed);
                     self.persist_step_state(step_id, StepState::Failed)?;
+                    self.persist_step_timings(step_id, &timing)?;
                     report.failed.push(step_id);
                     continue;
                 }
@@ -395,6 +475,8 @@ impl Executor {
                 // one tree, so a green step is immediately "merged".
                 sched.set_state(step_id, StepState::Merged);
                 self.persist_step_state(step_id, StepState::Merged)?;
+                timing.finish_total();
+                self.persist_step_timings(step_id, &timing)?;
                 report.merged.push(step_id);
             }
         }
@@ -460,6 +542,11 @@ impl Executor {
                 break;
             }
             for step_id in eligible {
+                // Timing capture (`plan-run-metrics`): derive the three step
+                // durations from the existing state transitions below — `total`
+                // from first leaving Pending, `impl` over the Running phase,
+                // `test` over Testing + the Merging re-test.
+                let mut timing = StepTiming::start();
                 sched.set_state(step_id, StepState::Running);
                 self.persist_step_state(step_id, StepState::Running)?;
 
@@ -477,8 +564,11 @@ impl Executor {
                         &wt.path,
                     )
                     .await?;
+                timing.finish_impl();
                 if impl_outcome == StepImplOutcome::AwaitingHuman {
                     sched.set_state(step_id, StepState::AwaitingHuman);
+                    // Record impl time always; never-merged → total stays NULL.
+                    self.persist_step_timings(step_id, &timing)?;
                     report.awaiting_human.push(step_id);
                     // Leave the worktree in place; the step resumes later
                     // without blocking siblings. For this single-pass driver
@@ -493,10 +583,13 @@ impl Executor {
                     Some(t) => run_post_step_tests(t, &wt.path, &locks, hooks).await?,
                     None => TestOutcome::Passed,
                 };
+                timing.add_test_span();
                 if let TestOutcome::Failed { .. } = post {
                     // Post-step red blocks entry to the merge queue.
                     sched.set_state(step_id, StepState::Failed);
                     self.persist_step_state(step_id, StepState::Failed)?;
+                    // impl + the test time that ran; total stays NULL (unmerged).
+                    self.persist_step_timings(step_id, &timing)?;
                     report.failed.push(step_id);
                     wt.teardown().ok();
                     continue;
@@ -513,17 +606,27 @@ impl Executor {
                         .map(StepTests::post_step_commands)
                         .unwrap_or_default(),
                 };
+                // The Merging phase rebases + mandatorily re-tests; count that
+                // span toward `test_ms` per the spec.
                 sched.set_state(step_id, StepState::Merging);
-                match mq.land(&item, &wt.path).await? {
+                timing.mark_merge_start();
+                let merge = mq.land(&item, &wt.path).await?;
+                timing.add_test_span();
+                match merge {
                     MergeResult::Merged => {
                         sched.set_state(step_id, StepState::Merged);
                         self.persist_step_state(step_id, StepState::Merged)?;
+                        // Merged → total is the full Pending→Merged wall clock.
+                        timing.finish_total();
+                        self.persist_step_timings(step_id, &timing)?;
                         report.merged.push(step_id);
                         wt.teardown().ok();
                     }
                     MergeResult::Escalated => {
                         sched.set_state(step_id, StepState::Failed);
                         self.persist_step_state(step_id, StepState::Failed)?;
+                        // Never merged → total stays NULL; impl + test recorded.
+                        self.persist_step_timings(step_id, &timing)?;
                         report.failed.push(step_id);
                         // Leave the worktree for the human/resolver follow-up.
                     }
@@ -603,6 +706,21 @@ impl Executor {
             .context("persisting step status")?;
             Ok(())
         })
+    }
+
+    /// Persist a step's measured wall-clock timings (`plan-run-metrics`).
+    /// Writes whatever has been captured so far — `impl_ms` always, `test_ms`
+    /// when a test phase ran, `total_ms` only once the step merged (NULL for a
+    /// never-merged step, applied consistently across both isolation modes).
+    fn persist_step_timings(&self, step_id: Uuid, timing: &StepTiming) -> Result<()> {
+        self.db
+            .set_step_timings(
+                step_id,
+                timing.impl_ms,
+                timing.test_ms_opt(),
+                timing.total_ms,
+            )
+            .context("persisting step timings")
     }
 
     /// Finalize a plan: mark it `done`. The caller invokes this only after
@@ -1074,6 +1192,98 @@ mod tests {
             .filter(|n| n.starts_with("step-"))
             .collect();
         assert_eq!(entries.len(), 2, "both step files merged onto main");
+    }
+
+    #[tokio::test]
+    async fn run_plan_stamps_step_timings_and_reset_clears_them() {
+        if !git_available() {
+            return;
+        }
+        let repo = init_repo_t();
+        let db = Db::open_in_memory().unwrap();
+        let plan = db
+            .create_plan(&NewPlan {
+                slug: "timing".into(),
+                title: "Timing".into(),
+                description: String::new(),
+                base_branch: Some("main".into()),
+                target_branch: Some("cockpit-plan/timing".into()),
+                isolation_mode: IsolationMode::Worktree,
+                model: None,
+            })
+            .unwrap();
+        let a = db
+            .add_step(
+                plan.id,
+                "alpha",
+                "{}",
+                &[],
+                &[NewTest {
+                    command: "true".into(),
+                    phase: TestPhase::PostStep,
+                    concurrency: TestConcurrency::Parallel,
+                }],
+            )
+            .unwrap();
+
+        let ex = Executor::new(db.clone());
+        ex.try_claim_slot(plan.id).unwrap();
+        ex.run_plan(plan.id, repo.path(), &WritingRunner, &GreenHooks)
+            .await
+            .unwrap();
+
+        // A merged step records impl + test + total (impl always; total only on
+        // merge). Durations are wall-clock so we only assert they're recorded.
+        let step = db.step_by_id(a.id).unwrap().unwrap();
+        assert!(step.impl_ms.is_some(), "impl time recorded");
+        assert!(step.test_ms.is_some(), "test time recorded (a test ran)");
+        assert!(step.total_ms.is_some(), "merged step records total time");
+
+        // Per-plan-not-per-run: attribute a fake inference call to this run's
+        // plan/step, then invoke the same reset `execute` runs at the top of a
+        // re-run. Timings clear and attribution drops (the row survives in
+        // global history), so a fresh run never double-counts.
+        let sess = db.create_session("p", "/x", "coder").unwrap();
+        db.insert_inference_call(&crate::db::inference_calls::InferenceCallRow {
+            call_id: uuid::Uuid::new_v4(),
+            session_id: sess.session_id,
+            project_id: "p".into(),
+            project_root: "/x".into(),
+            model: "opus".into(),
+            provider: "anthropic".into(),
+            timestamp: 1,
+            input_tokens: 1,
+            output_tokens: 1,
+            cached_input_tokens: 0,
+            cost_usd_micros: None,
+            plan_id: Some(plan.id.to_string()),
+            step_id: Some(a.id.to_string()),
+        })
+        .unwrap();
+
+        db.reset_plan_metrics(plan.id).unwrap();
+        let reset = db.step_by_id(a.id).unwrap().unwrap();
+        assert_eq!(
+            (reset.impl_ms, reset.test_ms, reset.total_ms),
+            (None, None, None),
+            "re-run reset clears the prior run's step timings"
+        );
+        let (attributed, total): (i64, i64) = db
+            .with_conn(|c| {
+                let a = c.query_row(
+                    "SELECT COUNT(*) FROM inference_calls WHERE plan_id = ?1",
+                    rusqlite::params![plan.id.to_string()],
+                    |r| r.get(0),
+                )?;
+                let t = c.query_row("SELECT COUNT(*) FROM inference_calls", [], |r| r.get(0))?;
+                Ok((a, t))
+            })
+            .unwrap();
+        assert_eq!(attributed, 0, "prior run's attribution dropped on re-run");
+        assert_eq!(
+            total, 1,
+            "the row stays in global history, just unattributed"
+        );
     }
 
     #[tokio::test]

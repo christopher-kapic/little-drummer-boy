@@ -72,6 +72,7 @@ impl SessionRegistry {
     /// re-walking the layered config every attach. (Wiring the
     /// resolver inside the daemon lands with the daemon-side `/config`
     /// payload.)
+    #[allow(clippy::too_many_arguments)]
     pub fn attach(
         &self,
         session_id: Option<Uuid>,
@@ -80,6 +81,7 @@ impl SessionRegistry {
         extended_cfg: &ExtendedConfig,
         client_no_sandbox: bool,
         model_override: Option<&str>,
+        plan_context: Option<(Uuid, Uuid)>,
     ) -> Result<SessionWorkerHandle> {
         // Resume path.
         if let Some(id) = session_id {
@@ -90,12 +92,14 @@ impl SessionRegistry {
                 .context("resuming session")?
                 .ok_or_else(|| anyhow::anyhow!("unknown session {id}"))?;
             // Resume keeps the running worker's model; an override only seeds
-            // a newly-created session (matched by the server's gating).
+            // a newly-created session (matched by the server's gating). Plan
+            // attribution is likewise create-only.
             return self.start_worker(
                 session,
                 providers_cfg,
                 extended_cfg,
                 client_no_sandbox,
+                None,
                 None,
             );
         }
@@ -124,6 +128,7 @@ impl SessionRegistry {
             extended_cfg,
             client_no_sandbox,
             model_override,
+            plan_context,
         )
     }
 
@@ -138,9 +143,17 @@ impl SessionRegistry {
         extended_cfg: &ExtendedConfig,
         client_no_sandbox: bool,
         model_override: Option<&str>,
+        plan_context: Option<(Uuid, Uuid)>,
     ) -> Result<SessionWorkerHandle> {
         let session_id = session.id;
         let project_root = session.project_root.clone();
+
+        // Plan-run metric attribution (`plan-run-metrics`): stamp the session
+        // with its plan/step so every inference call rolls up per plan. Set
+        // before the session is shared so the first call already carries it.
+        if let Some((plan_id, step_id)) = plan_context {
+            session.set_plan_context(plan_id.to_string(), step_id.to_string());
+        }
 
         // Build per-session redaction table from the session's
         // project_root + the daemon's env.

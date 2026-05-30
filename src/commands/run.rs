@@ -88,12 +88,25 @@ async fn run_turn(
     prompt: String,
     no_sandbox: bool,
 ) -> Result<i32> {
+    // Plan-run metric attribution (`plan-run-metrics`): when the plan executor
+    // spawns this coder for a step, it passes `--plan-id`/`--step-id` (clap
+    // requires them together); stamp the session so every inference call rolls
+    // up per plan/step. Malformed ids degrade to no attribution rather than
+    // failing the run — the executor always supplies well-formed uuids.
+    let plan_context = match (args.plan_id.as_deref(), args.step_id.as_deref()) {
+        (Some(p), Some(s)) => match (uuid::Uuid::parse_str(p), uuid::Uuid::parse_str(s)) {
+            (Ok(p), Ok(s)) => Some((p, s)),
+            _ => None,
+        },
+        _ => None,
+    };
     attach_send_pump(
         client,
         prompt,
         no_sandbox,
         args.format,
         args.model.as_deref(),
+        plan_context,
     )
     .await
 }
@@ -109,6 +122,7 @@ pub(crate) async fn attach_send_pump(
     no_sandbox: bool,
     format: OutputFormat,
     model_override: Option<&str>,
+    plan_context: Option<(uuid::Uuid, uuid::Uuid)>,
 ) -> Result<i32> {
     let cwd = std::env::current_dir().context("resolving cwd")?;
     let project_root = cwd.to_string_lossy().into_owned();
@@ -129,6 +143,7 @@ pub(crate) async fn attach_send_pump(
             // guidance error) rather than blocking.
             interactive: false,
             model_override: model_override.map(str::to_string),
+            plan_context,
         })
         .await?;
     let session_id = match attached {

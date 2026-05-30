@@ -32,6 +32,7 @@ pub async fn run(cmd: PlanCommand) -> Result<()> {
         PlanCommand::Run { slug, ephemeral } => run_plan(&slug, ephemeral).await,
         PlanCommand::Status { slug } => status(&slug),
         PlanCommand::List => list(),
+        PlanCommand::Stats { slugs } => stats(&slugs).await,
         PlanCommand::Duplicate {
             slug,
             new_slug,
@@ -73,10 +74,12 @@ async fn run_plan(slug: &str, ephemeral: bool) -> Result<()> {
     let runner = CommandStepRunner {
         ephemeral,
         model: plan.model.clone(),
+        plan_id: plan.id,
     };
     let hooks = CommandHooks {
         ephemeral,
         model: plan.model.clone(),
+        plan_id: plan.id,
     };
 
     let report = executor
@@ -148,6 +151,225 @@ fn list() -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// `cockpit plan stats <slug>...` (`plan-run-metrics`): one slug prints a
+/// per-model token table + per-step timing table + plan totals; two or more
+/// print a side-by-side comparison of per-model token totals + total timing so
+/// model A vs model B is directly readable. Cost is best-effort, omitted when
+/// `prices.json` is absent (mirrors `cockpit stats`).
+async fn stats(slugs: &[String]) -> Result<()> {
+    // clap enforces at least one slug (`required = true`).
+    let db = Db::open_default().context("opening cockpit DB")?;
+    let prices = crate::db::stats::PriceTable::load_default();
+
+    let mut metrics = Vec::with_capacity(slugs.len());
+    for slug in slugs {
+        let plan = db
+            .plan_by_slug(slug)?
+            .with_context(|| format!("no plan with slug `{slug}`"))?;
+        let slug = slug.clone();
+        let prices = prices.clone();
+        let m = db
+            .run_blocking(move |conn| crate::db::stats::plan_metrics(conn, plan.id, &slug, &prices))
+            .await?;
+        metrics.push(m);
+    }
+
+    if metrics.len() == 1 {
+        print_plan_metrics(&metrics[0]);
+    } else {
+        print_plan_comparison(&metrics);
+    }
+    Ok(())
+}
+
+/// Single-plan view: per-model token table, per-step timing table, plan totals.
+fn print_plan_metrics(m: &crate::db::stats::PlanMetrics) {
+    println!("plan `{}` — run metrics\n", m.slug);
+
+    println!("Token spend by model");
+    if m.by_model.is_empty() {
+        println!("  (no inference calls attributed to this plan)");
+    } else {
+        let header = ["Model", "In", "Out", "Cached", "Total", "Calls", "Cost"];
+        let mut rows: Vec<Vec<String>> = Vec::new();
+        for r in &m.by_model {
+            rows.push(vec![
+                r.model.clone(),
+                fmt_count(r.input_tokens),
+                fmt_count(r.output_tokens),
+                fmt_count(r.cached_input_tokens),
+                fmt_count(r.total_tokens),
+                r.calls.to_string(),
+                fmt_cost(r.cost_usd),
+            ]);
+        }
+        rows.push(vec![
+            "TOTAL".to_string(),
+            fmt_count(m.total_input),
+            fmt_count(m.total_output),
+            fmt_count(m.total_cached),
+            fmt_count(m.total_input + m.total_output + m.total_cached),
+            m.total_calls.to_string(),
+            fmt_cost(m.total_cost_usd),
+        ]);
+        print_aligned(&header, &rows, "  ");
+    }
+
+    println!("\nStep timing");
+    if m.steps.is_empty() {
+        println!("  (no steps)");
+    } else {
+        let header = ["Step", "Status", "Impl", "Test", "Total"];
+        let mut rows: Vec<Vec<String>> = Vec::new();
+        for s in &m.steps {
+            rows.push(vec![
+                s.title.clone(),
+                // Unmerged steps surface distinctly rather than silently
+                // omitted (settled edge case).
+                if s.merged {
+                    "merged".to_string()
+                } else {
+                    format!("{} (unmerged)", s.status)
+                },
+                fmt_ms(s.impl_ms),
+                fmt_ms(s.test_ms),
+                fmt_ms(s.total_ms),
+            ]);
+        }
+        print_aligned(&header, &rows, "  ");
+    }
+}
+
+/// Side-by-side comparison: one column per plan, per-model token totals + total
+/// timing. The primary affordance for model A vs model B (a duplicated plan run
+/// under two models).
+fn print_plan_comparison(metrics: &[crate::db::stats::PlanMetrics]) {
+    println!("plan comparison — {} plans\n", metrics.len());
+
+    // Per-model token totals: one labelled block per plan so each model stays
+    // its own row (multi-model plans never collapse).
+    let header = ["Model", "In", "Out", "Cached", "Total", "Calls", "Cost"];
+    for m in metrics {
+        println!("`{}`", m.slug);
+        if m.by_model.is_empty() {
+            println!("  (no inference calls attributed)");
+        } else {
+            let mut rows: Vec<Vec<String>> = Vec::new();
+            for r in &m.by_model {
+                rows.push(vec![
+                    r.model.clone(),
+                    fmt_count(r.input_tokens),
+                    fmt_count(r.output_tokens),
+                    fmt_count(r.cached_input_tokens),
+                    fmt_count(r.total_tokens),
+                    r.calls.to_string(),
+                    fmt_cost(r.cost_usd),
+                ]);
+            }
+            print_aligned(&header, &rows, "  ");
+        }
+        println!();
+    }
+
+    // Plan totals side by side: tokens + total step time, directly comparable.
+    println!("Totals");
+    let mut header_row = vec!["Metric".to_string()];
+    header_row.extend(metrics.iter().map(|m| m.slug.clone()));
+    // `(label, accessor)` rows; the accessor renders one plan's value for that
+    // metric. Aliased to keep the array type readable.
+    type MetricAccessor = fn(&crate::db::stats::PlanMetrics) -> String;
+    let metric_rows: [(&str, MetricAccessor); 6] = [
+        ("input", |m| fmt_count(m.total_input)),
+        ("output", |m| fmt_count(m.total_output)),
+        ("cached", |m| fmt_count(m.total_cached)),
+        ("calls", |m| m.total_calls.to_string()),
+        ("cost", |m| fmt_cost(m.total_cost_usd)),
+        ("total time", |m| fmt_ms(Some(plan_total_ms(m)))),
+    ];
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    for (label, f) in metric_rows {
+        let mut row = vec![label.to_string()];
+        row.extend(metrics.iter().map(f));
+        rows.push(row);
+    }
+    let header_refs: Vec<&str> = header_row.iter().map(String::as_str).collect();
+    print_aligned(&header_refs, &rows, "  ");
+}
+
+/// Sum of every step's `total_ms` (merged steps only contribute a value).
+fn plan_total_ms(m: &crate::db::stats::PlanMetrics) -> i64 {
+    m.steps.iter().filter_map(|s| s.total_ms).sum()
+}
+
+/// Milliseconds as a compact human duration, `—` when unmeasured.
+fn fmt_ms(ms: Option<i64>) -> String {
+    match ms {
+        None => "—".to_string(),
+        Some(ms) if ms < 1000 => format!("{ms}ms"),
+        Some(ms) => {
+            let secs = ms as f64 / 1000.0;
+            if secs < 60.0 {
+                format!("{secs:.1}s")
+            } else {
+                format!("{:.1}m", secs / 60.0)
+            }
+        }
+    }
+}
+
+/// Human-readable token count: `1.2K`, `3.4M`, or the raw number below 1000.
+fn fmt_count(n: i64) -> String {
+    let n_abs = n.unsigned_abs();
+    if n_abs >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n_abs >= 1_000 {
+        format!("{:.1}K", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
+}
+
+/// Cost cell: `$0.92` or an em-dash when unpriced (mirrors `cockpit stats`).
+fn fmt_cost(c: Option<f64>) -> String {
+    match c {
+        Some(v) => format!("${v:.2}"),
+        None => "—".to_string(),
+    }
+}
+
+/// Print a header + rows as left-aligned, space-padded columns (same shape as
+/// `cockpit stats`). Column width is the max of the header and every cell.
+fn print_aligned(header: &[&str], rows: &[Vec<String>], indent: &str) {
+    let cols = header.len();
+    let mut widths: Vec<usize> = header.iter().map(|h| h.chars().count()).collect();
+    for row in rows {
+        for (i, cell) in row.iter().enumerate().take(cols) {
+            widths[i] = widths[i].max(cell.chars().count());
+        }
+    }
+    let line = |cells: &[String]| {
+        let mut s = String::from(indent);
+        for (i, cell) in cells.iter().enumerate().take(cols) {
+            if i > 0 {
+                s.push_str("  ");
+            }
+            if i + 1 == cols {
+                s.push_str(cell);
+            } else {
+                let pad = widths[i].saturating_sub(cell.chars().count());
+                s.push_str(cell);
+                s.push_str(&" ".repeat(pad));
+            }
+        }
+        s
+    };
+    let header_owned: Vec<String> = header.iter().map(|h| h.to_string()).collect();
+    println!("{}", line(&header_owned));
+    for row in rows {
+        println!("{}", line(row));
+    }
 }
 
 /// Deep-copy a plan into a fresh `pending` plan (prompt
@@ -294,13 +516,16 @@ fn derive_unique_target_branch(
 struct CommandStepRunner {
     ephemeral: bool,
     model: Option<String>,
+    /// Plan being executed; passed to every spawned coder so its inference
+    /// calls attribute to this plan/step (`plan-run-metrics`).
+    plan_id: uuid::Uuid,
 }
 
 #[async_trait]
 impl StepRunner for CommandStepRunner {
     async fn implement(
         &self,
-        _step_id: uuid::Uuid,
+        step_id: uuid::Uuid,
         feature_description: &str,
         worktree: &Path,
     ) -> Result<StepImplOutcome> {
@@ -309,7 +534,14 @@ impl StepRunner for CommandStepRunner {
              Make the change, run the step's tests, and commit. You are running noninteractively \
              as part of a plan; only raise a `question` if you hit a genuine hard blocker."
         );
-        let status = spawn_coder(worktree, &prompt, self.ephemeral, self.model.as_deref()).await?;
+        let status = spawn_coder(
+            worktree,
+            &prompt,
+            self.ephemeral,
+            self.model.as_deref(),
+            Some((self.plan_id, step_id)),
+        )
+        .await?;
         // A clean exit means the coder finished; a non-zero exit is treated as
         // "needs human" so the merge queue doesn't try to land broken work.
         if status {
@@ -325,6 +557,9 @@ struct CommandHooks {
     ephemeral: bool,
     /// Plan-level model override passed to the resolver coder.
     model: Option<String>,
+    /// Plan being executed; the resolver coder's inference calls attribute to
+    /// it + the merge item's step (`plan-run-metrics`).
+    plan_id: uuid::Uuid,
 }
 
 #[async_trait]
@@ -335,7 +570,7 @@ impl MergeHooks for CommandHooks {
 
     async fn resolve(
         &self,
-        _item: &MergeItem,
+        item: &MergeItem,
         worktree: &Path,
         brief: &ResolverBrief,
     ) -> Result<bool> {
@@ -347,6 +582,7 @@ impl MergeHooks for CommandHooks {
             &brief.render_prompt(),
             self.ephemeral,
             self.model.as_deref(),
+            Some((self.plan_id, item.step_id)),
         )
         .await?;
         if !ok {
@@ -375,6 +611,7 @@ async fn spawn_coder(
     prompt: &str,
     ephemeral: bool,
     model: Option<&str>,
+    plan_context: Option<(uuid::Uuid, uuid::Uuid)>,
 ) -> Result<bool> {
     let exe = std::env::current_exe().context("locating own binary")?;
     let mut cmd = tokio::process::Command::new(exe);
@@ -387,6 +624,14 @@ async fn spawn_coder(
     // spawned coder (and any subagent it delegates to) runs under it.
     if let Some(m) = model {
         cmd.arg("--model").arg(m);
+    }
+    // Plan-run metric attribution (`plan-run-metrics`): the spawned coder's
+    // session is stamped with this plan/step so its inference calls roll up.
+    if let Some((plan_id, step_id)) = plan_context {
+        cmd.arg("--plan-id")
+            .arg(plan_id.to_string())
+            .arg("--step-id")
+            .arg(step_id.to_string());
     }
     cmd.arg(prompt)
         .current_dir(worktree)
@@ -410,6 +655,48 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         assert!(db.list_all_plan_summaries().unwrap().is_empty());
         assert!(db.plan_by_slug("nope").unwrap().is_none());
+    }
+
+    #[test]
+    fn fmt_ms_renders_compact_durations() {
+        assert_eq!(fmt_ms(None), "—");
+        assert_eq!(fmt_ms(Some(500)), "500ms");
+        assert_eq!(fmt_ms(Some(4200)), "4.2s");
+        assert_eq!(fmt_ms(Some(90_000)), "1.5m");
+    }
+
+    #[test]
+    fn plan_metrics_renderers_do_not_panic() {
+        use crate::db::stats::{PlanMetrics, StepTimingRow, TokenRow};
+        let m = PlanMetrics {
+            slug: "p".into(),
+            by_model: vec![TokenRow {
+                model: "opus".into(),
+                provider: "anthropic".into(),
+                input_tokens: 12_000,
+                output_tokens: 3_000,
+                cached_input_tokens: 1_000,
+                total_tokens: 16_000,
+                calls: 4,
+                cost_usd: Some(0.5),
+            }],
+            steps: vec![StepTimingRow {
+                title: "s".into(),
+                status: "done".into(),
+                impl_ms: Some(1000),
+                test_ms: Some(500),
+                total_ms: Some(1600),
+                merged: true,
+            }],
+            total_input: 12_000,
+            total_output: 3_000,
+            total_cached: 1_000,
+            total_calls: 4,
+            total_cost_usd: Some(0.5),
+        };
+        // Single + side-by-side render paths (would panic on a formatting bug).
+        print_plan_metrics(&m);
+        print_plan_comparison(&[m.clone(), m]);
     }
 
     #[test]

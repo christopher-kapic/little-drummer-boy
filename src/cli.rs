@@ -188,6 +188,14 @@ pub struct RunArgs {
     /// the run completes. Useful for CI and clean-state scripts.
     #[arg(long)]
     pub ephemeral: bool,
+
+    /// Plan id this run implements a step of (plan executor only).
+    #[arg(long, hide = true, requires = "step_id")]
+    pub plan_id: Option<String>,
+
+    /// Step id within `--plan-id` this run implements (plan executor only).
+    #[arg(long, hide = true, requires = "plan_id")]
+    pub step_id: Option<String>,
 }
 
 // ---- plan execution subcommands ----
@@ -212,6 +220,13 @@ pub enum PlanCommand {
     },
     /// List all plans (active first).
     List,
+    /// Show a plan's run metrics: per-model token spend + per-step timing; two
+    /// or more slugs print a side-by-side comparison.
+    Stats {
+        /// One or more plan slugs (2+ compares them side by side).
+        #[arg(required = true, num_args = 1..)]
+        slugs: Vec<String>,
+    },
     /// Deep-copy a plan into a fresh `pending` plan with its own slug,
     /// branch policy, and optional plan-level model.
     Duplicate {

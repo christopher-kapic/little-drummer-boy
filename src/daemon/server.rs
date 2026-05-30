@@ -405,6 +405,7 @@ async fn handle_request(
             no_sandbox,
             interactive,
             model_override,
+            plan_context,
         } => attach(
             state,
             ctx,
@@ -413,6 +414,7 @@ async fn handle_request(
             no_sandbox,
             interactive,
             model_override,
+            plan_context,
         ),
 
         Request::SendUserMessage { text, images } => {
@@ -844,6 +846,7 @@ fn spawn_until_idle_watcher(ctx: Arc<DaemonContext>) {
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn attach(
     state: &mut ClientState,
     ctx: &DaemonContext,
@@ -852,6 +855,7 @@ fn attach(
     no_sandbox: bool,
     interactive: bool,
     model_override: Option<String>,
+    plan_context: Option<(Uuid, Uuid)>,
 ) -> std::result::Result<Response, ErrorPayload> {
     // The client's `--no-sandbox` only governs sessions it *creates*
     // (sandboxing part 2). On resume of an existing session id the session
@@ -861,6 +865,10 @@ fn attach(
     // sessions this attach *creates*; on resume the worker is already
     // running, so the flag is ignored (mirrors `--no-sandbox`).
     let model_override = model_override.filter(|_| session_id.is_none());
+    // Plan-run metric attribution (`plan-run-metrics`) also governs only
+    // sessions this attach *creates* — a resumed worker already has its
+    // context (or none); mirrors the `--model` gate.
+    let plan_context = plan_context.filter(|_| session_id.is_none());
     let project_root = project_root.map(PathBuf::from);
 
     let cfg_root = match (session_id, &project_root) {
@@ -895,6 +903,7 @@ fn attach(
             &extended_cfg,
             client_no_sandbox,
             model_override.as_deref(),
+            plan_context,
         )
         .map_err(internal)?;
 
@@ -1044,9 +1053,49 @@ fn plan_detail(ctx: &DaemonContext, plan_id: Uuid) -> std::result::Result<Respon
             tests,
         });
     }
+    // Run metrics (`plan-run-metrics`): per-model token usage + per-step
+    // timing. Cost is best-effort from `prices.json` (omitted when absent).
+    let prices = crate::db::stats::PriceTable::load_default();
+    let slug = summary.slug.clone();
+    let metrics = ctx
+        .db
+        .with_conn(|conn| crate::db::stats::plan_metrics(conn, plan_id, &slug, &prices))
+        .map_err(internal)?;
+    let metrics = proto::PlanMetricsWire {
+        by_model: metrics
+            .by_model
+            .into_iter()
+            .map(|r| proto::PlanModelUsageWire {
+                model: r.model,
+                input_tokens: r.input_tokens,
+                output_tokens: r.output_tokens,
+                cached_input_tokens: r.cached_input_tokens,
+                calls: r.calls,
+                cost_usd: r.cost_usd,
+            })
+            .collect(),
+        steps: metrics
+            .steps
+            .into_iter()
+            .map(|s| proto::PlanStepTimingWire {
+                title: s.title,
+                impl_ms: s.impl_ms,
+                test_ms: s.test_ms,
+                total_ms: s.total_ms,
+                merged: s.merged,
+            })
+            .collect(),
+        total_input: metrics.total_input,
+        total_output: metrics.total_output,
+        total_cached: metrics.total_cached,
+        total_calls: metrics.total_calls,
+        total_cost_usd: metrics.total_cost_usd,
+    };
+
     Ok(Response::PlanDetail {
         plan: summary,
         steps: wire_steps,
+        metrics,
     })
 }
 

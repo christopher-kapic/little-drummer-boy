@@ -116,6 +116,13 @@ pub struct Session {
     /// flush point — it writes the `sessions` row *before* any dependent
     /// write, so FK/ordering invariants hold.
     pending_row: Mutex<Option<SessionRow>>,
+    /// Active plan/step this session runs on behalf of (`plan-run-metrics`).
+    /// Set once at spawn for a session the plan executor created (via
+    /// `cockpit run --plan-id/--step-id`); `None` for ordinary interactive
+    /// sessions. Stamped onto every `inference_calls` row so per-model token
+    /// totals roll up per plan/step directly. In-memory only — the attribution
+    /// lives on the call rows, not the session row.
+    plan_context: Mutex<Option<(String, String)>>,
 }
 
 /// The most recent dispatched tool call's loop-guard signature and its
@@ -259,7 +266,16 @@ impl Session {
             // Persisted by default; `create_deferred` overrides this with the
             // pending row right after construction.
             pending_row: Mutex::new(None),
+            plan_context: Mutex::new(None),
         })
+    }
+
+    /// Set the active plan/step this session runs on behalf of
+    /// (`plan-run-metrics`). Called once at spawn for a plan-executor session;
+    /// every later `inference_calls` row is stamped with `(plan_id, step_id)`
+    /// so per-model token totals roll up per plan/step.
+    pub fn set_plan_context(&self, plan_id: String, step_id: String) {
+        *self.plan_context.lock().unwrap() = Some((plan_id, step_id));
     }
 
     /// Whether filesystem sandboxing is active for this session right now
@@ -488,6 +504,10 @@ impl Session {
         let (Some(provider), Some(model)) = (self.active_provider(), self.active_model()) else {
             return Ok(());
         };
+        let (plan_id, step_id) = match self.plan_context.lock().unwrap().clone() {
+            Some((p, s)) => (Some(p), Some(s)),
+            None => (None, None),
+        };
         let row = crate::db::inference_calls::InferenceCallRow {
             call_id,
             session_id: self.id,
@@ -500,6 +520,8 @@ impl Session {
             output_tokens: usage.output_tokens as i64,
             cached_input_tokens: usage.cached_input_tokens as i64,
             cost_usd_micros: None,
+            plan_id,
+            step_id,
         };
         self.db
             .insert_inference_call(&row)

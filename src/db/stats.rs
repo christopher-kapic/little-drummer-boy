@@ -225,6 +225,149 @@ pub struct NonFileRow {
     pub calls: i64,
 }
 
+// ---- plan-run metrics (prompt `plan-run-metrics`) --------------------------
+
+/// Per-step wall-clock timing for the plan-metrics view. `total_ms` is `None`
+/// for a step that never merged; `merged` distinguishes a completed step from
+/// an unmerged one so the renderer can surface it distinctly.
+#[derive(Debug, Clone, Serialize)]
+pub struct StepTimingRow {
+    pub title: String,
+    /// Coarse persisted status (`pending` / `in_progress` / `done`).
+    pub status: String,
+    pub impl_ms: Option<i64>,
+    pub test_ms: Option<i64>,
+    pub total_ms: Option<i64>,
+    /// Whether the step reached `Merged` (i.e. `total_ms` is meaningful).
+    pub merged: bool,
+}
+
+/// Full plan-run metrics: the per-`(provider, model)` token rollup attributed
+/// to this plan plus each step's timing, ready for the CLI table, the
+/// side-by-side comparison, and the TUI plans browser.
+#[derive(Debug, Clone, Serialize)]
+pub struct PlanMetrics {
+    pub slug: String,
+    /// Per-model token spend (input/output/cached/calls/cost), descending by
+    /// total tokens. Each model is its own row — multi-model plans never
+    /// collapse.
+    pub by_model: Vec<TokenRow>,
+    /// Per-step timing in authoring order.
+    pub steps: Vec<StepTimingRow>,
+    /// Plan token totals across every model.
+    pub total_input: i64,
+    pub total_output: i64,
+    pub total_cached: i64,
+    pub total_calls: i64,
+    /// Summed cost across priced models, or `None` when no model was priced.
+    pub total_cost_usd: Option<f64>,
+}
+
+/// Roll up one plan's metrics: the per-model token totals (attributed via the
+/// `inference_calls.plan_id` column — pure-text calls included, fixing the
+/// join-only gap) plus each step's impl/test/total timing. `prices` supplies
+/// the cost column best-effort (omitted when `prices.json` is absent, exactly
+/// as the main stats view). Heavy-ish scan — drive through [`Db::run_blocking`]
+/// or [`Db::with_conn`].
+pub fn plan_metrics(
+    conn: &rusqlite::Connection,
+    plan_id: uuid::Uuid,
+    slug: &str,
+    prices: &PriceTable,
+) -> Result<PlanMetrics> {
+    // Per-model token spend attributed to this plan. Grouped on
+    // (model, provider) so each model stays its own row.
+    let mut stmt = conn
+        .prepare(
+            "SELECT model, provider,
+                    COALESCE(SUM(input_tokens), 0),
+                    COALESCE(SUM(output_tokens), 0),
+                    COALESCE(SUM(cached_input_tokens), 0),
+                    COUNT(*)
+               FROM inference_calls
+              WHERE plan_id = ?1
+              GROUP BY model, provider
+              ORDER BY SUM(input_tokens + output_tokens + cached_input_tokens) DESC",
+        )
+        .context("preparing plan token query")?;
+    let rows = stmt
+        .query_map([plan_id.to_string()], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, i64>(4)?,
+                r.get::<_, i64>(5)?,
+            ))
+        })
+        .context("querying plan token spend")?;
+
+    let mut by_model = Vec::new();
+    let (mut total_input, mut total_output, mut total_cached, mut total_calls) = (0, 0, 0, 0);
+    let mut total_cost: Option<f64> = None;
+    for r in rows {
+        let (model, provider, input, output, cached, calls) =
+            r.context("decoding plan token row")?;
+        let cost = prices.cost_for(&model, input, output, cached);
+        if let Some(c) = cost {
+            total_cost = Some(total_cost.unwrap_or(0.0) + c);
+        }
+        total_input += input;
+        total_output += output;
+        total_cached += cached;
+        total_calls += calls;
+        by_model.push(TokenRow {
+            model,
+            provider,
+            input_tokens: input,
+            output_tokens: output,
+            cached_input_tokens: cached,
+            total_tokens: input + output + cached,
+            calls,
+            cost_usd: cost,
+        });
+    }
+
+    // Per-step timing in authoring order.
+    let mut stmt = conn
+        .prepare(
+            "SELECT title, status, impl_ms, test_ms, total_ms
+               FROM plan_steps
+              WHERE plan_id = ?1
+              ORDER BY position",
+        )
+        .context("preparing plan step-timing query")?;
+    let step_rows = stmt
+        .query_map([plan_id.to_string()], |r| {
+            let status: String = r.get(1)?;
+            let total_ms: Option<i64> = r.get(4)?;
+            Ok(StepTimingRow {
+                title: r.get(0)?,
+                merged: status == "done",
+                status,
+                impl_ms: r.get(2)?,
+                test_ms: r.get(3)?,
+                total_ms,
+            })
+        })
+        .context("querying plan step timings")?;
+    let steps = step_rows
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .context("decoding plan step timings")?;
+
+    Ok(PlanMetrics {
+        slug: slug.to_string(),
+        by_model,
+        steps,
+        total_input,
+        total_output,
+        total_cached,
+        total_calls,
+        total_cost_usd: total_cost,
+    })
+}
+
 // ---- pricing (GOALS §15d) --------------------------------------------------
 
 /// Per-model price entry from `~/.cockpit/prices.json`. All three rates
@@ -748,6 +891,8 @@ mod tests {
             output_tokens: output,
             cached_input_tokens: cached,
             cost_usd_micros: None,
+            plan_id: None,
+            step_id: None,
         })
         .unwrap();
         call_id
@@ -1170,6 +1315,75 @@ mod tests {
         assert_eq!(coder.input_tokens, 100);
         let docs = roles.iter().find(|x| x.agent == "docs").unwrap();
         assert_eq!(docs.input_tokens, 30);
+    }
+
+    /// Per-plan rollup: attributes by `plan_id`, keeps each model its own row,
+    /// counts pure-text calls (no tool_call_events), and reads step timings.
+    #[test]
+    fn plan_metrics_per_model_and_per_step_timing() {
+        use crate::db::plans::{IsolationMode, NewPlan};
+        let db = Db::open_in_memory().unwrap();
+        let sid = seed_session(&db, "p1");
+        let plan = db
+            .create_plan(&NewPlan {
+                slug: "metrics".into(),
+                title: "Metrics".into(),
+                description: String::new(),
+                base_branch: None,
+                target_branch: None,
+                isolation_mode: IsolationMode::Worktree,
+                model: None,
+            })
+            .unwrap();
+        let step = db.add_step(plan.id, "build", "{}", &[], &[]).unwrap();
+
+        // Two models attributed to the plan + one unattributed call (must be
+        // excluded). None has tool_call_events — pure-text calls still count.
+        let attrib = |model: &str, provider: &str, i: i64, o: i64, c: i64| {
+            db.insert_inference_call(&InferenceCallRow {
+                call_id: Uuid::new_v4(),
+                session_id: sid,
+                project_id: "p1".into(),
+                project_root: "/root".into(),
+                model: model.into(),
+                provider: provider.into(),
+                timestamp: 1000,
+                input_tokens: i,
+                output_tokens: o,
+                cached_input_tokens: c,
+                cost_usd_micros: None,
+                plan_id: Some(plan.id.to_string()),
+                step_id: Some(step.id.to_string()),
+            })
+            .unwrap();
+        };
+        attrib("opus", "anthropic", 100, 50, 10);
+        attrib("opus", "anthropic", 200, 60, 0);
+        attrib("gpt-5", "openai", 5, 5, 0);
+        // Unattributed call — must NOT count toward the plan.
+        ic(&db, sid, "p1", "opus", "anthropic", 1000, 9999, 0, 0);
+
+        // Step timing.
+        db.set_step_timings(step.id, Some(4200), Some(1500), Some(6000))
+            .unwrap();
+
+        let m = db
+            .with_conn(|conn| plan_metrics(conn, plan.id, "metrics", &PriceTable::empty()))
+            .unwrap();
+        // Two model rows, never collapsed.
+        assert_eq!(m.by_model.len(), 2);
+        let opus = m.by_model.iter().find(|r| r.model == "opus").unwrap();
+        assert_eq!(opus.input_tokens, 300, "only attributed opus calls");
+        assert_eq!(opus.calls, 2);
+        assert!(m.by_model.iter().any(|r| r.model == "gpt-5"));
+        // Plan totals exclude the unattributed call.
+        assert_eq!(m.total_input, 305);
+        assert_eq!(m.total_calls, 3);
+        // Step timing read back.
+        assert_eq!(m.steps.len(), 1);
+        assert_eq!(m.steps[0].impl_ms, Some(4200));
+        assert_eq!(m.steps[0].test_ms, Some(1500));
+        assert_eq!(m.steps[0].total_ms, Some(6000));
     }
 
     #[test]

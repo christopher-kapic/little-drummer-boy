@@ -190,6 +190,15 @@ pub struct StepRow {
     pub position: i64,
     pub created_at: i64,
     pub updated_at: i64,
+    /// Wall-clock ms in the implementing (`Running`) state (`plan-run-metrics`),
+    /// or `None` until the step runs.
+    pub impl_ms: Option<i64>,
+    /// Wall-clock ms in the `Testing` state — post-step tests + the mandatory
+    /// merge re-test — or `None` until tests run.
+    pub test_ms: Option<i64>,
+    /// Wall-clock ms from first leaving `Pending` to reaching `Merged`, or
+    /// `None` for a step that never merged.
+    pub total_ms: Option<i64>,
 }
 
 impl StepRow {
@@ -206,6 +215,9 @@ impl StepRow {
             position: row.get("position")?,
             created_at: row.get("created_at")?,
             updated_at: row.get("updated_at")?,
+            impl_ms: row.get("impl_ms")?,
+            test_ms: row.get("test_ms")?,
+            total_ms: row.get("total_ms")?,
         })
     }
 }
@@ -618,6 +630,65 @@ impl Db {
         })
     }
 
+    /// Reset a plan's run metrics at run start (`plan-run-metrics`,
+    /// per-plan-not-per-run): clear every step's `impl_ms`/`test_ms`/`total_ms`
+    /// and drop this plan's `plan_id`/`step_id` attribution from
+    /// `inference_calls` (those rows stay in global history — they just stop
+    /// counting toward the plan). One transaction, so a fresh run never
+    /// double-counts the previous run's tokens or timings.
+    pub fn reset_plan_metrics(&self, plan_id: Uuid) -> Result<()> {
+        self.with_conn(|conn| {
+            let tx = conn
+                .unchecked_transaction()
+                .context("begin reset_plan_metrics tx")?;
+            tx.execute(
+                "UPDATE plan_steps SET impl_ms = NULL, test_ms = NULL, total_ms = NULL \
+                 WHERE plan_id = ?1",
+                params![plan_id.to_string()],
+            )
+            .context("clearing step timings")?;
+            tx.execute(
+                "UPDATE inference_calls SET plan_id = NULL, step_id = NULL WHERE plan_id = ?1",
+                params![plan_id.to_string()],
+            )
+            .context("clearing inference-call attribution")?;
+            tx.commit().context("commit reset_plan_metrics tx")?;
+            Ok(())
+        })
+    }
+
+    /// Record a step's measured wall-clock timings (`plan-run-metrics`).
+    /// Any `Some` value overwrites the column; `None` leaves it untouched, so
+    /// the executor can stamp `impl_ms` and `test_ms` as the phases complete
+    /// and `total_ms` only once the step merges.
+    pub fn set_step_timings(
+        &self,
+        step_id: Uuid,
+        impl_ms: Option<i64>,
+        test_ms: Option<i64>,
+        total_ms: Option<i64>,
+    ) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "UPDATE plan_steps SET \
+                   impl_ms  = COALESCE(?2, impl_ms), \
+                   test_ms  = COALESCE(?3, test_ms), \
+                   total_ms = COALESCE(?4, total_ms), \
+                   updated_at = ?5 \
+                 WHERE id = ?1",
+                params![
+                    step_id.to_string(),
+                    impl_ms,
+                    test_ms,
+                    total_ms,
+                    Utc::now().timestamp(),
+                ],
+            )
+            .context("updating step timings")?;
+            Ok(())
+        })
+    }
+
     /// Steps of a plan in authoring order.
     pub fn list_steps(&self, plan_id: Uuid) -> Result<Vec<StepRow>> {
         self.with_conn(|conn| {
@@ -759,6 +830,9 @@ impl Db {
             position,
             created_at: now,
             updated_at: now,
+            impl_ms: None,
+            test_ms: None,
+            total_ms: None,
         })
     }
 
@@ -1289,6 +1363,62 @@ mod tests {
             PlanStatus::InProgress
         );
         assert_eq!(db.list_steps(src.id).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn set_step_timings_is_partial_and_reset_clears_metrics() {
+        use crate::db::inference_calls::InferenceCallRow;
+        let db = Db::open_in_memory().unwrap();
+        let plan = db.create_plan(&sample_plan("metrics")).unwrap();
+        let step = db.add_step(plan.id, "s", "{}", &[], &[]).unwrap();
+        let sess = db.create_session("p", "/x", "coder").unwrap();
+
+        // Stamp impl, then test, then total — each call leaves prior columns.
+        db.set_step_timings(step.id, Some(100), None, None).unwrap();
+        db.set_step_timings(step.id, None, Some(50), None).unwrap();
+        db.set_step_timings(step.id, None, None, Some(200)).unwrap();
+        let got = db.step_by_id(step.id).unwrap().unwrap();
+        assert_eq!(
+            (got.impl_ms, got.test_ms, got.total_ms),
+            (Some(100), Some(50), Some(200))
+        );
+
+        // Attribute an inference call to the plan/step.
+        db.insert_inference_call(&InferenceCallRow {
+            call_id: Uuid::new_v4(),
+            session_id: sess.session_id,
+            project_id: "p".into(),
+            project_root: "/x".into(),
+            model: "opus".into(),
+            provider: "anthropic".into(),
+            timestamp: 1000,
+            input_tokens: 10,
+            output_tokens: 5,
+            cached_input_tokens: 0,
+            cost_usd_micros: None,
+            plan_id: Some(plan.id.to_string()),
+            step_id: Some(step.id.to_string()),
+        })
+        .unwrap();
+
+        // Reset: timings cleared, attribution dropped, but the row survives in
+        // global history (just unattributed) — no double-count on re-run.
+        db.reset_plan_metrics(plan.id).unwrap();
+        let got = db.step_by_id(step.id).unwrap().unwrap();
+        assert_eq!((got.impl_ms, got.test_ms, got.total_ms), (None, None, None));
+        let (attributed, total): (i64, i64) = db
+            .with_conn(|c| {
+                let a = c.query_row(
+                    "SELECT COUNT(*) FROM inference_calls WHERE plan_id = ?1",
+                    params![plan.id.to_string()],
+                    |r| r.get(0),
+                )?;
+                let t = c.query_row("SELECT COUNT(*) FROM inference_calls", [], |r| r.get(0))?;
+                Ok((a, t))
+            })
+            .unwrap();
+        assert_eq!(attributed, 0, "attribution dropped");
+        assert_eq!(total, 1, "row stays in global history");
     }
 
     #[test]

@@ -139,6 +139,8 @@ fn try_spawn_inner(
                     // plan-level override is only for the headless plan-run
                     // path (`cockpit run --model`).
                     model_override: None,
+                    // Interactive sessions never run on behalf of a plan step.
+                    plan_context: None,
                 })
                 .await
                 .map_err(|e| format!("attach: {e}"))?;
@@ -513,9 +515,20 @@ pub fn list_plans_blocking() -> Result<Vec<proto::PlanSummaryWire>, String> {
 /// or an unknown plan id.
 pub fn plan_detail_blocking(
     plan_id: uuid::Uuid,
-) -> Result<(proto::PlanSummaryWire, Vec<proto::PlanStepWire>), String> {
+) -> Result<
+    (
+        proto::PlanSummaryWire,
+        Vec<proto::PlanStepWire>,
+        proto::PlanMetricsWire,
+    ),
+    String,
+> {
     match daemon_request_blocking(Request::PlanDetail { plan_id })? {
-        Response::PlanDetail { plan, steps } => Ok((plan, steps)),
+        Response::PlanDetail {
+            plan,
+            steps,
+            metrics,
+        } => Ok((plan, steps, metrics)),
         other => Err(format!("unexpected plan_detail response: {other:?}")),
     }
 }

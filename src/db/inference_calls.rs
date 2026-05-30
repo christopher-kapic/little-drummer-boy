@@ -22,6 +22,11 @@ pub struct InferenceCallRow {
     pub output_tokens: i64,
     pub cached_input_tokens: i64,
     pub cost_usd_micros: Option<i64>,
+    /// Plan this call ran on behalf of (`plan-run-metrics`), or `None` for an
+    /// ordinary interactive session. Stamped by the executor's spawned coder.
+    pub plan_id: Option<String>,
+    /// Step within `plan_id` this call ran on behalf of, or `None`.
+    pub step_id: Option<String>,
 }
 
 impl Db {
@@ -32,8 +37,8 @@ impl Db {
                     call_id, session_id, project_id, project_root,
                     model, provider, timestamp,
                     input_tokens, output_tokens, cached_input_tokens,
-                    cost_usd_micros
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                    cost_usd_micros, plan_id, step_id
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                 params![
                     row.call_id.to_string(),
                     row.session_id.to_string(),
@@ -46,6 +51,8 @@ impl Db {
                     row.output_tokens,
                     row.cached_input_tokens,
                     row.cost_usd_micros,
+                    row.plan_id,
+                    row.step_id,
                 ],
             )
             .context("inserting inference_call")?;
@@ -74,6 +81,8 @@ mod tests {
             output_tokens: 567,
             cached_input_tokens: 8910,
             cost_usd_micros: Some(420),
+            plan_id: None,
+            step_id: None,
         };
         db.insert_inference_call(&row).unwrap();
         let count: i64 = db
