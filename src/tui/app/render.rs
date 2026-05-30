@@ -276,6 +276,29 @@ impl App {
                     }
                     rows
                 }
+                HistoryEntry::Subagent {
+                    outcome, expanded, ..
+                } => match outcome {
+                    // Running: one live line + trailing gap.
+                    None => 2,
+                    // Settled: header + body lines (capped to the preview
+                    // unless expanded) + possible expand chip + trailing gap.
+                    Some(o) => {
+                        let body = if o.report.trim().is_empty() {
+                            0
+                        } else {
+                            let lines = o.report.lines().count() as u16;
+                            if *expanded {
+                                lines.saturating_add(1)
+                            } else {
+                                lines
+                                    .min(crate::tui::history::SUBAGENT_PREVIEW_LINES as u16)
+                                    .saturating_add(1)
+                            }
+                        };
+                        body.saturating_add(2)
+                    }
+                },
             });
             prev_agent = matches!(entry, HistoryEntry::Agent { .. });
         }
@@ -534,6 +557,10 @@ impl App {
                     .checked_sub(1)
                     .map(|i| matches!(self.history[i], HistoryEntry::Agent { .. }))
                     .unwrap_or(false),
+                // Settled subagent block gets a trailing gap; the live
+                // running line gets none (so it doesn't jump when it
+                // settles in place).
+                HistoryEntry::Subagent { outcome, .. } => outcome.is_some(),
                 _ => false,
             };
             if gap {
@@ -1014,6 +1041,12 @@ impl App {
                 HistoryEntry::Agent {
                     text, reasoning, ..
                 } => crate::tokens::count(text) + crate::tokens::count(reasoning),
+                // The child's report is delivered to the parent as its
+                // `task` tool result, so it enters the model's context.
+                HistoryEntry::Subagent { outcome, .. } => outcome
+                    .as_ref()
+                    .map(|o| crate::tokens::count(&o.report))
+                    .unwrap_or(0),
                 // Local-command output is never sent to the agent
                 // (GOALS §1k); `/git`'s agent-bound cost is accounted
                 // via `pending_git_blocks`, not here.
@@ -1045,6 +1078,12 @@ impl App {
                 HistoryEntry::Agent {
                     text, reasoning, ..
                 } => text.len() + reasoning.len(),
+                // Add 1 for the settled state so the None→Some transition
+                // (which adds the report to context) busts the cache even
+                // for an empty report.
+                HistoryEntry::Subagent { outcome, .. } => {
+                    outcome.as_ref().map(|o| o.report.len() + 1).unwrap_or(0)
+                }
                 HistoryEntry::LocalCommand { .. } => 0,
                 HistoryEntry::CompactBoundary {
                     predecessor_short_id,
@@ -1475,6 +1514,26 @@ fn entry_rendered_rows(entry: &HistoryEntry) -> u16 {
             }
             rows
         }
+        HistoryEntry::Subagent {
+            outcome, expanded, ..
+        } => match outcome {
+            None => 1,
+            Some(o) => {
+                if o.report.trim().is_empty() {
+                    1
+                } else {
+                    let lines = o.report.lines().count() as u16;
+                    let body = if *expanded {
+                        lines.saturating_add(1)
+                    } else {
+                        lines
+                            .min(crate::tui::history::SUBAGENT_PREVIEW_LINES as u16)
+                            .saturating_add(1)
+                    };
+                    body.saturating_add(1)
+                }
+            }
+        },
     }
 }
 

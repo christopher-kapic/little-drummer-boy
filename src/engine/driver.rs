@@ -1480,19 +1480,18 @@ impl Driver {
                     task_call_id,
                     task_function_call_id,
                 } => {
-                    // Emit a single ToolStart/ToolEnd pair so the
-                    // user sees one row in the primary agent's history
-                    // — never a separate agent stream.
-                    let args_json = serde_json::json!({
-                        "agent": child_agent,
-                        "prompt": brief.clone(),
-                    });
+                    // Surface the delegation as a live `{parent} delegated
+                    // to {child}…` line in the parent's history (the TUI
+                    // renders SubagentSpawned/SubagentReport as one rich,
+                    // self-replacing block — `prompts/noninteractive-
+                    // subagent-display.md`). The brief is intentionally
+                    // dropped from the event: the running line shows no
+                    // prompt preview.
                     let _ = tx
-                        .send(TurnEvent::ToolStart {
-                            agent: self.stack.last().unwrap().agent.name.clone(),
-                            call_id: task_call_id.clone(),
-                            tool: format!("task→{child_agent}"),
-                            args: args_json,
+                        .send(TurnEvent::SubagentSpawned {
+                            parent: self.stack.last().unwrap().agent.name.clone(),
+                            child: child_agent.clone(),
+                            prompt: brief.clone(),
                         })
                         .await;
                     // Begin compact-after-delegation tracking for the
@@ -1573,12 +1572,9 @@ impl Driver {
                         tracing::warn!(error = %e, "record subagent_report event failed");
                     }
                     let _ = tx
-                        .send(TurnEvent::ToolEnd {
-                            agent: self.stack.last().unwrap().agent.name.clone(),
-                            call_id: task_call_id.clone(),
-                            tool: format!("task→{child_agent}"),
-                            output: report.clone(),
-                            truncated: false,
+                        .send(TurnEvent::SubagentReport {
+                            agent: child_agent.clone(),
+                            report: report.clone(),
                         })
                         .await;
                     // Deliver the result as the parent's next prompt.

@@ -12,3 +12,9 @@ pub const MUTED_COLOR_INDEX: u8 = 250;
 /// launch-banner box). The brighter blue that reads as the app accent
 /// against the surrounding chrome.
 pub const ACCENT_BLUE_INDEX: u8 = 33;
+
+/// Orange used for a subagent's (child) name in the delegation
+/// running-line and the `… worked for …` / `… failed after …` header.
+/// Only the child name carries it; the parent name uses the default
+/// style.
+pub const SUBAGENT_ORANGE_INDEX: u8 = 208;

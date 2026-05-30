@@ -39,7 +39,8 @@ use crate::tui::agent_runner::{self, AgentRunner};
 use crate::tui::composer::{Composer, VimMode, input_prefix_width};
 use crate::tui::geometry::PaneGeometry;
 use crate::tui::history::{
-    HistoryEntry, MarkdownOpts, PendingMsg, ToolCall, ToolCallState, route_text_delta,
+    HistoryEntry, MarkdownOpts, PendingMsg, SubagentOutcome, ToolCall, ToolCallState,
+    route_text_delta,
 };
 use crate::tui::settings::{self, Dialog};
 use crate::welcome::{self, LaunchInfo};
@@ -2182,21 +2183,23 @@ impl App {
                     });
                 }
             }
-            TurnEvent::SubagentSpawned {
-                parent,
-                child,
-                prompt,
-            } => {
+            TurnEvent::SubagentSpawned { parent, child, .. } => {
+                // One live line: `{parent} delegated to {child}… (elapsed)`.
+                // The prompt preview is intentionally dropped (the running
+                // line shows no prompt text). The elapsed clock and animated
+                // ellipses are derived at render time from `spawned_at`,
+                // reusing the working-span tick.
                 self.finalize_pending();
-                let short = agent_runner::first_line(&prompt, 100);
-                self.history.push(HistoryEntry::Plain {
-                    line: format!("[{parent} → {child}]: {short}"),
+                self.history.push(HistoryEntry::Subagent {
+                    parent,
+                    child,
+                    spawned_at: Instant::now(),
+                    outcome: None,
+                    expanded: false,
                 });
             }
-            TurnEvent::SubagentReport { agent, .. } => {
-                self.history.push(HistoryEntry::Plain {
-                    line: format!("{agent} returned to caller."),
-                });
+            TurnEvent::SubagentReport { agent, report } => {
+                self.settle_subagent(&agent, report);
             }
             TurnEvent::Usage { usage, .. } => {
                 self.last_usage = Some(usage);
@@ -2473,6 +2476,14 @@ impl App {
     pub(super) fn end_working_span(&mut self) {
         self.busy = false;
         self.span_started_at = None;
+    }
+
+    /// Settle the most-recent still-running [`HistoryEntry::Subagent`]
+    /// for `child` with its report: freeze the elapsed clock into the
+    /// total duration and replace the live `delegated to…` line with the
+    /// `worked for {duration}` (or `failed after`) header + response.
+    pub(super) fn settle_subagent(&mut self, child: &str, report: String) {
+        settle_subagent_in(&mut self.history, child, report);
     }
 
     /// True while the current inference round is in its reasoning phase:
@@ -2953,8 +2964,12 @@ impl App {
         // single owning entry whose `expanded` flag we toggle.
         if let Some(Some(entry_idx)) = self.clickable_rows.get(rel).copied() {
             self.selection = None;
-            if let Some(HistoryEntry::Agent { expanded, .. }) = self.history.get_mut(entry_idx) {
-                *expanded = !*expanded;
+            match self.history.get_mut(entry_idx) {
+                Some(HistoryEntry::Agent { expanded, .. })
+                | Some(HistoryEntry::Subagent { expanded, .. }) => {
+                    *expanded = !*expanded;
+                }
+                _ => {}
             }
             return;
         }
@@ -3901,6 +3916,47 @@ fn xml_escape(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
+/// Settle the most-recent still-running [`HistoryEntry::Subagent`] for
+/// `child` against its `report`. Freezes the elapsed clock into the
+/// total duration and flips the live `delegated to…` line into the
+/// settled header + response. A report whose text the driver prefixed
+/// with `Error: ` (its failure encoding) flips the entry to the failed
+/// header — never leaving a dangling animated line. If no running entry
+/// is found (defensive — spawn/report events should pair), a settled
+/// entry is pushed so the report is never lost.
+fn settle_subagent_in(history: &mut Vec<HistoryEntry>, child: &str, report: String) {
+    let failed = report.starts_with("Error: ");
+    let found = history.iter_mut().rev().find_map(|entry| match entry {
+        HistoryEntry::Subagent {
+            child: c,
+            spawned_at,
+            outcome: outcome @ None,
+            ..
+        } if c == child => Some((spawned_at, outcome)),
+        _ => None,
+    });
+    match found {
+        Some((spawned_at, outcome)) => {
+            *outcome = Some(SubagentOutcome {
+                duration: spawned_at.elapsed(),
+                failed,
+                report,
+            });
+        }
+        None => history.push(HistoryEntry::Subagent {
+            parent: String::new(),
+            child: child.to_string(),
+            spawned_at: Instant::now(),
+            outcome: Some(SubagentOutcome {
+                duration: Duration::ZERO,
+                failed,
+                report,
+            }),
+            expanded: false,
+        }),
+    }
+}
+
 fn entry_to_plain_lines(entry: &HistoryEntry) -> Vec<String> {
     match entry {
         HistoryEntry::Plain { line } => vec![line.clone()],
@@ -3985,6 +4041,32 @@ fn entry_to_plain_lines(entry: &HistoryEntry) -> Vec<String> {
             }
             out
         }
+        HistoryEntry::Subagent {
+            parent,
+            child,
+            outcome,
+            ..
+        } => match outcome {
+            // A still-running delegation spilled on `/new`: record the
+            // delegation line without the (now-meaningless) live timer.
+            None => vec![format!("{parent} delegated to {child}…")],
+            Some(o) => {
+                let verb = if o.failed {
+                    "failed after"
+                } else {
+                    "worked for"
+                };
+                let header = format!(
+                    "{child} {verb} {}",
+                    crate::tui::history::format_compact_duration(o.duration)
+                );
+                let mut out = vec![header];
+                for line in o.report.lines() {
+                    out.push(format!("  {line}"));
+                }
+                out
+            }
+        },
         HistoryEntry::CompactBoundary {
             predecessor_short_id,
             seed_tool_count,
@@ -4311,6 +4393,82 @@ mod local_cmd_tests {
         assert!(out.contains("hello"));
         let (_o, failed) = exec_capture_shell("exit 3", std::path::Path::new("."));
         assert!(failed);
+    }
+}
+
+#[cfg(test)]
+mod subagent_settle_tests {
+    use super::settle_subagent_in;
+    use crate::tui::history::HistoryEntry;
+
+    fn running(parent: &str, child: &str) -> HistoryEntry {
+        HistoryEntry::Subagent {
+            parent: parent.into(),
+            child: child.into(),
+            spawned_at: std::time::Instant::now(),
+            outcome: None,
+            expanded: false,
+        }
+    }
+
+    fn outcome(entry: &HistoryEntry) -> Option<(&str, bool)> {
+        match entry {
+            HistoryEntry::Subagent {
+                outcome: Some(o), ..
+            } => Some((o.report.as_str(), o.failed)),
+            _ => None,
+        }
+    }
+
+    /// Spawn → report transition settles the running entry in place
+    /// (no new entry pushed) with the report and failed=false.
+    #[test]
+    fn report_settles_running_entry_in_place() {
+        let mut history = vec![running("Build", "explore")];
+        settle_subagent_in(&mut history, "explore", "all done".into());
+        assert_eq!(history.len(), 1);
+        assert_eq!(outcome(&history[0]), Some(("all done", false)));
+    }
+
+    /// A report whose text is the driver's `Error: ` failure encoding
+    /// settles as a failure (failed=true) rather than a normal report.
+    #[test]
+    fn error_prefixed_report_settles_as_failure() {
+        let mut history = vec![running("Build", "explore")];
+        settle_subagent_in(&mut history, "explore", "Error: it broke".into());
+        assert_eq!(outcome(&history[0]), Some(("Error: it broke", true)));
+    }
+
+    /// An empty report still settles the entry (the renderer shows a
+    /// bare header) — it doesn't leave a dangling running line.
+    #[test]
+    fn empty_report_settles_running_entry() {
+        let mut history = vec![running("Build", "explore")];
+        settle_subagent_in(&mut history, "explore", String::new());
+        assert_eq!(outcome(&history[0]), Some(("", false)));
+    }
+
+    /// Each report settles the most-recent still-running entry for the
+    /// child (the just-spawned one), leaving already-settled entries
+    /// untouched. With two running entries, the first report settles the
+    /// newer (last) one, the second report settles the older.
+    #[test]
+    fn settles_most_recent_running_for_child() {
+        let mut history = vec![running("Build", "explore"), running("Build", "explore")];
+        settle_subagent_in(&mut history, "explore", "first".into());
+        settle_subagent_in(&mut history, "explore", "second".into());
+        assert_eq!(outcome(&history[1]), Some(("first", false)));
+        assert_eq!(outcome(&history[0]), Some(("second", false)));
+    }
+
+    /// A report with no matching running entry pushes a settled entry
+    /// (defensive) so the report is never lost.
+    #[test]
+    fn orphan_report_pushes_settled_entry() {
+        let mut history: Vec<HistoryEntry> = Vec::new();
+        settle_subagent_in(&mut history, "explore", "orphan".into());
+        assert_eq!(history.len(), 1);
+        assert_eq!(outcome(&history[0]), Some(("orphan", false)));
     }
 }
 

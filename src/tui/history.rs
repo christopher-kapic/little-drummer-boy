@@ -17,7 +17,7 @@ use ratatui::text::{Line, Span};
 
 use crate::config::extended::ThinkingDisplay;
 use crate::tui::markdown;
-use crate::tui::theme::MUTED_COLOR_INDEX;
+use crate::tui::theme::{MUTED_COLOR_INDEX, SUBAGENT_ORANGE_INDEX};
 
 /// Markdown render preferences, threaded from `App` to each
 /// per-entry renderer. Cheap to copy, so we pass by value.
@@ -108,6 +108,32 @@ pub enum HistoryEntry {
         /// True when the command exited non-zero — tints the label red.
         failed: bool,
     },
+    /// A noninteractive subagent delegation, surfaced via the subagent
+    /// spawn/report events. While the child runs (`outcome` is `None`)
+    /// it renders as a single live line — `{parent} delegated to
+    /// {child}… (elapsed)` — with animated ellipses and a ticking timer
+    /// driven by `spawned_at`. Once it returns, `outcome` is `Some` and
+    /// the line becomes a `{child} worked for {duration}` (or `failed
+    /// after`) header plus the markdown-rendered, left-bar-quoted,
+    /// truncatable response body. Child name renders in orange; parent
+    /// in the default style.
+    Subagent {
+        /// Delegating agent's name (default style).
+        parent: String,
+        /// Delegated-to agent's name (orange).
+        child: String,
+        /// `Instant` the spawn event arrived — drives the live elapsed
+        /// clock while running and freezes into `outcome.duration` on
+        /// report.
+        spawned_at: std::time::Instant,
+        /// `None` while the child is still running; `Some` once it has
+        /// reported (or failed).
+        outcome: Option<SubagentOutcome>,
+        /// Click-expanded: render the full report body instead of the
+        /// truncated leading-lines preview. Only meaningful once
+        /// `outcome` is `Some`.
+        expanded: bool,
+    },
     /// Boundary marker at the top of a `/compact`-created session
     /// (`prune-and-compact.md`). `/compact` forks to a fresh thread and
     /// preserves the old session whole, so this is the divider-equivalent
@@ -125,6 +151,23 @@ pub enum HistoryEntry {
         seed_tool_tokens: u64,
     },
 }
+
+/// The settled result of a [`HistoryEntry::Subagent`] delegation.
+#[derive(Debug, Clone)]
+pub struct SubagentOutcome {
+    /// The child's final report text. May be empty (renders as a bare
+    /// header with no quoted block).
+    pub report: String,
+    /// True when the delegation ended in error rather than a normal
+    /// report — flips the header to `failed after {duration}`.
+    pub failed: bool,
+    /// Total wall-clock from spawn to report.
+    pub duration: Duration,
+}
+
+/// Leading report lines a collapsed [`HistoryEntry::Subagent`] shows
+/// before the `… (expand)` affordance.
+pub const SUBAGENT_PREVIEW_LINES: usize = 3;
 
 /// Lifecycle state of one tool call. Drives the line color: yellow
 /// while the model waits, white on success, red when the tool failed,
@@ -393,6 +436,20 @@ pub fn render_entry(
                 continuations,
             }
         }
+        HistoryEntry::Subagent {
+            parent,
+            child,
+            spawned_at,
+            outcome,
+            expanded,
+        } => render_subagent(
+            parent,
+            child,
+            *spawned_at,
+            outcome.as_ref(),
+            *expanded,
+            width,
+        ),
         HistoryEntry::CompactBoundary {
             predecessor_short_id,
             seed_tool_count,
@@ -821,6 +878,158 @@ fn render_agent(
                 }
             }
         }
+    }
+
+    Rendered {
+        lines: out,
+        chip_row,
+        continuations: conts,
+    }
+}
+
+/// Light grey for the subagent response body — the same chrome/banner
+/// muted grey used elsewhere for secondary text.
+const SUBAGENT_BODY_FG: Color = Color::Indexed(MUTED_COLOR_INDEX);
+/// Orange for a subagent's (child) name in both the running line and
+/// the settled header.
+const SUBAGENT_NAME_FG: Color = Color::Indexed(SUBAGENT_ORANGE_INDEX);
+
+/// Render a [`HistoryEntry::Subagent`].
+///
+/// While the child runs (`outcome` is `None`) this is a single live
+/// line — `{parent} delegated to {child}… (elapsed)` — whose animated
+/// ellipses and ticking timer reuse the main working-span mechanism
+/// ([`thinking_dots_padded`] + [`format_status_elapsed`], fed
+/// `spawned_at.elapsed()`); the chat pane re-renders every event-loop
+/// tick, so the values advance on screen without a second timer.
+///
+/// Once the child reports, the line becomes a `{child} worked for
+/// {duration}` header (or `failed after` on error) followed by the
+/// response body: markdown-rendered, tinted light grey, sitting in a
+/// left-`│`-bar quoted block. The body is truncated to
+/// [`SUBAGENT_PREVIEW_LINES`] leading lines with a clickable `…
+/// (expand)` affordance (the returned `chip_row`) unless `expanded`.
+/// An empty report renders the header alone with no quoted block.
+///
+/// Only the child name carries orange; the parent uses the default
+/// style.
+fn render_subagent(
+    parent: &str,
+    child: &str,
+    spawned_at: std::time::Instant,
+    outcome: Option<&SubagentOutcome>,
+    expanded: bool,
+    width: u16,
+) -> Rendered {
+    let indent = " ".repeat(AGENT_INDENT);
+    let name_style = Style::default().fg(SUBAGENT_NAME_FG);
+
+    let Some(outcome) = outcome else {
+        // Running: one live line. Dots + elapsed advance every tick
+        // because the renderer reads `spawned_at.elapsed()` fresh each
+        // frame — the same source the working-span indicator uses.
+        let elapsed = spawned_at.elapsed();
+        let dots = thinking_dots_padded(elapsed.as_millis());
+        let spans = vec![
+            Span::raw(indent),
+            Span::styled(format!("{parent} delegated to "), Style::default()),
+            Span::styled(child.to_string(), name_style),
+            Span::styled(
+                format!("{dots} {}", format_status_elapsed(elapsed)),
+                Style::default().add_modifier(Modifier::ITALIC),
+            ),
+        ];
+        return Rendered {
+            lines: vec![Line::from(spans)],
+            chip_row: None,
+            continuations: vec![false],
+        };
+    };
+
+    // Settled: header line, child name in orange.
+    let verb = if outcome.failed {
+        "failed after"
+    } else {
+        "worked for"
+    };
+    let duration = format_compact_duration(outcome.duration);
+    let header = Line::from(vec![
+        Span::raw(indent.clone()),
+        Span::styled(child.to_string(), name_style),
+        Span::raw(format!(" {verb} {duration}")),
+    ]);
+
+    let mut out: Vec<Line<'static>> = vec![header];
+    let mut conts: Vec<bool> = vec![false];
+    let mut chip_row = None;
+
+    if outcome.report.trim().is_empty() {
+        return Rendered {
+            lines: out,
+            chip_row,
+            continuations: conts,
+        };
+    }
+
+    // Quoted body: markdown-rendered, light grey, behind a left `│`
+    // bar. Pre-wrap to the bar-reduced width so continuations keep the
+    // bar instead of dropping to column 0.
+    let bar = "│ ";
+    let body_w = (width as usize)
+        .saturating_sub(AGENT_INDENT + bar.chars().count())
+        .max(1);
+    let (wrapped, _conts) = wrap_lines_to_width(markdown::render(&outcome.report), body_w);
+
+    // Collapsed: show the leading lines, then a clickable expand chip.
+    // Expanded: show the whole body. (Mirrors the toolbox collapse
+    // affordance — a single click toggles `expanded`.)
+    let (visible, truncated) = if expanded || wrapped.len() <= SUBAGENT_PREVIEW_LINES {
+        (wrapped.as_slice(), false)
+    } else {
+        (&wrapped[..SUBAGENT_PREVIEW_LINES], true)
+    };
+
+    for line in visible {
+        let mut spans: Vec<Span<'static>> = vec![
+            Span::raw(indent.clone()),
+            Span::styled(bar.to_string(), Style::default().fg(SUBAGENT_BODY_FG)),
+        ];
+        for s in &line.spans {
+            spans.push(Span::styled(
+                s.content.to_string(),
+                s.style.patch(Style::default().fg(SUBAGENT_BODY_FG)),
+            ));
+        }
+        out.push(Line::from(spans));
+        conts.push(false);
+    }
+
+    if truncated {
+        let hidden = wrapped.len() - SUBAGENT_PREVIEW_LINES;
+        chip_row = Some(out.len());
+        out.push(Line::from(vec![
+            Span::raw(indent.clone()),
+            Span::styled(
+                format!("… ({hidden} more — click to expand)"),
+                Style::default()
+                    .fg(SUBAGENT_BODY_FG)
+                    .add_modifier(Modifier::DIM | Modifier::UNDERLINED),
+            ),
+        ]));
+        conts.push(false);
+    } else if expanded && wrapped.len() > SUBAGENT_PREVIEW_LINES {
+        // Expanded: offer a collapse affordance so it's reversible.
+        chip_row = Some(out.len());
+        out.push(Line::from(vec![
+            Span::raw(indent),
+            Span::styled(
+                "(click to collapse)".to_string(),
+                Style::default()
+                    .fg(SUBAGENT_BODY_FG)
+                    .add_modifier(Modifier::DIM | Modifier::UNDERLINED),
+            ),
+        ]));
+        conts.push(false);
     }
 
     Rendered {
@@ -1466,16 +1675,23 @@ pub fn thinking_dots_padded(elapsed_ms: u128) -> String {
     format!("{:<3}", thinking_dots(elapsed_ms))
 }
 
+/// Format an elapsed span compactly, whole seconds only: `Xs` under a
+/// minute, `Xm Ys` at or beyond. Shared by the parenthesized status
+/// readout and the subagent `worked for …` / `failed after …` header.
+pub fn format_compact_duration(d: Duration) -> String {
+    let secs = d.as_secs();
+    if secs < 60 {
+        format!("{secs}s")
+    } else {
+        format!("{}m {}s", secs / 60, secs % 60)
+    }
+}
+
 /// Format an elapsed span for the working / thinking status indicator:
 /// `(Xs)` under a minute, `(Xm Ys)` at or beyond. Whole seconds only —
 /// the indicator advances once a second; sub-second precision is noise.
 pub fn format_status_elapsed(d: Duration) -> String {
-    let secs = d.as_secs();
-    if secs < 60 {
-        format!("({secs}s)")
-    } else {
-        format!("({}m {}s)", secs / 60, secs % 60)
-    }
+    format!("({})", format_compact_duration(d))
 }
 
 /// Format a thinking duration. Examples: `0.4 seconds`, `7 seconds`,
@@ -1860,5 +2076,163 @@ mod tests {
         );
         let text = line_text(&r.lines[0]);
         assert!(text.contains("compacted from deadbe"));
+    }
+
+    #[test]
+    fn compact_duration_compact_under_and_over_a_minute() {
+        assert_eq!(format_compact_duration(Duration::from_secs(0)), "0s");
+        assert_eq!(format_compact_duration(Duration::from_secs(45)), "45s");
+        assert_eq!(format_compact_duration(Duration::from_secs(59)), "59s");
+        assert_eq!(format_compact_duration(Duration::from_secs(60)), "1m 0s");
+        assert_eq!(format_compact_duration(Duration::from_secs(130)), "2m 10s");
+        // Sub-second is floored.
+        assert_eq!(format_compact_duration(Duration::from_millis(1900)), "1s");
+    }
+
+    /// Whether any span on the line carries the orange child-name color.
+    fn any_orange(line: &Line<'static>) -> bool {
+        line.spans
+            .iter()
+            .any(|s| s.style.fg == Some(SUBAGENT_NAME_FG))
+    }
+
+    fn render_sub(
+        parent: &str,
+        child: &str,
+        spawned_at: std::time::Instant,
+        outcome: Option<SubagentOutcome>,
+        expanded: bool,
+    ) -> Rendered {
+        render_entry(
+            &HistoryEntry::Subagent {
+                parent: parent.into(),
+                child: child.into(),
+                spawned_at,
+                outcome,
+                expanded,
+            },
+            80,
+            ThinkingDisplay::Condensed,
+            MarkdownOpts::default(),
+            crate::config::extended::DiffStyle::default(),
+            false,
+            &no_elided(),
+        )
+    }
+
+    /// Running: one live line `{parent} delegated to {child}…
+    /// (elapsed)`, child name orange, no expand chip.
+    #[test]
+    fn subagent_running_is_one_orange_live_line() {
+        let r = render_sub("Build", "explore", std::time::Instant::now(), None, false);
+        assert_eq!(r.lines.len(), 1);
+        let text = line_text(&r.lines[0]);
+        assert!(text.contains("Build delegated to explore"), "{text}");
+        // Verbatim casing: parent capitalized, child lowercase.
+        assert!(!text.contains("Explore"));
+        // Elapsed clock rendered (the `(…s)` readout).
+        assert!(text.contains("s)"), "{text}");
+        assert!(any_orange(&r.lines[0]));
+        assert!(r.chip_row.is_none());
+    }
+
+    /// Settled (normal): `{child} worked for {duration}` header (orange
+    /// child) + left-bar-quoted body, truncated with an expand chip.
+    #[test]
+    fn subagent_report_renders_header_and_quoted_body() {
+        // Blank-line-separated so each paragraph renders as its own row
+        // (markdown reflows single-newline runs into one paragraph).
+        let report = (0..10)
+            .map(|i| format!("para {i}"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let r = render_sub(
+            "Build",
+            "explore",
+            std::time::Instant::now(),
+            Some(SubagentOutcome {
+                report,
+                failed: false,
+                duration: Duration::from_secs(130),
+            }),
+            false,
+        );
+        let header = line_text(&r.lines[0]);
+        assert!(header.contains("explore worked for 2m 10s"), "{header}");
+        assert!(any_orange(&r.lines[0]));
+        // Body rows carry the left `│` bar.
+        assert!(r.lines[1..].iter().any(|l| line_text(l).contains("│")));
+        // Truncated: an expand chip exists and is the clickable row.
+        assert!(r.chip_row.is_some());
+        let chip = line_text(&r.lines[r.chip_row.unwrap()]);
+        assert!(chip.contains("expand"), "{chip}");
+        // Collapsed body shows only the preview lines.
+        let body_rows = r.lines.len() - 1 /* header */ - 1 /* chip */;
+        assert_eq!(body_rows, SUBAGENT_PREVIEW_LINES);
+    }
+
+    /// Expanding reveals the full body and offers a collapse affordance.
+    #[test]
+    fn subagent_expanded_reveals_full_body() {
+        let report = (0..10)
+            .map(|i| format!("para {i}"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let r = render_sub(
+            "Build",
+            "explore",
+            std::time::Instant::now(),
+            Some(SubagentOutcome {
+                report,
+                failed: false,
+                duration: Duration::from_secs(5),
+            }),
+            true,
+        );
+        // All ten body paragraphs present (plus header + collapse chip).
+        let joined: String = r.lines.iter().map(line_text).collect();
+        assert!(joined.contains("para 9"));
+        assert!(r.chip_row.is_some());
+    }
+
+    /// Failure: `{child} failed after {duration}` header, child orange,
+    /// no dangling running line.
+    #[test]
+    fn subagent_failure_renders_failed_header() {
+        let r = render_sub(
+            "Build",
+            "explore",
+            std::time::Instant::now(),
+            Some(SubagentOutcome {
+                report: "Error: it broke".into(),
+                failed: true,
+                duration: Duration::from_secs(7),
+            }),
+            false,
+        );
+        let header = line_text(&r.lines[0]);
+        assert!(header.contains("explore failed after 7s"), "{header}");
+        assert!(!header.contains("delegated to"));
+        assert!(any_orange(&r.lines[0]));
+    }
+
+    /// Empty report: bare `{child} worked for {duration}` header, no
+    /// quoted block, no expand chip.
+    #[test]
+    fn subagent_empty_report_is_header_only() {
+        let r = render_sub(
+            "Build",
+            "explore",
+            std::time::Instant::now(),
+            Some(SubagentOutcome {
+                report: "   \n  ".into(),
+                failed: false,
+                duration: Duration::from_secs(3),
+            }),
+            false,
+        );
+        assert_eq!(r.lines.len(), 1);
+        assert!(line_text(&r.lines[0]).contains("explore worked for 3s"));
+        assert!(r.chip_row.is_none());
     }
 }
