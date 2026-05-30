@@ -32,6 +32,7 @@ pub mod paste;
 pub mod pty;
 pub mod sessions_pane;
 pub mod settings;
+pub mod skills_pane;
 pub mod slash;
 pub mod stats_pane;
 pub mod textfield;

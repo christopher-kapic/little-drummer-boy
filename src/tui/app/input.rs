@@ -289,6 +289,16 @@ impl App {
             return false;
         }
 
+        // `/skills` overlay (read-only). Same modal rule: route the key to
+        // the pane, close on its request, and always consume so nothing
+        // leaks into the composer underneath.
+        if let Some(pane) = self.skills_pane.as_mut() {
+            if pane.handle_key(key) {
+                self.skills_pane = None;
+            }
+            return false;
+        }
+
         // Ctrl+J toggles every agent reasoning block's expand/collapse
         // state. (See the doc comment on `toggle_recent_reasoning` for
         // why this is a keybind rather than a click handler.) Only
@@ -1280,6 +1290,7 @@ impl App {
             || self.model_picker.is_some()
             || self.stats_pane.is_some()
             || self.sessions_pane.is_some()
+            || self.skills_pane.is_some()
             || self.context_menu.is_some()
         {
             return;

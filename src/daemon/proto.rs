@@ -242,8 +242,9 @@ pub enum Request {
     /// `/config` tabbed editor (GOALS §2c).
     GetConfig,
 
-    /// List discovered skills.
-    ListSkills,
+    /// List discovered skills, resolving the configured scan dirs from
+    /// `project_root` (the client's cwd) so per-project config applies.
+    ListSkills { project_root: String },
 
     /// List discovered agents (bundled + on-disk + agent_dirs).
     ListAgents,

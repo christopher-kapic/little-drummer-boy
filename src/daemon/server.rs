@@ -461,7 +461,23 @@ async fn handle_request(
             Err(not_implemented("GetConfig (lands with /config TUI)"))
         }
 
-        Request::ListSkills => Err(not_implemented("ListSkills")),
+        Request::ListSkills { project_root } => {
+            // Resolve the configured scan dirs from the client's cwd so
+            // per-project skills config applies, then run the shared
+            // discovery used by the `skill` tool and auto-select path.
+            let cwd = Path::new(&project_root);
+            let extended = crate::config::extended::load_for_cwd(cwd);
+            let skills = crate::skills::discover(cwd, &extended.skills).map_err(internal)?;
+            let skills = skills
+                .into_iter()
+                .map(|s| proto::SkillSummary {
+                    name: s.frontmatter.name,
+                    description: s.frontmatter.description,
+                    source: s.source.display().to_string(),
+                })
+                .collect();
+            Ok(Response::Skills { skills })
+        }
         Request::ListAgents => Err(not_implemented("ListAgents")),
         Request::ListModels { .. } => Err(not_implemented("ListModels")),
 

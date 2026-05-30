@@ -327,6 +327,16 @@ impl App {
                 p.render(frame, rects.body);
             }
             self.sessions_pane = pane;
+        } else if self.skills_pane.is_some() {
+            // Same take/render/restore as the other panes. Renders into
+            // `rects.body` so the fixed chrome (cwd + git branch + context
+            // + active agent) stays visible — the overlay is a view, not a
+            // chrome change.
+            let mut pane = self.skills_pane.take();
+            if let Some(p) = pane.as_mut() {
+                p.render(frame, rects.body);
+            }
+            self.skills_pane = pane;
         } else {
             // Carve the body for an embedded pane (GOALS §1i) when one
             // is open: fullscreen fills the body, splits divide it. The

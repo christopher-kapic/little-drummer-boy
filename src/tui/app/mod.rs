@@ -252,6 +252,10 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "Open the settings dialog",
     },
     SlashCommand {
+        name: "skills",
+        description: "List every discovered skill in a read-only overlay",
+    },
+    SlashCommand {
         name: "stats",
         description: "On-device model and project performance (tokens, recovery, languages)",
     },
@@ -390,6 +394,10 @@ pub struct App {
     /// `stats_pane`. Enter resumes the highlighted session via the
     /// existing `attach_to_session` path.
     pub(super) sessions_pane: Option<crate::tui::sessions_pane::SessionsPane>,
+    /// `/skills` pane — a read-only overlay listing every discovered
+    /// skill (name + description + source). `None` when closed. Routed
+    /// input/render alongside `stats_pane` / `sessions_pane`.
+    pub(super) skills_pane: Option<crate::tui::skills_pane::SkillsPane>,
     /// "Daemon not running" prompt shown at startup. Once the user picks,
     /// this is taken and the prompt closes.
     pub(super) daemon_prompt: Option<crate::tui::daemon_prompt::DaemonPromptDialog>,
@@ -811,6 +819,7 @@ impl App {
             model_picker: None,
             stats_pane: None,
             sessions_pane: None,
+            skills_pane: None,
             daemon_prompt,
             question_dialog: None,
             daemon_connected,
@@ -2784,6 +2793,16 @@ impl App {
             }
             return;
         }
+        // `/skills` overlay: same full-body wheel-scroll / eat-everything-
+        // else rule as the other informational panes.
+        if let Some(pane) = self.skills_pane.as_mut() {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => pane.scroll_up(),
+                MouseEventKind::ScrollDown => pane.scroll_down(),
+                _ => {}
+            }
+            return;
+        }
         // Embedded pane (GOALS §1i/§1e): divider drag-resize, click-to-
         // focus, and PTY mouse forwarding. Consumes the event when it
         // lands on the divider or inside the pane so the chat handlers
@@ -3326,6 +3345,11 @@ impl App {
                 self.sessions_pane = Some(crate::tui::sessions_pane::SessionsPane::open(
                     &self.launch.cwd,
                 ));
+                return false;
+            }
+            "skills" => {
+                self.skills_pane =
+                    Some(crate::tui::skills_pane::SkillsPane::open(&self.launch.cwd));
                 return false;
             }
             "fork" => {
@@ -4137,6 +4161,15 @@ mod slash_rank_tests {
         assert!(
             SLASH_COMMANDS.iter().any(|c| c.name == "rename"),
             "/rename must be a registered slash command"
+        );
+    }
+
+    #[test]
+    fn skills_command_is_registered() {
+        // `/skills` (read-only skill listing) must be dispatchable.
+        assert!(
+            SLASH_COMMANDS.iter().any(|c| c.name == "skills"),
+            "/skills must be a registered slash command"
         );
     }
 
