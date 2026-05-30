@@ -288,7 +288,22 @@ async fn run_worker(
         // it gets the cross-session recall tools.
         interactive: true,
     };
-    let root = Arc::new(builtin::build(&spawn_args));
+    // Root primary: the session's stored active agent (so a resume restarts
+    // on `Plan` after a `/plan` swap, `plan.md §4.6.d`), falling back to
+    // `Build` when it's unset/unknown. `Build` and `Plan` are the only
+    // primary-mode agents; anything else degrades to `Build`.
+    let root_agent_name = session
+        .db
+        .get_session(session_id)
+        .ok()
+        .flatten()
+        .map(|row| row.active_agent)
+        .filter(|name| name == "Plan" || name == "Build")
+        .unwrap_or_else(|| "Build".to_string());
+    let root = Arc::new(
+        builtin::load(&root_agent_name, &spawn_args)
+            .unwrap_or_else(|_| builtin::build(&spawn_args)),
+    );
 
     // Snapshot the resolved agent-guidance file body that just went into
     // the frozen system block (live instructions-file diff injection,
@@ -490,8 +505,18 @@ async fn run_worker(
                 // Driver holds the model client by Arc.
             }
             SessionWork::SetAgent { name } => {
+                // Persist the active-agent choice so a resume restarts on it,
+                // then swap the live primary in place at the idle boundary
+                // (`/plan` → `Plan`, `/build` → `Build`, `plan.md §4.6.d`).
                 if let Err(e) = session.set_active_agent(&name) {
                     tracing::warn!(error = %e, "set_active_agent failed");
+                }
+                if driver_control_tx
+                    .send(crate::engine::driver::DriverControl::SwapPrimary { name })
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!(session_id = %session_id, "driver control channel closed");
                 }
             }
             SessionWork::CancelJob { job_id } => {
@@ -660,6 +685,9 @@ fn turn_event_to_proto(event: TurnEvent, session_id: Uuid) -> Vec<proto::Event> 
             }]
         }
         TurnEvent::AgentIdle => vec![proto::Event::AgentIdle { session_id }],
+        TurnEvent::PrimarySwapped { name } => {
+            vec![proto::Event::PrimarySwapped { session_id, name }]
+        }
         // Engine→proto direction never produces this — the `question`
         // tool emits `proto::Event::InterruptRaised` directly through
         // the interrupt hub, and the TUI-client direction

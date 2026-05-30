@@ -703,6 +703,7 @@ mod tests {
             interrupts: hub,
             cancel: tokio_util::sync::CancellationToken::new(),
             approver: Some(approver),
+            deferred_log: crate::engine::deferred::DeferredLog::new(),
         }
     }
 

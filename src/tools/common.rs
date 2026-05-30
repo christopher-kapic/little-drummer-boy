@@ -200,6 +200,7 @@ pub(crate) fn test_ctx(root: &Path) -> ToolCtx {
         interrupts: Arc::new(crate::engine::interrupt::InterruptHub::detached()),
         cancel: tokio_util::sync::CancellationToken::new(),
         approver: None,
+        deferred_log: crate::engine::deferred::DeferredLog::new(),
     }
 }
 

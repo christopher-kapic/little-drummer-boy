@@ -41,6 +41,13 @@ pub enum DriverControl {
     Compact,
     /// Pin a user message verbatim for the next `/compact` (`/pin`).
     Pin { text: String },
+    /// Swap the **primary** (root-frame) agent in place (`/plan` → `Plan`,
+    /// `/build` → `Build`, `plan.md §4.6.d`). Handled at the idle boundary
+    /// like other control requests; the root history is preserved so the
+    /// new primary continues the same conversation with its own tool
+    /// surface + system prompt. A no-op when an interactive subagent holds
+    /// the foreground (stack depth > 1) or the name is already active.
+    SwapPrimary { name: String },
 }
 
 /// Maximum number of queued user messages to fold into a single
@@ -98,6 +105,11 @@ pub struct AgentSession {
     /// parent's outstanding tool-call id (we have to answer it when we
     /// pop). `None` for the root session.
     pub answering: Option<PendingTaskCall>,
+    /// This frame's deferred-log buffer (`plan.md §3d`). A subagent's
+    /// `defer_to_orchestrator` calls append here; on pop the driver drains
+    /// it and folds it into the report the parent ingests. The root frame's
+    /// buffer is never read (the root has no parent to defer to).
+    pub deferred_log: crate::engine::deferred::DeferredLog,
 }
 
 #[derive(Debug, Clone)]
@@ -261,6 +273,7 @@ impl Driver {
                 agent: root,
                 history: Vec::new(),
                 answering: None,
+                deferred_log: crate::engine::deferred::DeferredLog::new(),
             }],
             time_injection_interval_minutes: 5,
             loop_guard_threshold: crate::config::extended::MIN_LOOP_GUARD_THRESHOLD,
@@ -510,6 +523,50 @@ impl Driver {
             }
             DriverControl::Pin { text } => {
                 self.session.pin_message(&text);
+            }
+            DriverControl::SwapPrimary { name } => {
+                self.swap_primary(&name, tx).await;
+            }
+        }
+    }
+
+    /// Swap the root-frame agent to `name` in place, preserving the root
+    /// history so the new primary continues the same conversation. Only the
+    /// root frame is swapped, and only at idle (the control boundary) — a
+    /// deeper interactive subagent frame is never touched. No-op when an
+    /// interactive subagent holds the foreground or the agent is already
+    /// active. The new agent is built through [`crate::engine::builtin::load`]
+    /// so a user override of `Plan`/`Build` takes effect.
+    async fn swap_primary(&mut self, name: &str, tx: &mpsc::Sender<TurnEvent>) {
+        if self.stack.len() != 1 {
+            tracing::warn!(
+                requested = %name,
+                "primary swap ignored: an interactive subagent holds the foreground"
+            );
+            return;
+        }
+        if self.stack[0].agent.name == name {
+            return;
+        }
+        match crate::engine::builtin::load(name, &self.spawn_args(true)) {
+            Ok(agent) => {
+                self.stack[0].agent = Arc::new(agent);
+                // The job authority's fork context is rooted on the old
+                // agent; rebind it so any future loop fork runs on the new
+                // primary's model/tool surface (single-authority rule).
+                self.jobs.set_agent(self.stack[0].agent.clone());
+                tracing::info!(agent = %name, "primary agent swapped");
+                // Tell the client chrome's active-agent slot about the new
+                // primary, then refresh the prunable projection.
+                let _ = tx
+                    .send(TurnEvent::PrimarySwapped {
+                        name: name.to_string(),
+                    })
+                    .await;
+                self.emit_context_projection(tx).await;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, requested = %name, "primary swap failed to load agent");
             }
         }
     }
@@ -866,6 +923,8 @@ impl Driver {
             // is consulted in earnest; a missing approver skips the
             // boundary prompt (never denies).
             approver: self.approver.clone(),
+            // Seed re-exec runs read-only tools only; nothing defers.
+            deferred_log: crate::engine::deferred::DeferredLog::new(),
         };
         let mut blocks: Vec<String> = Vec::new();
         for seed in seeds {
@@ -1297,6 +1356,10 @@ impl Driver {
             let is_root = self.stack.len() == 1;
             let turn_result = {
                 let top = self.stack.last_mut().expect("stack never empty");
+                // The foreground frame's deferred-log buffer (`plan.md §3d`):
+                // a subagent's `defer_to_orchestrator` calls land here, and
+                // the driver folds them into the report when the frame pops.
+                let deferred_log = top.deferred_log.clone();
                 turn(
                     &agent,
                     &mut top.history,
@@ -1310,6 +1373,7 @@ impl Driver {
                     self.approver.clone(),
                     self.loop_guard_threshold,
                     is_root,
+                    deferred_log,
                     tx,
                 )
                 .await
@@ -1388,7 +1452,21 @@ impl Driver {
                             let PendingDelegationShrink { tracker, handle } = pending;
                             self.finish_delegation_shrink(tracker, handle, tx).await;
                         }
-                        let report = collect_final_text(&child.history);
+                        // Fold the child frame's deferred-log into the report
+                        // (`plan.md §3d`): the parent ingests `{ report,
+                        // deferred_log }` as one tool result and addresses each
+                        // deferred item. Drained once on pop; nothing-deferred
+                        // is the common path and adds no framing.
+                        let report = if child.deferred_log.is_empty() {
+                            collect_final_text(&child.history)
+                        } else {
+                            let deferred = child.deferred_log.drain();
+                            format!(
+                                "{}{}",
+                                collect_final_text(&child.history),
+                                crate::engine::deferred::format_section(&deferred)
+                            )
+                        };
                         if let Err(e) = self.session.record_event(
                             crate::db::session_log::SessionEventKind::SubagentReport,
                             Some(&child.agent.name),
@@ -1477,6 +1555,7 @@ impl Driver {
                             call_id: task_call_id,
                             function_call_id: task_function_call_id,
                         }),
+                        deferred_log: crate::engine::deferred::DeferredLog::new(),
                     });
                     next_prompt = Message::user(self.redact.scrub(&brief));
                     continue;
@@ -1780,6 +1859,11 @@ pub(crate) async fn run_noninteractive(
     let agent = Arc::new(child);
     let mut history: Vec<Message> = Vec::new();
     let mut next_prompt = Message::user(brief);
+    // A noninteractive subagent's own deferred-log (`plan.md §3d`). The
+    // bundled leaves (explore/docs) lack `defer_to_orchestrator`, so this
+    // stays empty for them; a custom subagent that holds the tool gets its
+    // deferred items folded into the leaf report it returns up.
+    let deferred_log = crate::engine::deferred::DeferredLog::new();
 
     for _ in 0..max_turns {
         let outcome = turn(
@@ -1798,6 +1882,7 @@ pub(crate) async fn run_noninteractive(
             // system prompt on spawn, so it never needs the live
             // instructions-file diff injection.
             false,
+            deferred_log.clone(),
             &sink_tx,
         )
         .await?;
@@ -1810,7 +1895,12 @@ pub(crate) async fn run_noninteractive(
             TurnOutcome::Done => {
                 drop(sink_tx);
                 let _ = drain.await;
-                return Ok(collect_final_text(&history));
+                let deferred = deferred_log.drain();
+                return Ok(format!(
+                    "{}{}",
+                    collect_final_text(&history),
+                    crate::engine::deferred::format_section(&deferred)
+                ));
             }
             TurnOutcome::SpawnSubagent { .. }
             | TurnOutcome::SpawnNoninteractive { .. }
@@ -1991,6 +2081,7 @@ mod tests {
             agent: child,
             history: dup_read_history(),
             answering: None,
+            deferred_log: crate::engine::deferred::DeferredLog::new(),
         });
 
         // Prune the foreground (the subagent on top).

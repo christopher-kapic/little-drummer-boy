@@ -169,6 +169,10 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "Keep the machine awake so agents survive a closed lid (arg: on/off/until-idle)",
     },
     SlashCommand {
+        name: "build",
+        description: "Switch the primary agent to Build (make changes)",
+    },
+    SlashCommand {
         name: "clear",
         description: "Clear the chat and start a fresh session (alias of /new)",
     },
@@ -239,6 +243,10 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
     SlashCommand {
         name: "pin",
         description: "Pin a message so it survives /compact verbatim (arg: text)",
+    },
+    SlashCommand {
+        name: "plan",
+        description: "Switch the primary agent to Plan (author a plan)",
     },
     SlashCommand {
         name: "plans",
@@ -1797,6 +1805,23 @@ impl App {
         });
     }
 
+    /// `/plan` / `/build` — swap the session's primary agent (`plan.md
+    /// §4.6.d`). Sends `SetAgent`, which the worker persists and forwards to
+    /// the driver as a live root-frame swap at the idle boundary; the chrome
+    /// updates off the daemon's `PrimarySwapped` event. A no-op message when
+    /// no runner is connected yet.
+    pub(super) fn swap_primary_agent(&mut self, name: &str) {
+        let sent = self.send_daemon_request(crate::daemon::proto::Request::SetAgent {
+            name: name.to_string(),
+        });
+        let line = if sent {
+            format!("Switched primary agent to `{name}`")
+        } else {
+            "Send a message first to start a session, then switch agents".to_string()
+        };
+        self.history.push(HistoryEntry::Plain { line });
+    }
+
     /// Send a fire-and-forget daemon request over the runner's record
     /// channel (same path `/jobs cancel` uses). Returns whether a runner
     /// was connected to receive it.
@@ -2396,6 +2421,14 @@ impl App {
                 self.reconnect_attempt = None;
                 self.finalize_pending();
                 self.end_working_span();
+            }
+            TurnEvent::PrimarySwapped { name } => {
+                // The primary (root-frame) agent was swapped (`/plan` ↔
+                // `/build`). Reflect it in the chrome's active-agent slot.
+                // The daemon path also tracks this off the runner's
+                // `PrimarySwapped` → `update_active_agent`; this arm keeps
+                // `apply_event` exhaustive and covers any in-process path.
+                self.launch.agent_name = name;
             }
             TurnEvent::InterruptRaised {
                 interrupt_id,
@@ -3589,6 +3622,14 @@ impl App {
                     Some(crate::tui::skills_pane::SkillsPane::open(&self.launch.cwd));
                 return false;
             }
+            "plan" => {
+                self.swap_primary_agent("Plan");
+                return false;
+            }
+            "build" => {
+                self.swap_primary_agent("Build");
+                return false;
+            }
             "plans" => {
                 self.plans_pane = Some(crate::tui::plans_pane::PlansPane::open());
                 return false;
@@ -4579,6 +4620,26 @@ mod slash_rank_tests {
         assert!(
             SLASH_COMMANDS.iter().any(|c| c.name == "sandbox"),
             "/sandbox must be a registered slash command"
+        );
+    }
+
+    #[test]
+    fn plan_and_build_commands_are_registered() {
+        // `/plan` and `/build` swap the primary agent (`plan.md §4.6.d`).
+        for name in ["plan", "build"] {
+            assert!(
+                SLASH_COMMANDS.iter().any(|c| c.name == name),
+                "/{name} must be a registered slash command"
+            );
+        }
+    }
+
+    #[test]
+    fn plan_agent_color_is_f8d749() {
+        // The `Plan` agent shows in #f8d749 in the chrome/history.
+        assert_eq!(
+            crate::tui::history::agent_color("Plan"),
+            ratatui::style::Color::Rgb(0xf8, 0xd7, 0x49)
         );
     }
 

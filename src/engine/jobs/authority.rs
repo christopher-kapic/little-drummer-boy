@@ -470,6 +470,14 @@ impl JobAuthority {
     pub fn set_turn_tx(&mut self, tx: mpsc::Sender<TurnEvent>) {
         self.turn_tx = tx;
     }
+
+    /// Rebind the fork context's agent after a primary swap (`/plan` ↔
+    /// `/build`, `plan.md §4.6.d`) so future ephemeral-fork loop iterations
+    /// run on the new primary's model/tool surface. Existing live jobs keep
+    /// the agent they were spawned with.
+    pub fn set_agent(&mut self, agent: Arc<Agent>) {
+        self.ctx.agent = agent;
+    }
 }
 
 /// Short random job id (`job-xxxxxxxx`). Human-typable in `/jobs cancel`

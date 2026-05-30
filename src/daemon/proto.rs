@@ -650,6 +650,11 @@ pub enum Event {
     /// emits it too.
     AgentIdle { session_id: Uuid },
 
+    /// The primary (root-frame) agent was swapped in place (`/plan` →
+    /// `Plan`, `/build` → `Build`, `plan.md §4.6.d`). The client chrome's
+    /// active-agent slot tracks `name`.
+    PrimarySwapped { session_id: Uuid, name: String },
+
     /// The session ended (user requested, daemon shutting down,
     /// crash recovery couldn't restore it, …).
     SessionEnded { session_id: Uuid, reason: String },

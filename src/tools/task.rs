@@ -26,10 +26,17 @@ impl TaskTool {
     /// Build the tool with the agent enum populated from the caller's
     /// available subagents — keeps the schema honest so the model
     /// can't ask to delegate to an agent that doesn't exist.
+    ///
+    /// `mode` is an optional override of the per-agent default
+    /// interactivity. Omitted, the engine routes by the agent's own default
+    /// (`coder`/`plan-author` are interactive handoffs; everything else runs
+    /// noninteractively). The explicit value is the seam the future
+    /// LLM-strategy axis switches on (`design-need-to-discuss-or-test.md`):
+    /// the interactive-subagent path is the one wired today.
     pub fn with_subagents(agents: &[&str]) -> Self {
         let list = agents.join("/");
         let description = format!(
-            "Delegate a scoped piece of work to a subagent ({list}); coder takes over the conversation, explore runs noninteractively"
+            "Delegate a scoped piece of work to a subagent ({list}); an interactive subagent takes over the conversation, others run noninteractively"
         );
         let parameters = serde_json::json!({
             "type": "object",
@@ -42,6 +49,11 @@ impl TaskTool {
                 "prompt": {
                     "type": "string",
                     "description": "Self-contained brief: goal, constraints, files, what \"done\" looks like"
+                },
+                "mode": {
+                    "type": "string",
+                    "description": "Delegation mode override",
+                    "enum": ["subagent", "subagent_interactive"]
                 }
             },
             "required": ["agent", "prompt"]

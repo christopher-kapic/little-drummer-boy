@@ -257,7 +257,7 @@ pub const TIMESTAMP_WIDTH: usize = 5;
 pub fn agent_color(name: &str) -> Color {
     match name {
         "Build" => Color::Cyan,
-        "Plan" => Color::Magenta,
+        "Plan" => Color::Rgb(0xf8, 0xd7, 0x49),
         "coder" => Color::Green,
         "explore" => Color::Yellow,
         "docs" => Color::Blue,

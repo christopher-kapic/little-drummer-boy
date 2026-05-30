@@ -728,15 +728,20 @@ agent uses keys that opencode doesn't recognize.
 
 ### 3a. Bundled agent cast (v1)
 
-cockpit ships five built-in agents (Build and Plan + three
+cockpit ships six built-in agents (Build and Plan + four
 specialists). The cast is deliberately minimal — these compose into
-"plan ↔ build → look at project → look at deps → write." Anything
+"plan ↔ build → interview per subfeature → look at project → look at
+deps → write." The sixth agent, `plan-author`, is a deliberate
+user-approved expansion: the planning authoring flow (`plan.md` §3d)
+needs a dedicated interactive interviewer so the verbose per-subfeature
+interview stays out of `Plan`'s context (token economy §10). Anything
 else is a user-authored agent.
 
 | Agent                 | Mode     | Cwd | Purpose |
 |-----------------------|----------|-----|---------|
 | `Build`  | primary  | project root | The traditional coding-harness experience. Owns the user's conversation when the focus is *making the change*. Tools: `read` (shallow inspection of files the user references; not for searching), `task` (delegation), `skill`. May invoke `explore` interactively (one at a time) or in the background (multiple in parallel). May invoke `coder` interactively (one at a time). Does not directly `write`/`edit` and does not hold file locks. |
-| `Plan`   | primary  | project root | Ralph-style planner. Owns the user's conversation when the focus is *deciding what to do*. Tools: `read` (shallow inspection), `task`, `skill`, plus plan-graph tools (create / append / update / delete / trigger). Sees in-progress and not-yet-implemented plans (completed plans are hidden by default; see "plan visibility" below). Triggering hands the plan off to the ralph executor (see §3b "Background agents") — `Plan` does **not** hold the user's conversation while the plan runs; the user keeps talking to `Plan` about other plans. Delegates to `explore` (interactive one-at-a-time, or background multi-parallel). Does not write code. |
+| `Plan`   | primary  | project root | Ralph-style planner. Owns the user's conversation when the focus is *deciding what to do*. Tools: `read`, `bash` (read-only inspection + git branch checks), the planning tools (`plan_create`/`add_step`/`add_step_dependency`/`plan_set_branches`/`plan_list`), `task`, `skill`, `question`. Sees in-progress and not-yet-implemented plans (completed plans are hidden by default; see "plan visibility" below). Authors plans by interviewing the user one subfeature at a time through the interactive `plan-author` subagent (`plan.md` §3d); ingests `{ report, deferred_log }` on the interviewer's return. Triggering hands the plan off to the executor (later cut). Does not write code. |
+| `plan-author`         | subagent (interactive) | project root | Per-subfeature interviewer spawned by `Plan` via `task(mode="subagent_interactive")`. Takes over the conversation, grills the user draft-prompt-style on one subfeature, confirms packages, infers + confirms each test's concurrency class, and records small dependency-ordered steps via `add_step`/`add_step_dependency`. Out-of-scope asks go back to `Plan` via `defer_to_orchestrator` (`plan.md` §3d). Tools: `read`, `bash`, `add_step`, `add_step_dependency`, `question`, `defer_to_orchestrator`. Authors plan structure only — no `write`/`edit`, no locks, no code-writing delegation. |
 | `explore`             | subagent | project root | Read-only investigator over the **current project**. Tools: `read`, `bash` (raw `rg`/`fd`), and the read-only codebase-intelligence tools (§21). Cannot invoke subagents. Returns `file:line` citations, not prose summaries. |
 | `coder`               | subagent | project root | The only agent that holds file locks and writes/edits. Tools: `read`/`readlock`/`write`/`writeunlock`/`unlock`/`edit`/`bash`/`task` plus the codebase-intelligence tools (§21). The `task` permission is scoped to `docs` only (noninteractive, may run multiple in parallel). Receives a scoped task from its caller, makes the changes, returns a structured report. Mode is set by caller: interactive when invoked by `Build`, noninteractive when invoked by the ralph executor (see §3b). |
 | `docs`                | subagent | (pipeline; see below) | A **fixed two-stage, fully-noninteractive pipeline** that answers a caller's question about how to use a third-party dependency, by reading that dependency's *actual source code*. Not a single read/bash investigator and not general delegation — the driver routes it (`engine::docs_pipeline`). **Docs.1 (resolver)** runs in the caller's cwd with `list-packages` / `add-package` / `bash` / `webfetch` / `websearch`; it confirms or shallow-clones the dependency into cockpit's package registry (§4d-bis) and sees **only** the package name (the question never enters its context — token economy §10). **Docs.2 (answerer)** then runs in the resolved package directory with `read` + the sandboxed `grep` / `glob` only — no bash, no network, no write — and produces `file:line`-cited output from the dependency source. Cannot invoke subagents. |
@@ -766,13 +771,14 @@ deliberately shallow and leaf-terminated:
 
 ```
 Build → explore, coder
-Plan  → explore   (+ triggers plans via the ralph executor)
+Plan  → plan-author   (interactive, one per subfeature)
 coder              → docs
 explore            → (leaf, cannot spawn)
+plan-author        → (leaf, cannot spawn)
 docs               → (leaf, cannot spawn)
 ```
 
-The leaf-termination rule (explore and docs cannot spawn) is what
+The leaf-termination rule (explore, plan-author, and docs cannot spawn) is what
 keeps context aggregation tractable: every delegation tree has a
 bounded depth and a single writer. `docs` is itself a fixed
 two-stage internal pipeline (Docs.1 resolver → Docs.2 answerer; see

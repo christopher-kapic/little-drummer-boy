@@ -72,6 +72,14 @@ pub fn known_tool_names() -> &'static [&'static str] {
         "skill",
         "question",
         "jobs",
+        // planning tools (`src/tools/plan.rs`) + the subagent deferral tool
+        // (`plan.md §3d`). None hold write/lock, so any agent may grant them.
+        "plan_create",
+        "add_step",
+        "add_step_dependency",
+        "plan_set_branches",
+        "plan_list",
+        "defer_to_orchestrator",
         // cross-session recall (interactive-only at spawn)
         "session_search",
         "session_read",

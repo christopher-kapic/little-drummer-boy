@@ -452,6 +452,65 @@ impl Tool for AddDependencyTool {
     }
 }
 
+// ── plan_set_branches ──────────────────────────────────────────────────────
+
+pub struct SetBranchesTool;
+
+#[async_trait]
+impl Tool for SetBranchesTool {
+    fn name(&self) -> &str {
+        "plan_set_branches"
+    }
+
+    fn description(&self) -> &str {
+        "Set a plan's base and target branch policy after authoring"
+    }
+
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "plan": { "type": "string", "description": "Plan slug or id" },
+                "base_branch": { "type": "string", "description": "Branch work forks from" },
+                "target_branch": { "type": "string", "description": "Branch the plan lands on" }
+            },
+            "required": ["plan"]
+        })
+    }
+
+    async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
+        let plan_ref = args
+            .get("plan")
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid_input("`plan` is required"))?;
+        let plan_id = resolve_plan(ctx, plan_ref)?;
+
+        let base_branch = args
+            .get("base_branch")
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty());
+        let target_branch = args
+            .get("target_branch")
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty());
+        if base_branch.is_none() && target_branch.is_none() {
+            return Err(invalid_input(
+                "at least one of `base_branch` or `target_branch` is required",
+            ));
+        }
+
+        ctx.session
+            .db
+            .set_plan_branches(plan_id, base_branch, target_branch)?;
+
+        Ok(ToolOutput::text(format!(
+            "set branch policy on plan `{plan_ref}` (base {}, target {})",
+            base_branch.unwrap_or("unchanged"),
+            target_branch.unwrap_or("unchanged"),
+        )))
+    }
+}
+
 // ── plan_list ──────────────────────────────────────────────────────────────
 
 pub struct ListPlansTool;
@@ -660,6 +719,47 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("cycle"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn set_branches_persists_policy() {
+        let ctx = test_ctx();
+        CreatePlanTool
+            .call(serde_json::json!({ "slug": "b", "title": "B" }), &ctx)
+            .await
+            .unwrap();
+        SetBranchesTool
+            .call(
+                serde_json::json!({
+                    "plan": "b",
+                    "base_branch": "main",
+                    "target_branch": "cockpit-plan/b"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let plan = ctx.session.db.plan_by_slug("b").unwrap().unwrap();
+        assert_eq!(plan.base_branch.as_deref(), Some("main"));
+        assert_eq!(plan.target_branch.as_deref(), Some("cockpit-plan/b"));
+    }
+
+    #[tokio::test]
+    async fn set_branches_requires_at_least_one_branch() {
+        let ctx = test_ctx();
+        CreatePlanTool
+            .call(serde_json::json!({ "slug": "b", "title": "B" }), &ctx)
+            .await
+            .unwrap();
+        let err = SetBranchesTool
+            .call(serde_json::json!({ "plan": "b" }), &ctx)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("base_branch") || err.contains("target_branch"),
+            "{err}"
+        );
     }
 
     #[tokio::test]

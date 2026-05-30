@@ -24,6 +24,7 @@
 pub mod agent;
 pub mod builtin;
 pub mod compact;
+pub mod deferred;
 pub mod deleg_shrink;
 pub mod docs_pipeline;
 pub mod driver;

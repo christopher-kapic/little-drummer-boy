@@ -124,6 +124,11 @@ pub enum TurnEvent {
     /// whole-stack signal, not a per-agent one.
     AgentIdle,
 
+    /// The primary (root-frame) agent was swapped in place (`/plan` →
+    /// `Plan`, `/build` → `Build`, `plan.md §4.6.d`). Emitted by the driver
+    /// so the client chrome's active-agent slot tracks the new primary.
+    PrimarySwapped { name: String },
+
     /// A `question` tool raised an interrupt (GOALS §3b): the agent is
     /// blocked until the user answers. The TUI opens the answering
     /// dialog from this; the answer round-trips back to the daemon as
@@ -296,6 +301,7 @@ pub async fn turn(
     approver: Option<Arc<crate::approval::Approver>>,
     loop_guard_threshold: u32,
     is_root: bool,
+    deferred_log: crate::engine::deferred::DeferredLog,
     tx: &mpsc::Sender<TurnEvent>,
 ) -> Result<TurnOutcome> {
     let tools = agent.tools.definitions();
@@ -460,6 +466,7 @@ pub async fn turn(
         interrupts,
         cancel,
         approver,
+        deferred_log,
     };
 
     for tc in &calls {
@@ -486,7 +493,16 @@ pub async fn turn(
                 .and_then(Value::as_str)
                 .unwrap_or("coder")
                 .to_string();
-            let noninteractive = crate::engine::builtin::is_noninteractive(&child);
+            // Interactivity: an explicit `mode` override wins; otherwise the
+            // agent's own default (`coder`/`plan-author` interactive, the
+            // rest noninteractive). The explicit `mode` is the seam the
+            // future LLM-strategy axis switches on
+            // (`design-need-to-discuss-or-test.md`).
+            let noninteractive = match tc.function.arguments.get("mode").and_then(Value::as_str) {
+                Some("subagent_interactive") => false,
+                Some("subagent") => true,
+                _ => crate::engine::builtin::is_noninteractive(&child),
+            };
             // Timeline event (Part B): a `task` delegation spawned a
             // child. Carries the child agent, the triggering task call id,
             // and the brief. (Interactive subagents share this session's

@@ -145,28 +145,28 @@ This primitive stays scoped to the three lazy-discovery consumers
 
 ---
 
-## D17. Direct-write orchestrator-build (relax single-writer for small tasks)
+## D17. Direct-write `Build` (relax single-writer for small tasks)
 
 **Context.** Today only `coder` writes / holds file locks — single
 writer per delegation tree (GOALS §3a, CLAUDE.md). For a *small* task,
-having `orchestrator-build` spawn `coder` at all is arguably overkill:
+having `Build` spawn `coder` at all is arguably overkill:
 the round-trip costs tokens and latency for a one-line edit.
 
-**The proposal (deferred, not adopted).** Give `orchestrator-build`
+**The proposal (deferred, not adopted).** Give `Build`
 direct `readlock` / `edit` / `write` (and a new `append` tool, D18 below)
 for small tasks, making it a *second writer*. The tool descriptions
-surfaced to `orchestrator-build` would steer it: edit directly when the
+surfaced to `Build` would steer it: edit directly when the
 task is small, delegate to `coder` when it's big.
 
 **Decision so far (2026-05-28).** Keep the single-writer invariant for
-now — option **(i)**: `orchestrator-build` stays delegation-only; we make
+now — option **(i)**: `Build` stays delegation-only; we make
 the `coder` hop *cheap* for small tasks instead (fast-path spawn, minimal
 ceremony) rather than adding a second writer. **Revisit (ii) later.**
 
 **Hard prerequisite for revisiting.** Direct-write is *contingent on
 dynamic (per-agent) tool descriptions* — without the ability to vary a
 tool's description by the agent it's surfaced to, we can't steer
-`orchestrator-build` to "edit small / delegate big," so direct-write
+`Build` to "edit small / delegate big," so direct-write
 would have no guard rail. Per-agent descriptions (the GOALS §3a `read`
 nudge is the first instance) must land first.
 
@@ -192,7 +192,7 @@ contents never enter context.
 **Open.**
 - It mutates a file, so it's a *write-capable* tool → subject to the same
   single-writer policy as D17. v1 home is therefore `coder` only (not
-  `orchestrator-build`) until D17(ii) is revisited.
+  `Build`) until D17(ii) is revisited.
 - Locking: append must acquire/append/release atomically so concurrent
   appends from parallel `coder`s (ralph) don't interleave. Confirm the
   lock manager grants a short exclusive append-lock.
@@ -303,7 +303,7 @@ after a few cycles.
   2026-05-28**: Phase 1 implemented in `src/intel/` (index + tree-sitter
   extraction + import resolver + budgeted writer) and `src/tools/intel.rs`
   (8 tools), with `read` extended for line-ranges; wired to `explore`,
-  `coder`, and `orchestrator-build`. Migration 0005 backs the index.
+  `coder`, and `Build`. Migration 0005 backs the index.
   (`impact` + trigram search index remain Phase 2.)
 
 - **D14. Async jobs (loop/timer/background) + mid-conversation tool
@@ -364,3 +364,43 @@ after a few cycles.
   commands/{packages,kcl}.rs}`. User-approval gating for new-package
   clones is left as a clean seam (out of scope; a future tool-approval
   task adds it).
+
+---
+
+## D19. LLM-strategy axis: `defensive` vs `normal` (per-subfeature spawn vs episode sequencing)
+
+**Context.** The planning authoring flow (`plan.md` §3d, spec
+`prompts/planning-mode-authoring-flow.md`) interviews the user one
+subfeature at a time. Two mechanisms can drive "do the subfeatures in
+sequence":
+
+- **Interactive subagent per subfeature** — `Plan` spawns a fresh
+  `plan-author` (`task(mode="subagent_interactive")`) for each confirmed
+  subfeature; the verbose interview lives in the child's context and is
+  discarded on return, so `Plan`'s context stays lean. This is the
+  **only** path wired today (it is the right default for the
+  ~120k-context OS-model target — priority #1).
+- **Episode sequencing** — the `Build` per-task fresh-context mechanism
+  (`plan.md` §3d-bis): the same agent runs the subfeatures as a sequence
+  of episodes without a child handoff. Cheaper round-trips for strong
+  frontier models that don't need the context-minimizing handoff.
+
+**What's open.** Whether to expose the choice as an `llm_mode` setting
+(`defensive` → interactive subagents; `normal` → episode sequencing),
+where it lives in the config layering (cf. D8 per-model config), and
+whether it also flips other per-agent behavior (tool descriptions, repair
+aggressiveness) or is scoped to the planning/decomposition spawn only.
+
+**What's built now (the seam, not the feature).** The per-subfeature
+spawn goes through `task(mode=…)` (`src/tools/task.rs` +
+`src/engine/agent.rs`: an explicit `mode` overrides the agent's default
+interactivity). Episode sequencing can slot in behind that one call site
+without restructuring `Plan` or the `plan-author` cast. **No** strategy
+system, per-strategy tool definitions, or episode-sequencing code exists
+yet — only the interactive-subagent path is implemented.
+
+**What it unblocks.** A frontier-model fast path for plan authoring; and,
+more broadly, a single axis the whole harness can read to pick
+defensive-vs-normal behavior (the AgentMode `Primary`/`All` distinction
+in `src/agents/mod.rs` already reserves room for this — it is explicitly
+*not* the LLM-mode axis).

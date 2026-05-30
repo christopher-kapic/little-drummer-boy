@@ -18,6 +18,7 @@
 
 pub mod bash;
 pub mod custom;
+pub mod defer;
 pub mod docs;
 pub mod editunlock;
 pub mod glob;

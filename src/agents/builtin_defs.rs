@@ -22,10 +22,10 @@ use super::{AgentDef, AgentMode};
 
 /// Names of the built-in agents in scope for user editing, in canonical
 /// listing order. Drives the override-resolution, listing, and reset
-/// paths. Driven off the code (the factory functions), not docs: `Plan`
-/// is documented in `CLAUDE.md` but no such agent ships yet, so it is
-/// **not** here.
-pub const BUILTIN_AGENT_NAMES: &[&str] = &["Build", "coder", "explore"];
+/// paths. Driven off the code (the factory functions): `Plan` and its
+/// interactive interviewer `plan-author` are bundled agents (`plan.md
+/// §4.6.d`), so they are user-overridable like the rest.
+pub const BUILTIN_AGENT_NAMES: &[&str] = &["Build", "coder", "explore", "Plan", "plan-author"];
 
 /// True when `name` is one of the editable built-in agents.
 pub fn is_builtin_agent(name: &str) -> bool {
@@ -40,6 +40,8 @@ pub fn embedded_default(name: &str) -> Option<AgentDef> {
         "Build" => Some(build_def()),
         "coder" => Some(coder_def()),
         "explore" => Some(explore_def()),
+        "Plan" => Some(plan_def()),
+        "plan-author" => Some(plan_author_def()),
         _ => None,
     }
 }
@@ -126,5 +128,49 @@ fn explore_def() -> AgentDef {
             "search",
         ],
         crate::engine::builtin::EXPLORE_PROMPT,
+    )
+}
+
+/// `Plan` — the user-facing planning agent (`plan.md §4.6.d`). Authors
+/// plans and delegates each subfeature to `plan-author`; never writes code.
+/// Tool surface mirrors [`crate::engine::builtin::plan`].
+fn plan_def() -> AgentDef {
+    def(
+        "Plan",
+        "Planning agent; turns a feature request into a dependency-ordered plan, no code writes.",
+        AgentMode::Primary,
+        &[
+            "read",
+            "bash",
+            "plan_create",
+            "add_step",
+            "add_step_dependency",
+            "plan_set_branches",
+            "plan_list",
+            "question",
+            "skill",
+            "task",
+        ],
+        crate::engine::builtin::PLAN_PROMPT,
+    )
+}
+
+/// `plan-author` — the interactive per-subfeature interviewer (`plan.md
+/// §3d`). Authors plan structure only — no write/lock, no code-writing
+/// delegation. Tool surface mirrors [`crate::engine::builtin::plan_author`].
+fn plan_author_def() -> AgentDef {
+    def(
+        "plan-author",
+        "Interactive interviewer; turns one subfeature into dependency-ordered plan steps.",
+        AgentMode::Subagent,
+        &[
+            "read",
+            "bash",
+            "add_step",
+            "add_step_dependency",
+            "question",
+            "defer_to_orchestrator",
+        ],
+        crate::engine::builtin::PLAN_AUTHOR_PROMPT,
     )
 }

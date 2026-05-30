@@ -25,6 +25,8 @@ use crate::tools::custom::CustomBashTool;
 pub(crate) const BUILD_PROMPT: &str = include_str!("build.md");
 pub(crate) const CODER_PROMPT: &str = include_str!("coder.md");
 pub(crate) const EXPLORE_PROMPT: &str = include_str!("explore.md");
+pub(crate) const PLAN_PROMPT: &str = include_str!("plan.md");
+pub(crate) const PLAN_AUTHOR_PROMPT: &str = include_str!("plan_author.md");
 /// Docs pipeline stage prompts (GOALS §3a, prompt `docs-agent.md`).
 const DOCS_RESOLVER_PROMPT: &str = include_str!("docs_resolver.md");
 const DOCS_ANSWERER_PROMPT: &str = include_str!("docs_answerer.md");
@@ -335,6 +337,8 @@ pub fn load(name: &str, args: &SpawnArgs) -> Result<Agent> {
         "Build" => Ok(build(args)),
         "coder" => Ok(coder(args)),
         "explore" => Ok(explore(args)),
+        "Plan" => Ok(plan(args)),
+        "plan-author" => Ok(plan_author(args)),
         other => bail!("unknown built-in agent `{other}`"),
     }
 }
@@ -344,14 +348,17 @@ pub fn load(name: &str, args: &SpawnArgs) -> Result<Agent> {
 /// (synchronously) rather than handing the primary conversation off. The
 /// driver uses this to route `task(agent=…, …)` correctly.
 ///
-/// `coder` is the sole interactive *handoff* subagent (it takes over the
-/// conversation, GOALS §3a/§3b). Everything else delegated via `task` —
-/// `explore`, the `docs` pipeline (leaf-terminated, GOALS §3a), and every
-/// user-authored custom subagent — runs noninteractively and reports one
-/// leaf result up. Defined as the complement of the single interactive
-/// agent so custom agents inherit the safe default without a registry.
+/// `coder` (the writer handoff, GOALS §3a/§3b) and `plan-author` (the
+/// per-subfeature interviewer, `plan.md §3d`) are the interactive *handoff*
+/// subagents: each takes over the conversation and talks to the user
+/// directly. Everything else delegated via `task` — `explore`, the `docs`
+/// pipeline (leaf-terminated, GOALS §3a), and every user-authored custom
+/// subagent — runs noninteractively and reports one leaf result up. Defined
+/// as the complement of the interactive set so custom agents inherit the
+/// safe default without a registry. A caller may still override per-call via
+/// `task(mode=…)`; this is only the default.
 pub fn is_noninteractive(name: &str) -> bool {
-    name != "coder"
+    !matches!(name, "coder" | "plan-author")
 }
 
 #[cfg(test)]
@@ -359,6 +366,100 @@ mod tests {
     use super::*;
 
     use crate::config::extended::ExtendedConfig;
+
+    /// A keyless localhost model + [`SpawnArgs`] for exercising the agent
+    /// factories. The model is never actually called — these tests only
+    /// inspect the constructed agent's name + tool surface.
+    fn test_spawn_args(cwd: &Path) -> SpawnArgs {
+        use crate::config::providers::{ActiveModelRef, ProviderEntry, ProvidersConfig};
+        use std::collections::BTreeMap;
+        let mut providers = BTreeMap::new();
+        providers.insert(
+            "lmstudio".to_string(),
+            ProviderEntry {
+                url: "http://localhost:1/v1".into(),
+                headers: vec![],
+                ..ProviderEntry::default()
+            },
+        );
+        let pcfg = ProvidersConfig {
+            providers,
+            active_model: Some(ActiveModelRef {
+                provider: "lmstudio".into(),
+                model: "local".into(),
+                thinking_mode: None,
+            }),
+            ..ProvidersConfig::default()
+        };
+        let model = Arc::new(crate::engine::model::Model::from_config(&pcfg).unwrap());
+        SpawnArgs {
+            model,
+            params: ModelParams::default(),
+            cwd: cwd.to_path_buf(),
+            session_short_id: String::new(),
+            interactive: true,
+        }
+    }
+
+    #[test]
+    fn plan_factory_has_planning_surface_no_writes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = plan(&test_spawn_args(tmp.path()));
+        assert_eq!(agent.name, "Plan");
+        let names = agent.tools.names();
+        for t in [
+            "plan_create",
+            "add_step",
+            "add_step_dependency",
+            "plan_set_branches",
+            "plan_list",
+            "question",
+            "task",
+        ] {
+            assert!(names.contains(&t), "Plan missing `{t}`: {names:?}");
+        }
+        // Never holds write/lock or code-writing delegation specifics.
+        for t in ["readlock", "writeunlock", "editunlock", "unlock"] {
+            assert!(!names.contains(&t), "Plan must not hold `{t}`");
+        }
+    }
+
+    #[test]
+    fn plan_author_factory_has_interview_surface_no_writes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = plan_author(&test_spawn_args(tmp.path()));
+        assert_eq!(agent.name, "plan-author");
+        let names = agent.tools.names();
+        for t in [
+            "add_step",
+            "add_step_dependency",
+            "question",
+            "defer_to_orchestrator",
+        ] {
+            assert!(names.contains(&t), "plan-author missing `{t}`: {names:?}");
+        }
+        // Authors plan structure only — no write/lock, no `task` delegation.
+        for t in ["readlock", "writeunlock", "editunlock", "unlock", "task"] {
+            assert!(!names.contains(&t), "plan-author must not hold `{t}`");
+        }
+    }
+
+    #[test]
+    fn load_dispatches_plan_and_plan_author() {
+        let tmp = tempfile::tempdir().unwrap();
+        let args = test_spawn_args(tmp.path());
+        assert_eq!(load("Plan", &args).unwrap().name, "Plan");
+        assert_eq!(load("plan-author", &args).unwrap().name, "plan-author");
+    }
+
+    #[test]
+    fn plan_author_is_interactive_by_default() {
+        // The interactive-handoff set is `coder` + `plan-author`.
+        assert!(!is_noninteractive("plan-author"));
+        assert!(!is_noninteractive("coder"));
+        assert!(is_noninteractive("explore"));
+        assert!(is_noninteractive("docs"));
+    }
 
     /// Config with a name set, used by the deterministic name-present case.
     fn cfg_with_name(name: &str) -> ExtendedConfig {
@@ -616,6 +717,12 @@ fn add_tool_by_name(
         "skill" => tb.with(Arc::new(tools::skill::SkillTool)),
         "question" => tb.with(Arc::new(tools::question::QuestionTool)),
         "jobs" => tb.with(Arc::new(tools::jobs::JobsTool)),
+        "plan_create" => tb.with(Arc::new(tools::plan::CreatePlanTool)),
+        "add_step" => tb.with(Arc::new(tools::plan::AddStepTool)),
+        "add_step_dependency" => tb.with(Arc::new(tools::plan::AddDependencyTool)),
+        "plan_set_branches" => tb.with(Arc::new(tools::plan::SetBranchesTool)),
+        "plan_list" => tb.with(Arc::new(tools::plan::ListPlansTool)),
+        "defer_to_orchestrator" => tb.with(Arc::new(tools::defer::DeferTool)),
         "task" => {
             let subs = reachable_subagents(def, &args.cwd);
             let sub_refs: Vec<&str> = subs.iter().map(String::as_str).collect();
@@ -630,15 +737,32 @@ fn add_tool_by_name(
     }
 }
 
-/// The subagents a `task`-granting agent may delegate to: the bundled
-/// reachable set (`coder`/`explore`/`docs`, what `Build` ships with) plus
-/// any user-authored custom agent whose `mode` makes it reachable as a
-/// subagent (`subagent`/`all`). Each is listed once, minus the caller
-/// itself to avoid a self-delegation loop. Honors the `mode` field for
-/// reachability per `prompts/user-definable-agents.md`.
+/// The subagents a `task`-granting agent may delegate to. For `Plan` the
+/// bundled reachable set is the interactive interviewer (`plan-author`,
+/// `plan.md §3d`); for everyone else it is the `Build` cast
+/// (`coder`/`explore`/`docs`). Either way, any user-authored custom agent
+/// whose `mode` makes it reachable as a subagent (`subagent`/`all`) is
+/// appended. Each is listed once, minus the caller itself to avoid a
+/// self-delegation loop. Honors the `mode` field for reachability per
+/// `prompts/user-definable-agents.md`.
 fn reachable_subagents(def: &crate::agents::AgentDef, cwd: &Path) -> Vec<String> {
-    let mut out = build_subagents(cwd);
+    let mut out = if def.name == "Plan" {
+        plan_subagents(cwd)
+    } else {
+        build_subagents(cwd)
+    };
     out.retain(|s| *s != def.name);
+    out
+}
+
+/// The bundled reachable subagent set for `Plan` (`plan-author`) plus any
+/// user-authored custom subagent (`mode` `subagent`/`all`). Shared by the
+/// bundled `Plan` factory and the generic [`reachable_subagents`]. The
+/// bundled name leads so the cached prefix stays stable when no custom
+/// agents are present.
+fn plan_subagents(cwd: &Path) -> Vec<String> {
+    let mut out: Vec<String> = vec!["plan-author".to_string()];
+    append_custom_subagents(&mut out, cwd);
     out
 }
 
@@ -655,6 +779,16 @@ fn build_subagents(cwd: &Path) -> Vec<String> {
         "explore".to_string(),
         "docs".to_string(),
     ];
+    append_custom_subagents(&mut out, cwd);
+    out
+}
+
+/// Append every user-authored custom agent whose `mode` makes it reachable
+/// as a subagent (`subagent`/`all`) to `out`, skipping names already
+/// present. Shared by [`build_subagents`] and [`plan_subagents`] so both
+/// honor the `mode` field for reachability the same way
+/// (`prompts/user-definable-agents.md`).
+fn append_custom_subagents(out: &mut Vec<String>, cwd: &Path) {
     for listing in crate::agents::list_all(cwd) {
         if !matches!(listing.kind, crate::agents::AgentKind::Custom) {
             continue;
@@ -666,7 +800,6 @@ fn build_subagents(cwd: &Path) -> Vec<String> {
             out.push(listing.name);
         }
     }
-    out
 }
 
 /// Resolve a per-agent `model` override to a concrete [`Model`]. Falls
@@ -808,6 +941,84 @@ pub fn explore(args: &SpawnArgs) -> Agent {
     Agent {
         name: "explore".to_string(),
         system: compose_system_prompt(EXPLORE_PROMPT, &args.session_short_id, &args.cwd),
+        tools,
+        model: args.model.clone(),
+        params: args.params.clone(),
+    }
+}
+
+/// `Plan` — the user-facing planning agent (`plan.md §4.6.d`). Owns the
+/// chat when the focus is *deciding what to do*: authors/mutates plans via
+/// the prompt-1 planning tools and interviews the user one subfeature at a
+/// time through the interactive `plan-author` subagent. Does **not** write
+/// code or hold locks — that is `coder` under `Build`.
+///
+/// Strategy seam (`design-need-to-discuss-or-test.md`): the
+/// interactive-subagent-per-subfeature path is the one wired today. The
+/// future LLM-strategy axis (`defensive` vs `normal`) would swap the
+/// per-subfeature spawn for episode sequencing here, behind the same
+/// `task(mode=…)` seam — no other restructuring required.
+pub fn plan(args: &SpawnArgs) -> Agent {
+    let tools = with_recall_tools(
+        with_custom_tools(
+            ToolBox::new()
+                .with(Arc::new(crate::tools::read::ReadTool))
+                .with(Arc::new(crate::tools::bash::BashTool::new()))
+                // Prompt-1 planning tools (`src/tools/plan.rs`): author and
+                // mutate the plan DAG. Registered here for the first time.
+                .with(Arc::new(crate::tools::plan::CreatePlanTool))
+                .with(Arc::new(crate::tools::plan::AddStepTool))
+                .with(Arc::new(crate::tools::plan::AddDependencyTool))
+                .with(Arc::new(crate::tools::plan::SetBranchesTool))
+                .with(Arc::new(crate::tools::plan::ListPlansTool))
+                // `question` (GOALS §3b): blocks for the fit-check,
+                // subfeature confirmation, and branch-selection prompts.
+                .with(Arc::new(crate::tools::question::QuestionTool))
+                .with(Arc::new(crate::tools::skill::SkillTool))
+                // Delegates each subfeature to the interactive interviewer.
+                .with(Arc::new(crate::tools::task::TaskTool::with_subagents(&[
+                    "plan-author",
+                ]))),
+            &args.cwd,
+        ),
+        args,
+    );
+
+    Agent {
+        name: "Plan".to_string(),
+        system: compose_system_prompt(PLAN_PROMPT, &args.session_short_id, &args.cwd),
+        tools,
+        model: args.model.clone(),
+        params: args.params.clone(),
+    }
+}
+
+/// `plan-author` — the interactive per-subfeature interviewer (`plan.md
+/// §3d`). Spawned by `Plan` via `task(mode="subagent_interactive")`; it
+/// takes over the conversation, interviews the user about its one assigned
+/// subfeature, and records dependency-ordered steps. Out-of-scope asks go
+/// back to `Plan` through `defer_to_orchestrator`. Authors plan structure
+/// only — **no** `write`/`edit`/lock and **no** code-writing delegation.
+pub fn plan_author(args: &SpawnArgs) -> Agent {
+    let tools = with_recall_tools(
+        with_custom_tools(
+            ToolBox::new()
+                .with(Arc::new(crate::tools::read::ReadTool))
+                .with(Arc::new(crate::tools::bash::BashTool::new()))
+                .with(Arc::new(crate::tools::plan::AddStepTool))
+                .with(Arc::new(crate::tools::plan::AddDependencyTool))
+                // `question` (GOALS §3b): the interview blocks on answers.
+                .with(Arc::new(crate::tools::question::QuestionTool))
+                // Hands out-of-scope asks back to `Plan` (`plan.md §3d`).
+                .with(Arc::new(crate::tools::defer::DeferTool)),
+            &args.cwd,
+        ),
+        args,
+    );
+
+    Agent {
+        name: "plan-author".to_string(),
+        system: compose_system_prompt(PLAN_AUTHOR_PROMPT, &args.session_short_id, &args.cwd),
         tools,
         model: args.model.clone(),
         params: args.params.clone(),

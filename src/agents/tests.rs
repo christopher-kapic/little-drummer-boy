@@ -141,6 +141,51 @@ fn even_coder_cannot_get_sandbox_tools() {
 }
 
 #[test]
+fn plan_and_plan_author_embedded_defs_validate() {
+    // The bundled `Plan` + `plan-author` defs are admissible: their grants
+    // hold no write/lock or sandbox tools (`plan.md §4.6.d`).
+    for name in ["Plan", "plan-author"] {
+        let def = embedded_default(name).unwrap();
+        assert!(
+            validate_invariants(&def).is_ok(),
+            "embedded `{name}` def must validate"
+        );
+    }
+}
+
+#[test]
+fn planning_tools_are_grantable() {
+    // The planning + deferral tools are known names any agent may grant
+    // (none are write/lock).
+    let def = def_with_tools(
+        "my-planner",
+        &[
+            "plan_create",
+            "add_step",
+            "add_step_dependency",
+            "plan_set_branches",
+            "plan_list",
+            "defer_to_orchestrator",
+        ],
+    );
+    assert!(validate_invariants(&def).is_ok());
+}
+
+#[test]
+fn plan_author_def_holds_no_write_or_lock_tools() {
+    // Defense-in-depth: the plan-author's grant intersects neither the
+    // write/lock set nor sandbox tools.
+    let def = embedded_default("plan-author").unwrap();
+    let tools = def.tools.clone().unwrap();
+    for t in LOCK_WRITE_TOOLS.iter().chain(SANDBOX_ONLY_TOOLS) {
+        assert!(
+            !tools.contains(&t.to_string()),
+            "plan-author must not grant `{t}`"
+        );
+    }
+}
+
+#[test]
 fn unknown_tool_name_is_rejected_backticked() {
     let def = def_with_tools("my-agent", &["read", "frobnicate"]);
     let err = validate_invariants(&def).unwrap_err();

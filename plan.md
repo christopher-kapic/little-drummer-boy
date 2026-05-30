@@ -2263,16 +2263,21 @@ cockpit ships a small, generic-named default cast in
 | Agent                 | Mode     | Default category | Cwd | Purpose |
 |-----------------------|----------|------------------|-----|---------|
 | `Build`               | primary  | `default`        | project | Traditional coding-harness experience. Owns the conversation when the focus is *making the change*. Delegates to `explore` / `docs` / `coder`. No direct `write`/`edit`; no file locks. `/build` slash command swaps to this one. |
-| `Plan`                | primary  | `slow` (thinking)| project | Ralph-style planner. Owns the conversation when the focus is *deciding what to do*. Sees the full feature dependency graph(s) (§4.1), can create new graph plans, can append to existing ones. Produces / mutates plan structures; does not write code directly. `/plan` slash command swaps to this one. |
+| `Plan`                | primary  | `slow` (thinking)| project | Ralph-style planner. Owns the conversation when the focus is *deciding what to do*. Sees the full feature dependency graph(s) (§4.1), can create new graph plans, can append to existing ones. Authors / mutates plan structures via the planning tools (`plan_create`/`add_step`/`add_step_dependency`/`plan_set_branches`/`plan_list`); interviews the user one subfeature at a time through the interactive `plan-author` subagent (§3d). Does not write code directly. `/plan` slash command swaps to this one. |
+| `plan-author`         | subagent (interactive) | `default` | project | Per-subfeature interviewer spawned by `Plan` via `task(mode="subagent_interactive")`. Takes over the conversation, grills the user draft-prompt-style on one subfeature, confirms packages, infers + confirms each test's concurrency class, and records small dependency-ordered steps with `add_step`. Out-of-scope asks go back to `Plan` via `defer_to_orchestrator` (§3d). Authors plan structure only — no `write`/`edit`, no locks, no code-writing delegation. |
 | `explore`             | subagent | `default`        | project | Read-only investigator over the *current* project. Tools: `read`, `bash` (raw `rg`/`fd`), and the read-only codebase-intelligence tools (GOALS §21). Designed as a search engine — returns `file:line` citations, not prose summaries. |
 | `coder`               | subagent | `slow`           | project | The only agent that holds locks and writes/edits. Receives a scoped task from the active primary agent, makes the changes, returns a structured report. |
 | `docs`                | subagent | `default`        | pipeline (caller cwd → package dir) | Fixed two-stage noninteractive pipeline that answers "how do I use this dependency?" from its real source. Docs.1 (resolver, caller cwd) confirms/shallow-clones the dependency into cockpit's package registry; Docs.2 (answerer, package dir) reads it with `read` + sandboxed `grep`/`glob` (no bash/network/write) and returns `file:line` citations. To the caller it's one leaf invocation. See GOALS §3a / §4d-bis. |
 
 Names are generic, not personality-themed. The cast is **deliberately
-minimal at v1** — five agents that compose into "plan ↔ build →
-look at project → look at deps → write." Earlier drafts listed a
-larger cast (`planner`, `reviewer`, `committer`, `fast-search`,
-etc.); those are not bundled in v1. Users who want named personas,
+minimal** — six agents that compose into "plan ↔ build →
+interview per subfeature → look at project → look at deps → write."
+`plan-author` is the one deliberate, user-approved expansion beyond the
+original five: the planning authoring flow (§3d) needs a dedicated
+interactive interviewer so the verbose per-subfeature interview stays
+out of `Plan`'s context (token economy, GOALS §10). Earlier drafts
+listed a larger cast (`reviewer`, `committer`, `fast-search`,
+etc.); those are not bundled. Users who want named personas,
 or who want a reviewer / committer / researcher role, write their
 own agent files. Resist the temptation to expand the bundled cast
 beyond what's load-bearing.

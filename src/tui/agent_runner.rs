@@ -211,6 +211,11 @@ fn try_spawn_inner(
         let events = events.clone();
         let active_agent = active_agent.clone();
         let client = client.clone();
+        // The current primary (root-frame) agent, tracked so a subagent pop
+        // returns the active-agent slot to the right primary after a `/plan`
+        // or `/build` swap (not a hardcoded `Build`). Seeded from the
+        // attach-time active agent.
+        let primary_agent = Arc::new(Mutex::new(active_agent.lock().unwrap().clone()));
         tokio::spawn(async move {
             while let Some(event) = client.next_event().await {
                 // Daemon-global events (caffeinate) carry no session_id and
@@ -220,7 +225,7 @@ fn try_spawn_inner(
                 if !is_global && event_session(&event) != Some(session_id) {
                     continue;
                 }
-                update_active_agent(&event, &active_agent);
+                update_active_agent(&event, &active_agent, &primary_agent);
                 if let Some(translated) = proto_event_to_turn_event(event) {
                     events.lock().unwrap().push(translated);
                 }
@@ -418,16 +423,27 @@ pub fn session_live_status_blocking(
     }
 }
 
-fn update_active_agent(event: &proto::Event, slot: &Arc<Mutex<String>>) {
+fn update_active_agent(
+    event: &proto::Event,
+    slot: &Arc<Mutex<String>>,
+    primary: &Arc<Mutex<String>>,
+) {
     match event {
+        proto::Event::PrimarySwapped { name, .. } => {
+            // The root-frame primary changed (`/plan` ↔ `/build`). Track it
+            // and, since a swap only happens at idle (no subagent on top),
+            // reflect it in the live slot immediately.
+            *primary.lock().unwrap() = name.clone();
+            *slot.lock().unwrap() = name.clone();
+        }
         proto::Event::SubagentSpawned { child, .. } => {
             *slot.lock().unwrap() = child.clone();
         }
         proto::Event::SubagentReport { .. } => {
-            // Pop back to the root. v1 supports a depth-1 stack
-            // (`Build` → coder | explore); deeper trees
-            // need a proper stack to track properly.
-            *slot.lock().unwrap() = "Build".to_string();
+            // Pop back to the current primary. v1 supports a depth-1 stack
+            // (`Build`/`Plan` → one subagent); deeper trees need a proper
+            // stack to track properly.
+            *slot.lock().unwrap() = primary.lock().unwrap().clone();
         }
         _ => {}
     }
@@ -450,6 +466,7 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         | InterruptRaised { session_id, .. }
         | InterruptResolved { session_id, .. }
         | AgentIdle { session_id, .. }
+        | PrimarySwapped { session_id, .. }
         | SessionEnded { session_id, .. }
         | JobStarted { session_id, .. }
         | JobProgress { session_id, .. }
@@ -622,6 +639,9 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
             message,
         },
         InterruptRaised { .. } | InterruptResolved { .. } | SessionEnded { .. } => return None,
+        // The chrome's active-agent slot is updated directly in
+        // `update_active_agent`; the swap needs no history-stream entry.
+        PrimarySwapped { .. } => return None,
     })
 }
 

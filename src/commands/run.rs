@@ -361,6 +361,7 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         | InterruptRaised { session_id, .. }
         | InterruptResolved { session_id, .. }
         | AgentIdle { session_id, .. }
+        | PrimarySwapped { session_id, .. }
         | SessionEnded { session_id, .. }
         | JobStarted { session_id, .. }
         | JobProgress { session_id, .. }

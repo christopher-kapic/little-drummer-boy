@@ -196,6 +196,13 @@ pub struct ToolCtx {
     /// skips the prompt — it never silently denies. Shared `Arc` so one
     /// approver instance backs the whole delegation tree.
     pub approver: Option<Arc<crate::approval::Approver>>,
+    /// The current frame's deferred-log buffer (`plan.md §3d`). A subagent's
+    /// `defer_to_orchestrator` tool appends out-of-scope asks here; the
+    /// driver drains it when the frame pops and folds it into the report the
+    /// parent ingests. `Default` (empty) for the root frame and for contexts
+    /// with no subagent (tests, seed-tool re-exec) — defer there is a no-op
+    /// drain nobody reads.
+    pub deferred_log: crate::engine::deferred::DeferredLog,
 }
 
 /// Project the `Tool` trait into a `ToolDefinition` rig understands.
