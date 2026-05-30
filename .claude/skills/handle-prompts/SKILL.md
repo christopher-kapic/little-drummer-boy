@@ -19,6 +19,10 @@ This is the inverse of `draft-prompt`: that skill *writes* specs to
 Repeat until `prompts/` holds no prompt files:
 
 1. **Read every remaining prompt.** List `prompts/` and read each file.
+   **Re-list on every iteration — never work off a stale snapshot.** The
+   user may add new prompt files while you work, so a directory that
+   looked empty earlier can have fresh prompts; only stop the loop when a
+   live re-list shows no prompt files.
 
 2. **Pick a dependency-free prompt.** A prompt depends on another when it
    can't be correctly implemented until the other's change exists (it
@@ -99,12 +103,37 @@ Repeat until `prompts/` holds no prompt files:
      Stage paths explicitly — never `git add -A` / `git add .`, because
      of the untracked sibling directories. Follow the repo's commit
      conventions (e.g. the `Co-Authored-By` trailer in `CLAUDE.md`).
+   - **Push the commit** to the remote (`git push`) right after it
+     lands, before moving on. Every prompt's commit gets pushed.
 
 7. **Delete the prompt — but do not commit the deletion.** `rm` the
    prompt file so it drops out of the next re-list and the loop can
    terminate. Leave the deletion unstaged; the user commits removals
    periodically themselves. (The prompt's *content* is already preserved
    in history by the implement+prompt commit from step 6.)
+
+## Periodic maintenance
+
+These run **between** prompts, never mid-prompt. When one comes due,
+finish the current prompt's commit + push first, then do the
+maintenance, then resume the loop.
+
+- **Every 3 prompts: prune `target/`.** This machine is space-
+  constrained — keep build artifacts from filling the disk. After every
+  3rd shipped prompt (the 3rd, 6th, 9th, …), run `cargo clean -p
+  cockpit-cli` to drop our crate's artifacts while keeping the
+  dependency artifacts cached. Count prompts you've actually landed, not
+  iterations.
+
+- **Periodically: a repo-wide cleanup pass.** Every so often (and at
+  least once during a long run), delegate a subagent to audit the
+  **entire** repo — not just the latest change — for bad patterns, bugs,
+  and code that can be abstracted or simplified. Have it make those
+  fixes, then **you** independently verify the gates (the same four, plus
+  the message-multiset clippy check) and review the diff. Commit and push
+  this cleanup as its **own** commit (bump the patch version, follow the
+  same staging/commit rules) **before** returning to normal prompts —
+  never fold it into a prompt's commit.
 
 ## When the directory is empty
 
@@ -115,8 +144,8 @@ Then summarize: one or two lines per prompt — what it did and its commit
 ## Rules
 
 - **One prompt per iteration.** Implement, verify, bump the patch
-  version, commit, delete, then re-list. Don't batch multiple prompts
-  into one commit — each prompt ships in its own version.
+  version, commit, push, delete, then re-list. Don't batch multiple
+  prompts into one commit — each prompt ships in its own version.
 - **No tech debt.** The prompts themselves say so; hold the subagent to
   it. No TODOs, no half-finished paths, no shortcuts.
 - **Stage explicitly.** This repo has untracked sibling directories that

@@ -82,24 +82,23 @@ and cross-reference with `GOALS.md`, `plan.md`, `miscellaneous.md`,
     with a deferred-log return channel.** When an orchestrator
     spawns a subagent in interactive mode, the subagent is **swapped
     into the composer** as the agent the user talks to directly,
-    while the orchestrator is paused. If the user asks the subagent
+    while the active primary agent is paused. If the user asks the subagent
     for out-of-scope work, the subagent doesn't expand its scope —
     it calls `defer_to_orchestrator(message)`, which appends to a
     per-task deferred-log buffer. On subagent completion, the
-    orchestrator resumes and receives `{ report, deferred_log: [..] }`
+    active primary agent resumes and receives `{ report, deferred_log: [..] }`
     in one go. The pattern keeps subagent scope discipline intact
     while letting users fluidly steer the conversation mid-flight.
     No surveyed harness combines transparent foreground-swap with
     the deferred-log return channel.
-12b. **Two-orchestrator split (`orchestrator-build` vs
-    `orchestrator-plan`).** Other harnesses treat "plan" and "build"
+12b. **Two-agent split (`Build` vs `Plan`).** Other harnesses treat "plan" and "build"
     as behavioral modes of one agent (opencode's `/plan` / `/build`
     slash toggles). cockpit makes them **separate primary agents** with
     distinct prompts, distinct categories (planner defaults to a
     thinking model), distinct cognitive framing. They share the
     session DB and lock manager, so a graph plan authored under
-    `-plan` is immediately consumable when the user switches to
-    `-build`. The split is structural, not just naming.
+    Plan is immediately consumable when the user switches to
+    Build. The split is structural, not just naming.
 13. **In-process ralph (graph plan) executor** — ralph-rs reimplemented
     inside cockpit so a single process owns file-lock leases. Possibly
     also in claw-code's lane orchestration, but not generalized there.

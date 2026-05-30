@@ -132,9 +132,9 @@ Frontmatter fields: `description`, `mode` (`primary`/`subagent`/`all`),
 | `permission` overrides per agent | **COPY** |
 | Hidden subagents (`hidden: true`) | **COPY** |
 | Agent generation via `agent create` | **COPY** with the same flags (`--path`, `--description`, `--mode`, `--tools`, `-m`). |
-| Built-in agents | **DIVERGE.** cockpit ships its own five-agent cast — `orchestrator-build`, `orchestrator-plan`, `explore`, `coder`, `docs` (see `GOALS.md` §3a). The two-orchestrator split (build vs plan) replaces opencode's mode-toggle model with separate agent identities; `docs` is cockpit-specific — a fixed two-stage noninteractive pipeline (resolver → answerer) that auto-clones a dependency into cockpit's package registry and answers usage questions from its real source via sandboxed `grep`/`glob`. |
+| Built-in agents | **DIVERGE.** cockpit ships its own five-agent cast — `Build`, `Plan`, `explore`, `coder`, `docs` (see `GOALS.md` §3a). The two-agent split (Build vs Plan) replaces opencode's mode-toggle model with separate agent identities; `docs` is cockpit-specific — a fixed two-stage noninteractive pipeline (resolver → answerer) that auto-clones a dependency into cockpit's package registry and answers usage questions from its real source via sandboxed `grep`/`glob`. |
 | Background plan execution / "background agents" | **NEW (cockpit)** — see `GOALS.md` §3b. opencode has no equivalent. cockpit's ralph executor runs plans in the daemon (§8) decoupled from the user's interactive conversation; `coder` instances spawned by the executor can raise typed questions onto a needs-attention queue without blocking other work. This is the primitive that unlocks the future remote-dashboard surface (§8d). |
-| Caller-based interactive/noninteractive mode for `coder` | **NEW (cockpit)** — `coder` runs interactive when invoked by `orchestrator-build`, noninteractive when invoked by the ralph executor. The agent file is one; the mode is set by the caller. |
+| Caller-based interactive/noninteractive mode for `coder` | **NEW (cockpit)** — `coder` runs interactive when invoked by `Build`, noninteractive when invoked by the ralph executor. The agent file is one; the mode is set by the caller. |
 
 ---
 
@@ -181,9 +181,9 @@ Confirmed-or-likely set from opencode + codex influence:
   without leaving the TUI.
 - `/plan`, `/build` — **COPY the verbs, deepen the meaning.** In
   opencode these toggle a behavioral mode of one agent. In cockpit
-  they swap which **orchestrator** owns the conversation:
-  `orchestrator-plan` (ralph-style graph planner) vs
-  `orchestrator-build` (traditional coding-harness). See
+  they swap which **primary agent** owns the conversation:
+  `Plan` (ralph-style graph planner) vs
+  `Build` (traditional coding-harness). See
   `GOALS.md` §3a.
 - `/skills` — list skills. **COPY** (extends opencode by including
   `~/.claude/skills/`).
