@@ -22,9 +22,9 @@ use crate::tools::custom::CustomBashTool;
 /// authored opencode-style for forward-compat with [`crate::agents`]
 /// — we still pull the prompt out by hand here because the agent loop
 /// already knows the tool surface.
-const BUILD_PROMPT: &str = include_str!("build.md");
-const CODER_PROMPT: &str = include_str!("coder.md");
-const EXPLORE_PROMPT: &str = include_str!("explore.md");
+pub(crate) const BUILD_PROMPT: &str = include_str!("build.md");
+pub(crate) const CODER_PROMPT: &str = include_str!("coder.md");
+pub(crate) const EXPLORE_PROMPT: &str = include_str!("explore.md");
 /// Docs pipeline stage prompts (GOALS §3a, prompt `docs-agent.md`).
 const DOCS_RESOLVER_PROMPT: &str = include_str!("docs_resolver.md");
 const DOCS_ANSWERER_PROMPT: &str = include_str!("docs_answerer.md");
@@ -290,35 +290,68 @@ fn with_custom_tools(mut tb: ToolBox, cwd: &Path) -> ToolBox {
     tb
 }
 
-/// Build a built-in agent by name. Returns `Err` for unknown names so
-/// the `task` tool can surface "unknown agent" loudly rather than
-/// silently spawning the wrong one.
+/// Build an agent by name. Resolution order (overlay model, prompt
+/// `user-definable-agents.md`):
+///   1. An on-disk override / custom agent ([`crate::agents::resolve`])
+///      — the user's edited or new definition wins, and its
+///      prompt/tools/model/temperature flow into the constructed agent.
+///   2. The embedded factory function for a built-in (no override) —
+///      unchanged byte-for-byte so the cached system prefix and exact
+///      tool surface are preserved (prompt-cache discipline).
+///
+/// Returns `Err` for unknown names so the `task` tool can surface
+/// "unknown agent" loudly rather than silently spawning the wrong one.
 pub fn load(name: &str, args: &SpawnArgs) -> Result<Agent> {
+    // The docs pipeline stages are routed by the driver and never reach
+    // here through a name; guard them before any disk resolution so a
+    // stray `agents/docs.md` can't hijack the pipeline.
+    if matches!(name, "docs" | "docs-resolver" | "docs-answerer") {
+        bail!(
+            "`{name}` is a pipeline stage routed by the driver; load() should be unreachable for it"
+        );
+    }
+
+    // Overlay: an on-disk override (edited built-in) or a custom agent
+    // takes precedence over the embedded factory. A malformed override
+    // fails loudly here (naming its source) rather than silently falling
+    // back to the embedded default.
+    match crate::agents::resolve(&args.cwd, name)? {
+        // A genuine on-disk file (override of a built-in, or a custom
+        // agent): build generically from the resolved definition so the
+        // user's edited tools/model/prompt take effect.
+        Some(def) if !def.source.as_os_str().is_empty() => {
+            return Ok(agent_from_def(&def, args));
+        }
+        // An embedded default came back (no override): fall through to the
+        // hardcoded factory, which is byte-identical and cache-stable.
+        Some(_) => {}
+        // Not a built-in and no file on disk: unknown agent.
+        None => bail!("unknown agent `{name}`"),
+    }
+
+    // Unreachable in practice: `resolve` returned an embedded default, so
+    // `name` is a built-in and matches above. Kept exhaustive for safety.
     match name {
         "Build" => Ok(build(args)),
         "coder" => Ok(coder(args)),
         "explore" => Ok(explore(args)),
-        // `docs` is a fixed two-stage pipeline, not a single agent — the
-        // driver routes it to [`crate::engine::docs_pipeline`] before any
-        // `load()`. Its internal stages are built by the pipeline via
-        // [`docs_resolver`] / [`docs_answerer`], which need per-run state
-        // (`DocsResolution`, the target package, the question) that a name
-        // alone can't supply. Reaching here means the routing diverged.
-        "docs" | "docs-resolver" | "docs-answerer" => bail!(
-            "`{name}` is a pipeline stage routed by the driver; load() should be unreachable for it"
-        ),
         other => bail!("unknown built-in agent `{other}`"),
     }
 }
 
-/// True if `name` denotes a built-in agent that runs *noninteractively*
-/// — the primary agent dispatches it like a tool call (synchronously)
-/// rather than handing the primary conversation off. The driver uses
-/// this to route `task(agent=…, …)` correctly. `docs` is noninteractive:
-/// the caller sees one leaf invocation even though it's a two-stage
-/// pipeline internally (GOALS §3a leaf-termination).
+/// True if `name` denotes an agent that runs *noninteractively* when
+/// delegated to via `task` — the primary dispatches it like a tool call
+/// (synchronously) rather than handing the primary conversation off. The
+/// driver uses this to route `task(agent=…, …)` correctly.
+///
+/// `coder` is the sole interactive *handoff* subagent (it takes over the
+/// conversation, GOALS §3a/§3b). Everything else delegated via `task` —
+/// `explore`, the `docs` pipeline (leaf-terminated, GOALS §3a), and every
+/// user-authored custom subagent — runs noninteractively and reports one
+/// leaf result up. Defined as the complement of the single interactive
+/// agent so custom agents inherit the safe default without a registry.
 pub fn is_noninteractive(name: &str) -> bool {
-    matches!(name, "explore" | "docs")
+    name != "coder"
 }
 
 #[cfg(test)]
@@ -479,10 +512,198 @@ mod tests {
     }
 }
 
+/// Build an [`Agent`] from a resolved [`crate::agents::AgentDef`] — the
+/// path taken for an on-disk override (edited built-in) or a custom
+/// agent. The def's `prompt`, `tools`, `temperature`, and (when
+/// resolvable) `model` flow into the constructed agent so an edit takes
+/// effect on the next run. Invariants were already enforced at load
+/// ([`crate::agents::validate_invariants`]); this builds the toolbox from
+/// the validated grant.
+///
+/// When `tools` is absent the agent falls back to its role-default
+/// surface: for a built-in name we reuse that built-in's embedded
+/// default grant (so an override that only tweaks the prompt keeps the
+/// right tools); a custom agent with no grant gets the read-only
+/// investigator surface.
+fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) -> Agent {
+    // Resolve the tool-name grant: explicit list, else the role default.
+    let grant: Vec<String> = match &def.tools {
+        Some(t) => t.clone(),
+        None => crate::agents::embedded_default(&def.name)
+            .and_then(|d| d.tools)
+            .unwrap_or_else(default_custom_tools),
+    };
+
+    let mut tb = ToolBox::new();
+    for name in &grant {
+        tb = add_tool_by_name(tb, name, def, args);
+    }
+    // Custom-bash tools (webfetch/websearch/…) are config-driven, not part
+    // of the named grant — attach them like the built-in factories do.
+    tb = with_custom_tools(tb, &args.cwd);
+    // Cross-session recall tools, gated on interactive spawn.
+    tb = with_recall_tools(tb, args);
+
+    // Per-agent model override: a `provider:model-id` selector resolved
+    // through the same provider pipeline the foreground model uses. On any
+    // failure (unconfigured provider, malformed selector) fall back to the
+    // session model rather than failing the spawn — the override is a
+    // preference, not a hard requirement.
+    let model = resolve_agent_model(def, args);
+
+    let mut params = args.params.clone();
+    if let Some(temp) = def.temperature {
+        params.temperature = Some(temp as f64);
+    }
+
+    Agent {
+        name: def.name.clone(),
+        system: compose_system_prompt(def.resolved_prompt(), &args.session_short_id, &args.cwd),
+        tools: tb,
+        model,
+        params,
+    }
+}
+
+/// Default tool grant for a custom agent that names no `tools:` — the
+/// read-only investigator surface (`explore`'s grant). Conservative:
+/// never includes write/lock or structural-delegation tools.
+fn default_custom_tools() -> Vec<String> {
+    [
+        "read",
+        "bash",
+        "tree",
+        "outline",
+        "symbol_find",
+        "word",
+        "deps",
+        "hot",
+        "circular",
+        "search",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
+/// Append the tool named `name` to `tb`. Structural tools (`task`) are
+/// wired with the def's reachable subagents. Unknown names are skipped
+/// silently here because they were already rejected at load time by
+/// [`crate::agents::validate_invariants`]; the custom-bash tools are
+/// attached separately, so a name not handled here is a no-op.
+fn add_tool_by_name(
+    tb: ToolBox,
+    name: &str,
+    def: &crate::agents::AgentDef,
+    args: &SpawnArgs,
+) -> ToolBox {
+    use crate::tools;
+    match name {
+        "read" => tb.with(Arc::new(tools::read::ReadTool)),
+        "bash" => tb.with(Arc::new(tools::bash::BashTool::new())),
+        "readlock" => tb.with(Arc::new(tools::readlock::ReadlockTool)),
+        "writeunlock" => tb.with(Arc::new(tools::writeunlock::WriteunlockTool)),
+        "editunlock" => tb.with(Arc::new(tools::editunlock::EditunlockTool)),
+        "unlock" => tb.with(Arc::new(tools::unlock::UnlockTool)),
+        "tree" => tb.with(Arc::new(tools::intel::TreeTool)),
+        "outline" => tb.with(Arc::new(tools::intel::OutlineTool)),
+        "symbol_find" => tb.with(Arc::new(tools::intel::SymbolFindTool)),
+        "word" => tb.with(Arc::new(tools::intel::WordTool)),
+        "deps" => tb.with(Arc::new(tools::intel::DepsTool)),
+        "hot" => tb.with(Arc::new(tools::intel::HotTool)),
+        "circular" => tb.with(Arc::new(tools::intel::CircularTool)),
+        "search" => tb.with(Arc::new(tools::intel::SearchTool)),
+        "skill" => tb.with(Arc::new(tools::skill::SkillTool)),
+        "question" => tb.with(Arc::new(tools::question::QuestionTool)),
+        "jobs" => tb.with(Arc::new(tools::jobs::JobsTool)),
+        "task" => {
+            let subs = reachable_subagents(def, &args.cwd);
+            let sub_refs: Vec<&str> = subs.iter().map(String::as_str).collect();
+            tb.with(Arc::new(tools::task::TaskTool::with_subagents(&sub_refs)))
+        }
+        // `session_search`/`session_read` are added by `with_recall_tools`
+        // (interactive-gated); naming them in the grant is a no-op so they
+        // aren't double-registered. `grep`/`glob` are sandbox-only and were
+        // rejected at load. Anything else is a custom-bash tool, attached
+        // by `with_custom_tools`.
+        _ => tb,
+    }
+}
+
+/// The subagents a `task`-granting agent may delegate to: the bundled
+/// reachable set (`coder`/`explore`/`docs`, what `Build` ships with) plus
+/// any user-authored custom agent whose `mode` makes it reachable as a
+/// subagent (`subagent`/`all`). Each is listed once, minus the caller
+/// itself to avoid a self-delegation loop. Honors the `mode` field for
+/// reachability per `prompts/user-definable-agents.md`.
+fn reachable_subagents(def: &crate::agents::AgentDef, cwd: &Path) -> Vec<String> {
+    let mut out = build_subagents(cwd);
+    out.retain(|s| *s != def.name);
+    out
+}
+
+/// The bundled reachable subagent set (`coder`/`explore`/`docs`) plus any
+/// user-authored custom agent whose `mode` makes it reachable as a
+/// subagent (`subagent`/`all`). Shared by the bundled `Build` factory and
+/// the generic [`reachable_subagents`] so both honor the `mode` field for
+/// reachability (`prompts/user-definable-agents.md`). Each name appears
+/// once; the bundled set leads so the cached prefix stays stable when no
+/// custom agents are present.
+fn build_subagents(cwd: &Path) -> Vec<String> {
+    let mut out: Vec<String> = vec![
+        "coder".to_string(),
+        "explore".to_string(),
+        "docs".to_string(),
+    ];
+    for listing in crate::agents::list_all(cwd) {
+        if !matches!(listing.kind, crate::agents::AgentKind::Custom) {
+            continue;
+        }
+        if let Ok(custom) = &listing.def
+            && custom.mode.is_subagent()
+            && !out.contains(&listing.name)
+        {
+            out.push(listing.name);
+        }
+    }
+    out
+}
+
+/// Resolve a per-agent `model` override to a concrete [`Model`]. Falls
+/// back to the session model on any failure so an override pointing at an
+/// unconfigured provider degrades gracefully rather than breaking the
+/// spawn.
+fn resolve_agent_model(def: &crate::agents::AgentDef, args: &SpawnArgs) -> Arc<Model> {
+    let Some(selector) = def
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return args.model.clone();
+    };
+    let Some((provider, model_id)) = selector.split_once(':') else {
+        return args.model.clone();
+    };
+    let cfg = discover_config_dirs(&args.cwd)
+        .into_iter()
+        .find_map(|d| crate::config::providers::ConfigDoc::load(&d.path.join("config.json")).ok())
+        .map(|d| d.providers())
+        .unwrap_or_default();
+    match Model::for_provider(&cfg, provider, model_id) {
+        Ok(m) => Arc::new(m),
+        Err(_) => args.model.clone(),
+    }
+}
+
 /// `Build` — the user-facing primary agent. Owns the chat
 /// when the focus is *making the change* (GOALS §3a). Delegates writes
 /// to `coder` via `task`.
 pub fn build(args: &SpawnArgs) -> Agent {
+    // Reachable subagents: the bundled set plus any custom subagent the
+    // user has added (`prompts/user-definable-agents.md` discoverability).
+    let subs = build_subagents(&args.cwd);
+    let sub_refs: Vec<&str> = subs.iter().map(String::as_str).collect();
     let tools = with_recall_tools(
         with_custom_tools(
             ToolBox::new()
@@ -502,9 +723,9 @@ pub fn build(args: &SpawnArgs) -> Agent {
                 // `skill` (GOALS §5): manual on-demand skill loading. Both
                 // interactive primaries get it; leaf agents don't.
                 .with(Arc::new(crate::tools::skill::SkillTool))
-                .with(Arc::new(crate::tools::task::TaskTool::with_subagents(&[
-                    "coder", "explore", "docs",
-                ]))),
+                .with(Arc::new(crate::tools::task::TaskTool::with_subagents(
+                    &sub_refs,
+                ))),
             &args.cwd,
         ),
         args,

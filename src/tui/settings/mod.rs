@@ -23,6 +23,7 @@
 //! page's `r`=refetch action) use [`FetchHandle`] — a shared cell the
 //! background task writes into and the event loop reads on each tick.
 
+mod agents_page;
 mod auth;
 mod providers;
 mod skills_page;
@@ -114,7 +115,7 @@ pub struct SettingsDialog {
 #[allow(private_interfaces)]
 pub(super) enum Page {
     Root { cursor: usize },
-    Agents,
+    Agents(AgentsPage),
     Tools(ToolsPage),
     Providers(ProvidersPage),
     Ui(UiPage),
@@ -122,6 +123,7 @@ pub(super) enum Page {
     Skills(SkillsPage),
 }
 
+use agents_page::AgentsPage;
 use providers::{AddState, AddStep, ProvidersPage};
 use skills_page::SkillsPage;
 use tools_page::ToolsPage;
@@ -544,21 +546,7 @@ impl SettingsDialog {
             return self.handle_root_key(key, cursor);
         }
         match &self.page {
-            Page::Agents => {
-                if matches!(
-                    key.code,
-                    KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') | KeyCode::Backspace
-                ) {
-                    self.page = Page::Root {
-                        cursor: self.last_root_cursor,
-                    };
-                    false
-                } else if matches!(key.code, KeyCode::Char('q')) {
-                    true
-                } else {
-                    false
-                }
-            }
+            Page::Agents(_) => self.handle_agents_key(key),
             Page::Tools(_) => self.handle_tools_key(key),
             Page::Ui(_) => self.handle_ui_key(key),
             Page::Instructions(_) => self.handle_instructions_key(key),
@@ -589,7 +577,9 @@ impl SettingsDialog {
                 self.last_root_cursor = cursor;
                 match chosen {
                     "Providers" => self.enter_providers(),
-                    "Agents" => self.page = Page::Agents,
+                    "Agents" => {
+                        self.page = Page::Agents(AgentsPage::new(&self.agents_cwd()));
+                    }
                     "Tools" => {
                         self.reload_extended();
                         self.page = Page::Tools(ToolsPage {
@@ -643,9 +633,7 @@ impl SettingsDialog {
 
         match &self.page {
             Page::Root { cursor } => render_root(frame, layout[0], *cursor),
-            Page::Agents => {
-                render_stub(frame, layout[0], "Agents", AGENTS_STUB);
-            }
+            Page::Agents(p) => self.render_agents_page(frame, layout[0], p),
             Page::Tools(p) => self.render_tools_page(frame, layout[0], p),
             Page::Ui(p) => self.render_ui_page(frame, layout[0], p),
             Page::Instructions(p) => self.render_instructions_page(frame, layout[0], p),
@@ -658,7 +646,7 @@ impl SettingsDialog {
     fn title(&self) -> String {
         let crumbs = match &self.page {
             Page::Root { .. } => String::new(),
-            Page::Agents => " › Agents".into(),
+            Page::Agents(_) => " › Agents".into(),
             Page::Tools(_) => " › Tools".into(),
             Page::Ui(_) => " › UI".into(),
             Page::Skills(_) => " › Skills".into(),
@@ -691,7 +679,13 @@ impl SettingsDialog {
                     "↑/↓  enter: open  esc: close"
                 }
             }
-            Page::Agents => "h: back  esc: close",
+            Page::Agents(p) => {
+                if p.confirm_reset {
+                    "y: confirm reset-all  n/esc: cancel"
+                } else {
+                    "↑/↓  enter/e: eject built-in  R: reset all to default  h: back  esc: close"
+                }
+            }
             Page::Instructions(p) => {
                 if p.grabbed.is_some() {
                     "type to rename  ↑/↓: reorder  enter: drop & save  esc: cancel"
@@ -809,8 +803,6 @@ struct NavNode {
     description: &'static str,
 }
 
-const AGENTS_STUB: &str = "(stub) Agent editor — list agent definitions, edit their system prompts, tool grants, and model overrides.";
-
 pub(super) fn save_status(r: Result<(), String>) -> Option<String> {
     match r {
         Ok(()) => Some("saved".into()),
@@ -850,21 +842,6 @@ fn render_root(frame: &mut Frame, area: Rect, cursor: usize) {
             .style(Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX))),
         cols[1],
     );
-}
-
-fn render_stub(frame: &mut Frame, area: Rect, title: &str, body: &str) {
-    let lines = vec![
-        Line::from(Span::styled(
-            title.to_string(),
-            Style::default().add_modifier(Modifier::BOLD),
-        )),
-        Line::default(),
-        Line::from(Span::styled(
-            body.to_string(),
-            Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
-        )),
-    ];
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
 }
 
 enum ListAction {
@@ -1418,7 +1395,7 @@ mod tests {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             match self {
                 Page::Root { cursor } => write!(f, "Root({cursor})"),
-                Page::Agents => f.write_str("Agents"),
+                Page::Agents(_) => f.write_str("Agents"),
                 Page::Tools(_) => f.write_str("Tools"),
                 Page::Providers(_) => f.write_str("Providers"),
                 Page::Ui(_) => f.write_str("Ui"),
