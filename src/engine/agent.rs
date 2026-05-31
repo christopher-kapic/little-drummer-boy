@@ -121,6 +121,14 @@ pub enum TurnEvent {
         agent: String,
         usage: crate::tokens::TokenUsage,
     },
+    /// A non-blocking system notice for the transcript (warn chip). Used
+    /// by the prompt-injection guard (GOALS §4i) to surface a flagged-but-
+    /// below-threshold prompt and the fail-open "scan could not run"
+    /// case. Rendered as a muted/yellow plain line; never enters the
+    /// model's context (it's UI-only — the user message itself proceeds
+    /// unchanged).
+    Notice { text: String },
+
     /// The driver loop unwound to the root and drained its queue: the
     /// agent is idle, waiting for the next user message. Emitted by the
     /// driver (not by [`turn`]) as the falling edge that stops the

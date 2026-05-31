@@ -286,6 +286,7 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         | AssistantTextDelta { session_id, .. }
         | ReasoningDelta { session_id, .. }
         | AssistantText { session_id, .. }
+        | Notice { session_id, .. }
         | ToolStart { session_id, .. }
         | ToolEnd { session_id, .. }
         | ToolError { session_id, .. }

@@ -30,6 +30,7 @@ pub mod docs_pipeline;
 pub mod driver;
 pub mod exec;
 pub mod guidance_diff;
+pub mod injection_check;
 pub mod interrupt;
 pub mod jobs;
 pub mod message;

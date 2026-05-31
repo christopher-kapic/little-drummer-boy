@@ -597,6 +597,7 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         | AssistantTextDelta { session_id, .. }
         | ReasoningDelta { session_id, .. }
         | AssistantText { session_id, .. }
+        | Notice { session_id, .. }
         | ToolStart { session_id, .. }
         | ToolEnd { session_id, .. }
         | ToolError { session_id, .. }
@@ -631,6 +632,7 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
         AssistantTextDelta { agent, delta, .. } => TurnEvent::AssistantTextDelta { agent, delta },
         ReasoningDelta { agent, delta, .. } => TurnEvent::ReasoningDelta { agent, delta },
         AssistantText { agent, text, .. } => TurnEvent::AssistantText { agent, text },
+        Notice { text, .. } => TurnEvent::Notice { text },
         ToolStart {
             agent,
             call_id,

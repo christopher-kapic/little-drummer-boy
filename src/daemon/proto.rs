@@ -615,6 +615,11 @@ pub enum Event {
         text: String,
     },
 
+    /// A non-blocking system notice (warn chip) for the transcript.
+    /// Used by the prompt-injection guard (GOALS §4i). UI-only: never
+    /// enters the model's context.
+    Notice { session_id: Uuid, text: String },
+
     /// Tool dispatch started; args are post-repair.
     ToolStart {
         session_id: Uuid,

@@ -20,7 +20,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 
 use crate::config::extended::{
-    DefaultPrimaryAgent, IsolationModeSetting, LlmMode, ThinkingDisplay, VimModeSetting,
+    DefaultPrimaryAgent, InjectionThreshold, IsolationModeSetting, LlmMode, ThinkingDisplay,
+    VimModeSetting,
 };
 use crate::config::providers::ProvidersConfig;
 use crate::tui::textfield::TextField;
@@ -60,6 +61,7 @@ pub(super) enum UiField {
     PackagesDir,
     PlanBranchRoot,
     LoopGuardThreshold,
+    InjectionCheckPrompt,
 }
 
 /// A single selectable model row in the utility-model picker, shown as
@@ -189,9 +191,9 @@ pub(super) struct GrabState {
 /// render-agent-markdown, render-user-markdown, mouse, rich-text-copy,
 /// emojis, caffeinate display-awake, name, packages dir, utility model,
 /// plan branch root, plan isolation, loop-guard threshold, default agent,
-/// instructions file). The `[reset to defaults]` button follows at cursor
-/// [`UI_CONFIG_ROWS`].
-pub(super) const UI_CONFIG_ROWS: usize = 17;
+/// injection threshold, injection check-prompt, instructions file). The
+/// `[reset to defaults]` button follows at cursor [`UI_CONFIG_ROWS`].
+pub(super) const UI_CONFIG_ROWS: usize = 19;
 
 /// Total navigable rows: the labeled config rows plus the trailing
 /// `[reset to defaults]` button.
@@ -276,6 +278,17 @@ pub(super) fn default_primary_agent_label(a: DefaultPrimaryAgent) -> &'static st
         }
         DefaultPrimaryAgent::Build => "build (start on the coding agent — make the change now)",
         DefaultPrimaryAgent::Plan => "plan (start on the planning agent — author a plan)",
+    }
+}
+
+pub(super) fn injection_threshold_label(t: InjectionThreshold) -> &'static str {
+    match t {
+        InjectionThreshold::Off => "off (default — no prompt-injection scanning)",
+        InjectionThreshold::Low => "low (block prompts rated low or higher; needs a utility model)",
+        InjectionThreshold::Medium => {
+            "medium (block prompts rated medium or higher; needs a utility model)"
+        }
+        InjectionThreshold::High => "high (block only prompts rated high; needs a utility model)",
     }
 }
 
@@ -364,6 +377,13 @@ impl SettingsDialog {
                                 .map(|v| v.max(crate::config::extended::MIN_LOOP_GUARD_THRESHOLD))
                                 .unwrap_or(crate::config::extended::MIN_LOOP_GUARD_THRESHOLD);
                             self.extended.loop_guard.repeat_threshold = parsed;
+                        }
+                        UiField::InjectionCheckPrompt => {
+                            // A blank value resets to the user-authored
+                            // default (unset) rather than storing an empty
+                            // template.
+                            self.extended.prompt_injection_guard.check_prompt =
+                                if new.is_empty() { None } else { Some(new) };
                         }
                     }
                     p.editing = None;
@@ -485,6 +505,26 @@ impl SettingsDialog {
                     self.extended.default_primary_agent =
                         self.extended.default_primary_agent.cycled();
                     p.status = save_status(self.save_extended());
+                }
+                16 => {
+                    // Cycle the prompt-injection block threshold
+                    // (`off` → `low` → `medium` → `high` → `off`).
+                    self.extended.prompt_injection_guard.threshold =
+                        self.extended.prompt_injection_guard.threshold.cycled();
+                    p.status = save_status(self.save_extended());
+                }
+                17 => {
+                    // Edit the injection check-prompt template. Pre-fill the
+                    // current custom value; leave blank when unset so the
+                    // user types a fresh template (blank keeps the default).
+                    let cur = self
+                        .extended
+                        .prompt_injection_guard
+                        .check_prompt
+                        .clone()
+                        .unwrap_or_default();
+                    p.buf = TextField::new(cur);
+                    p.editing = Some(UiField::InjectionCheckPrompt);
                 }
                 UI_INSTRUCTIONS_ROW => {
                     return Nav::Replace(Page::Instructions(InstructionsPage {
@@ -630,7 +670,7 @@ impl SettingsDialog {
         )));
         lines.push(Line::default());
 
-        let rows: [(&str, String); 17] = [
+        let rows: [(&str, String); 19] = [
             (
                 "vim mode",
                 vim_label(self.extended.tui.vim_mode).to_string(),
@@ -738,6 +778,19 @@ impl SettingsDialog {
                 default_primary_agent_label(self.extended.default_primary_agent).to_string(),
             ),
             (
+                "injection threshold",
+                injection_threshold_label(self.extended.prompt_injection_guard.threshold)
+                    .to_string(),
+            ),
+            (
+                "injection check-prompt",
+                if self.extended.prompt_injection_guard.check_prompt.is_some() {
+                    "(custom)".to_string()
+                } else {
+                    "(default template)".to_string()
+                },
+            ),
+            (
                 "instructions file",
                 if self.extended.agent_guidance_files.is_empty() {
                     "(none)".to_string()
@@ -782,6 +835,7 @@ impl SettingsDialog {
                 UiField::PackagesDir => "packages dir: ",
                 UiField::PlanBranchRoot => "plan branch root: ",
                 UiField::LoopGuardThreshold => "loop-guard threshold (>= 2): ",
+                UiField::InjectionCheckPrompt => "injection check-prompt (blank = default): ",
             };
             lines.push(Line::default());
             lines.push(Line::from(vec![

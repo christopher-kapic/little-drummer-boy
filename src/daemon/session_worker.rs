@@ -667,6 +667,9 @@ fn turn_event_to_proto(event: TurnEvent, session_id: Uuid) -> Vec<proto::Event> 
                 text,
             }]
         }
+        TurnEvent::Notice { text } => {
+            vec![proto::Event::Notice { session_id, text }]
+        }
         TurnEvent::ToolStart {
             agent,
             call_id,

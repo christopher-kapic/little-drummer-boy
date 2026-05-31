@@ -229,6 +229,45 @@ impl Model {
         }
     }
 
+    /// One-shot, non-streaming, single-tool completion that **forces** the
+    /// model to answer through `tool` (`tool_choice = required`). Used by
+    /// background tasks that need a *structured* verdict rather than free
+    /// text — the prompt-injection guard's `risk` tool (GOALS §4i). Sends
+    /// only `system` + `prompt` (no conversation history), and returns
+    /// every [`ToolCall`] the model emitted so the caller can read the
+    /// structured arguments. History-free by construction: the untrusted
+    /// text the caller wraps into `prompt` is the only content the model
+    /// sees.
+    pub async fn tool_completion(
+        &self,
+        system: &str,
+        prompt: &str,
+        tool: &ToolDefinition,
+    ) -> Result<Vec<crate::engine::message::ToolCall>> {
+        use rig::completion::Completion;
+        // Inference-dispatch chokepoint: refuse a *new* provider request once
+        // the daemon has begun draining (`daemon-graceful-drain-shutdown.md`).
+        if self.gate().is_draining() {
+            return Err(anyhow::Error::new(InferenceGated));
+        }
+        match self {
+            Model::OpenAi {
+                client, model_id, ..
+            } => {
+                let agent = client.agent(model_id).preamble(system).build();
+                let response = agent
+                    .completion(Message::user(prompt), Vec::<Message>::new())
+                    .await?
+                    .tool(tool.clone())
+                    .tool_choice(ToolChoice::Required)
+                    .send()
+                    .await
+                    .context("tool_completion: send failed")?;
+                Ok(crate::engine::message::collect_tool_calls(&response.choice))
+            }
+        }
+    }
+
     /// Build a streaming completion request and aggregate it.
     ///
     /// Streaming is on for every provider variant — rig's

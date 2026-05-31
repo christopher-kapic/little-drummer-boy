@@ -70,6 +70,80 @@ pub enum DriverControl {
 /// hit this cap, extras stay in the channel for the *next* fold.
 const MAX_FOLD: usize = 16;
 
+/// Option ids for the prompt-injection false-positive override prompt
+/// (GOALS §4i). Stable strings the resolved interrupt response maps back
+/// to in [`Driver::injection_override`].
+const ID_INJECTION_SEND_ONCE: &str = "inj_send_once";
+const ID_INJECTION_LOWER: &str = "inj_lower";
+const ID_INJECTION_EDIT: &str = "inj_edit";
+
+/// The selected option id from a resolved single-select interrupt, if
+/// any. Unwraps the `Batch` wrapper a one-question set may arrive in;
+/// `Cancel` / other shapes → `None`.
+fn single_selected_id(resp: &crate::daemon::proto::ResolveResponse) -> Option<String> {
+    use crate::daemon::proto::ResolveResponse;
+    match resp {
+        ResolveResponse::Single { selected_id } => Some(selected_id.clone()),
+        ResolveResponse::Batch { responses } => match responses.first() {
+            Some(ResolveResponse::Single { selected_id }) => Some(selected_id.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The free-text answer from a resolved free-text interrupt, if any.
+/// Unwraps a one-question `Batch`; `Cancel` / other shapes → `None`.
+fn single_freetext(resp: &crate::daemon::proto::ResolveResponse) -> Option<String> {
+    use crate::daemon::proto::ResolveResponse;
+    match resp {
+        ResolveResponse::Freetext { text } => Some(text.clone()),
+        ResolveResponse::Batch { responses } => match responses.first() {
+            Some(ResolveResponse::Freetext { text }) => Some(text.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Path to the global `extended-config.json` to write override settings
+/// into: the first existing home-scoped config dir, else the first
+/// creatable one (scaffolded). Errors only when no home dir is locatable.
+fn global_extended_config_path() -> Result<std::path::PathBuf> {
+    use crate::config::dirs::{ConfigDirKind, creatable_config_dirs, discover_config_dirs};
+    // Prefer an existing home-scoped layer.
+    if let Some(dir) = discover_config_dirs(std::path::Path::new("."))
+        .into_iter()
+        .find(|d| matches!(d.kind, ConfigDirKind::HomeXdg | ConfigDirKind::HomeDot))
+    {
+        return Ok(dir.path.join("extended-config.json"));
+    }
+    // Otherwise scaffold the first creatable home location.
+    let dir = creatable_config_dirs()
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("no home directory to write global config into"))?;
+    std::fs::create_dir_all(&dir.path)?;
+    Ok(dir.path.join("extended-config.json"))
+}
+
+/// Resolve where to persist an edited injection check-prompt: the project
+/// `.cockpit/` layer for `cwd` when one already exists (so the override is
+/// project-scoped where the project already carries config), else the
+/// global home config. Returns the target path plus a human scope label.
+fn injection_check_prompt_target(
+    cwd: &std::path::Path,
+) -> Result<(std::path::PathBuf, &'static str)> {
+    use crate::config::dirs::{ConfigDirKind, discover_config_dirs};
+    if let Some(dir) = discover_config_dirs(cwd)
+        .into_iter()
+        .find(|d| matches!(d.kind, ConfigDirKind::Project))
+    {
+        return Ok((dir.path.join("extended-config.json"), "project"));
+    }
+    Ok((global_extended_config_path()?, "global"))
+}
+
 /// Handle the session worker keeps to cancel the in-flight user-message
 /// run on a ctrl+c (`SessionWork::Cancel`). Shares the driver's
 /// `cancel_current` slot; cancelling the live token aborts the in-flight
@@ -191,6 +265,10 @@ pub struct Driver {
     /// utility_model" notice (GOALS §5). Logged at most once per driver
     /// so an unconfigured utility model doesn't spam the log every turn.
     skills_no_utility_model_logged: bool,
+    /// One-shot guard for the prompt-injection "scan could not run" warn
+    /// chip (GOALS §4i). Surfaced at most once per driver so a missing /
+    /// broken utility model doesn't append a chip to every turn.
+    injection_no_scan_logged: bool,
     /// Cancellation handle for the in-flight user-message run (ctrl+c →
     /// `CancelTurn`, GOALS §3a). `run_user_input` installs a fresh
     /// [`CancellationToken`] here at the start of each run and clears it on
@@ -305,6 +383,7 @@ impl Driver {
             pending_seed_context: None,
             interrupts: Arc::new(crate::engine::interrupt::InterruptHub::detached()),
             skills_no_utility_model_logged: false,
+            injection_no_scan_logged: false,
             cancel_current: Arc::new(std::sync::Mutex::new(None)),
             approver: None,
             deleg_shrinks: std::collections::HashMap::new(),
@@ -404,6 +483,273 @@ impl Driver {
         }
     }
 
+    /// Prompt-injection guard (GOALS §4i). Scans the **raw** user text
+    /// (before redaction) through the history-free, nonce-wrapped
+    /// injection check ([`crate::engine::injection_check`]) and returns
+    /// whether the prompt may proceed.
+    ///
+    /// Behavior:
+    ///   - threshold `off` → no scan, always allow.
+    ///   - unavailable utility model / call error / timeout → **fail
+    ///     open**: allow, with a one-time "scan could not run" warn chip.
+    ///   - rated below threshold → allow, with a warn chip noting the
+    ///     rating (every flagged prompt is surfaced).
+    ///   - rated at/above threshold → **block**, then raise the
+    ///     false-positive override prompt; allow only if the user approves
+    ///     (and apply the chosen side-effect — lower threshold / edit the
+    ///     check-prompt). A dismissal drops the prompt (returns `false`).
+    async fn injection_guard_allows(
+        &mut self,
+        raw_text: &str,
+        tx: &mpsc::Sender<TurnEvent>,
+    ) -> bool {
+        use crate::config::extended::{InjectionThreshold, resolve_injection_guard};
+        use crate::engine::injection_check::{CheckOutcome, check};
+
+        let (extended, providers) = crate::auto_title::load_configs_for(&self.cwd);
+        let guard = resolve_injection_guard(&self.cwd);
+        if guard.threshold == InjectionThreshold::Off {
+            return true; // scanning disabled
+        }
+
+        // The guard's own model override falls back to the utility model.
+        let model_ref = extended
+            .prompt_injection_guard
+            .model
+            .as_deref()
+            .or(extended.utility_model.as_deref());
+
+        let outcome = check(model_ref, &providers, &guard.check_prompt, raw_text).await;
+        match outcome {
+            CheckOutcome::Unavailable => {
+                // Fail open: proceed, but tell the user the scan didn't run
+                // (logged at most once per driver so a missing/broken
+                // utility model doesn't spam the transcript every turn).
+                if !self.injection_no_scan_logged {
+                    self.injection_no_scan_logged = true;
+                    let _ = tx
+                        .send(TurnEvent::Notice {
+                            text: "prompt-injection scan could not run (utility model unset or \
+                                   unavailable); proceeding unscanned"
+                                .to_string(),
+                        })
+                        .await;
+                }
+                true
+            }
+            CheckOutcome::Rated(rating) => {
+                if guard.threshold.blocks(rating) {
+                    // At/above threshold → block + offer the override.
+                    self.injection_override(rating, tx).await
+                } else {
+                    // Below threshold → surface the flag, proceed.
+                    let _ = tx
+                        .send(TurnEvent::Notice {
+                            text: format!(
+                                "prompt-injection guard rated this prompt `{}` (below the `{}` \
+                                 block threshold) — proceeding",
+                                rating.as_str(),
+                                guard.threshold.as_str()
+                            ),
+                        })
+                        .await;
+                    true
+                }
+            }
+        }
+    }
+
+    /// Raise the false-positive override prompt for a blocked prompt and
+    /// act on the user's choice. Returns whether the prompt may proceed.
+    ///
+    /// Headless (no interactive client that can answer) → block stands
+    /// (`false`): there is no human to override, and silently sending a
+    /// high-risk prompt would defeat the guard. A dismissal reads the same.
+    async fn injection_override(
+        &mut self,
+        rating: crate::config::extended::InjectionThreshold,
+        tx: &mpsc::Sender<TurnEvent>,
+    ) -> bool {
+        use crate::daemon::proto::{InterruptOption, InterruptQuestion, InterruptQuestionSet};
+
+        if !self.interrupts.is_interactive_attached() {
+            let _ = tx
+                .send(TurnEvent::Notice {
+                    text: format!(
+                        "prompt-injection guard blocked this prompt (rated `{}`); no interactive \
+                         client to confirm an override — dropped",
+                        rating.as_str()
+                    ),
+                })
+                .await;
+            return false;
+        }
+
+        let agent = self.active_agent().to_string();
+        let description = format!(
+            "Prompt-injection guard rated this prompt `{}` (at or above your block threshold). \
+             This may be a false positive. How do you want to proceed?",
+            rating.as_str()
+        );
+        let question = InterruptQuestion::Single {
+            prompt: "Allow this blocked prompt?".to_string(),
+            options: vec![
+                InterruptOption {
+                    id: ID_INJECTION_SEND_ONCE.to_string(),
+                    label: "Approve & send this prompt once".to_string(),
+                    description: Some("does not change any setting".to_string()),
+                },
+                InterruptOption {
+                    id: ID_INJECTION_LOWER.to_string(),
+                    label: "Approve & lower the block threshold".to_string(),
+                    description: Some("relaxes the global threshold one level".to_string()),
+                },
+                InterruptOption {
+                    id: ID_INJECTION_EDIT.to_string(),
+                    label: "Approve & edit the injection-check prompt".to_string(),
+                    description: Some("you'll type a new check-prompt next".to_string()),
+                },
+            ],
+            allow_freetext: false,
+            command_detail: None,
+        };
+        let set = InterruptQuestionSet {
+            questions: vec![question],
+        };
+
+        let choice = self.raise_and_wait(&agent, &description, set).await;
+        let id = single_selected_id(&choice);
+        match id.as_deref() {
+            Some(ID_INJECTION_SEND_ONCE) => {
+                let _ = tx
+                    .send(TurnEvent::Notice {
+                        text: "prompt-injection block overridden (sent once)".to_string(),
+                    })
+                    .await;
+                true
+            }
+            Some(ID_INJECTION_LOWER) => {
+                let msg = match self.lower_injection_threshold() {
+                    Ok(new) => format!(
+                        "prompt-injection block overridden; threshold lowered to `{}`",
+                        new.as_str()
+                    ),
+                    Err(e) => format!(
+                        "prompt-injection block overridden (sent once); lowering threshold \
+                         failed: {e}"
+                    ),
+                };
+                let _ = tx.send(TurnEvent::Notice { text: msg }).await;
+                true
+            }
+            Some(ID_INJECTION_EDIT) => {
+                // Follow-up free-text interrupt for the new check-prompt.
+                let edit_set = InterruptQuestionSet {
+                    questions: vec![InterruptQuestion::Freetext {
+                        prompt:
+                            "Enter the new injection-check prompt (blank keeps the current one)"
+                                .to_string(),
+                    }],
+                };
+                let resp = self
+                    .raise_and_wait(&agent, "Edit the injection-check prompt", edit_set)
+                    .await;
+                let new_prompt = single_freetext(&resp);
+                let msg = match new_prompt {
+                    Some(text) if !text.trim().is_empty() => {
+                        match self.write_injection_check_prompt(&text) {
+                            Ok(scope) => format!(
+                                "prompt-injection block overridden; check-prompt updated ({scope})"
+                            ),
+                            Err(e) => format!(
+                                "prompt-injection block overridden (sent once); saving the \
+                                 check-prompt failed: {e}"
+                            ),
+                        }
+                    }
+                    _ => "prompt-injection block overridden (sent once); check-prompt unchanged"
+                        .to_string(),
+                };
+                let _ = tx.send(TurnEvent::Notice { text: msg }).await;
+                true
+            }
+            _ => {
+                // Dismissed → the block stands.
+                let _ = tx
+                    .send(TurnEvent::Notice {
+                        text: "prompt-injection block kept — prompt dropped".to_string(),
+                    })
+                    .await;
+                false
+            }
+        }
+    }
+
+    /// Raise an interrupt with the given question set and block until the
+    /// user answers (or dismisses). Mirrors the persist → register → emit
+    /// → wait ordering the `question` tool and `Approver` rely on. On a DB
+    /// failure (can't persist the interrupt) returns `Cancel` so the
+    /// caller treats it as a dismissal rather than hanging.
+    async fn raise_and_wait(
+        &self,
+        agent: &str,
+        description: &str,
+        set: crate::daemon::proto::InterruptQuestionSet,
+    ) -> crate::daemon::proto::ResolveResponse {
+        let interrupt_id = match self.session.db.raise_interrupt_questions(
+            self.session.id,
+            agent,
+            description,
+            &set,
+        ) {
+            Ok(id) => id,
+            Err(e) => {
+                tracing::warn!(error = %e, "injection override: raising interrupt failed");
+                return crate::daemon::proto::ResolveResponse::Cancel;
+            }
+        };
+        let pending = self.interrupts.register(interrupt_id);
+        self.interrupts
+            .emit_raised(self.session.id, interrupt_id, agent, description, set);
+        pending.wait().await
+    }
+
+    /// Lower the global injection-block threshold by one level (toward
+    /// `off`) and persist it to a global config dir. Returns the new
+    /// threshold. The write target is the first existing/home global
+    /// config dir, scaffolded if needed.
+    fn lower_injection_threshold(&self) -> Result<crate::config::extended::InjectionThreshold> {
+        use crate::config::extended::{InjectionThreshold, resolve_injection_guard};
+        let current = resolve_injection_guard(&self.cwd).threshold;
+        // One notch toward `off`: high→medium→low→off.
+        let next = match current {
+            InjectionThreshold::High => InjectionThreshold::Medium,
+            InjectionThreshold::Medium => InjectionThreshold::Low,
+            InjectionThreshold::Low => InjectionThreshold::Off,
+            InjectionThreshold::Off => InjectionThreshold::Off,
+        };
+        let path = global_extended_config_path()?;
+        let mut doc = crate::config::extended::ExtendedConfigDoc::load(&path)?;
+        let mut cfg = doc.config();
+        cfg.prompt_injection_guard.threshold = next;
+        doc.write(&cfg)?;
+        Ok(next)
+    }
+
+    /// Persist a new injection check-prompt. Writes to the project
+    /// `.cockpit/` layer when one exists for this cwd (so the override is
+    /// project-scoped where the project already overrides config),
+    /// otherwise the global config dir. Returns a human label for the
+    /// scope it wrote to.
+    fn write_injection_check_prompt(&self, text: &str) -> Result<&'static str> {
+        let (path, scope) = injection_check_prompt_target(&self.cwd)?;
+        let mut doc = crate::config::extended::ExtendedConfigDoc::load(&path)?;
+        let mut cfg = doc.config();
+        cfg.prompt_injection_guard.check_prompt = Some(text.to_string());
+        doc.write(&cfg)?;
+        Ok(scope)
+    }
+
     /// Name of the agent currently holding the user's conversation.
     /// Used by the TUI for the active-agent slot.
     pub fn active_agent(&self) -> &str {
@@ -475,6 +821,19 @@ impl Driver {
                     // PNG, not env-scannable text — so only the text side
                     // goes through `scrub`.
                     let folded = fold_submissions(batch);
+                    // Prompt-injection guard (GOALS §4i): scan the RAW user
+                    // text (before redaction) through the utility model. A
+                    // block (rating >= threshold) prompts the user for a
+                    // false-positive override; a dismissed block drops the
+                    // message. The scan never routes through `redact::scrub` —
+                    // it is an inbound check, independent of the outbound
+                    // redaction chokepoint.
+                    if !self.injection_guard_allows(&folded.text, tx).await {
+                        // Blocked and not overridden: do not send this prompt.
+                        self.emit_context_projection(tx).await;
+                        let _ = tx.send(TurnEvent::AgentIdle).await;
+                        continue;
+                    }
                     let submission = UserSubmission {
                         text: self.redact.scrub(&folded.text),
                         images: folded.images,

@@ -3346,6 +3346,14 @@ impl App {
                     line: format!("[job {job_id} note] {text}"),
                 });
             }
+            TurnEvent::Notice { text } => {
+                // Non-blocking system notice (prompt-injection warn chip,
+                // GOALS §4i). UI-only — never enters model context.
+                self.finalize_pending();
+                self.history.push(HistoryEntry::Plain {
+                    line: format!("⚠ {text}"),
+                });
+            }
             TurnEvent::JobCompleted {
                 job_id,
                 label,
