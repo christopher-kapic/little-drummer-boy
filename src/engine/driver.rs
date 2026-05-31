@@ -247,6 +247,13 @@ pub struct Driver {
     /// since — nothing new can be prunable. Keyed by stack depth so an
     /// interactive subagent's watermark doesn't bleed into the parent's.
     prune_watermark: std::collections::HashMap<usize, usize>,
+    /// One-shot latch for auto-compact (`prompts/model-provider-settings.md`):
+    /// once the ctx%-threshold auto-compact has fired for this session it is
+    /// not fired again — `/compact` hands the conversation off to a fresh
+    /// session (the client re-attaches), so re-firing on the abandoned old
+    /// session would loop. Reset would only matter across sessions, and each
+    /// session gets its own driver.
+    auto_compacted: bool,
     /// Re-executed seed-tool context for a `/compact` fresh session
     /// (T6.e). Set by [`Self::run_seed_tools`] before the loop starts;
     /// prepended to the **first** user message so the fresh agent's first
@@ -302,6 +309,12 @@ pub struct Driver {
     /// to the whole delegation tree — coder, merge-resolver, any subagent.
     /// `None` outside a plan run.
     model_override: Option<Arc<crate::engine::model::Model>>,
+    /// Test-only injected (providers config, provider, model). Lets the
+    /// auto-prune/auto-compact trigger tests exercise the real
+    /// resolution + trigger paths deterministically without depending on the
+    /// test machine's on-disk config layers. Never set in production.
+    #[cfg(test)]
+    test_providers_override: Option<(crate::config::providers::ProvidersConfig, String, String)>,
 }
 
 /// An in-flight compact-after-delegation: the decision tracker plus the
@@ -380,6 +393,7 @@ impl Driver {
             job_cmd_rx,
             appended_hints: std::collections::HashSet::new(),
             prune_watermark: std::collections::HashMap::new(),
+            auto_compacted: false,
             pending_seed_context: None,
             interrupts: Arc::new(crate::engine::interrupt::InterruptHub::detached()),
             skills_no_utility_model_logged: false,
@@ -388,6 +402,8 @@ impl Driver {
             approver: None,
             deleg_shrinks: std::collections::HashMap::new(),
             model_override: None,
+            #[cfg(test)]
+            test_providers_override: None,
         }
     }
 
@@ -886,11 +902,17 @@ impl Driver {
                     }
                 }
             }
-            // Stack has unwound to the root and the queue is drained —
-            // the agent is idle until the next message. Emit the falling
-            // edge so the TUI can stop its working-indicator clock, and
-            // refresh the "% prunable" projection from the now-settled
-            // foreground history.
+            // Stack has unwound to the root and the queue is drained — the
+            // agent is idle until the next message: the same safe inference
+            // boundary auto-prune uses. Auto-compact fires here when the last
+            // turn pushed ctx% over the configured auto-compact line
+            // (`prompts/model-provider-settings.md`); it emits `CompactReady`
+            // and the client re-attaches to the fresh session. Guarded by the
+            // one-shot latch + `at_safe_boundary` so it can't loop.
+            self.maybe_auto_compact(tx).await;
+            // Emit the falling edge so the TUI can stop its working-indicator
+            // clock, and refresh the "% prunable" projection from the
+            // now-settled foreground history.
             self.emit_context_projection(tx).await;
             let _ = tx.send(TurnEvent::AgentIdle).await;
         }
@@ -1037,8 +1059,22 @@ impl Driver {
 
     /// Snapshot-dedup the foreground agent's history. `auto` distinguishes
     /// the cache-aware auto-fire from a manual `/prune`. Emits `Pruned` +
-    /// a refreshed `ContextProjection`.
+    /// a refreshed `ContextProjection`. Never breaks a warm cache (the
+    /// cache-cold or manual paths), so `cache_break = false`.
     async fn do_prune(&mut self, auto: bool, tx: &mpsc::Sender<TurnEvent>) {
+        self.do_prune_inner(auto, false, tx).await;
+    }
+
+    /// Inner prune: `cache_break` flags a ctx%-threshold auto-prune that ran
+    /// against a warm cache (`prompts/model-provider-settings.md`), so the
+    /// client surfaces the shared cache-break warning. Emits `Pruned` + a
+    /// refreshed `ContextProjection`.
+    async fn do_prune_inner(
+        &mut self,
+        auto: bool,
+        cache_break: bool,
+        tx: &mpsc::Sender<TurnEvent>,
+    ) {
         let depth = self.stack.len();
         let agent_name = self.active_agent().to_string();
         let top = self.stack.last_mut().expect("stack never empty");
@@ -1098,15 +1134,25 @@ impl Driver {
                 bodies,
                 tokens_saved,
                 elided,
+                cache_break,
             })
             .await;
         self.emit_context_projection(tx).await;
     }
 
-    /// Cache-aware auto-prune (GOALS §10): before an inference call, if
-    /// the cache-cold predicate holds, the foreground history has grown
-    /// since the last prune, and there is something prunable, fire
-    /// `/prune` with no user prompt. Returns `true` if a prune happened.
+    /// Cache-aware auto-prune (GOALS §10 / `prompts/model-provider-settings.md`):
+    /// before an inference call, fire `/prune` with no user prompt when the
+    /// foreground history has grown since the last prune, there is something
+    /// prunable, and **either**
+    ///
+    /// - the cache-cold predicate holds (free pruning, unchanged), **or**
+    /// - the ctx%-threshold branch holds (`ctx% > auto-prune ctx %` AND
+    ///   `prunable% > auto-prune prunable %`), which may prune even on a warm
+    ///   cache, accepting the cache bust to reclaim context.
+    ///
+    /// When the threshold branch fires against a warm cache the same
+    /// cache-break warning the manual `/prune` surfaces is emitted via the
+    /// `Pruned { cache_break }` flag. Returns `true` if a prune happened.
     async fn maybe_auto_prune(&mut self, tx: &mpsc::Sender<TurnEvent>) -> bool {
         if !self.at_safe_boundary() {
             return false;
@@ -1123,10 +1169,8 @@ impl Driver {
         // send, so cases (a) and (b) carry the predicate.
         let cache = self.resolve_cache_config();
         let secs = self.session.seconds_since_last_send();
-        let state = prune::cache_state(&cache, secs, false);
-        if !state.is_cold() {
-            return false;
-        }
+        let cold = prune::cache_state(&cache, secs, false).is_cold();
+
         // Is anything actually prunable? Avoid an empty Pruned event.
         let plan = {
             let top = self.stack.last().expect("stack never empty");
@@ -1137,7 +1181,67 @@ impl Driver {
             self.prune_watermark.insert(depth, history_len);
             return false;
         }
-        self.do_prune(true, tx).await;
+
+        // The ctx%-threshold branch (inert when context_length is unknown):
+        // prune above the configured ctx% AND prunable% even on a warm cache.
+        let ctx_cfg = self.resolve_context_config();
+        let usage = self.session.last_usage();
+        let metrics = context_metrics(
+            self.active_model_context_length(),
+            usage.map(|u| u.input_tokens),
+            plan.tokens_saved() as u64,
+        );
+        let threshold_hit = metrics.is_some_and(|m| {
+            m.ctx_pct > f64::from(ctx_cfg.auto_prune_pct)
+                && m.prunable_pct > f64::from(ctx_cfg.auto_prune_prunable_pct)
+        });
+
+        if !cold && !threshold_hit {
+            return false;
+        }
+        // Warm cache + threshold-driven prune → the cache anchor is broken;
+        // surface the same warning the manual prune does.
+        let cache_break = !cold && threshold_hit;
+        self.do_prune_inner(true, cache_break, tx).await;
+        true
+    }
+
+    /// Auto-compact trigger (`prompts/model-provider-settings.md`): at or
+    /// above the configured auto-compact ctx% the foreground context is
+    /// compacted automatically via the existing `/compact` machinery — no
+    /// prune-first step for the compact trigger (the prune threshold handles
+    /// the cheaper reclaim below the compact line). Inert when
+    /// `context_length` is unknown (ctx% uncomputable). Guarded by the same
+    /// `at_safe_boundary` / watermark short-circuit as auto-prune so it can't
+    /// loop. Returns `true` if a compaction was started.
+    async fn maybe_auto_compact(&mut self, tx: &mpsc::Sender<TurnEvent>) -> bool {
+        // One-shot: `/compact` hands off to a fresh session, so firing again
+        // on this (now-abandoned) session would loop.
+        if self.auto_compacted {
+            return false;
+        }
+        if !self.at_safe_boundary() {
+            return false;
+        }
+        // Only the foreground root frame is compactable at the boundary; a
+        // deeper interactive subagent frame is never auto-compacted.
+        if self.stack.len() != 1 {
+            return false;
+        }
+        let ctx_cfg = self.resolve_context_config();
+        let usage = self.session.last_usage();
+        let Some(metrics) = context_metrics(
+            self.active_model_context_length(),
+            usage.map(|u| u.input_tokens),
+            0,
+        ) else {
+            return false;
+        };
+        if metrics.ctx_pct < f64::from(ctx_cfg.auto_compact_pct) {
+            return false;
+        }
+        self.auto_compacted = true;
+        self.do_compact(tx).await;
         true
     }
 
@@ -1163,6 +1267,31 @@ impl Driver {
         providers.resolve_shrink(&provider, &model)
     }
 
+    /// Resolve the context-threshold config for the session's active
+    /// (provider, model). Defaults to (80/50/30) when the config can't be
+    /// loaded (`prompts/model-provider-settings.md`).
+    fn resolve_context_config(&self) -> crate::config::providers::ContextConfig {
+        let Some((providers, provider, model)) = self.active_providers_config() else {
+            return crate::config::providers::ContextConfig::default();
+        };
+        providers.resolve_context(&provider, &model)
+    }
+
+    /// The active model's declared context window (`context_length`), or
+    /// `None` when no model is selected, the config can't be loaded, or the
+    /// model declares no limit. When `None` the ctx%-gated triggers are inert
+    /// (`prompts/model-provider-settings.md`).
+    fn active_model_context_length(&self) -> Option<u32> {
+        let (providers, provider, model) = self.active_providers_config()?;
+        providers
+            .providers
+            .get(&provider)?
+            .models
+            .iter()
+            .find(|m| m.id == model)
+            .and_then(|m| m.context_length)
+    }
+
     /// Load the layered providers config plus the session's active
     /// (provider, model). `None` when no model is selected or the config
     /// can't be loaded — callers fall back to conservative defaults. Same
@@ -1170,6 +1299,10 @@ impl Driver {
     fn active_providers_config(
         &self,
     ) -> Option<(crate::config::providers::ProvidersConfig, String, String)> {
+        #[cfg(test)]
+        if let Some(o) = &self.test_providers_override {
+            return Some(o.clone());
+        }
         use crate::config::dirs::discover_config_dirs;
         use crate::config::providers::ConfigDoc;
         let provider = self.session.active_provider()?;
@@ -2349,6 +2482,33 @@ fn wire_token_total(history: &[Message]) -> u64 {
         .sum()
 }
 
+/// Context-fill metrics for the auto-prune/auto-compact triggers
+/// (`prompts/model-provider-settings.md`). `ctx_pct` is the last request's
+/// prompt size as a percentage of the model's context window; `prunable_pct`
+/// is the prunable wire tokens as a percentage of the same window. Returns
+/// `None` (ctx%-gated triggers inert) when the window size is unknown/zero or
+/// no request has reported its usage yet — exactly the edge case the spec
+/// requires the ctx%-gated paths to skip.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ContextMetrics {
+    ctx_pct: f64,
+    prunable_pct: f64,
+}
+
+fn context_metrics(
+    context_length: Option<u32>,
+    input_tokens: Option<u64>,
+    prunable_tokens: u64,
+) -> Option<ContextMetrics> {
+    let window = context_length.filter(|n| *n > 0)?;
+    let used = input_tokens?;
+    let window = f64::from(window);
+    Some(ContextMetrics {
+        ctx_pct: used as f64 / window * 100.0,
+        prunable_pct: prunable_tokens as f64 / window * 100.0,
+    })
+}
+
 /// Turn cap for the explore subagent's noninteractive loop. Real
 /// exploration work needs headroom; 64 turns bounds runaway loops
 /// without cutting legitimate work short.
@@ -2592,6 +2752,39 @@ mod tests {
         vec![call("c1"), result("c1"), call("c2"), result("c2")]
     }
 
+    /// Like [`dup_read_history`] but with a large duplicated body so the
+    /// prune reclaims a substantial token count (used by the ctx%-threshold
+    /// auto-prune test, where the elision marker would otherwise dwarf a tiny
+    /// body and leave `tokens_saved` at 0).
+    fn dup_read_history_big() -> Vec<Message> {
+        use rig::OneOrMany;
+        use rig::message::{AssistantContent, ToolResult, ToolResultContent, UserContent};
+        let call = |id: &str| Message::Assistant {
+            id: None,
+            content: OneOrMany::one(AssistantContent::ToolCall(
+                crate::engine::message::ToolCall {
+                    id: id.to_string(),
+                    call_id: None,
+                    function: rig::message::ToolFunction {
+                        name: "read".into(),
+                        arguments: serde_json::json!({ "path": "/abs/foo.rs" }),
+                    },
+                    signature: None,
+                    additional_params: None,
+                },
+            )),
+        };
+        let big = "lorem ipsum dolor sit amet ".repeat(400);
+        let result = move |id: &str| Message::User {
+            content: OneOrMany::one(UserContent::ToolResult(ToolResult {
+                id: id.to_string(),
+                call_id: None,
+                content: OneOrMany::one(ToolResultContent::text(big.clone())),
+            })),
+        };
+        vec![call("c1"), result("c1"), call("c2"), result("c2")]
+    }
+
     /// `/prune` (and auto-prune) target the **foreground** agent only —
     /// the top of the interactive-agent stack. A suspended parent frame's
     /// history is never touched (GOALS §3b scope).
@@ -2658,6 +2851,275 @@ mod tests {
         let (tx, _rx) = mpsc::channel::<TurnEvent>(64);
         // Empty foreground history: nothing to prune.
         assert!(!driver.maybe_auto_prune(&tx).await);
+    }
+
+    /// `context_metrics` (the ctx%/prunable% figure the auto-compact +
+    /// ctx%-threshold auto-prune triggers consume): computed from the last
+    /// request's prompt size against the model's context window, inert when
+    /// the window is unknown or no usage has been reported
+    /// (`prompts/model-provider-settings.md`).
+    #[test]
+    fn context_metrics_compute_and_inert_cases() {
+        // 60k of a 100k window → 60% ctx; 30k prunable → 30% prunable.
+        let m = context_metrics(Some(100_000), Some(60_000), 30_000).unwrap();
+        assert!((m.ctx_pct - 60.0).abs() < 1e-9);
+        assert!((m.prunable_pct - 30.0).abs() < 1e-9);
+
+        // No context_length known → None (ctx%-gated triggers inert): the
+        // exact edge case the spec requires the ctx% paths to skip.
+        assert!(context_metrics(None, Some(60_000), 30_000).is_none());
+        // A zero/garbage window is treated as unknown.
+        assert!(context_metrics(Some(0), Some(60_000), 30_000).is_none());
+        // No usage reported yet → None (no last send).
+        assert!(context_metrics(Some(100_000), None, 30_000).is_none());
+
+        // Threshold composition mirrors `maybe_auto_prune`: above the prune
+        // ctx% (50) AND above prunable% (30) fires.
+        let warm = context_metrics(Some(100_000), Some(55_000), 31_000).unwrap();
+        assert!(warm.ctx_pct > 50.0 && warm.prunable_pct > 30.0);
+        // Below either gate → no threshold fire.
+        let low_prunable = context_metrics(Some(100_000), Some(55_000), 10_000).unwrap();
+        assert!(!(low_prunable.ctx_pct > 50.0 && low_prunable.prunable_pct > 30.0));
+
+        // The auto-compact line (80%): at/above fires, below doesn't.
+        let hot = context_metrics(Some(100_000), Some(85_000), 0).unwrap();
+        assert!(hot.ctx_pct >= 80.0);
+        let mid = context_metrics(Some(100_000), Some(70_000), 0).unwrap();
+        assert!(mid.ctx_pct < 80.0);
+    }
+
+    /// Install a test providers override with the given context thresholds,
+    /// cache mode, and the active model's `context_length` so the
+    /// auto-prune/auto-compact triggers resolve deterministically.
+    fn install_test_providers(
+        driver: &mut Driver,
+        cache_mode: crate::config::providers::CacheMode,
+        ctx: crate::config::providers::ContextConfig,
+        context_length: u32,
+    ) {
+        use crate::config::providers::{
+            ActiveModelRef, CacheConfig, ModelEntry, ProviderEntry, ProvidersConfig,
+        };
+        let mut entry = ProviderEntry {
+            url: "http://localhost:1/v1".into(),
+            cache: CacheConfig {
+                mode: cache_mode,
+                ttl_secs: 300,
+            },
+            context: ctx,
+            ..ProviderEntry::default()
+        };
+        entry.models.push(ModelEntry {
+            id: "local".into(),
+            name: None,
+            thinking_modes: vec![],
+            inputs: None,
+            context_length: Some(context_length),
+            favorite: false,
+            manual: false,
+            cache: None,
+            shrink: None,
+            context: None,
+            mode: None,
+            extra: Default::default(),
+        });
+        let mut providers = std::collections::BTreeMap::new();
+        providers.insert("lmstudio".to_string(), entry);
+        let cfg = ProvidersConfig {
+            providers,
+            active_model: Some(ActiveModelRef {
+                provider: "lmstudio".into(),
+                model: "local".into(),
+                thinking_mode: None,
+            }),
+            ..ProvidersConfig::default()
+        };
+        driver.test_providers_override = Some((cfg, "lmstudio".into(), "local".into()));
+    }
+
+    /// Threshold-branch auto-prune: a WARM cache (ephemeral, just sent) with
+    /// ctx% > the prune ctx% (50) AND prunable% > the prunable% (30) prunes
+    /// anyway, accepting the cache bust — and the `Pruned` event carries
+    /// `cache_break = true` so the client surfaces the warning.
+    #[tokio::test]
+    async fn auto_prune_threshold_branch_prunes_warm_cache_with_cache_break() {
+        use crate::config::providers::{CacheMode, ContextConfig};
+        let (mut driver, _tmp) = test_driver(8);
+        let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
+        // A big duplicated body so the prune actually reclaims many tokens
+        // (the elision marker is small relative to the body).
+        driver.stack[0].history = dup_read_history_big();
+        let prunable = prune::dedup_plan(&driver.stack[0].history).tokens_saved();
+        assert!(prunable > 0, "the big-body history must be prunable");
+        // Pick a window so prunable% > 30 and ctx% > 50: window = prunable*2
+        // makes prunable% = 50, and input = 60% of the window keeps ctx% > 50.
+        let window = (prunable as u32) * 2;
+        install_test_providers(
+            &mut driver,
+            CacheMode::Ephemeral,
+            ContextConfig::default(),
+            window,
+        );
+        // Warm cache: a send just happened.
+        driver.session.note_send();
+        let input = (f64::from(window) * 0.6) as u64; // ctx% = 60 (> 50)
+        driver
+            .session
+            .record_usage(
+                uuid::Uuid::new_v4(),
+                crate::tokens::TokenUsage {
+                    input_tokens: input,
+                    output_tokens: 0,
+                    cached_input_tokens: 0,
+                },
+            )
+            .unwrap();
+
+        assert!(
+            driver.maybe_auto_prune(&tx).await,
+            "threshold branch prunes on a warm cache"
+        );
+        // The emitted Pruned event flags the cache break.
+        let mut saw_cache_break = false;
+        drop(tx);
+        while let Some(ev) = rx.recv().await {
+            if let TurnEvent::Pruned { cache_break, .. } = ev {
+                saw_cache_break = saw_cache_break || cache_break;
+            }
+        }
+        assert!(
+            saw_cache_break,
+            "warm-cache threshold prune flags cache_break"
+        );
+    }
+
+    /// Auto-compact fires at/above the configured ctx% (default 80) and is a
+    /// one-shot (the second call no-ops because the session is being handed
+    /// off). Below the line it doesn't fire.
+    #[tokio::test]
+    async fn auto_compact_fires_at_threshold_once() {
+        use crate::config::providers::{CacheMode, ContextConfig};
+        let (mut driver, _tmp) = test_driver(8);
+        let (tx, mut rx) = mpsc::channel::<TurnEvent>(256);
+        install_test_providers(&mut driver, CacheMode::None, ContextConfig::default(), 100);
+
+        // 70% < 80 → no compact.
+        driver
+            .session
+            .record_usage(
+                uuid::Uuid::new_v4(),
+                crate::tokens::TokenUsage {
+                    input_tokens: 70,
+                    output_tokens: 0,
+                    cached_input_tokens: 0,
+                },
+            )
+            .unwrap();
+        assert!(
+            !driver.maybe_auto_compact(&tx).await,
+            "below 80% no compact"
+        );
+
+        // 85% ≥ 80 → compact fires once.
+        driver
+            .session
+            .record_usage(
+                uuid::Uuid::new_v4(),
+                crate::tokens::TokenUsage {
+                    input_tokens: 85,
+                    output_tokens: 0,
+                    cached_input_tokens: 0,
+                },
+            )
+            .unwrap();
+        assert!(driver.maybe_auto_compact(&tx).await, "at/over 80% compacts");
+        // One-shot: a second call no-ops even while still hot.
+        assert!(
+            !driver.maybe_auto_compact(&tx).await,
+            "auto-compact is one-shot per session"
+        );
+        drop(tx);
+        while rx.recv().await.is_some() {}
+    }
+
+    /// No `context_length` known → the ctx%-gated paths are inert: the
+    /// threshold auto-prune branch and auto-compact both skip, but the
+    /// cache-cold auto-prune branch still fires.
+    #[tokio::test]
+    async fn no_context_length_makes_ctx_gated_paths_inert() {
+        use crate::config::providers::{
+            ActiveModelRef, CacheConfig, CacheMode, ModelEntry, ProviderEntry, ProvidersConfig,
+        };
+        let (mut driver, _tmp) = test_driver(8);
+        let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
+
+        // Provider config WITHOUT a context_length on the model, ephemeral
+        // (so cache could be warm), warm send.
+        let mut entry = ProviderEntry {
+            url: "http://localhost:1/v1".into(),
+            cache: CacheConfig {
+                mode: CacheMode::Ephemeral,
+                ttl_secs: 300,
+            },
+            ..ProviderEntry::default()
+        };
+        entry.models.push(ModelEntry {
+            id: "local".into(),
+            name: None,
+            thinking_modes: vec![],
+            inputs: None,
+            context_length: None, // unknown window
+            favorite: false,
+            manual: false,
+            cache: None,
+            shrink: None,
+            context: None,
+            mode: None,
+            extra: Default::default(),
+        });
+        let mut providers = std::collections::BTreeMap::new();
+        providers.insert("lmstudio".to_string(), entry);
+        driver.test_providers_override = Some((
+            ProvidersConfig {
+                providers,
+                active_model: Some(ActiveModelRef {
+                    provider: "lmstudio".into(),
+                    model: "local".into(),
+                    thinking_mode: None,
+                }),
+                ..ProvidersConfig::default()
+            },
+            "lmstudio".into(),
+            "local".into(),
+        ));
+
+        // Auto-compact inert (no ctx%).
+        driver
+            .session
+            .record_usage(
+                uuid::Uuid::new_v4(),
+                crate::tokens::TokenUsage {
+                    input_tokens: 999_999,
+                    output_tokens: 0,
+                    cached_input_tokens: 0,
+                },
+            )
+            .unwrap();
+        assert!(
+            !driver.maybe_auto_compact(&tx).await,
+            "no context_length → auto-compact inert"
+        );
+
+        // Threshold auto-prune branch inert on a WARM cache (no ctx%), so the
+        // only thing that could fire it is the cache-cold branch. Make it
+        // cold (no send → cold) and confirm the cache-cold branch still works.
+        driver.stack[0].history = dup_read_history();
+        assert!(
+            driver.maybe_auto_prune(&tx).await,
+            "cache-cold auto-prune still fires without context_length"
+        );
+        drop(tx);
+        while rx.recv().await.is_some() {}
     }
 
     #[tokio::test]

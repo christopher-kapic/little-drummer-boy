@@ -33,12 +33,13 @@ use crate::tui::textfield::TextField;
 use crate::tui::theme::MUTED_COLOR_INDEX;
 
 use super::auth::{CodexLoginProgress, CodexLoginState, FetchHandle};
+use super::settings_editor::{SettingsEditor, SettingsField, SettingsResult};
 use super::{Nav, Page, SettingsDialog};
 
 /// Number of selectable rows in the Edit-provider action menu.
-/// Index map: 0=URL · 1=Headers · 2=Models · 3=Favorite · 4=Refetch ·
-/// 5=Delete · 6=Back.
-const EDIT_MENU_LEN: usize = 7;
+/// Index map: 0=URL · 1=Headers · 2=Models · 3=Settings · 4=Favorite ·
+/// 5=Refetch · 6=Delete · 7=Back.
+const EDIT_MENU_LEN: usize = 8;
 
 #[allow(private_interfaces)]
 pub(super) enum ProvidersPage {
@@ -71,6 +72,24 @@ pub(super) enum ProvidersPage {
     /// `parent.entry.models` set from `editor.rows`.
     Models {
         editor: ModelEditor,
+        parent: Box<EditState>,
+    },
+    /// Edit a single model's `Option<…>` settings overrides
+    /// (`prompts/model-provider-settings.md`). Reached by Enter/l/→ on a
+    /// model row in the Models sub-page (every model, fetched or manual).
+    /// Back navigation returns to `Models { parent }` with the model's
+    /// override fields written back into the editor's rows.
+    ModelSettings {
+        editor: SettingsEditor,
+        models: ModelEditor,
+        parent: Box<EditState>,
+    },
+    /// Edit the provider's concrete settings values
+    /// (`prompts/model-provider-settings.md`). Reached by the "Settings" row
+    /// on the Edit page. Back navigation returns to `Edit(parent)` with the
+    /// concrete values written into `parent.entry`.
+    ProviderSettings {
+        editor: SettingsEditor,
         parent: Box<EditState>,
     },
     /// Triggered by /fetch-models — prompts on unlisted models.
@@ -438,6 +457,10 @@ pub(super) enum ModelMode {
 pub(super) enum ModelResult {
     Stay,
     Back,
+    /// Open the model-settings sub-dialog for the row at this index
+    /// (`prompts/model-provider-settings.md`). Works on every model — these
+    /// are overrides, not edits to fetched data.
+    OpenSettings(usize),
 }
 
 impl ModelEditor {
@@ -551,6 +574,8 @@ impl ModelEditor {
                     manual: true,
                     cache: None,
                     shrink: None,
+                    context: None,
+                    mode: None,
                     extra: Default::default(),
                 });
                 self.cursor = self.rows.len() - 1;
@@ -605,15 +630,23 @@ impl ModelEditor {
                 }
                 ModelResult::Stay
             }
-            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+            // `r` renames (id/name/context) — manual entries only, as before.
+            KeyCode::Char('r') => {
                 if self.cursor < self.rows.len() {
                     if self.rows[self.cursor].manual {
                         self.begin_edit(self.cursor);
                     } else {
                         self.status =
-                            Some("fetched models can't be edited (delete with d)".to_string());
+                            Some("fetched models can't be renamed (settings: enter)".to_string());
                     }
-                    ModelResult::Stay
+                }
+                ModelResult::Stay
+            }
+            // Enter/l/→ opens the model-settings sub-dialog (every model) or
+            // the add affordance on the synthetic row.
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                if self.cursor < self.rows.len() {
+                    ModelResult::OpenSettings(self.cursor)
                 } else if self.cursor == self.add_row_idx() {
                     self.begin_add();
                     ModelResult::Stay
@@ -797,6 +830,8 @@ impl SettingsDialog {
                     auth: Some(crate::config::providers::AuthKind::DeviceFlow),
                     cache: Default::default(),
                     shrink: Default::default(),
+                    context: Default::default(),
+                    mode: None,
                     models: Vec::new(),
                 };
                 self.config.providers.insert(id.clone(), entry);
@@ -875,6 +910,13 @@ impl SettingsDialog {
                 // list. The model editor owns the live (unsaved) rows, so
                 // we don't touch them here — just record the outcome on
                 // the parent so it surfaces when they return to Edit.
+                parent.status = Some(message);
+                parent.fetch = None;
+            }
+            Page::Providers(ProvidersPage::ModelSettings { parent, .. })
+            | Page::Providers(ProvidersPage::ProviderSettings { parent, .. }) => {
+                // Same as Models: the settings editors own their live state,
+                // so just clear the in-flight handle and record the outcome.
                 parent.status = Some(message);
                 parent.fetch = None;
             }
@@ -1069,6 +1111,14 @@ impl SettingsDialog {
                 self.handle_headers_key(key, editor, parent)
             }
             ProvidersPage::Models { editor, parent } => self.handle_models_key(key, editor, parent),
+            ProvidersPage::ModelSettings {
+                editor,
+                models,
+                parent,
+            } => self.handle_model_settings_key(key, editor, models, parent),
+            ProvidersPage::ProviderSettings { editor, parent } => {
+                self.handle_provider_settings_key(key, editor, parent)
+            }
             ProvidersPage::FetchAll(state) => self.handle_fetch_all_key(key, state),
             ProvidersPage::CopilotSetup(state) => self.handle_copilot_setup_key(key, state),
         }
@@ -1224,6 +1274,8 @@ impl SettingsDialog {
                     auth: Some(template.auth),
                     cache: Default::default(),
                     shrink: Default::default(),
+                    context: Default::default(),
+                    mode: None,
                     models: vec![],
                 };
                 self.save_and_fetch_provider(s, id, entry, template);
@@ -1246,6 +1298,8 @@ impl SettingsDialog {
                             auth: Some(template.auth),
                             cache: Default::default(),
                             shrink: Default::default(),
+                            context: Default::default(),
+                            mode: None,
                             models: vec![],
                         };
                         self.save_and_fetch_provider(s, id, entry, template);
@@ -1276,6 +1330,8 @@ impl SettingsDialog {
                             auth: Some(template.auth),
                             cache: Default::default(),
                             shrink: Default::default(),
+                            context: Default::default(),
+                            mode: None,
                             models: vec![],
                         };
                         self.save_and_fetch_provider(s, id, entry, template);
@@ -1298,6 +1354,8 @@ impl SettingsDialog {
                         auth: Some(template.auth),
                         cache: Default::default(),
                         shrink: Default::default(),
+                        context: Default::default(),
+                        mode: None,
                         models: vec![],
                     };
                     self.save_and_fetch_provider(s, id, entry, template);
@@ -1468,6 +1526,20 @@ impl SettingsDialog {
                         }));
                     }
                     3 => {
+                        // Hand off to the provider-settings sub-page, moving
+                        // the EditState out so it returns intact on back
+                        // (mirrors the Headers/Models rows).
+                        let settings = SettingsEditor::for_provider(&s.entry);
+                        let owned = std::mem::replace(
+                            s,
+                            EditState::new(String::new(), ProviderEntry::default()),
+                        );
+                        return Nav::Replace(Page::Providers(ProvidersPage::ProviderSettings {
+                            editor: settings,
+                            parent: Box::new(owned),
+                        }));
+                    }
+                    4 => {
                         let new = !s.entry.favorite.unwrap_or(false);
                         s.entry.favorite = if new { Some(true) } else { None };
                         s.status = Some(if new {
@@ -1476,7 +1548,7 @@ impl SettingsDialog {
                             "removed favorite".into()
                         });
                     }
-                    4 => {
+                    5 => {
                         // Same as 'r'
                         match models_fetch::resolve_provider_request(&s.provider_id, &s.entry) {
                             Err(e) => {
@@ -1491,7 +1563,7 @@ impl SettingsDialog {
                             }
                         }
                     }
-                    5 => {
+                    6 => {
                         if s.delete_pending {
                             self.config.providers.remove(&s.provider_id);
                             let saved = self.save_config();
@@ -1509,7 +1581,7 @@ impl SettingsDialog {
                             s.status = Some("press Enter again to confirm delete".into());
                         }
                     }
-                    6 => {
+                    7 => {
                         return Nav::Replace(Page::Providers(ProvidersPage::List {
                             cursor: 0,
                             status: s.status.clone(),
@@ -1582,6 +1654,101 @@ impl SettingsDialog {
                 // user to persist with `s`.
                 owned.cursor = 2;
                 owned.status = Some("models updated; press s to save".into());
+                Nav::Replace(Page::Providers(ProvidersPage::Edit(owned)))
+            }
+            ModelResult::OpenSettings(idx) => {
+                let Some(model_id) = editor.rows.get(idx).map(|m| m.id.clone()) else {
+                    return Nav::Stay;
+                };
+                // Seed the settings editor from the provider entry carrying
+                // the *live* (unsaved) model rows so inherited values resolve
+                // correctly. The ModelEditor and parent are moved into the
+                // sub-page so they're recalled intact on back.
+                let mut seed_entry = parent.entry.clone();
+                seed_entry.models = editor.rows.clone();
+                let settings = SettingsEditor::for_model(&seed_entry, &model_id);
+                let models = std::mem::replace(editor, ModelEditor::new(Vec::new()));
+                let owned = std::mem::replace(
+                    parent.as_mut(),
+                    EditState::new(String::new(), ProviderEntry::default()),
+                );
+                Nav::Replace(Page::Providers(ProvidersPage::ModelSettings {
+                    editor: settings,
+                    models,
+                    parent: Box::new(owned),
+                }))
+            }
+        }
+    }
+
+    /// Handle keys on the model-settings sub-dialog
+    /// (`prompts/model-provider-settings.md`). Keys go to the
+    /// [`SettingsEditor`] until it signals `Back`; on back, write the model's
+    /// override fields into the live model rows and return to the Models
+    /// sub-page (which returns to Edit on its own back, where `s` persists).
+    fn handle_model_settings_key(
+        &mut self,
+        key: KeyEvent,
+        editor: &mut SettingsEditor,
+        models: &mut ModelEditor,
+        parent: &mut Box<EditState>,
+    ) -> Nav {
+        match editor.handle_key(key) {
+            SettingsResult::Stay => Nav::Stay,
+            SettingsResult::Back => {
+                // Write the overrides into a provider entry carrying the live
+                // model rows, then lift the updated rows back into the model
+                // editor so the Models page sees them.
+                let mut tmp = parent.entry.clone();
+                tmp.models = std::mem::take(&mut models.rows);
+                editor.write_into(&mut tmp);
+                let mut owned = std::mem::replace(
+                    parent.as_mut(),
+                    EditState::new(String::new(), ProviderEntry::default()),
+                );
+                // Persist immediately: "editing a field and leaving the
+                // dialog persists it" (`prompts/model-provider-settings.md`).
+                // The model-row edit is a self-contained override write, so
+                // we save rather than wait for the Edit page's `s`.
+                owned.entry.models = tmp.models.clone();
+                self.config
+                    .providers
+                    .insert(owned.provider_id.clone(), owned.entry.clone());
+                owned.status = Some(super::save_status(self.save_config()).unwrap_or_default());
+                let new_models = ModelEditor::new(tmp.models);
+                Nav::Replace(Page::Providers(ProvidersPage::Models {
+                    editor: new_models,
+                    parent: Box::new(owned),
+                }))
+            }
+        }
+    }
+
+    /// Handle keys on the provider-settings sub-dialog. Keys go to the
+    /// [`SettingsEditor`] until it signals `Back`; on back, write the concrete
+    /// values into `parent.entry` and return to the Edit page (where `s`
+    /// persists), mirroring the Headers/Models round trip.
+    fn handle_provider_settings_key(
+        &mut self,
+        key: KeyEvent,
+        editor: &mut SettingsEditor,
+        parent: &mut Box<EditState>,
+    ) -> Nav {
+        match editor.handle_key(key) {
+            SettingsResult::Stay => Nav::Stay,
+            SettingsResult::Back => {
+                let mut owned = std::mem::replace(
+                    parent.as_mut(),
+                    EditState::new(String::new(), ProviderEntry::default()),
+                );
+                editor.write_into(&mut owned.entry);
+                owned.cursor = 3;
+                // Persist immediately on leaving the dialog
+                // (`prompts/model-provider-settings.md`).
+                self.config
+                    .providers
+                    .insert(owned.provider_id.clone(), owned.entry.clone());
+                owned.status = Some(super::save_status(self.save_config()).unwrap_or_default());
                 Nav::Replace(Page::Providers(ProvidersPage::Edit(owned)))
             }
         }
@@ -1775,6 +1942,12 @@ impl SettingsDialog {
             }
             ProvidersPage::Models { editor, parent } => {
                 self.render_models_page(frame, area, editor, parent.as_ref())
+            }
+            ProvidersPage::ModelSettings { editor, parent, .. } => {
+                self.render_settings_editor(frame, area, editor, parent.as_ref())
+            }
+            ProvidersPage::ProviderSettings { editor, parent } => {
+                self.render_settings_editor(frame, area, editor, parent.as_ref())
             }
             ProvidersPage::FetchAll(s) => self.render_fetch_all(frame, area, s),
             ProvidersPage::CopilotSetup(s) => self.render_copilot_setup(frame, area, s),
@@ -2119,10 +2292,26 @@ impl SettingsDialog {
         } else {
             format!("{} model(s)", s.entry.models.len())
         };
+        let settings_summary = {
+            let ctx = &s.entry.context;
+            let mode = match s.entry.mode {
+                Some(crate::config::extended::LlmMode::Defensive) => "defensive",
+                Some(crate::config::extended::LlmMode::Normal) => "normal",
+                None => "undefined",
+            };
+            format!(
+                "compact {}% · prune {}%/{}% · cache {}s · mode {mode}",
+                ctx.auto_compact_pct,
+                ctx.auto_prune_pct,
+                ctx.auto_prune_prunable_pct,
+                s.entry.cache.ttl_secs,
+            )
+        };
         let rows = [
             ("URL", s.entry.url.clone()),
             ("Headers", headers_summary),
             ("Models", models_summary),
+            ("Settings", settings_summary),
             (
                 "Favorite",
                 if s.entry.favorite.unwrap_or(false) {
@@ -2262,6 +2451,109 @@ impl SettingsDialog {
         if editor.is_editing() {
             render_model_edit_popup(frame, area, editor);
         }
+    }
+
+    /// Full-pane render for the model/provider settings sub-dialog
+    /// (`prompts/model-provider-settings.md`). Lists the seven fields with
+    /// their working values; an inherited (non-overridden) model-scope field
+    /// is dimmed with an `(inherited)` tag. The active numeric edit shows its
+    /// buffer inline.
+    fn render_settings_editor(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        editor: &SettingsEditor,
+        parent: &EditState,
+    ) {
+        use super::settings_editor::SETTINGS_FIELD_COUNT;
+        let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+        let yellow = Style::default().fg(Color::Yellow);
+        let scope_label = match &editor.scope {
+            super::settings_editor::SettingsScope::Model { model_id } => {
+                format!("{} › {}", parent.provider_id, model_id)
+            }
+            super::settings_editor::SettingsScope::Provider => parent.provider_id.clone(),
+        };
+        let mut lines: Vec<Line<'static>> = vec![
+            Line::from(vec![
+                Span::styled("Settings: ", muted),
+                Span::styled(scope_label, Style::default().add_modifier(Modifier::BOLD)),
+            ]),
+            Line::default(),
+        ];
+
+        let fields = [
+            SettingsField::AutoCompactPct,
+            SettingsField::AutoPrunePct,
+            SettingsField::AutoPrunePrunablePct,
+            SettingsField::CacheTtlSecs,
+            SettingsField::CacheMode,
+            SettingsField::ShrinkStrategy,
+            SettingsField::Mode,
+        ];
+        debug_assert_eq!(fields.len(), SETTINGS_FIELD_COUNT);
+        let label_w = fields
+            .iter()
+            .map(|f| f.label().chars().count())
+            .max()
+            .unwrap_or(0);
+
+        for (i, field) in fields.iter().enumerate() {
+            let selected = i == editor.cursor;
+            let marker = if selected { "▸ " } else { "  " };
+            let label_style = if selected {
+                yellow.add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            let overridden = editor.is_overridden(*field);
+            // While editing a numeric field, show the live buffer with a
+            // caret; otherwise the formatted working value.
+            let value = if editor.editing == Some(*field) {
+                format!("{}▎", editor.buf.text())
+            } else {
+                editor.value_str(*field)
+            };
+            let value_style = if !overridden {
+                muted
+            } else if selected {
+                Style::default().fg(Color::White)
+            } else {
+                muted
+            };
+            let mut spans = vec![
+                Span::raw(marker),
+                Span::styled(
+                    format!("{:<width$}", field.label(), width = label_w),
+                    label_style,
+                ),
+                Span::raw("  "),
+                Span::styled(value, value_style),
+            ];
+            if !overridden {
+                spans.push(Span::styled("  (inherited)".to_string(), muted));
+            }
+            lines.push(Line::from(spans));
+        }
+
+        lines.push(Line::default());
+        if let Some(status) = &editor.status {
+            lines.push(Line::from(Span::styled(status.clone(), yellow)));
+        } else if matches!(
+            editor.scope,
+            super::settings_editor::SettingsScope::Model { .. }
+        ) {
+            lines.push(Line::from(Span::styled(
+                "enter: edit/cycle   x: clear to inherit   h: back".to_string(),
+                muted,
+            )));
+        } else {
+            lines.push(Line::from(Span::styled(
+                "enter: edit/cycle   h: back".to_string(),
+                muted,
+            )));
+        }
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
     }
 
     fn render_fetch_all(&self, frame: &mut Frame, area: Rect, s: &FetchAllState) {
@@ -2850,6 +3142,43 @@ fn compute_unlisted(dialog: &SettingsDialog) -> Vec<(String, String)> {
         }
     }
     unlisted
+}
+
+/// Build the `ProvidersPage` for `/model-settings`: the active model's
+/// model-settings sub-dialog (`prompts/model-provider-settings.md`). Falls
+/// back to the providers list with an inline status when no model is active
+/// or the active (provider, model) can't be resolved in config.
+pub(super) fn active_model_settings_page(
+    config: &crate::config::providers::ProvidersConfig,
+) -> ProvidersPage {
+    let no_model = |msg: &str| ProvidersPage::List {
+        cursor: 0,
+        status: Some(msg.to_string()),
+        delete_pending: false,
+    };
+    let Some(active) = config.active_model.as_ref() else {
+        return no_model("no model selected — pick one with /model first");
+    };
+    let Some(entry) = config.providers.get(&active.provider) else {
+        return no_model(&format!(
+            "active provider `{}` not found in config",
+            active.provider
+        ));
+    };
+    if !entry.models.iter().any(|m| m.id == active.model) {
+        return no_model(&format!(
+            "active model `{}/{}` not found in config",
+            active.provider, active.model
+        ));
+    }
+    let settings = SettingsEditor::for_model(entry, &active.model);
+    let models = ModelEditor::new(entry.models.clone());
+    let parent = EditState::new(active.provider.clone(), entry.clone());
+    ProvidersPage::ModelSettings {
+        editor: settings,
+        models,
+        parent: Box::new(parent),
+    }
 }
 
 pub(super) fn valid_url(s: &str) -> bool {

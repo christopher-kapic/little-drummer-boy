@@ -270,6 +270,8 @@ pub fn parse_models_body(body: &str) -> Result<Vec<ModelEntry>> {
                 manual: false,
                 cache: None,
                 shrink: None,
+                context: None,
+                mode: None,
                 extra,
             })
         })

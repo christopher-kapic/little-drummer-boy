@@ -308,7 +308,14 @@ async fn run_worker(
     // default primary agent (the auto-router feature) both read it; the live
     // `/llm-mode` switch overrides the mode in place via `DriverControl`.
     let extended_cfg = crate::config::extended::load_for_cwd(&project_root);
-    let llm_mode = extended_cfg.llm_mode;
+    // Effective LLM mode = active model `mode` override → active provider
+    // `mode` override → the persisted global `llm_mode`
+    // (`prompts/model-provider-settings.md`). Re-resolved here so a
+    // model/provider that pins a mode takes effect at session start (and on a
+    // `/model` change, which restarts the worker on the new active model). A
+    // live `/llm-mode` toggle still overrides this for the running session via
+    // `DriverControl::SetLlmMode`.
+    let llm_mode = resolve_effective_llm_mode(&session, &project_root, extended_cfg.llm_mode);
     let spawn_args = SpawnArgs {
         model,
         params: ModelParams::default(),
@@ -803,12 +810,14 @@ fn turn_event_to_proto(event: TurnEvent, session_id: Uuid) -> Vec<proto::Event> 
             bodies,
             tokens_saved,
             elided,
+            cache_break,
         } => vec![proto::Event::Pruned {
             session_id,
             auto,
             bodies,
             tokens_saved,
             elided,
+            cache_break,
         }],
         TurnEvent::CompactReady {
             new_session_id,
@@ -876,6 +885,34 @@ fn resolve_root_agent(
         .map(|row| row.active_agent)
         .filter(|name| name == "Auto" || name == "Plan" || name == "Build")
         .unwrap_or_else(|| initial_active_agent(cfg).to_string())
+}
+
+/// Resolve the effective LLM mode for the session's active (provider, model)
+/// against the override chain (`prompts/model-provider-settings.md`): model
+/// `mode` → provider `mode` → the persisted global `llm_mode` (`global`). When
+/// no model is active or the providers config can't be loaded, the global
+/// value passes through unchanged. Same first-hit config-layer rule as the
+/// rest of the worker.
+fn resolve_effective_llm_mode(
+    session: &Session,
+    project_root: &std::path::Path,
+    global: crate::config::extended::LlmMode,
+) -> crate::config::extended::LlmMode {
+    use crate::config::dirs::discover_config_dirs;
+    use crate::config::providers::ConfigDoc;
+    let (Some(provider), Some(model)) = (session.active_provider(), session.active_model()) else {
+        return global;
+    };
+    let providers = discover_config_dirs(project_root)
+        .first()
+        .map(|d| d.path.join("config.json"))
+        .filter(|p| p.exists())
+        .and_then(|p| ConfigDoc::load(&p).ok())
+        .map(|doc| doc.providers());
+    match providers {
+        Some(cfg) => cfg.resolve_mode(&provider, &model, global),
+        None => global,
+    }
 }
 
 /// Persist a live `/llm-mode` switch to the layered config so a resume

@@ -39,6 +39,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+use crate::config::extended::LlmMode;
+
 /// Top-level config slice that owns the `providers` map and the
 /// fetch-policy field. Marshalled in/out of the raw `Value` of
 /// `config.json` so we never destroy fields cockpit doesn't know about.
@@ -113,9 +115,71 @@ pub struct ProviderEntry {
     #[serde(default)]
     pub shrink: ShrinkConfig,
 
+    /// Context-management thresholds for this provider: the ctx% / prunable%
+    /// figures that gate auto-compact and the ctx%-threshold branch of
+    /// auto-prune. A per-model `context` overrides this. Surfaced in the
+    /// provider-settings sub-dialog (`prompts/model-provider-settings.md`).
+    #[serde(default)]
+    pub context: ContextConfig,
+
+    /// Per-provider LLM-mode override. When set, takes precedence over the
+    /// persisted global `llm_mode` for the cache resolved against this
+    /// provider; a per-model `mode` overrides this in turn. `None` means
+    /// "inherit" — fall through to the global. Skipped on serialize so
+    /// providers that never pin a mode stay clean.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<LlmMode>,
+
     /// Cached model list. Populated by `/fetch-models` (or the wizard).
     #[serde(default)]
     pub models: Vec<ModelEntry>,
+}
+
+/// Context-management thresholds. Set per-provider on [`ProviderEntry`] and
+/// optionally overridden per-model on [`ModelEntry`]. Drive the
+/// inference-boundary auto-compact and ctx%-threshold auto-prune triggers
+/// (`prompts/model-provider-settings.md`). All three are percentages of the
+/// model's `context_length`; when the context window is unknown the
+/// ctx%-gated triggers are inert (the cache-cold auto-prune branch still
+/// fires).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContextConfig {
+    /// At or above this ctx% the foreground context is compacted
+    /// automatically (the `/compact` machinery runs without a prompt).
+    /// Default 80.
+    #[serde(default = "default_auto_compact_pct")]
+    pub auto_compact_pct: u8,
+    /// Above this ctx% (and above `auto_prune_prunable_pct` of prunable
+    /// tokens) auto-prune fires even on a warm cache, accepting the cache
+    /// bust to reclaim context. Default 50.
+    #[serde(default = "default_auto_prune_pct")]
+    pub auto_prune_pct: u8,
+    /// The prunable-token threshold (as a ctx%) that the ctx%-threshold
+    /// auto-prune branch also requires. Default 30.
+    #[serde(default = "default_auto_prune_prunable_pct")]
+    pub auto_prune_prunable_pct: u8,
+}
+
+impl Default for ContextConfig {
+    fn default() -> Self {
+        Self {
+            auto_compact_pct: default_auto_compact_pct(),
+            auto_prune_pct: default_auto_prune_pct(),
+            auto_prune_prunable_pct: default_auto_prune_prunable_pct(),
+        }
+    }
+}
+
+fn default_auto_compact_pct() -> u8 {
+    80
+}
+
+fn default_auto_prune_pct() -> u8 {
+    50
+}
+
+fn default_auto_prune_prunable_pct() -> u8 {
+    30
 }
 
 /// Prompt-cache configuration. Set per-provider on [`ProviderEntry`] and
@@ -265,6 +329,17 @@ pub struct ModelEntry {
     /// (`prompts/compact-after-delegation.md`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shrink: Option<ShrinkConfig>,
+    /// Per-model context-threshold override. When set, takes precedence over
+    /// the provider-level [`ProviderEntry::context`]
+    /// (`prompts/model-provider-settings.md`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<ContextConfig>,
+    /// Per-model LLM-mode override. When set, takes precedence over the
+    /// provider-level [`ProviderEntry::mode`] and the global `llm_mode`.
+    /// `None` means "inherit". Skipped on serialize so models that never
+    /// pin a mode stay clean.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<LlmMode>,
     /// Free-form metadata the `/models` endpoint returned but we don't
     /// model explicitly. Preserved verbatim so re-saving doesn't drop
     /// fields the user (or provider) cares about.
@@ -370,6 +445,40 @@ impl ProvidersConfig {
             .find(|m| m.id == model)
             .and_then(|m| m.shrink.clone())
             .unwrap_or_else(|| entry.shrink.clone())
+    }
+
+    /// Resolve the effective context-threshold config for
+    /// `(provider, model)`: the model-level override if present, else the
+    /// provider-level config, else the built-in defaults (80/50/30). Drives
+    /// the auto-compact + ctx%-threshold auto-prune triggers
+    /// (`prompts/model-provider-settings.md`).
+    pub fn resolve_context(&self, provider: &str, model: &str) -> ContextConfig {
+        let Some(entry) = self.providers.get(provider) else {
+            return ContextConfig::default();
+        };
+        entry
+            .models
+            .iter()
+            .find(|m| m.id == model)
+            .and_then(|m| m.context.clone())
+            .unwrap_or_else(|| entry.context.clone())
+    }
+
+    /// Resolve the effective LLM mode for `(provider, model)`: the model
+    /// `mode` override → the provider `mode` override → the persisted global
+    /// `llm_mode` passed in by the caller. `None` at a scope means "inherit"
+    /// (`prompts/model-provider-settings.md`).
+    pub fn resolve_mode(&self, provider: &str, model: &str, global: LlmMode) -> LlmMode {
+        let Some(entry) = self.providers.get(provider) else {
+            return global;
+        };
+        entry
+            .models
+            .iter()
+            .find(|m| m.id == model)
+            .and_then(|m| m.mode)
+            .or(entry.mode)
+            .unwrap_or(global)
     }
 }
 
@@ -502,6 +611,8 @@ mod tests {
                 auth: Some(AuthKind::ApiKey),
                 cache: CacheConfig::default(),
                 shrink: ShrinkConfig::default(),
+                context: ContextConfig::default(),
+                mode: None,
                 models: vec![ModelEntry {
                     id: "claude-opus-4-7".into(),
                     name: Some("Claude Opus 4.7".into()),
@@ -511,6 +622,8 @@ mod tests {
                     manual: false,
                     cache: None,
                     shrink: None,
+                    context: None,
+                    mode: None,
                     inputs: Some(Inputs {
                         images: Some(true),
                         video: None,
@@ -606,6 +719,8 @@ mod tests {
                 ttl_secs: 300,
             }),
             shrink: None,
+            context: None,
+            mode: None,
             inputs: None,
             extra: Default::default(),
         });
@@ -622,6 +737,116 @@ mod tests {
         assert_eq!(cfg.resolve_cache("nope", "x").mode, CacheMode::None);
     }
 
+    #[test]
+    fn context_defaults_are_80_50_30() {
+        let c = ContextConfig::default();
+        assert_eq!(c.auto_compact_pct, 80);
+        assert_eq!(c.auto_prune_pct, 50);
+        assert_eq!(c.auto_prune_prunable_pct, 30);
+        // Older configs (no `context` key) load with the defaults.
+        let entry = ProviderEntry::default();
+        assert_eq!(entry.context, ContextConfig::default());
+        assert!(entry.mode.is_none());
+    }
+
+    #[test]
+    fn resolve_context_prefers_model_then_provider_then_default() {
+        let mut cfg = ProvidersConfig::default();
+        let mut entry = ProviderEntry {
+            url: "https://x".into(),
+            context: ContextConfig {
+                auto_compact_pct: 90,
+                auto_prune_pct: 60,
+                auto_prune_prunable_pct: 40,
+            },
+            ..ProviderEntry::default()
+        };
+        let mut pinned = model("pinned", false);
+        pinned.context = Some(ContextConfig {
+            auto_compact_pct: 70,
+            auto_prune_pct: 55,
+            auto_prune_prunable_pct: 25,
+        });
+        entry.models.push(pinned);
+        entry.models.push(model("bare", false));
+        cfg.providers.insert("p".into(), entry);
+
+        // Model override wins.
+        assert_eq!(cfg.resolve_context("p", "pinned").auto_compact_pct, 70);
+        // No model override → provider value.
+        assert_eq!(cfg.resolve_context("p", "bare").auto_compact_pct, 90);
+        assert_eq!(cfg.resolve_context("p", "bare").auto_prune_pct, 60);
+        // Unknown provider → built-in default.
+        assert_eq!(cfg.resolve_context("nope", "x"), ContextConfig::default());
+    }
+
+    #[test]
+    fn resolve_mode_falls_through_model_provider_global() {
+        let mut cfg = ProvidersConfig::default();
+        let mut entry = ProviderEntry {
+            url: "https://x".into(),
+            mode: Some(LlmMode::Defensive),
+            ..ProviderEntry::default()
+        };
+        let mut pinned = model("pinned", false);
+        pinned.mode = Some(LlmMode::Normal);
+        entry.models.push(pinned);
+        entry.models.push(model("bare", false));
+        cfg.providers.insert("p".into(), entry);
+
+        // Model override beats provider + global.
+        assert_eq!(
+            cfg.resolve_mode("p", "pinned", LlmMode::Defensive),
+            LlmMode::Normal
+        );
+        // No model override → provider override beats the global.
+        assert_eq!(
+            cfg.resolve_mode("p", "bare", LlmMode::Normal),
+            LlmMode::Defensive
+        );
+        // Provider with no mode override → global wins.
+        let mut cfg2 = ProvidersConfig::default();
+        cfg2.providers.insert(
+            "q".into(),
+            ProviderEntry {
+                url: "https://y".into(),
+                models: vec![model("m", false)],
+                ..ProviderEntry::default()
+            },
+        );
+        assert_eq!(
+            cfg2.resolve_mode("q", "m", LlmMode::Normal),
+            LlmMode::Normal
+        );
+        // Unknown provider → global.
+        assert_eq!(
+            cfg.resolve_mode("nope", "x", LlmMode::Normal),
+            LlmMode::Normal
+        );
+    }
+
+    #[test]
+    fn mode_undefined_serializes_as_absent() {
+        // A model with no `mode`/`context` override omits both keys entirely
+        // (parse to a map so the `cache.mode` inner key can't false-match).
+        let v: Value = serde_json::to_value(model("x", false)).unwrap();
+        let obj = v.as_object().unwrap();
+        assert!(!obj.contains_key("mode"), "undefined mode is absent");
+        assert!(!obj.contains_key("context"), "absent context override");
+        // A provider with no `mode` override omits the top-level key.
+        let entry = ProviderEntry {
+            url: "https://x".into(),
+            ..ProviderEntry::default()
+        };
+        let pv: Value = serde_json::to_value(&entry).unwrap();
+        assert!(!pv.as_object().unwrap().contains_key("mode"));
+        // A pinned model mode serializes its lowercase spelling.
+        let mut m = model("x", false);
+        m.mode = Some(LlmMode::Normal);
+        let mv: Value = serde_json::to_value(&m).unwrap();
+        assert_eq!(mv.get("mode").and_then(Value::as_str), Some("normal"));
+    }
+
     /// Minimal `ModelEntry` for the merge tests.
     fn model(id: &str, manual: bool) -> ModelEntry {
         ModelEntry {
@@ -634,6 +859,8 @@ mod tests {
             manual,
             cache: None,
             shrink: None,
+            context: None,
+            mode: None,
             extra: Default::default(),
         }
     }

@@ -787,6 +787,11 @@ pub enum Event {
         tokens_saved: u64,
         #[serde(default)]
         elided: Vec<String>,
+        /// True when a warm prompt cache was broken by a ctx%-threshold
+        /// auto-prune (`prompts/model-provider-settings.md`); the client
+        /// surfaces the shared cache-break warning.
+        #[serde(default)]
+        cache_break: bool,
     },
 
     /// A `/compact` handoff is assembled and a fresh session created.

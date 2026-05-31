@@ -314,6 +314,10 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "Switch the active model",
     },
     SlashCommand {
+        name: "model-settings",
+        description: "Open the active model's context, cache, shrink, and mode settings",
+    },
+    SlashCommand {
         name: "mouse",
         description: "Toggle mouse capture (click-to-position, drag-select) on/off",
     },
@@ -393,6 +397,17 @@ impl SlashCommand {
             "lazygit" => program_on_path("lazygit"),
             _ => true,
         }
+    }
+
+    /// The `/model-settings` command the hidden `/modelsettings` alias
+    /// resolves to (`prompts/model-provider-settings.md`). Returns the
+    /// registered command so the dispatch + usage tally match the visible
+    /// form exactly.
+    pub(super) fn model_settings_alias() -> SlashCommand {
+        *SLASH_COMMANDS
+            .iter()
+            .find(|c| c.name == "model-settings")
+            .expect("model-settings command registered")
     }
 }
 
@@ -3396,6 +3411,7 @@ impl App {
                 bodies,
                 tokens_saved,
                 elided,
+                cache_break,
             } => {
                 self.finalize_pending();
                 // Replace the live elided set wholesale (it's the full
@@ -3414,6 +3430,12 @@ impl App {
                     )
                 };
                 self.history.push(HistoryEntry::Plain { line });
+                // A ctx%-threshold auto-prune broke a warm cache to reclaim
+                // context — surface the shared cache-break warning (suppressed
+                // on a no-cache provider by the helper).
+                if cache_break && let Some(warning) = self.cache_break_warning() {
+                    self.history.push(HistoryEntry::Plain { line: warning });
+                }
             }
             TurnEvent::CompactReady {
                 new_session_id,
@@ -4436,6 +4458,10 @@ impl App {
             }
             "settings" => {
                 self.dialog = Dialog::open(&self.launch.cwd);
+                return false;
+            }
+            "model-settings" => {
+                self.dialog = Dialog::open_model_settings(&self.launch.cwd);
                 return false;
             }
             "fetch-models" => {

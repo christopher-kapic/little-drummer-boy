@@ -1172,7 +1172,15 @@ impl App {
             }
             return false;
         }
-        if self.slash_query().is_some() {
+        if let Some(query) = self.slash_query() {
+            // Hidden alias: `/modelsettings` resolves to the same handler as
+            // the visible `/model-settings` without appearing in the menu
+            // (`prompts/model-provider-settings.md`). Matched on the exact
+            // typed token so a prefix like `/models` still falls through to
+            // the normal suggestion list.
+            if query == "modelsettings" {
+                return self.execute_slash(super::SlashCommand::model_settings_alias());
+            }
             // Run whatever is highlighted. The default highlight is the
             // frequency-ranked top match (index 0), so `/foo`+Enter still
             // runs the top match — preserving the pre-cursor muscle memory.

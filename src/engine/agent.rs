@@ -218,6 +218,12 @@ pub enum TurnEvent {
         bodies: usize,
         tokens_saved: u64,
         elided: Vec<String>,
+        /// True when this prune broke a warm prompt cache — the
+        /// ctx%-threshold auto-prune branch firing on a warm cache
+        /// (`prompts/model-provider-settings.md`). The client surfaces the
+        /// shared cache-break warning. Always false for cache-cold (free)
+        /// prunes and manual `/prune`.
+        cache_break: bool,
     },
 
     /// `/compact` assembled a fresh-thread handoff. Carries the

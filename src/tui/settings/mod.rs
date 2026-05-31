@@ -28,6 +28,7 @@ mod agents_page;
 mod auth;
 mod providers;
 mod reset;
+mod settings_editor;
 mod skills_page;
 mod tools_page;
 mod ui_page;
@@ -186,6 +187,24 @@ impl Dialog {
             if let Dialog::Settings(s) = &mut d {
                 s.enter_providers();
             }
+        }
+        d
+    }
+
+    /// Open the settings dialog directly on the **active** model's
+    /// model-settings sub-dialog (`prompts/model-provider-settings.md`,
+    /// `/model-settings`). When no model is active — or the active
+    /// provider/model can't be found in config — open to the providers list
+    /// with an inline status explaining there's nothing selected.
+    pub fn open_model_settings(cwd: &std::path::Path) -> Self {
+        let mut d = Self::open(cwd);
+        if let Dialog::PickConfig { dirs, .. } = &d
+            && let Some(dir) = dirs.first()
+        {
+            let path = dir.path.join("config.json");
+            let mut s = SettingsDialog::open_from_picker(path, cwd.to_path_buf());
+            s.enter_model_settings();
+            d = Dialog::Settings(s);
         }
         d
     }
@@ -500,6 +519,14 @@ impl SettingsDialog {
         });
     }
 
+    /// Navigate to the active model's model-settings sub-dialog
+    /// (`prompts/model-provider-settings.md`). Falls back to the providers
+    /// list with an inline status when no model is active or the active
+    /// (provider, model) can't be found.
+    fn enter_model_settings(&mut self) {
+        self.page = Page::Providers(providers::active_model_settings_page(&self.config));
+    }
+
     fn reload_config(&mut self) {
         if let Ok(doc) = ConfigDoc::load(&self.config_path) {
             self.config = doc.providers();
@@ -523,6 +550,8 @@ impl SettingsDialog {
             Page::Providers(ProvidersPage::Edit(s)) => s.fetch.clone(),
             Page::Providers(ProvidersPage::Headers { parent, .. }) => parent.fetch.clone(),
             Page::Providers(ProvidersPage::Models { parent, .. }) => parent.fetch.clone(),
+            Page::Providers(ProvidersPage::ModelSettings { parent, .. }) => parent.fetch.clone(),
+            Page::Providers(ProvidersPage::ProviderSettings { parent, .. }) => parent.fetch.clone(),
             _ => None,
         };
         if let Some(handle) = pending
@@ -699,6 +728,12 @@ impl SettingsDialog {
             Page::Providers(ProvidersPage::Models { parent, .. }) => {
                 format!(" › Providers › {} › Models", parent.provider_id)
             }
+            Page::Providers(ProvidersPage::ModelSettings { parent, .. }) => {
+                format!(" › Providers › {} › Model Settings", parent.provider_id)
+            }
+            Page::Providers(ProvidersPage::ProviderSettings { parent, .. }) => {
+                format!(" › Providers › {} › Settings", parent.provider_id)
+            }
             Page::Providers(ProvidersPage::FetchAll(_)) => " › Providers › refetch all".into(),
             Page::Providers(ProvidersPage::CopilotSetup(_)) => {
                 " › Providers › Copilot setup".into()
@@ -785,7 +820,21 @@ impl SettingsDialog {
                 if editor.is_editing() {
                     "type to edit  Tab: switch field  enter: save  esc: cancel"
                 } else {
-                    "↑/↓  a: add manual  enter: edit manual  d: delete  h: back"
+                    "↑/↓  a: add  r: rename  enter: settings  d: delete  h: back"
+                }
+            }
+            Page::Providers(ProvidersPage::ModelSettings { editor, .. }) => {
+                if editor.editing.is_some() {
+                    "type to edit  enter: apply  esc: cancel"
+                } else {
+                    "↑/↓  enter: edit/cycle  x: clear to inherit  h: back"
+                }
+            }
+            Page::Providers(ProvidersPage::ProviderSettings { editor, .. }) => {
+                if editor.editing.is_some() {
+                    "type to edit  enter: apply  esc: cancel"
+                } else {
+                    "↑/↓  enter: edit/cycle  h: back"
                 }
             }
             Page::Providers(ProvidersPage::FetchAll(s)) => {
@@ -1057,6 +1106,8 @@ mod tests {
                     manual: false,
                     cache: None,
                     shrink: None,
+                    context: None,
+                    mode: None,
                     extra: Default::default(),
                 })
                 .collect(),
@@ -1120,6 +1171,8 @@ mod tests {
                 manual: false,
                 cache: None,
                 shrink: None,
+                context: None,
+                mode: None,
                 extra: Default::default(),
             },
             ModelEntry {
@@ -1132,6 +1185,8 @@ mod tests {
                 manual: false,
                 cache: None,
                 shrink: None,
+                context: None,
+                mode: None,
                 extra: Default::default(),
             },
         ]);

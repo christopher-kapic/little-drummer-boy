@@ -737,12 +737,14 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
             bodies,
             tokens_saved,
             elided,
+            cache_break,
             ..
         } => TurnEvent::Pruned {
             auto,
             bodies,
             tokens_saved,
             elided,
+            cache_break,
         },
         CompactReady {
             new_session_id,
