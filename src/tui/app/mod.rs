@@ -3124,13 +3124,26 @@ impl App {
                 let p = self.pending.get_or_insert_with(|| new_pending(agent));
                 p.reasoning.push_str(&delta);
             }
-            TurnEvent::AssistantText { .. } => {
-                // Mark text-start (non-streaming providers land here
-                // without ever emitting a Delta).
-                if let Some(p) = &mut self.pending
-                    && p.text_started_at.is_none()
-                {
-                    p.text_started_at = Some(Instant::now());
+            TurnEvent::AssistantText { text, .. } => {
+                if let Some(p) = &mut self.pending {
+                    // Mark text-start (non-streaming providers land here
+                    // without ever emitting a Delta).
+                    if p.text_started_at.is_none() {
+                        p.text_started_at = Some(Instant::now());
+                    }
+                    // The engine's finalizing text is the authoritative
+                    // user-facing form: identical to the streamed accumulation
+                    // on the common path, but the *translated* answer when
+                    // round-trip translation is active
+                    // (`prompts/utility-translation.md`, no streaming
+                    // translation — the translated text lands here, once, on
+                    // finalize). Adopt it when it differs so the frozen row
+                    // shows the translation rather than the streamed
+                    // model-language text. Empty event text (text-only
+                    // reasoning turns) keeps the streamed accumulation.
+                    if !text.trim().is_empty() && text != p.text {
+                        p.text = text;
+                    }
                 }
                 self.finalize_pending();
             }

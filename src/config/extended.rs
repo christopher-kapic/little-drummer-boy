@@ -132,6 +132,43 @@ pub struct ExtendedConfig {
     /// [`initial_active_agent`]: crate::daemon::session_worker
     #[serde(rename = "defaultPrimaryAgent", default)]
     pub default_primary_agent: DefaultPrimaryAgent,
+
+    /// Round-trip utility-model translation (`prompts/utility-translation.md`).
+    /// The user's language and the model's language; when both are set and
+    /// differ, the inbound prompt is translated into the model's language
+    /// and the agent's final response is translated back into the user's.
+    /// Empty/equal languages or an unset utility model disable it.
+    #[serde(default)]
+    pub translation: TranslationConfig,
+}
+
+/// Round-trip translation config (`prompts/utility-translation.md`). Both
+/// languages are free-text labels handed verbatim to the utility model
+/// (e.g. `"Spanish"`, `"English"`, `"日本語"`); the comparison that decides
+/// whether to translate is trim + case-insensitive, and an empty value on
+/// either side disables the feature. Names rather than ISO codes so the
+/// utility model gets the most natural instruction.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TranslationConfig {
+    /// The user's language (inbound source / outbound target). Empty
+    /// disables translation.
+    #[serde(default)]
+    pub user_language: String,
+    /// The model's language (inbound target / outbound source). Empty
+    /// disables translation.
+    #[serde(default)]
+    pub model_language: String,
+}
+
+impl TranslationConfig {
+    /// Whether round-trip translation is active: both languages are
+    /// non-empty (after trimming) and differ case-insensitively. When this
+    /// is false, text flows through untranslated.
+    pub fn is_active(&self) -> bool {
+        let user = self.user_language.trim();
+        let model = self.model_language.trim();
+        !user.is_empty() && !model.is_empty() && !user.eq_ignore_ascii_case(model)
+    }
 }
 
 /// Which primary agent a new session starts on (the auto-router feature).
@@ -910,6 +947,7 @@ impl Default for ExtendedConfig {
             default_isolation_mode: IsolationModeSetting::default(),
             llm_mode: LlmMode::default(),
             default_primary_agent: DefaultPrimaryAgent::default(),
+            translation: TranslationConfig::default(),
         }
     }
 }
@@ -1346,6 +1384,66 @@ mod tests {
         );
         assert_eq!(DefaultPrimaryAgent::Build.agent_name(), "Build");
         assert_eq!(DefaultPrimaryAgent::Plan.agent_name(), "Plan");
+    }
+
+    #[test]
+    fn translation_defaults_empty_and_inactive() {
+        let cfg = ExtendedConfig::default();
+        assert!(cfg.translation.user_language.is_empty());
+        assert!(cfg.translation.model_language.is_empty());
+        assert!(!cfg.translation.is_active());
+        // A config that omits the field reads the same inactive default.
+        let parsed: ExtendedConfig = serde_json::from_str("{}").unwrap();
+        assert!(!parsed.translation.is_active());
+    }
+
+    #[test]
+    fn translation_is_active_only_when_set_and_differing() {
+        // Both set + differing → active.
+        let cfg = TranslationConfig {
+            user_language: "Spanish".into(),
+            model_language: "English".into(),
+        };
+        assert!(cfg.is_active());
+
+        // Equal languages (case/whitespace-insensitive) → inactive.
+        let cfg = TranslationConfig {
+            user_language: " English ".into(),
+            model_language: "english".into(),
+        };
+        assert!(!cfg.is_active());
+
+        // Either side empty → inactive (feature off / unconfigured).
+        let cfg = TranslationConfig {
+            user_language: "Spanish".into(),
+            model_language: "   ".into(),
+        };
+        assert!(!cfg.is_active());
+        let cfg = TranslationConfig {
+            user_language: String::new(),
+            model_language: "English".into(),
+        };
+        assert!(!cfg.is_active());
+    }
+
+    #[test]
+    fn translation_round_trips_through_extended_doc() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("extended-config.json");
+        std::fs::write(&path, "{}").unwrap();
+        let mut doc = ExtendedConfigDoc::load(&path).unwrap();
+        let mut cfg = doc.config();
+        cfg.translation.user_language = "Spanish".into();
+        cfg.translation.model_language = "English".into();
+        doc.write(&cfg).unwrap();
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(on_disk.contains("\"translation\""), "{on_disk}");
+        assert!(on_disk.contains("Spanish"), "{on_disk}");
+        let doc2 = ExtendedConfigDoc::load(&path).unwrap();
+        let cfg2 = doc2.config();
+        assert_eq!(cfg2.translation.user_language, "Spanish");
+        assert_eq!(cfg2.translation.model_language, "English");
+        assert!(cfg2.translation.is_active());
     }
 
     #[test]

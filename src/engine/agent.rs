@@ -481,18 +481,38 @@ pub async fn turn(
         content: choice.clone(),
     });
 
+    let calls: Vec<ToolCall> = collect_tool_calls(&choice);
+
     // Even with streaming, emit a final AssistantText so the TUI knows
     // to freeze the live-streaming entry into a static history row.
     // Non-streaming paths land here directly. `text` was extracted above.
     if !text.trim().is_empty() {
+        // Outbound translation (`prompts/utility-translation.md`): when this
+        // is the foreground primary's *final* user-facing answer (root frame,
+        // no tool calls this turn), translate the COMPLETE assembled text from
+        // the model's language back into the user's. The translated form is
+        // shown to the user only — the model-language `text` already went into
+        // `history` (the wire/transcript split is preserved: the model sees
+        // its own output, the user reads the translation) and the timeline
+        // `AssistantMessage` event below records the original. When
+        // translation is inactive (languages unset/equal, or the utility
+        // model is unset/erroring) the text is emitted unchanged — identical
+        // to the pre-feature behavior. No streaming translation: the
+        // translated answer lands once, here, after the response completes.
+        let shown = if is_root && calls.is_empty() {
+            translate_final_response(&text, &cwd).await
+        } else {
+            text.clone()
+        };
         let _ = tx
             .send(TurnEvent::AssistantText {
                 agent: agent.name.clone(),
-                text: text.clone(),
+                text: shown,
             })
             .await;
         // Timeline event (Part B). Tagged with the same `call_id` as the
-        // request that produced it so the export can group a turn.
+        // request that produced it so the export can group a turn. Records the
+        // model's *original* output — never the translated user-facing form.
         if let Err(e) = session.record_event(
             crate::db::session_log::SessionEventKind::AssistantMessage,
             Some(&agent.name),
@@ -503,7 +523,6 @@ pub async fn turn(
         }
     }
 
-    let calls: Vec<ToolCall> = collect_tool_calls(&choice);
     if calls.is_empty() {
         return Ok(TurnOutcome::Done);
     }
@@ -866,6 +885,22 @@ fn loop_guard_message(tool: &str) -> String {
          different approach: change the arguments, use a different tool, or reconsider \
          whether the previous result already answered the question."
     )
+}
+
+/// Translate the foreground primary's complete final response from the
+/// model's language back into the user's (`prompts/utility-translation.md`).
+/// Loads the layered config for `cwd`; when translation is inactive or the
+/// utility model is unset/unavailable the input is returned unchanged
+/// (degrade, never block). The `<think>…</think>` reasoning that some
+/// models inline in their text is stripped before translation so the
+/// translated answer matches what the streamed path already shows (the
+/// reasoning rides the separate reasoning channel).
+async fn translate_final_response(text: &str, cwd: &std::path::Path) -> String {
+    let Some((extended, providers)) = crate::engine::translate::load_if_active(cwd) else {
+        return text.to_string();
+    };
+    let stripped = crate::engine::translate::strip_think_blocks(text);
+    crate::engine::translate::outbound(&stripped, &extended, &providers).await
 }
 
 async fn dispatch_one(

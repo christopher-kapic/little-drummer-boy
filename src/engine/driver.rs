@@ -483,21 +483,36 @@ impl Driver {
         }
     }
 
+    /// Inbound utility-model translation (`prompts/utility-translation.md`):
+    /// translate `text` from the user's language into the model's language.
+    /// Returns the text unchanged when the feature is inactive (languages
+    /// unset/equal) or the utility model is unset/unavailable/erroring —
+    /// degrade, never block the turn. Called between the injection scan
+    /// (which sees the raw text) and outbound redaction.
+    async fn translate_inbound(&self, text: &str) -> String {
+        match crate::engine::translate::load_if_active(&self.cwd) {
+            Some((extended, providers)) => {
+                crate::engine::translate::inbound(text, &extended, &providers).await
+            }
+            None => text.to_string(),
+        }
+    }
+
     /// Prompt-injection guard (GOALS §4i). Scans the **raw** user text
     /// (before redaction) through the history-free, nonce-wrapped
     /// injection check ([`crate::engine::injection_check`]) and returns
     /// whether the prompt may proceed.
     ///
     /// Behavior:
-    ///   - threshold `off` → no scan, always allow.
-    ///   - unavailable utility model / call error / timeout → **fail
-    ///     open**: allow, with a one-time "scan could not run" warn chip.
-    ///   - rated below threshold → allow, with a warn chip noting the
-    ///     rating (every flagged prompt is surfaced).
-    ///   - rated at/above threshold → **block**, then raise the
-    ///     false-positive override prompt; allow only if the user approves
-    ///     (and apply the chosen side-effect — lower threshold / edit the
-    ///     check-prompt). A dismissal drops the prompt (returns `false`).
+    /// - threshold `off` → no scan, always allow.
+    /// - unavailable utility model / call error / timeout → **fail open**:
+    ///   allow, with a one-time "scan could not run" warn chip.
+    /// - rated below threshold → allow, with a warn chip noting the rating
+    ///   (every flagged prompt is surfaced).
+    /// - rated at/above threshold → **block**, then raise the false-positive
+    ///   override prompt; allow only if the user approves (and apply the
+    ///   chosen side-effect — lower threshold / edit the check-prompt). A
+    ///   dismissal drops the prompt (returns `false`).
     async fn injection_guard_allows(
         &mut self,
         raw_text: &str,
@@ -834,8 +849,15 @@ impl Driver {
                         let _ = tx.send(TurnEvent::AgentIdle).await;
                         continue;
                     }
+                    // Inbound translation (`prompts/utility-translation.md`):
+                    // after the injection scan saw the RAW text, translate the
+                    // user's prompt from the user's language into the model's
+                    // language — strictly before outbound redaction. Inactive
+                    // languages / unset-or-erroring utility model → the text
+                    // passes through unchanged.
+                    let inbound_text = self.translate_inbound(&folded.text).await;
                     let submission = UserSubmission {
-                        text: self.redact.scrub(&folded.text),
+                        text: self.redact.scrub(&inbound_text),
                         images: folded.images,
                     };
                     self.run_user_input(submission, &mut input_rx, tx).await?;

@@ -62,6 +62,11 @@ pub(super) enum UiField {
     PlanBranchRoot,
     LoopGuardThreshold,
     InjectionCheckPrompt,
+    /// User's language for round-trip translation
+    /// (`prompts/utility-translation.md`). Blank disables.
+    TranslationUserLanguage,
+    /// Model's language for round-trip translation. Blank disables.
+    TranslationModelLanguage,
 }
 
 /// A single selectable model row in the utility-model picker, shown as
@@ -191,9 +196,10 @@ pub(super) struct GrabState {
 /// render-agent-markdown, render-user-markdown, mouse, rich-text-copy,
 /// emojis, caffeinate display-awake, name, packages dir, utility model,
 /// plan branch root, plan isolation, loop-guard threshold, default agent,
-/// injection threshold, injection check-prompt, instructions file). The
-/// `[reset to defaults]` button follows at cursor [`UI_CONFIG_ROWS`].
-pub(super) const UI_CONFIG_ROWS: usize = 19;
+/// injection threshold, injection check-prompt, your language, model
+/// language, instructions file). The `[reset to defaults]` button follows
+/// at cursor [`UI_CONFIG_ROWS`].
+pub(super) const UI_CONFIG_ROWS: usize = 21;
 
 /// Total navigable rows: the labeled config rows plus the trailing
 /// `[reset to defaults]` button.
@@ -385,6 +391,14 @@ impl SettingsDialog {
                             self.extended.prompt_injection_guard.check_prompt =
                                 if new.is_empty() { None } else { Some(new) };
                         }
+                        UiField::TranslationUserLanguage => {
+                            // Free-text language label; blank disables
+                            // translation (stored verbatim — trimmed already).
+                            self.extended.translation.user_language = new;
+                        }
+                        UiField::TranslationModelLanguage => {
+                            self.extended.translation.model_language = new;
+                        }
                     }
                     p.editing = None;
                     p.status = match self.save_extended() {
@@ -525,6 +539,18 @@ impl SettingsDialog {
                         .unwrap_or_default();
                     p.buf = TextField::new(cur);
                     p.editing = Some(UiField::InjectionCheckPrompt);
+                }
+                18 => {
+                    // Your language (round-trip translation): free-text label;
+                    // blank disables translation.
+                    p.buf = TextField::new(self.extended.translation.user_language.clone());
+                    p.editing = Some(UiField::TranslationUserLanguage);
+                }
+                19 => {
+                    // Model language (round-trip translation): free-text label;
+                    // blank disables translation.
+                    p.buf = TextField::new(self.extended.translation.model_language.clone());
+                    p.editing = Some(UiField::TranslationModelLanguage);
                 }
                 UI_INSTRUCTIONS_ROW => {
                     return Nav::Replace(Page::Instructions(InstructionsPage {
@@ -670,7 +696,7 @@ impl SettingsDialog {
         )));
         lines.push(Line::default());
 
-        let rows: [(&str, String); 19] = [
+        let rows: [(&str, String); UI_CONFIG_ROWS] = [
             (
                 "vim mode",
                 vim_label(self.extended.tui.vim_mode).to_string(),
@@ -791,6 +817,22 @@ impl SettingsDialog {
                 },
             ),
             (
+                "your language",
+                if self.extended.translation.user_language.trim().is_empty() {
+                    "(unset — disables translation)".to_string()
+                } else {
+                    self.extended.translation.user_language.clone()
+                },
+            ),
+            (
+                "model language",
+                if self.extended.translation.model_language.trim().is_empty() {
+                    "(unset — disables translation)".to_string()
+                } else {
+                    self.extended.translation.model_language.clone()
+                },
+            ),
+            (
                 "instructions file",
                 if self.extended.agent_guidance_files.is_empty() {
                     "(none)".to_string()
@@ -836,6 +878,8 @@ impl SettingsDialog {
                 UiField::PlanBranchRoot => "plan branch root: ",
                 UiField::LoopGuardThreshold => "loop-guard threshold (>= 2): ",
                 UiField::InjectionCheckPrompt => "injection check-prompt (blank = default): ",
+                UiField::TranslationUserLanguage => "your language (blank = off): ",
+                UiField::TranslationModelLanguage => "model language (blank = off): ",
             };
             lines.push(Line::default());
             lines.push(Line::from(vec![
