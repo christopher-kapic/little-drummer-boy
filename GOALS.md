@@ -1335,7 +1335,16 @@ Initial schema:
   // the last prelude exceeds this many minutes.
   "system_prompt": {
     "time_injection_interval_minutes": 5
-  }
+  },
+
+  // 4l. Composer next-message prediction (§25).
+  // After each agent turn the utility model (§4h) predicts the user's
+  // likely next message and offers it as grey ghost text in an empty
+  // composer; Tab (vim insert mode) accepts it as editable text.
+  // "off" issues no utility call; "short" (the default) bounds the
+  // prediction to one line; "long" allows a bounded full proposed
+  // response (may be multi-line). Needs a utility model to do anything.
+  "predictNextMessage": "short"
 }
 ```
 
@@ -3502,6 +3511,68 @@ is the prefix for suggested plan branches: `${planBranchRoot}/<feature>`.
 The planning agent (`Plan`), the `/plans` TUI, and worktree
 execution are built in the follow-on prompts; this section is the
 storage + tool substrate they consume.
+
+---
+
+## 25. Composer next-message prediction
+
+After each agent turn cockpit uses the utility model (§4h) to predict
+the user's likely **next message** and offers it as grey **ghost text**
+in the composer's input box while the box is empty. The prediction is
+about the *user's* next message, not the agent's, and applies regardless
+of the active primary agent (`Auto`/`Plan`/`Build`).
+
+Controlled by `predictNextMessage` (config §4l): `off` |
+`short` (default) | `long`.
+
+- **`off`** — feature disabled: no utility call, no ghost affordance.
+- **`short`** — the prediction is one line or less.
+- **`long`** — the prediction is a bounded full proposed response, which
+  may span multiple lines.
+
+**Prediction input (token economy, §10).** When a prediction is
+generated, the utility model is fed the **last 3 turns**, each turn
+reduced to **only** the user's message + the agent's final response —
+**no tool calls, no intermediate reasoning**. The assembled prompt goes
+through `redact::scrub()` like every outbound prompt (§7) — there is no
+per-call opt-out. The predicted output is bounded to the mode (`short` ≈
+one line; `long` a bounded full response, never unbounded).
+
+**Lifecycle — eager, regenerate-on-clear from cache.**
+
+- A prediction is generated automatically when each agent turn ends.
+- While the input box is empty the prediction shows as grey ghost text;
+  it appears **once ready** (no streaming, no partial render).
+- Any keystroke that puts content in the box hides the ghost — the
+  prediction never overwrites typed content.
+- Clearing the box back to empty within the same turn restores the
+  **cached** prediction — no new utility call is issued for the same
+  turn.
+- A new prediction is computed on the next agent turn; a prediction
+  belongs to the turn it was generated for and a prior turn's prediction
+  is never shown.
+- A fresh session (no agent response yet) has nothing to predict — no
+  ghost, no utility call.
+- An in-flight prediction that returns after the user started typing is
+  discarded silently (never pops in over active input).
+
+**Accept — Tab, vim insert mode only, fills-not-sends.** Tab accepts the
+ghost text; it is active **only in vim insert mode** and only when the
+box is empty with a pending ghost. In Normal mode Tab keeps its existing
+behavior. Accepting **fills** the input with editable real text — it does
+**not** auto-send. A `short` prediction (and a single-line `long` one)
+converts to real text on the first Tab. A multi-line `long` prediction is
+a two-stage reveal: initially only the first line shows (box stays
+single-line height); the **first Tab** expands the box and reveals the
+**whole** response, still as ghost text; the **second Tab** converts the
+full response to real editable text.
+
+Implementation: the one-shot utility-model call + the pure pieces (turn
+assembly, prompt build, output bounding) live in `src/engine/predict.rs`
+(mirroring the auto-titling §17d and translation utility-model paths);
+the ghost-text state machine + accept/expand reveal live on the composer
+(`src/tui/composer.rs`, `src/tui/app/`). The async result is tagged with
+the turn it belongs to so a stale (or post-typing) result is discarded.
 
 ---
 

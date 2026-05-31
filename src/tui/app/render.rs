@@ -127,11 +127,20 @@ impl App {
         // Inner content width = terminal width - 2 side rails.
         let wrap_width = (term_w as usize).saturating_sub(2).max(1);
         let prefix = input_prefix_width();
+        // Ghost text (`prompts/predict-next-message.md`): when a multi-line
+        // `long` prediction has been expanded, the box grows to fit the
+        // full grey response even though the composer buffer is still
+        // empty. Otherwise the box sizes to the real (typed) content; a
+        // collapsed/short ghost never grows the box (stays single-line).
         let text = self.composer.text();
-        let lines: Vec<&str> = if text.is_empty() {
+        let measured: String = match self.prediction_state.ghost() {
+            Some(g) if self.composer.is_empty() && g.box_expanded() => g.full_text().to_string(),
+            _ => text.to_string(),
+        };
+        let lines: Vec<&str> = if measured.is_empty() {
             vec![""]
         } else {
-            text.split('\n').collect()
+            measured.split('\n').collect()
         };
         let mut visual: usize = 0;
         for line in &lines {
@@ -800,6 +809,36 @@ impl App {
         let inner_w = input_inner.width as usize;
         let budget = inner_w.saturating_sub(prefix_width).max(1);
         let mut lines: Vec<Line<'static>> = Vec::new();
+        // Ghost text (`prompts/predict-next-message.md`): when the box is
+        // empty and a prediction is pending, render the prediction grey
+        // (muted) after the prompt prefix — the first line while a
+        // multi-line `long` prediction is collapsed, the whole prediction
+        // once expanded. The real cursor stays at the start (row 0, just
+        // past the prefix); typing or Tab dismisses the ghost.
+        let ghost_display = if text.is_empty() {
+            self.prediction_state.ghost().map(|g| g.display_text())
+        } else {
+            None
+        };
+        if let Some(ghost) = ghost_display {
+            let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+            for (li, gline) in ghost.split('\n').enumerate() {
+                let gchars: Vec<char> = gline.chars().collect();
+                let chunks = wrap_logical_line_chunks(gline, budget);
+                for (ci, (start, end)) in chunks.iter().enumerate() {
+                    let chunk_text: String = gchars[*start..*end].iter().collect();
+                    let pre = if li == 0 && ci == 0 {
+                        INPUT_PREFIX
+                    } else {
+                        indent.as_str()
+                    };
+                    lines.push(Line::from(vec![
+                        Span::styled(pre.to_string(), Style::default().fg(Color::White)),
+                        Span::styled(chunk_text, muted),
+                    ]));
+                }
+            }
+        }
         // Byte offset of the start of the current logical line within the
         // full buffer — used to map a wrapped chunk back to absolute byte
         // ranges so paste-block placeholders render with a distinct style
@@ -807,6 +846,12 @@ impl App {
         // separator adds one byte.
         let mut line_byte_start = 0usize;
         for (li, line) in buf_lines.iter().enumerate() {
+            // When a ghost is rendered the empty real-buffer line is
+            // already represented by the ghost's first row (the cursor
+            // sits on it); don't also push a blank white line.
+            if ghost_display.is_some() {
+                break;
+            }
             let line_chars: Vec<char> = line.chars().collect();
             // Char→byte prefix sums for this line, so a chunk's char
             // range maps to absolute buffer byte offsets.
@@ -860,9 +905,10 @@ impl App {
 
         // Context indicator on the top-right of the input box. Only
         // shown when the composer is empty so it doesn't fight with
-        // the text the user is typing. Light grey, right-aligned to
-        // the inner edge.
-        if self.composer.text().is_empty() {
+        // the text the user is typing — and suppressed while a ghost
+        // prediction occupies the box so the two don't collide. Light
+        // grey, right-aligned to the inner edge.
+        if self.composer.text().is_empty() && self.prediction_state.ghost().is_none() {
             let label = self.context_indicator_text();
             let label_w = label.chars().count() as u16;
             if label_w + 1 < input_inner.width {

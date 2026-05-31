@@ -21,7 +21,7 @@ use ratatui::widgets::{Paragraph, Wrap};
 
 use crate::config::extended::{
     ApprovalMode, DefaultPrimaryAgent, InjectionThreshold, IsolationModeSetting, LlmMode,
-    ThinkingDisplay, VimModeSetting,
+    PredictNextMessage, ThinkingDisplay, VimModeSetting,
 };
 use crate::config::providers::ProvidersConfig;
 use crate::tui::textfield::TextField;
@@ -197,9 +197,9 @@ pub(super) struct GrabState {
 /// emojis, caffeinate display-awake, name, packages dir, utility model,
 /// plan branch root, plan isolation, loop-guard threshold, default agent,
 /// injection threshold, injection check-prompt, your language, model
-/// language, approval mode, instructions file). The `[reset to defaults]`
-/// button follows at cursor [`UI_CONFIG_ROWS`].
-pub(super) const UI_CONFIG_ROWS: usize = 22;
+/// language, approval mode, predict next message, instructions file). The
+/// `[reset to defaults]` button follows at cursor [`UI_CONFIG_ROWS`].
+pub(super) const UI_CONFIG_ROWS: usize = 23;
 
 /// Total navigable rows: the labeled config rows plus the trailing
 /// `[reset to defaults]` button.
@@ -308,6 +308,18 @@ pub(super) fn approval_mode_label(m: ApprovalMode) -> &'static str {
             "auto (safety-gated — utility model vets each command/network call; needs a utility model)"
         }
         ApprovalMode::Yolo => "yolo (run every command and network call unprompted)",
+    }
+}
+
+pub(super) fn predict_next_message_label(m: PredictNextMessage) -> &'static str {
+    match m {
+        PredictNextMessage::Off => "off (no next-message prediction; no utility call)",
+        PredictNextMessage::Short => {
+            "short (default — utility model predicts a one-line next message; needs a utility model)"
+        }
+        PredictNextMessage::Long => {
+            "long (utility model predicts a full proposed message; needs a utility model)"
+        }
     }
 }
 
@@ -572,6 +584,13 @@ impl SettingsDialog {
                     // router agent on the "default agent" row.
                     self.extended.default_approval_mode =
                         self.extended.default_approval_mode.cycled();
+                    p.status = save_status(self.save_extended());
+                }
+                21 => {
+                    // Cycle the composer next-message prediction mode
+                    // (`off` → `short` → `long` → `off`).
+                    self.extended.predict_next_message =
+                        self.extended.predict_next_message.cycled();
                     p.status = save_status(self.save_extended());
                 }
                 UI_INSTRUCTIONS_ROW => {
@@ -857,6 +876,10 @@ impl SettingsDialog {
             (
                 "approval mode",
                 approval_mode_label(self.extended.default_approval_mode).to_string(),
+            ),
+            (
+                "predict next message",
+                predict_next_message_label(self.extended.predict_next_message).to_string(),
             ),
             (
                 "instructions file",

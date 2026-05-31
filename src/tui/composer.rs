@@ -30,6 +30,107 @@ pub enum VimMode {
     Operator(Operator),
 }
 
+/// The two-stage reveal stage of a `long` multi-line prediction
+/// (`prompts/predict-next-message.md`). A `short` prediction, and a
+/// single-line `long` prediction, never enter [`Self::FullGhost`] — they
+/// convert to real text on the first Tab (see [`PredictionGhost::accept`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GhostStage {
+    /// Only the first line of a multi-line `long` prediction is shown as
+    /// ghost text; the box stays single-line height. The first Tab moves
+    /// to [`Self::FullGhost`].
+    CollapsedFirstLine,
+    /// The whole multi-line `long` prediction is shown as ghost text and
+    /// the box has expanded to fit it. The next Tab converts it to real
+    /// editable text.
+    FullGhost,
+}
+
+/// What a Tab press on a pending ghost prediction should do, returned by
+/// [`PredictionGhost::accept`] so the app can apply it to the composer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GhostAccept {
+    /// Fill the composer with this text as real editable content (does
+    /// NOT send). Terminal step — the ghost is consumed.
+    Fill(String),
+    /// Expand the box and keep showing the full prediction as ghost text
+    /// (the first Tab of a multi-line `long` prediction).
+    Expand,
+}
+
+/// A completed next-message prediction offered as composer ghost text
+/// (`prompts/predict-next-message.md`). Stored on the app while the input
+/// box is empty; shown grey; accepted with Tab in vim insert mode.
+///
+/// The prediction belongs to the agent turn it was generated for
+/// ([`Self::turn`]); a result tagged with a stale turn is discarded rather
+/// than shown, so a prior turn's prediction never appears.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PredictionGhost {
+    /// The bounded prediction text (already mode-capped by
+    /// `engine::predict::bound_prediction`).
+    text: String,
+    /// `true` when the prediction is multi-line AND the mode allows the
+    /// two-stage reveal (`long`). A `short` prediction is always treated
+    /// as single-line for accept purposes.
+    multiline_long: bool,
+    /// The two-stage reveal stage. Only meaningful when `multiline_long`.
+    stage: GhostStage,
+}
+
+impl PredictionGhost {
+    /// Build a ghost from a bounded prediction. `long_mode` is true when
+    /// the active setting is `long`; only then can a multi-line prediction
+    /// use the collapsed→full→real two-Tab reveal. A `short` prediction
+    /// (or a single-line `long` one) renders fully and converts on the
+    /// first Tab.
+    pub fn new(text: String, long_mode: bool) -> Self {
+        let multiline_long = long_mode && text.contains('\n');
+        Self {
+            text,
+            multiline_long,
+            stage: GhostStage::CollapsedFirstLine,
+        }
+    }
+
+    /// The text to render as ghost right now: the first line while a
+    /// multi-line `long` prediction is collapsed, the whole prediction
+    /// otherwise.
+    pub fn display_text(&self) -> &str {
+        if self.multiline_long && self.stage == GhostStage::CollapsedFirstLine {
+            self.text.split('\n').next().unwrap_or("")
+        } else {
+            &self.text
+        }
+    }
+
+    /// The full prediction text (every line), regardless of stage. Used
+    /// when computing the expanded box height.
+    pub fn full_text(&self) -> &str {
+        &self.text
+    }
+
+    /// True when the box should be sized to the full multi-line prediction
+    /// (a `long` prediction whose ghost has been expanded but not yet
+    /// converted to real text).
+    pub fn box_expanded(&self) -> bool {
+        self.multiline_long && self.stage == GhostStage::FullGhost
+    }
+
+    /// Apply a Tab press. Returns [`GhostAccept::Expand`] for the first Tab
+    /// of a collapsed multi-line `long` prediction (advancing the stage),
+    /// or [`GhostAccept::Fill`] with the full text otherwise (the terminal
+    /// convert-to-real step).
+    pub fn accept(&mut self) -> GhostAccept {
+        if self.multiline_long && self.stage == GhostStage::CollapsedFirstLine {
+            self.stage = GhostStage::FullGhost;
+            GhostAccept::Expand
+        } else {
+            GhostAccept::Fill(self.text.clone())
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Operator {
     Delete,
@@ -865,5 +966,42 @@ mod tests {
         c.find_char_backward('f');
         // 'f' lives on the previous line.
         assert_eq!(c.cursor, 6);
+    }
+
+    #[test]
+    fn ghost_short_converts_to_real_on_first_tab() {
+        // A short (single-line) prediction shows fully and the first Tab
+        // fills the composer with real text.
+        let mut g = PredictionGhost::new("add a test".to_string(), false);
+        assert_eq!(g.display_text(), "add a test");
+        assert!(!g.box_expanded());
+        assert_eq!(g.accept(), GhostAccept::Fill("add a test".to_string()));
+    }
+
+    #[test]
+    fn ghost_single_line_long_is_one_tab() {
+        // `long` mode but a single-line prediction behaves like short:
+        // one Tab → real text, no expansion stage.
+        let mut g = PredictionGhost::new("just one line".to_string(), true);
+        assert_eq!(g.display_text(), "just one line");
+        assert!(!g.box_expanded());
+        assert_eq!(g.accept(), GhostAccept::Fill("just one line".to_string()));
+    }
+
+    #[test]
+    fn ghost_multiline_long_is_two_tab_expand_then_fill() {
+        // `long` + multi-line: collapsed first line, first Tab expands to
+        // full ghost, second Tab converts to real text.
+        let full = "first line\nsecond line\nthird line".to_string();
+        let mut g = PredictionGhost::new(full.clone(), true);
+        // Collapsed: only the first line shows; box not yet expanded.
+        assert_eq!(g.display_text(), "first line");
+        assert!(!g.box_expanded());
+        // First Tab → expand (still ghost, full text now).
+        assert_eq!(g.accept(), GhostAccept::Expand);
+        assert_eq!(g.display_text(), full);
+        assert!(g.box_expanded());
+        // Second Tab → fill with the full text as real editable content.
+        assert_eq!(g.accept(), GhostAccept::Fill(full));
     }
 }

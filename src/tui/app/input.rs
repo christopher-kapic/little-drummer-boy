@@ -559,6 +559,17 @@ impl App {
             }
         }
         match key.code {
+            // Ghost-text accept (`prompts/predict-next-message.md`): Tab in
+            // insert mode, while the box is empty with a pending prediction,
+            // accepts the ghost. A `long` multi-line prediction's first Tab
+            // expands the box to the full ghost; the next Tab (and every
+            // single-line/`short` case) fills the composer with real
+            // editable text — it does NOT send. With no ghost, Tab is inert
+            // (this path is reached only when the `@`-popup is closed).
+            KeyCode::Tab if self.composer.is_empty() && self.prediction_state.ghost().is_some() => {
+                self.accept_prediction_ghost();
+                false
+            }
             KeyCode::Esc => {
                 // Esc cancels an in-progress slash command. Otherwise:
                 // when vim is enabled, it drops the composer into
@@ -1616,6 +1627,33 @@ impl App {
     /// insert when no blocks exist (so ordinary typing is byte-identical
     /// to today). Otherwise snaps the insertion point out of any block
     /// interior and shifts trailing block ranges.
+    /// Apply a Tab press to the pending ghost prediction
+    /// (`prompts/predict-next-message.md`). The first Tab of a multi-line
+    /// `long` prediction expands the ghost in place (box grows, still
+    /// grey); otherwise the ghost converts to real editable text (fills,
+    /// does NOT send). A `Fill` consumes the ghost and clears the cache so
+    /// the now-real text is never re-offered as a ghost.
+    pub(super) fn accept_prediction_ghost(&mut self) {
+        use crate::tui::composer::GhostAccept;
+        let Some(ghost) = self.prediction_state.ghost_mut() else {
+            return;
+        };
+        match ghost.accept() {
+            GhostAccept::Expand => {
+                // Stays a ghost; the renderer + box height read the new
+                // (full) stage off the ghost.
+            }
+            GhostAccept::Fill(text) => {
+                self.composer.set(text);
+                self.paste_registry.clear();
+                // Consume the ghost + its cache: the text is real now, and
+                // clearing the box later must not restore this prediction
+                // (the user has acted on it).
+                self.prediction_state.consume();
+            }
+        }
+    }
+
     fn composer_insert_char(&mut self, ch: char) {
         if self.paste_registry.is_empty() {
             self.composer.insert_char(ch);

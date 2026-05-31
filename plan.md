@@ -1484,6 +1484,16 @@ NDJSON renderer is another. The relay client (post-v1) is a third.
 Code paths must never reach into `Session` internals — only the event
 bus.
 
+Composer next-message prediction (GOALS §25) is a TUI-side feature
+layered on the same utility-model one-shot call path as auto-titling
+(§17d): on each turn-end (`AgentIdle`) the TUI assembles the last-3-turns
+(user + agent-final-response only) transcript, scrubs it, and spawns a
+`engine::predict` call whose result is posted back on the existing
+per-tick async-result channel, tagged with the turn it belongs to so a
+stale result is dropped. The ghost-text state machine (show-while-empty,
+hide-on-type, restore-from-cache-on-clear, Tab-to-accept with the `long`
+two-stage reveal) lives on the composer.
+
 ### 3h. Persistence (sqlite via `rusqlite`)
 
 Schema, drizzle-style ([`features/opencode.md` §3](./features/opencode.md)):

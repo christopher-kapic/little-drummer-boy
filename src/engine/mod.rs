@@ -35,6 +35,7 @@ pub mod interrupt;
 pub mod jobs;
 pub mod message;
 pub mod model;
+pub mod predict;
 pub mod prune;
 pub mod repair;
 pub mod retry;

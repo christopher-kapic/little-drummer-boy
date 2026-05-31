@@ -875,6 +875,145 @@ pub struct App {
     /// `DaemonDraining` event. While set, the composer refuses new
     /// submissions with a short notice — new work is rejected, not queued.
     pub(super) daemon_draining: bool,
+    /// Composer next-message prediction setting
+    /// (`prompts/predict-next-message.md`). `off` short-circuits before
+    /// any utility call; `short`/`long` bound the prediction.
+    pub(super) predict_setting: crate::config::extended::PredictNextMessage,
+    /// The next-message prediction lifecycle state (turn counter, cache,
+    /// live ghost). Pure + unit-testable; see [`PredictionState`].
+    pub(super) prediction_state: PredictionState,
+    /// Async prediction-result slot. The spawned utility-model task writes
+    /// `(turn, Option<bounded-text>)`; the event loop drains it each tick
+    /// and adopts the text only when `turn` still matches the current turn
+    /// and the box is empty (appear-once-ready, discard-if-stale).
+    pub(super) prediction_result: PredictionResultSlot,
+}
+
+/// Shared slot a spawned prediction task posts its `(turn, bounded-text)`
+/// result back through; drained by the event loop each tick.
+pub(super) type PredictionResultSlot = Arc<Mutex<Option<(u64, Option<String>)>>>;
+
+/// A completed composer next-message prediction
+/// (`prompts/predict-next-message.md`), cached so a clear-to-empty within
+/// the same turn restores the ghost without a new utility call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Prediction {
+    /// Agent turn the prediction was generated for.
+    pub(super) turn: u64,
+    /// Bounded prediction text (mode-capped by `engine::predict`).
+    pub(super) text: String,
+    /// `true` when the active setting is `long` (enables the two-stage
+    /// reveal for multi-line predictions).
+    pub(super) long_mode: bool,
+}
+
+/// The next-message prediction lifecycle (`prompts/predict-next-message.md`),
+/// kept pure so the eager-generate / hide-on-type / restore-on-clear /
+/// stale-replacement behavior is unit-testable without an `App`.
+///
+/// `turn` is a monotonic agent-turn counter (bumped at each `AgentIdle` and
+/// on `/new`); a prediction belongs to the turn it was generated for, so a
+/// result tagged with an older turn is discarded rather than shown. `cached`
+/// is the bounded prediction for the current turn (the restore-on-clear
+/// cache); `ghost` is the live two-stage reveal state, present only while
+/// the box is empty.
+#[derive(Debug, Default)]
+pub(super) struct PredictionState {
+    /// Monotonic agent-turn counter.
+    turn: u64,
+    /// Cached prediction for the current turn (`None` until one lands).
+    cached: Option<Prediction>,
+    /// Live ghost shown while the box is empty.
+    ghost: Option<crate::tui::composer::PredictionGhost>,
+}
+
+impl PredictionState {
+    /// The current agent-turn id (the tag a freshly-spawned prediction
+    /// carries).
+    pub(super) fn turn(&self) -> u64 {
+        self.turn
+    }
+
+    /// The live ghost, if any (read by the renderer + key handler).
+    pub(super) fn ghost(&self) -> Option<&crate::tui::composer::PredictionGhost> {
+        self.ghost.as_ref()
+    }
+
+    /// Mutable access to the live ghost (the Tab-accept path advances its
+    /// stage).
+    pub(super) fn ghost_mut(&mut self) -> Option<&mut crate::tui::composer::PredictionGhost> {
+        self.ghost.as_mut()
+    }
+
+    /// A new agent turn ended (or `/new`): bump the turn id (invalidating
+    /// any in-flight or cached prior-turn prediction) and drop the cache +
+    /// ghost so a stale prediction never shows.
+    pub(super) fn begin_turn(&mut self) {
+        self.turn = self.turn.wrapping_add(1);
+        self.cached = None;
+        self.ghost = None;
+    }
+
+    /// Adopt a completed async result tagged with `result_turn`. Discards a
+    /// stale result (older turn) or a `None` text. Caches a usable result
+    /// and — only when `box_empty` (appear-once-ready, never over active
+    /// input) — builds the ghost. `long_mode` enables the two-stage reveal.
+    pub(super) fn on_result(
+        &mut self,
+        result_turn: u64,
+        text: Option<String>,
+        long_mode: bool,
+        box_empty: bool,
+    ) {
+        if result_turn != self.turn {
+            return; // stale: a newer turn started
+        }
+        let Some(text) = text else {
+            return;
+        };
+        self.cached = Some(Prediction {
+            turn: result_turn,
+            text: text.clone(),
+            long_mode,
+        });
+        if box_empty {
+            self.ghost = Some(crate::tui::composer::PredictionGhost::new(text, long_mode));
+        }
+    }
+
+    /// Reconcile the ghost with the composer's empty/non-empty state. A
+    /// non-empty box hides the ghost (user typing wins); a box cleared back
+    /// to empty restores the cached prediction's ghost for the current turn
+    /// — **without** a new utility call (the cache is reused).
+    pub(super) fn reconcile(&mut self, box_empty: bool) {
+        if !box_empty {
+            self.ghost = None;
+            return;
+        }
+        if self.ghost.is_none()
+            && let Some(p) = &self.cached
+            && p.turn == self.turn
+        {
+            self.ghost = Some(crate::tui::composer::PredictionGhost::new(
+                p.text.clone(),
+                p.long_mode,
+            ));
+        }
+    }
+
+    /// The Tab-accept terminal step: the ghost converted to real text, so
+    /// consume the ghost AND the cache (the prediction has been acted on
+    /// and must not be re-offered on a later clear-to-empty).
+    pub(super) fn consume(&mut self) {
+        self.ghost = None;
+        self.cached = None;
+    }
+
+    /// Force the feature off (setting changed to `off`): drop cache + ghost.
+    pub(super) fn clear(&mut self) {
+        self.cached = None;
+        self.ghost = None;
+    }
 }
 
 /// A live async job tracked by the TUI for the jobs strip / `/jobs`.
@@ -968,7 +1107,9 @@ impl App {
         let tui_cfg = load_tui_config(&launch.cwd);
         // The active LLM mode (`prompts/llm-modes-defensive-normal.md`),
         // resolved from the same layered config the daemon root reads.
-        let llm_mode = crate::config::extended::load_for_cwd(&launch.cwd).llm_mode;
+        let extended = crate::config::extended::load_for_cwd(&launch.cwd);
+        let llm_mode = extended.llm_mode;
+        let predict_setting = extended.predict_next_message;
         let vim_setting = tui_cfg.vim_mode;
         let thinking_setting = tui_cfg.thinking;
         let markdown_opts = MarkdownOpts {
@@ -1102,6 +1243,9 @@ impl App {
             plan_status: crate::db::plans::PlanStatusCounts::default(),
             side_conversation: None,
             daemon_draining: false,
+            predict_setting,
+            prediction_state: PredictionState::default(),
+            prediction_result: Arc::new(Mutex::new(None)),
         };
         // First-run convenience: if the daemon prompt doesn't gate
         // startup, open the Add-Provider wizard immediately when no
@@ -1326,6 +1470,8 @@ impl App {
             self.sync_repo_status();
             self.drain_fetch_progress();
             self.drain_agent_events();
+            self.drain_prediction();
+            self.sync_prediction_ghost();
             self.sync_active_agent();
             self.sync_mouse_capture_from_dialog();
             self.tick_toast();
@@ -1520,6 +1666,90 @@ impl App {
         }
     }
 
+    /// Assemble the prediction input from the visible transcript: the
+    /// trailing turns, each reduced to the user's message + the agent's
+    /// final response text. Tool calls, diffs, subagent reports, plain
+    /// notices, and reasoning are skipped — only [`HistoryEntry::User`]
+    /// and [`HistoryEntry::Agent`] carry into a turn (the latter's `text`
+    /// is the final response; `reasoning` is never included).
+    ///
+    /// A user message opens a turn; the next agent message closes it.
+    /// Consecutive user messages (e.g. queued + folded) flatten into the
+    /// most recent open turn's user text so the turn count stays faithful.
+    /// `engine::predict::last_turns` then keeps only the last 3.
+    pub(super) fn prediction_turns(&self) -> Vec<crate::engine::predict::PredictionTurn> {
+        turns_from_history(&self.history)
+    }
+
+    /// Kick off the eager next-message prediction for the current turn
+    /// (`prompts/predict-next-message.md`). Short-circuits before any
+    /// utility call when the setting is `off`, when there's no agent
+    /// response to predict from (fresh session), or when no provider
+    /// config can be loaded. The result lands in `prediction_result`
+    /// tagged with the turn it belongs to; `drain_prediction` adopts it.
+    pub(super) fn spawn_prediction(&mut self) {
+        let mode = self.predict_setting;
+        if !mode.is_enabled() {
+            return;
+        }
+        let turns = self.prediction_turns();
+        // Nothing to predict yet (no agent final response) → no call.
+        if turns.is_empty() || turns.iter().all(|t| t.agent.trim().is_empty()) {
+            return;
+        }
+        let turn_id = self.prediction_state.turn();
+        let cwd = self.launch.cwd.clone();
+        let slot = Arc::clone(&self.prediction_result);
+        tokio::spawn(async move {
+            let (extended, providers) = crate::auto_title::load_configs_for(&cwd);
+            // Build the same non-bypassable redaction table the driver uses
+            // (GOALS §7) so the prediction prompt is scrubbed before send.
+            let redactor = match crate::redact::RedactionTable::build(&extended.redact, &cwd) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::debug!(error = %e, "predict: redaction table build failed; no ghost");
+                    return;
+                }
+            };
+            let text =
+                crate::engine::predict::predict(&turns, mode, &extended, &providers, &redactor)
+                    .await;
+            if let Ok(mut guard) = slot.lock() {
+                *guard = Some((turn_id, text));
+            }
+        });
+    }
+
+    /// Adopt a completed async prediction. Runs each tick. Discards a
+    /// result tagged with a stale turn (a newer turn started) or one that
+    /// arrives after the user began typing (box non-empty) —
+    /// appear-once-ready, never pop in over active input. On a usable
+    /// result for the current empty turn, caches it and builds the ghost.
+    pub(super) fn drain_prediction(&mut self) {
+        let drained = match self.prediction_result.lock() {
+            Ok(mut slot) => slot.take(),
+            Err(_) => return,
+        };
+        let Some((turn_id, text)) = drained else {
+            return;
+        };
+        let long_mode = matches!(
+            self.predict_setting,
+            crate::config::extended::PredictNextMessage::Long
+        );
+        self.prediction_state
+            .on_result(turn_id, text, long_mode, self.composer.is_empty());
+    }
+
+    /// Reconcile the ghost with the composer's empty/non-empty state. Runs
+    /// each tick after key handling: a non-empty box hides the ghost; a
+    /// box cleared back to empty within the same turn restores the cached
+    /// prediction's ghost — **without** a new utility call (the cache is
+    /// reused). Never overwrites typed content.
+    pub(super) fn sync_prediction_ghost(&mut self) {
+        self.prediction_state.reconcile(self.composer.is_empty());
+    }
+
     pub(super) fn sync_repo_status(&mut self) {
         if let Ok(guard) = self.repo_status.lock()
             && self.launch.repo_status != *guard
@@ -1580,6 +1810,10 @@ impl App {
         // Fresh thread → no wire-side elisions yet.
         self.elided_event_ids.clear();
         self.prunable_tokens = 0;
+        // A fresh session has no prior turn to predict from: drop any
+        // cached/pending ghost and bump the turn counter so a stale async
+        // result from the old session can never land in the new one.
+        self.prediction_state.begin_turn();
         // Reload from disk in case settings changed.
         self.reload_launch_info();
         self.reload_tui_config();
@@ -3302,6 +3536,12 @@ impl App {
                 self.reconnect_attempt = None;
                 self.finalize_pending();
                 self.end_working_span();
+                // A new agent turn has ended: a prediction now belongs to
+                // this fresh turn. Bump the turn id (invalidates any
+                // in-flight or cached prior-turn prediction) and kick off
+                // the eager prediction for the next user message.
+                self.prediction_state.begin_turn();
+                self.spawn_prediction();
             }
             TurnEvent::PrimarySwapped { name } => {
                 // The primary (root-frame) agent was swapped (`/plan` ↔
@@ -4779,6 +5019,16 @@ impl App {
         self.exit_tail_lines = tui_cfg.exit_tail_lines;
         self.rich_text_copy = tui_cfg.rich_text_copy;
         self.use_emojis = tui_cfg.use_emojis;
+        // The predict-next-message setting lives at the extended-config
+        // root (not in `tui`); reload it so a `/settings` change takes
+        // effect on subsequent turns. Turning it `off` also drops any
+        // pending ghost/cache immediately.
+        let predict_setting =
+            crate::config::extended::load_for_cwd(&self.launch.cwd).predict_next_message;
+        self.predict_setting = predict_setting;
+        if !predict_setting.is_enabled() {
+            self.prediction_state.clear();
+        }
         // Note: mouse_capture is *not* synced here. The live terminal
         // state is reconciled via the dialog's pending-flag drain
         // (see sync_mouse_capture_from_dialog) so we don't reapply
@@ -5101,6 +5351,57 @@ fn last_agent_text(history: &[HistoryEntry]) -> Option<String> {
         HistoryEntry::Agent { text, .. } if !text.trim().is_empty() => Some(text.clone()),
         _ => None,
     })
+}
+
+/// Reduce the visible transcript to the prediction input
+/// (`prompts/predict-next-message.md`): one (user, agent-final-response)
+/// pair per turn, with tool calls / diffs / subagent reports / notices /
+/// reasoning skipped — only [`HistoryEntry::User`] + [`HistoryEntry::Agent`]
+/// carry into a turn, and the agent's `reasoning` is never included. A user
+/// message opens a turn; the next agent message closes it; a user message
+/// arriving before the agent reply folds into the open turn so the
+/// one-pair-per-turn shape (and the last-3 window) stays faithful. Pure +
+/// deterministic so the assembly is unit-testable without an `App`.
+fn turns_from_history(history: &[HistoryEntry]) -> Vec<crate::engine::predict::PredictionTurn> {
+    use crate::engine::predict::PredictionTurn;
+    let mut turns: Vec<PredictionTurn> = Vec::new();
+    // True when the last pushed turn is still awaiting its agent reply (so a
+    // following user message folds rather than opening a new one).
+    let mut open = false;
+    for entry in history {
+        match entry {
+            HistoryEntry::User { text, .. } => {
+                if open {
+                    if let Some(last) = turns.last_mut() {
+                        last.user.push_str("\n\n");
+                        last.user.push_str(text);
+                    }
+                } else {
+                    turns.push(PredictionTurn {
+                        user: text.clone(),
+                        agent: String::new(),
+                    });
+                    open = true;
+                }
+            }
+            HistoryEntry::Agent { text, .. } => {
+                if let Some(last) = turns.last_mut() {
+                    // Fold multiple agent messages (rare: tool rounds can
+                    // finalize text more than once) into one final response
+                    // so the pairing stays one-per-turn.
+                    if last.agent.is_empty() {
+                        last.agent = text.clone();
+                    } else {
+                        last.agent.push('\n');
+                        last.agent.push_str(text);
+                    }
+                    open = false;
+                }
+            }
+            _ => {}
+        }
+    }
+    turns
 }
 
 /// Job ids in `jobs` owned by `session_id`, in map (stable, job-id)
@@ -6146,6 +6447,235 @@ mod subagent_settle_tests {
         settle_subagent_in(&mut history, "explore", "orphan".into());
         assert_eq!(history.len(), 1);
         assert_eq!(outcome(&history[0]), Some(("orphan", false)));
+    }
+}
+
+#[cfg(test)]
+mod prediction_turn_assembly_tests {
+    use super::turns_from_history;
+    use crate::tui::history::{HistoryEntry, ToolCall, ToolCallState};
+
+    fn user(text: &str) -> HistoryEntry {
+        HistoryEntry::User {
+            text: text.into(),
+            timestamp: chrono::Local::now(),
+        }
+    }
+
+    fn agent(text: &str, reasoning: &str) -> HistoryEntry {
+        HistoryEntry::Agent {
+            name: "Build".into(),
+            text: text.into(),
+            reasoning: reasoning.into(),
+            timestamp: chrono::Local::now(),
+            expanded: false,
+            think_duration: None,
+        }
+    }
+
+    fn tool_box() -> HistoryEntry {
+        HistoryEntry::ToolBox {
+            calls: vec![ToolCall {
+                call_id: "c1".into(),
+                tool: "bash".into(),
+                summary: "ls".into(),
+                full_input: "ls".into(),
+                output: "file.txt".into(),
+                state: ToolCallState::Success,
+            }],
+            view_offset: 0,
+            follow: true,
+            expanded: false,
+        }
+    }
+
+    /// One pair per turn: the user message + the agent's final response,
+    /// with tool calls and reasoning skipped entirely.
+    #[test]
+    fn pairs_user_with_agent_final_response_only() {
+        let history = vec![
+            user("add a flag"),
+            tool_box(),
+            agent("Done, added the flag.", "let me think about this"),
+        ];
+        let turns = turns_from_history(&history);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].user, "add a flag");
+        // The agent FINAL TEXT carries; reasoning never does.
+        assert_eq!(turns[0].agent, "Done, added the flag.");
+        assert!(!turns[0].agent.contains("think"));
+    }
+
+    /// More than three turns: assembly keeps every turn (the last-3 window
+    /// is applied by `engine::predict::last_turns`), but each is faithful.
+    #[test]
+    fn assembles_every_turn_faithfully() {
+        let history = vec![
+            user("q1"),
+            agent("a1", ""),
+            user("q2"),
+            tool_box(),
+            agent("a2", ""),
+            user("q3"),
+            agent("a3", ""),
+            user("q4"),
+            agent("a4", ""),
+        ];
+        let turns = turns_from_history(&history);
+        assert_eq!(turns.len(), 4);
+        let last3 = crate::engine::predict::last_turns(&turns);
+        assert_eq!(last3.len(), 3);
+        assert_eq!(last3[0].user, "q2");
+        assert_eq!(last3[2].user, "q4");
+        assert_eq!(last3[2].agent, "a4");
+    }
+
+    /// A user message arriving before the agent reply (queued + folded)
+    /// folds into the open turn rather than opening a phantom turn.
+    #[test]
+    fn consecutive_user_messages_fold_into_open_turn() {
+        let history = vec![user("first part"), user("second part"), agent("ok", "")];
+        let turns = turns_from_history(&history);
+        assert_eq!(turns.len(), 1);
+        assert!(turns[0].user.contains("first part"));
+        assert!(turns[0].user.contains("second part"));
+        assert_eq!(turns[0].agent, "ok");
+    }
+
+    /// A trailing user message with no agent reply yet stays an open turn
+    /// with an empty agent response — never paired with the wrong reply.
+    #[test]
+    fn trailing_open_turn_has_empty_agent() {
+        let history = vec![user("q1"), agent("a1", ""), user("q2")];
+        let turns = turns_from_history(&history);
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[1].user, "q2");
+        assert!(turns[1].agent.is_empty());
+    }
+
+    /// A fresh session (no agent response yet) yields a window that
+    /// `engine::predict` treats as "nothing to predict".
+    #[test]
+    fn fresh_session_has_no_agent_response() {
+        let history = vec![user("first message")];
+        let turns = turns_from_history(&history);
+        let window = crate::engine::predict::last_turns(&turns);
+        assert!(window.iter().all(|t| t.agent.trim().is_empty()));
+    }
+}
+
+#[cfg(test)]
+mod prediction_lifecycle_tests {
+    use super::PredictionState;
+
+    /// Eager generate: a turn ends, a result for that turn lands, and the
+    /// empty box shows the ghost. Then typing hides it; clearing back to
+    /// empty restores it from the cache — WITHOUT a new result/utility call.
+    #[test]
+    fn show_hide_on_type_then_restore_from_cache_without_recall() {
+        let mut st = PredictionState::default();
+        st.begin_turn(); // turn 1
+        let turn = st.turn();
+        // Result for the current turn, box empty → ghost shows.
+        st.on_result(turn, Some("run the tests".into()), false, true);
+        assert_eq!(
+            st.ghost().map(|g| g.display_text().to_string()),
+            Some("run the tests".to_string())
+        );
+        // User types → box non-empty → ghost hidden (cache retained).
+        st.reconcile(false);
+        assert!(st.ghost().is_none());
+        // User clears back to empty → ghost restored from CACHE. No new
+        // `on_result` call was made (no new utility call this turn).
+        st.reconcile(true);
+        assert_eq!(
+            st.ghost().map(|g| g.display_text().to_string()),
+            Some("run the tests".to_string())
+        );
+    }
+
+    /// Stale replacement: a result tagged with an older turn (a newer turn
+    /// already began) is discarded — never shown.
+    #[test]
+    fn stale_turn_result_is_discarded() {
+        let mut st = PredictionState::default();
+        st.begin_turn(); // turn 1
+        let stale_turn = st.turn();
+        st.begin_turn(); // turn 2 — the stale result now belongs to turn 1
+        st.on_result(stale_turn, Some("old prediction".into()), false, true);
+        assert!(
+            st.ghost().is_none(),
+            "a prior turn's prediction must not show"
+        );
+        // A result for the CURRENT turn does land.
+        st.on_result(st.turn(), Some("fresh prediction".into()), false, true);
+        assert_eq!(
+            st.ghost().map(|g| g.display_text().to_string()),
+            Some("fresh prediction".to_string())
+        );
+    }
+
+    /// Appear-once-ready: a result that arrives while the user is already
+    /// typing (box non-empty) does NOT pop in over active input, but the
+    /// cache is kept so a later clear-to-empty restores it.
+    #[test]
+    fn result_arriving_during_typing_does_not_pop_in_but_caches() {
+        let mut st = PredictionState::default();
+        st.begin_turn();
+        let turn = st.turn();
+        // Box non-empty when the async result lands → no ghost now.
+        st.on_result(turn, Some("later".into()), false, false);
+        assert!(st.ghost().is_none());
+        // Clearing to empty restores it from the cache (no new call).
+        st.reconcile(true);
+        assert_eq!(
+            st.ghost().map(|g| g.display_text().to_string()),
+            Some("later".to_string())
+        );
+    }
+
+    /// A new turn invalidates the previous turn's cache + ghost so a prior
+    /// prediction never lingers into the next turn.
+    #[test]
+    fn begin_turn_drops_previous_prediction() {
+        let mut st = PredictionState::default();
+        st.begin_turn();
+        st.on_result(st.turn(), Some("first".into()), false, true);
+        assert!(st.ghost().is_some());
+        st.begin_turn();
+        assert!(st.ghost().is_none(), "new turn drops the old ghost");
+        // The old cache is gone too: an empty-box reconcile restores
+        // nothing until a fresh result lands.
+        st.reconcile(true);
+        assert!(st.ghost().is_none());
+    }
+
+    /// Consume (Tab → real text) drops both ghost and cache so a later
+    /// clear-to-empty does not re-offer the accepted prediction.
+    #[test]
+    fn consume_clears_cache_so_clear_to_empty_does_not_restore() {
+        let mut st = PredictionState::default();
+        st.begin_turn();
+        st.on_result(st.turn(), Some("accepted text".into()), false, true);
+        st.consume();
+        assert!(st.ghost().is_none());
+        st.reconcile(true);
+        assert!(
+            st.ghost().is_none(),
+            "an accepted prediction must not reappear as a ghost"
+        );
+    }
+
+    /// A `None` result (degrade path — model unset/timeout/empty) leaves no
+    /// ghost and no cache.
+    #[test]
+    fn none_result_leaves_no_ghost() {
+        let mut st = PredictionState::default();
+        st.begin_turn();
+        st.on_result(st.turn(), None, false, true);
+        assert!(st.ghost().is_none());
+        st.reconcile(true);
+        assert!(st.ghost().is_none());
     }
 }
 

@@ -150,6 +150,48 @@ pub struct ExtendedConfig {
     /// exposes the cycle; the session reads this at spawn.
     #[serde(rename = "defaultApprovalMode", default)]
     pub default_approval_mode: ApprovalMode,
+
+    /// Composer next-message prediction (`prompts/predict-next-message.md`).
+    /// After each agent turn the utility model predicts the user's likely
+    /// next message and offers it as grey ghost text in an empty composer;
+    /// Tab (vim insert mode) accepts it as editable text. `off` issues no
+    /// utility call; `short` (the default) bounds the prediction to one
+    /// line; `long` allows a bounded full proposed response. `/settings`
+    /// exposes the cycle.
+    #[serde(rename = "predictNextMessage", default)]
+    pub predict_next_message: PredictNextMessage,
+}
+
+/// Composer next-message prediction mode (`prompts/predict-next-message.md`).
+/// Governs whether — and how long — the utility-model prediction shown as
+/// composer ghost text may be.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum PredictNextMessage {
+    /// No prediction: no utility call, no ghost text.
+    Off,
+    /// Bounded to a single line (the default).
+    #[default]
+    Short,
+    /// A bounded full proposed response (may be multi-line).
+    Long,
+}
+
+impl PredictNextMessage {
+    /// Whether prediction is enabled (any non-`off` mode).
+    pub fn is_enabled(self) -> bool {
+        !matches!(self, PredictNextMessage::Off)
+    }
+
+    /// Cycle to the next choice — the `/settings` row's toggle action
+    /// (`off → short → long → off`).
+    pub fn cycled(self) -> Self {
+        match self {
+            PredictNextMessage::Off => PredictNextMessage::Short,
+            PredictNextMessage::Short => PredictNextMessage::Long,
+            PredictNextMessage::Long => PredictNextMessage::Off,
+        }
+    }
 }
 
 /// Round-trip translation config (`prompts/utility-translation.md`). Both
@@ -1004,6 +1046,7 @@ impl Default for ExtendedConfig {
             default_primary_agent: DefaultPrimaryAgent::default(),
             translation: TranslationConfig::default(),
             default_approval_mode: ApprovalMode::default(),
+            predict_next_message: PredictNextMessage::default(),
         }
     }
 }
@@ -1794,5 +1837,54 @@ mod tests {
         let resolved = resolve_injection_guard_from_paths(&[absent]);
         assert_eq!(resolved.threshold, InjectionThreshold::Off);
         assert_eq!(resolved.check_prompt, default_injection_check_prompt());
+    }
+
+    #[test]
+    fn predict_next_message_defaults_to_short_and_parses_all_values() {
+        // Default + an omitted field both read `short`.
+        assert_eq!(
+            ExtendedConfig::default().predict_next_message,
+            PredictNextMessage::Short
+        );
+        let parsed: ExtendedConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(parsed.predict_next_message, PredictNextMessage::Short);
+        // All three spellings parse.
+        for (json, expect) in [
+            (r#"{"predictNextMessage":"off"}"#, PredictNextMessage::Off),
+            (
+                r#"{"predictNextMessage":"short"}"#,
+                PredictNextMessage::Short,
+            ),
+            (r#"{"predictNextMessage":"long"}"#, PredictNextMessage::Long),
+        ] {
+            let cfg: ExtendedConfig = serde_json::from_str(json).unwrap();
+            assert_eq!(cfg.predict_next_message, expect, "{json}");
+        }
+    }
+
+    #[test]
+    fn predict_next_message_cycles_off_short_long() {
+        assert_eq!(PredictNextMessage::Off.cycled(), PredictNextMessage::Short);
+        assert_eq!(PredictNextMessage::Short.cycled(), PredictNextMessage::Long);
+        assert_eq!(PredictNextMessage::Long.cycled(), PredictNextMessage::Off);
+        assert!(!PredictNextMessage::Off.is_enabled());
+        assert!(PredictNextMessage::Short.is_enabled());
+        assert!(PredictNextMessage::Long.is_enabled());
+    }
+
+    #[test]
+    fn predict_next_message_round_trips_through_extended_doc() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("extended-config.json");
+        std::fs::write(&path, "{}").unwrap();
+        let mut doc = ExtendedConfigDoc::load(&path).unwrap();
+        let mut cfg = doc.config();
+        cfg.predict_next_message = PredictNextMessage::Long;
+        doc.write(&cfg).unwrap();
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(on_disk.contains("\"predictNextMessage\""), "{on_disk}");
+        assert!(on_disk.contains("long"), "{on_disk}");
+        let doc2 = ExtendedConfigDoc::load(&path).unwrap();
+        assert_eq!(doc2.config().predict_next_message, PredictNextMessage::Long);
     }
 }
