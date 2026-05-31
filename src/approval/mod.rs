@@ -218,6 +218,26 @@ impl Approver {
         }
     }
 
+    /// Escalate a single non-command tool call to the user (the
+    /// command-safety gate's `auto` mode for `webfetch`/`mcp_invoke`, and
+    /// its fail-closed path). Unlike [`Self::approve_command`] there is no
+    /// command line to classify and no persistable key — the call's
+    /// arguments vary per invocation — so this prompts **once-only** (no
+    /// "remember" scopes), mirroring the wrapper-command prompt shape.
+    /// `label` is the human description shown in the prompt (e.g.
+    /// `` `webfetch` `` plus the URL). Returns `Allow { Once }` on approval,
+    /// `Deny` on dismissal.
+    pub async fn approve_tool_call(&self, label: &str) -> Result<Decision> {
+        // `wrapper = true` makes the prompt offer only "Yes, once" — the
+        // right shape for a non-persistable per-call approval. Nothing is
+        // recorded; a later identical call prompts again.
+        let choice = self.prompt(label, true, None).await?;
+        match choice {
+            ApprovalChoice::Deny => Ok(Decision::Deny),
+            ApprovalChoice::Approve(_) => Ok(Decision::Allow { scope: Scope::Once }),
+        }
+    }
+
     /// Decide a path access (part 2's native confinement). Granted →
     /// allow; else prompt showing the exact path. Paths are never
     /// wrappers, so all four scopes are offered.

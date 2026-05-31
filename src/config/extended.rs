@@ -140,6 +140,16 @@ pub struct ExtendedConfig {
     /// Empty/equal languages or an unset utility model disable it.
     #[serde(default)]
     pub translation: TranslationConfig,
+
+    /// Which command-approval mode new sessions start in
+    /// (`prompts/utility-command-safety-gate.md`). `manual` (the default)
+    /// asks the user for every gated call; `auto` runs each gated call past
+    /// the utility-model safety gate (safe → run, unsafe → ask); `yolo` runs
+    /// everything unprompted. Distinct from the `auto` *router agent*
+    /// ([`DefaultPrimaryAgent::Auto`]) and from [`LlmMode`]. `/settings`
+    /// exposes the cycle; the session reads this at spawn.
+    #[serde(rename = "defaultApprovalMode", default)]
+    pub default_approval_mode: ApprovalMode,
 }
 
 /// Round-trip translation config (`prompts/utility-translation.md`). Both
@@ -204,6 +214,51 @@ impl DefaultPrimaryAgent {
             DefaultPrimaryAgent::Auto => DefaultPrimaryAgent::Build,
             DefaultPrimaryAgent::Build => DefaultPrimaryAgent::Plan,
             DefaultPrimaryAgent::Plan => DefaultPrimaryAgent::Auto,
+        }
+    }
+}
+
+/// Command-approval mode (`prompts/utility-command-safety-gate.md`).
+/// Governs whether — and how — a gated tool call (`bash`, `webfetch`,
+/// `mcp_invoke`) prompts the user before it runs.
+///
+/// Deliberately distinct from the `auto`/`Auto` *router agent*
+/// ([`DefaultPrimaryAgent::Auto`]) and from [`LlmMode`]: this is the
+/// *approval* `auto`, the safety-gate engine. UI labels disambiguate it as
+/// "auto (safety-gated)" so the two are never conflated.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ApprovalMode {
+    /// Ask the user for every gated call (the default — the safety gate is
+    /// not invoked; the user is the gate).
+    #[default]
+    Manual,
+    /// Route each gated call past the utility-model safety gate first: a
+    /// `safe` verdict runs without prompting, an `unsafe` one escalates to
+    /// the user. Fails closed (asks the user) when the utility model is
+    /// unset/unavailable.
+    Auto,
+    /// Run every gated call unprompted (the safety gate is bypassed).
+    Yolo,
+}
+
+impl ApprovalMode {
+    /// The lowercase config/serde spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ApprovalMode::Manual => "manual",
+            ApprovalMode::Auto => "auto",
+            ApprovalMode::Yolo => "yolo",
+        }
+    }
+
+    /// Cycle to the next choice — the `/settings` row's toggle action
+    /// (`manual` → `auto` → `yolo` → `manual`).
+    pub fn cycled(self) -> Self {
+        match self {
+            ApprovalMode::Manual => ApprovalMode::Auto,
+            ApprovalMode::Auto => ApprovalMode::Yolo,
+            ApprovalMode::Yolo => ApprovalMode::Manual,
         }
     }
 }
@@ -948,6 +1003,7 @@ impl Default for ExtendedConfig {
             llm_mode: LlmMode::default(),
             default_primary_agent: DefaultPrimaryAgent::default(),
             translation: TranslationConfig::default(),
+            default_approval_mode: ApprovalMode::default(),
         }
     }
 }
@@ -1495,6 +1551,53 @@ mod tests {
         assert!(on_disk.contains("\"llm_mode\""), "{on_disk}");
         let doc2 = ExtendedConfigDoc::load(&path).unwrap();
         assert_eq!(doc2.config().llm_mode, LlmMode::Normal);
+    }
+
+    #[test]
+    fn approval_mode_defaults_to_manual_and_parses_all_values() {
+        // Default + an omitted field both read `manual` (fail-safe default).
+        assert_eq!(
+            ExtendedConfig::default().default_approval_mode,
+            ApprovalMode::Manual
+        );
+        let parsed: ExtendedConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(parsed.default_approval_mode, ApprovalMode::Manual);
+        // All three spellings parse.
+        for (json, expect) in [
+            (r#"{"defaultApprovalMode":"manual"}"#, ApprovalMode::Manual),
+            (r#"{"defaultApprovalMode":"auto"}"#, ApprovalMode::Auto),
+            (r#"{"defaultApprovalMode":"yolo"}"#, ApprovalMode::Yolo),
+        ] {
+            let cfg: ExtendedConfig = serde_json::from_str(json).unwrap();
+            assert_eq!(cfg.default_approval_mode, expect, "{json}");
+        }
+    }
+
+    #[test]
+    fn approval_mode_cycles_manual_auto_yolo() {
+        assert_eq!(ApprovalMode::Manual.cycled(), ApprovalMode::Auto);
+        assert_eq!(ApprovalMode::Auto.cycled(), ApprovalMode::Yolo);
+        assert_eq!(ApprovalMode::Yolo.cycled(), ApprovalMode::Manual);
+    }
+
+    #[test]
+    fn approval_mode_round_trips_through_extended_doc() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("extended-config.json");
+        // An unknown root key must survive the write (preserve-unknown).
+        std::fs::write(&path, r#"{"futureKey": 1}"#).unwrap();
+        let mut doc = ExtendedConfigDoc::load(&path).unwrap();
+        let mut cfg = doc.config();
+        cfg.default_approval_mode = ApprovalMode::Auto;
+        doc.write(&cfg).unwrap();
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(on_disk.contains("\"defaultApprovalMode\""), "{on_disk}");
+        assert!(
+            on_disk.contains("futureKey"),
+            "unknown key dropped: {on_disk}"
+        );
+        let doc2 = ExtendedConfigDoc::load(&path).unwrap();
+        assert_eq!(doc2.config().default_approval_mode, ApprovalMode::Auto);
     }
 
     #[test]

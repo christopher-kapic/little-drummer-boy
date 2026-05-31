@@ -20,8 +20,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 
 use crate::config::extended::{
-    DefaultPrimaryAgent, InjectionThreshold, IsolationModeSetting, LlmMode, ThinkingDisplay,
-    VimModeSetting,
+    ApprovalMode, DefaultPrimaryAgent, InjectionThreshold, IsolationModeSetting, LlmMode,
+    ThinkingDisplay, VimModeSetting,
 };
 use crate::config::providers::ProvidersConfig;
 use crate::tui::textfield::TextField;
@@ -197,9 +197,9 @@ pub(super) struct GrabState {
 /// emojis, caffeinate display-awake, name, packages dir, utility model,
 /// plan branch root, plan isolation, loop-guard threshold, default agent,
 /// injection threshold, injection check-prompt, your language, model
-/// language, instructions file). The `[reset to defaults]` button follows
-/// at cursor [`UI_CONFIG_ROWS`].
-pub(super) const UI_CONFIG_ROWS: usize = 21;
+/// language, approval mode, instructions file). The `[reset to defaults]`
+/// button follows at cursor [`UI_CONFIG_ROWS`].
+pub(super) const UI_CONFIG_ROWS: usize = 22;
 
 /// Total navigable rows: the labeled config rows plus the trailing
 /// `[reset to defaults]` button.
@@ -295,6 +295,19 @@ pub(super) fn injection_threshold_label(t: InjectionThreshold) -> &'static str {
             "medium (block prompts rated medium or higher; needs a utility model)"
         }
         InjectionThreshold::High => "high (block only prompts rated high; needs a utility model)",
+    }
+}
+
+/// Label for the approval-mode row. The `auto` value is disambiguated as
+/// "auto (safety-gated)" so it is never conflated with the `auto` *router
+/// agent* (the "default agent" row above).
+pub(super) fn approval_mode_label(m: ApprovalMode) -> &'static str {
+    match m {
+        ApprovalMode::Manual => "manual (default — approve every command and network call)",
+        ApprovalMode::Auto => {
+            "auto (safety-gated — utility model vets each command/network call; needs a utility model)"
+        }
+        ApprovalMode::Yolo => "yolo (run every command and network call unprompted)",
     }
 }
 
@@ -551,6 +564,15 @@ impl SettingsDialog {
                     // blank disables translation.
                     p.buf = TextField::new(self.extended.translation.model_language.clone());
                     p.editing = Some(UiField::TranslationModelLanguage);
+                }
+                20 => {
+                    // Cycle the command-approval mode new sessions start in
+                    // (`manual` → `auto` → `yolo` → `manual`). The `auto` value
+                    // is the safety-gated mode — distinct from the `auto`
+                    // router agent on the "default agent" row.
+                    self.extended.default_approval_mode =
+                        self.extended.default_approval_mode.cycled();
+                    p.status = save_status(self.save_extended());
                 }
                 UI_INSTRUCTIONS_ROW => {
                     return Nav::Replace(Page::Instructions(InstructionsPage {
@@ -831,6 +853,10 @@ impl SettingsDialog {
                 } else {
                     self.extended.translation.model_language.clone()
                 },
+            ),
+            (
+                "approval mode",
+                approval_mode_label(self.extended.default_approval_mode).to_string(),
             ),
             (
                 "instructions file",

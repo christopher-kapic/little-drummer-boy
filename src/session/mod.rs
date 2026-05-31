@@ -20,7 +20,7 @@
 
 use std::path::PathBuf;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -56,6 +56,14 @@ pub struct Session {
     /// [`Self::sandbox_enabled`]; effective immediately. Default `true`
     /// (sandboxing on) until the spawn path resolves the precedence.
     sandbox_enabled: std::sync::atomic::AtomicBool,
+    /// Command-approval mode for this session right now
+    /// (`prompts/utility-command-safety-gate.md`), encoded by
+    /// [`approval_mode_to_u8`] / [`approval_mode_from_u8`]. Resolved at
+    /// spawn from [`crate::config::extended::ExtendedConfig::default_approval_mode`]
+    /// ([`Self::set_approval_mode`]); read per gated tool call via
+    /// [`Self::approval_mode`]. Default `manual` until the spawn path
+    /// applies the config default. Distinct from the `auto` *router agent*.
+    approval_mode: AtomicU8,
     /// 6-char human-display id, unique within `project_id`
     /// (GOALS §17b). Populated at create-time; backfilled lazily for
     /// pre-§17 rows on [`Session::resume`].
@@ -262,6 +270,10 @@ impl Session {
             calibrator: Mutex::new(crate::tokens::Calibrator::new()),
             tmp_dir: Mutex::new(None),
             sandbox_enabled: std::sync::atomic::AtomicBool::new(true),
+            // Default `manual` until the spawn path applies the config default.
+            approval_mode: AtomicU8::new(approval_mode_to_u8(
+                crate::config::extended::ApprovalMode::Manual,
+            )),
             last_tool_call: Mutex::new(None),
             // Persisted by default; `create_deferred` overrides this with the
             // pending row right after construction.
@@ -309,6 +321,24 @@ impl Session {
     pub fn toggle_sandbox_enabled(&self) -> bool {
         let new = !self.sandbox_enabled();
         self.set_sandbox_enabled(new)
+    }
+
+    /// The session's current command-approval mode
+    /// (`prompts/utility-command-safety-gate.md`). Read per gated tool call.
+    pub fn approval_mode(&self) -> crate::config::extended::ApprovalMode {
+        approval_mode_from_u8(self.approval_mode.load(Ordering::Relaxed))
+    }
+
+    /// Set the session's command-approval mode. Used by the spawn path to
+    /// apply the config default and by `/settings` to flip it at runtime.
+    /// Returns the new mode.
+    pub fn set_approval_mode(
+        &self,
+        mode: crate::config::extended::ApprovalMode,
+    ) -> crate::config::extended::ApprovalMode {
+        self.approval_mode
+            .store(approval_mode_to_u8(mode), Ordering::Relaxed);
+        mode
     }
 
     /// The session's private tmp dir (sandboxing part 2), creating it on
@@ -888,6 +918,29 @@ pub struct ToolCallRow {
     pub duration_ms: u64,
 }
 
+/// Encode an [`crate::config::extended::ApprovalMode`] as the `u8` the
+/// session's atomic stores. Inverse of [`approval_mode_from_u8`].
+fn approval_mode_to_u8(mode: crate::config::extended::ApprovalMode) -> u8 {
+    use crate::config::extended::ApprovalMode;
+    match mode {
+        ApprovalMode::Manual => 0,
+        ApprovalMode::Auto => 1,
+        ApprovalMode::Yolo => 2,
+    }
+}
+
+/// Decode the session's stored `u8` back to an
+/// [`crate::config::extended::ApprovalMode`]. Any unexpected value reads as
+/// `Manual` — the fail-safe default (ask the user).
+fn approval_mode_from_u8(v: u8) -> crate::config::extended::ApprovalMode {
+    use crate::config::extended::ApprovalMode;
+    match v {
+        1 => ApprovalMode::Auto,
+        2 => ApprovalMode::Yolo,
+        _ => ApprovalMode::Manual,
+    }
+}
+
 /// Hash the project root into a 12-char hex id. Stable across symlink
 /// shifts because the input is the realpath when available.
 pub fn project_id_for(root: &PathBuf) -> String {
@@ -1115,6 +1168,20 @@ mod tests {
         assert!(!s.toggle_sandbox_enabled());
         assert!(s.toggle_sandbox_enabled());
         assert!(s.sandbox_enabled());
+    }
+
+    #[test]
+    fn approval_mode_defaults_manual_and_round_trips() {
+        use crate::config::extended::ApprovalMode;
+        let db = Db::open_in_memory().unwrap();
+        let s = Session::create(db, PathBuf::from("/x"), "coder").unwrap();
+        // Fail-safe default until the spawn path applies the config default.
+        assert_eq!(s.approval_mode(), ApprovalMode::Manual);
+        // Each mode round-trips through the atomic encode/decode.
+        for m in [ApprovalMode::Auto, ApprovalMode::Yolo, ApprovalMode::Manual] {
+            assert_eq!(s.set_approval_mode(m), m);
+            assert_eq!(s.approval_mode(), m);
+        }
     }
 
     #[test]

@@ -38,6 +38,7 @@ pub mod model;
 pub mod prune;
 pub mod repair;
 pub mod retry;
+pub mod safety_gate;
 pub mod tool;
 pub mod translate;
 

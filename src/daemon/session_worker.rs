@@ -244,6 +244,10 @@ pub fn spawn(
     //   (c) else ON.
     // A later `/sandbox` flip overrides this for the session.
     session.set_sandbox_enabled(resolve_sandbox_default(client_no_sandbox));
+    // Command-approval mode (`prompts/utility-command-safety-gate.md`): new
+    // sessions start in the configured default (`manual` unless overridden).
+    // A later `/settings` change re-resolves on the next session.
+    session.set_approval_mode(extended_cfg.default_approval_mode);
     let (work_tx, work_rx) = mpsc::channel::<SessionWork>(WORK_QUEUE_CAPACITY);
     let (event_tx, _initial_rx) = broadcast::channel::<proto::Event>(EVENT_BROADCAST_CAPACITY);
     let live = Arc::new(LiveState::default());
