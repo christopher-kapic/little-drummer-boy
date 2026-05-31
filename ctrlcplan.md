@@ -246,7 +246,7 @@ boundary. Either is fine; per-channel is the smaller diff.
   no-op in `tokio-util`.
 
 - **Subagent calls.** If the active agent is a subagent
-  (`orchestrator-build` spawned `coder`), should `Ctrl+C` cancel
+  (`Build` spawned `coder`), should `Ctrl+C` cancel
   just the child, or the whole tree? Recommend **whole tree** —
   the parent is blocked waiting on the child's report, so
   cancelling just the child would leave the parent stuck without

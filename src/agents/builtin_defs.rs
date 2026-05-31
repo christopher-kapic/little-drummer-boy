@@ -25,7 +25,8 @@ use super::{AgentDef, AgentMode};
 /// paths. Driven off the code (the factory functions): `Plan` and its
 /// interactive interviewer `plan-author` are bundled agents (`plan.md
 /// §4.6.d`), so they are user-overridable like the rest.
-pub const BUILTIN_AGENT_NAMES: &[&str] = &["Build", "coder", "explore", "Plan", "plan-author"];
+pub const BUILTIN_AGENT_NAMES: &[&str] =
+    &["Auto", "Build", "coder", "explore", "Plan", "plan-author"];
 
 /// True when `name` is one of the editable built-in agents.
 pub fn is_builtin_agent(name: &str) -> bool {
@@ -37,6 +38,7 @@ pub fn is_builtin_agent(name: &str) -> bool {
 /// factory functions compose into the system prompt.
 pub fn embedded_default(name: &str) -> Option<AgentDef> {
     match name {
+        "Auto" => Some(auto_def()),
         "Build" => Some(build_def()),
         "coder" => Some(coder_def()),
         "explore" => Some(explore_def()),
@@ -65,6 +67,19 @@ fn def(name: &str, description: &str, mode: AgentMode, tools: &[&str], prompt: &
         // Embedded defaults have no on-disk source.
         source: PathBuf::new(),
     }
+}
+
+/// `Auto` — the default front-door primary. Converses, answers plain
+/// questions directly, and routes to `Plan`/`Build` via the `handoff`
+/// tool. Tool surface mirrors [`crate::engine::builtin::auto`].
+fn auto_def() -> AgentDef {
+    def(
+        "Auto",
+        "Default front-door agent; converses and hands off to `Plan` or `Build` once intent is clear.",
+        AgentMode::Primary,
+        &["read", "bash", "skill", "question", "handoff"],
+        crate::engine::builtin::AUTO_PROMPT,
+    )
 }
 
 /// `Build` — the user-facing primary agent (GOALS §3a). Delegates writes

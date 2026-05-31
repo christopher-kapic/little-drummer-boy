@@ -121,6 +121,54 @@ pub struct ExtendedConfig {
     /// the offending value backticked and the valid set listed.
     #[serde(default, deserialize_with = "deserialize_llm_mode")]
     pub llm_mode: LlmMode,
+
+    /// Which primary agent a new session starts on (the auto-router
+    /// feature). `auto` (the default) is the conversational front door that
+    /// hands off to `Plan`/`Build`; the user may pin `build` or `plan` to
+    /// skip it. `/settings` exposes the cycle; [`initial_active_agent`]
+    /// reads this. Distinct from [`crate::agents::AgentMode`] and
+    /// [`LlmMode`].
+    ///
+    /// [`initial_active_agent`]: crate::daemon::session_worker
+    #[serde(rename = "defaultPrimaryAgent", default)]
+    pub default_primary_agent: DefaultPrimaryAgent,
+}
+
+/// Which primary agent a new session starts on (the auto-router feature).
+/// The serde spelling is lowercase (`auto`/`build`/`plan`); the resolved
+/// agent name [`Self::agent_name`] keeps the in-binary casing convention
+/// (capitalized primaries — `Auto`/`Build`/`Plan`).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum DefaultPrimaryAgent {
+    /// The conversational front door (default): routes to `Plan`/`Build`.
+    #[default]
+    Auto,
+    /// Start directly on `Build` (make-the-change-now).
+    Build,
+    /// Start directly on `Plan` (graph-shaped planning).
+    Plan,
+}
+
+impl DefaultPrimaryAgent {
+    /// The in-binary agent name (the capitalized primary spelling the
+    /// agent factory + `swap_primary` match on).
+    pub fn agent_name(self) -> &'static str {
+        match self {
+            DefaultPrimaryAgent::Auto => "Auto",
+            DefaultPrimaryAgent::Build => "Build",
+            DefaultPrimaryAgent::Plan => "Plan",
+        }
+    }
+
+    /// Cycle to the next choice — the `/settings` row's toggle action.
+    pub fn cycled(self) -> Self {
+        match self {
+            DefaultPrimaryAgent::Auto => DefaultPrimaryAgent::Build,
+            DefaultPrimaryAgent::Build => DefaultPrimaryAgent::Plan,
+            DefaultPrimaryAgent::Plan => DefaultPrimaryAgent::Auto,
+        }
+    }
 }
 
 /// The LLM-strength steering axis (`prompts/llm-modes-defensive-normal.md`).
@@ -706,6 +754,7 @@ impl Default for ExtendedConfig {
             plan_branch_root: default_plan_branch_root(),
             default_isolation_mode: IsolationModeSetting::default(),
             llm_mode: LlmMode::default(),
+            default_primary_agent: DefaultPrimaryAgent::default(),
         }
     }
 }
@@ -1078,6 +1127,53 @@ mod tests {
             doc2.config().default_isolation_mode,
             IsolationModeSetting::SharedTree
         );
+    }
+
+    #[test]
+    fn default_primary_agent_defaults_to_auto() {
+        // A new session starts on the front-door router unless pinned.
+        let cfg = ExtendedConfig::default();
+        assert_eq!(cfg.default_primary_agent, DefaultPrimaryAgent::Auto);
+        assert_eq!(cfg.default_primary_agent.agent_name(), "Auto");
+        let parsed: ExtendedConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(parsed.default_primary_agent, DefaultPrimaryAgent::Auto);
+    }
+
+    #[test]
+    fn default_primary_agent_round_trips() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("extended-config.json");
+        std::fs::write(&path, "{}").unwrap();
+        let mut doc = ExtendedConfigDoc::load(&path).unwrap();
+        let mut cfg = doc.config();
+        cfg.default_primary_agent = DefaultPrimaryAgent::Plan;
+        doc.write(&cfg).unwrap();
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(on_disk.contains("\"defaultPrimaryAgent\""), "{on_disk}");
+        assert!(on_disk.contains("plan"), "{on_disk}");
+        let doc2 = ExtendedConfigDoc::load(&path).unwrap();
+        assert_eq!(
+            doc2.config().default_primary_agent,
+            DefaultPrimaryAgent::Plan
+        );
+    }
+
+    #[test]
+    fn default_primary_agent_cycles_auto_build_plan() {
+        assert_eq!(
+            DefaultPrimaryAgent::Auto.cycled(),
+            DefaultPrimaryAgent::Build
+        );
+        assert_eq!(
+            DefaultPrimaryAgent::Build.cycled(),
+            DefaultPrimaryAgent::Plan
+        );
+        assert_eq!(
+            DefaultPrimaryAgent::Plan.cycled(),
+            DefaultPrimaryAgent::Auto
+        );
+        assert_eq!(DefaultPrimaryAgent::Build.agent_name(), "Build");
+        assert_eq!(DefaultPrimaryAgent::Plan.agent_name(), "Plan");
     }
 
     #[test]

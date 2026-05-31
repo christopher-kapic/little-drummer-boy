@@ -72,6 +72,9 @@ pub fn known_tool_names() -> &'static [&'static str] {
         "skill",
         "question",
         "jobs",
+        // `Auto`'s structural front-door handoff tool (`src/tools/handoff.rs`).
+        // Holds no write/lock, so any agent may name it.
+        "handoff",
         // planning tools (`src/tools/plan.rs`) + the subagent deferral tool
         // (`plan.md §3d`). None hold write/lock, so any agent may grant them.
         "plan_create",

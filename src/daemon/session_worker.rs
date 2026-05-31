@@ -220,6 +220,7 @@ pub enum SessionWork {
 /// (sandboxing part 2): `Some(true)` means the client asked for new
 /// sessions it creates to be unsandboxed. The session-spawn default is
 /// resolved here by the precedence daemon-flag → client-flag → ON.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn(
     session: Arc<Session>,
     locks: Arc<LockManager>,
@@ -228,8 +229,14 @@ pub fn spawn(
     model_override: Option<Arc<Model>>,
     project_root: PathBuf,
     client_no_sandbox: bool,
+    extended_cfg: &crate::config::extended::ExtendedConfig,
 ) -> (SessionWorkerHandle, tokio::task::JoinHandle<()>) {
     let session_id = session.id;
+    // The primary the chrome's active-agent slot opens on: the stored agent
+    // (resume) or the configured default (`Auto` unless pinned). The worker
+    // re-derives the same value via `resolve_root_agent` and emits
+    // `PrimarySwapped` on any later swap, so this is purely the start state.
+    let initial_agent = resolve_root_agent(session_id, &session.db, extended_cfg);
     // Resolve the new-session sandbox default (highest wins):
     //   (a) daemon launched `--no-sandbox` → OFF for ALL sessions.
     //   (b) else this client passed `--no-sandbox` → OFF for the
@@ -248,7 +255,7 @@ pub fn spawn(
     let handle = SessionWorkerHandle {
         session_id,
         project_root: project_root.clone(),
-        active_agent_name: "Build".into(),
+        active_agent_name: initial_agent,
         work_tx,
         event_tx: event_tx.clone(),
         live: live.clone(),
@@ -292,10 +299,12 @@ async fn run_worker(
 ) {
     let session_id = session.id;
 
-    // The active LLM mode (`prompts/llm-modes-defensive-normal.md`) is
-    // resolved from the layered `extended-config.json` at session start; the
-    // live `/llm-mode` switch overrides it in place via `DriverControl`.
-    let llm_mode = crate::config::extended::load_for_cwd(&project_root).llm_mode;
+    // The layered `extended-config.json` resolved once at session start.
+    // The active LLM mode (`prompts/llm-modes-defensive-normal.md`) and the
+    // default primary agent (the auto-router feature) both read it; the live
+    // `/llm-mode` switch overrides the mode in place via `DriverControl`.
+    let extended_cfg = crate::config::extended::load_for_cwd(&project_root);
+    let llm_mode = extended_cfg.llm_mode;
     let spawn_args = SpawnArgs {
         model,
         params: ModelParams::default(),
@@ -310,17 +319,10 @@ async fn run_worker(
         model_override: model_override.clone(),
     };
     // Root primary: the session's stored active agent (so a resume restarts
-    // on `Plan` after a `/plan` swap, `plan.md §4.6.d`), falling back to
-    // `Build` when it's unset/unknown. `Build` and `Plan` are the only
-    // primary-mode agents; anything else degrades to `Build`.
-    let root_agent_name = session
-        .db
-        .get_session(session_id)
-        .ok()
-        .flatten()
-        .map(|row| row.active_agent)
-        .filter(|name| name == "Plan" || name == "Build")
-        .unwrap_or_else(|| "Build".to_string());
+    // on `Plan` after a `/plan` swap or whichever primary `Auto` handed off
+    // to, `plan.md §4.6.d`), falling back to the configured default
+    // (`Auto` unless the user pinned another) when it's unset/unknown.
+    let root_agent_name = resolve_root_agent(session_id, &session.db, &extended_cfg);
     let root = Arc::new(
         builtin::load(&root_agent_name, &spawn_args)
             .unwrap_or_else(|_| builtin::build(&spawn_args)),
@@ -433,7 +435,7 @@ async fn run_worker(
         grant_store,
         session.db.clone(),
         session_id,
-        initial_active_agent(),
+        initial_active_agent(&extended_cfg),
         interrupts.clone(),
     ));
     driver.set_approver(approver);
@@ -839,11 +841,34 @@ fn turn_event_to_proto(event: TurnEvent, session_id: Uuid) -> Vec<proto::Event> 
     }
 }
 
-/// Marker the registry uses when it constructs (or resumes) a session
-/// row before passing the work off to a worker. Lives here so the
-/// constants and event-translation helpers stay in one module.
-pub(crate) fn initial_active_agent() -> &'static str {
-    "Build"
+/// The primary agent a new session starts on: the user's configured
+/// `defaultPrimaryAgent`, falling back to `Auto` (the conversational
+/// front-door router) when unset. The registry uses this when it
+/// constructs a fresh session row; the worker uses it for the approver's
+/// prompt-attribution agent. Lives here so the constants and
+/// event-translation helpers stay in one module.
+pub(crate) fn initial_active_agent(cfg: &crate::config::extended::ExtendedConfig) -> &'static str {
+    cfg.default_primary_agent.agent_name()
+}
+
+/// Resolve the root-frame primary for a session: its stored active agent
+/// (so a resume restarts on whatever `Auto` handed off to, or a `/plan`
+/// swap landed on), falling back to the configured default
+/// ([`initial_active_agent`]) when unset/unknown. `Auto`, `Build`, and
+/// `Plan` are the primary-mode agents; anything else degrades to the
+/// default. Shared by [`spawn`] (the handle's initial chrome slot) and
+/// [`run_worker`] (the agent it actually loads) so both agree.
+fn resolve_root_agent(
+    session_id: Uuid,
+    db: &crate::db::Db,
+    cfg: &crate::config::extended::ExtendedConfig,
+) -> String {
+    db.get_session(session_id)
+        .ok()
+        .flatten()
+        .map(|row| row.active_agent)
+        .filter(|name| name == "Auto" || name == "Plan" || name == "Build")
+        .unwrap_or_else(|| initial_active_agent(cfg).to_string())
 }
 
 /// Persist a live `/llm-mode` switch to the layered config so a resume

@@ -224,7 +224,8 @@ async fn run_iteration(
             // iteration rather than spin.
             TurnOutcome::SpawnSubagent { .. }
             | TurnOutcome::SpawnNoninteractive { .. }
-            | TurnOutcome::JobAction { .. } => {
+            | TurnOutcome::JobAction { .. }
+            | TurnOutcome::Handoff { .. } => {
                 return Ok(collect_final_text(history));
             }
         }

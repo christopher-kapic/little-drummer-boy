@@ -19,7 +19,9 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 
-use crate::config::extended::{IsolationModeSetting, LlmMode, ThinkingDisplay, VimModeSetting};
+use crate::config::extended::{
+    DefaultPrimaryAgent, IsolationModeSetting, LlmMode, ThinkingDisplay, VimModeSetting,
+};
 use crate::config::providers::ProvidersConfig;
 use crate::tui::textfield::TextField;
 use crate::tui::theme::MUTED_COLOR_INDEX;
@@ -186,10 +188,10 @@ pub(super) struct GrabState {
 /// Labeled config rows on the UI page (vim mode, thinking, llm mode,
 /// render-agent-markdown, render-user-markdown, mouse, rich-text-copy,
 /// emojis, caffeinate display-awake, name, packages dir, utility model,
-/// plan branch root, plan isolation, loop-guard threshold, instructions
-/// file). The `[reset to defaults]` button follows at cursor
+/// plan branch root, plan isolation, loop-guard threshold, default agent,
+/// instructions file). The `[reset to defaults]` button follows at cursor
 /// [`UI_CONFIG_ROWS`].
-pub(super) const UI_CONFIG_ROWS: usize = 16;
+pub(super) const UI_CONFIG_ROWS: usize = 17;
 
 /// Total navigable rows: the labeled config rows plus the trailing
 /// `[reset to defaults]` button.
@@ -264,6 +266,16 @@ pub(super) fn isolation_mode_label(m: IsolationModeSetting) -> &'static str {
         IsolationModeSetting::SharedTree => {
             "shared_tree (one tree, serialized by the file-lock manager; no worktrees/merge queue)"
         }
+    }
+}
+
+pub(super) fn default_primary_agent_label(a: DefaultPrimaryAgent) -> &'static str {
+    match a {
+        DefaultPrimaryAgent::Auto => {
+            "auto (default — front-door router; converses, hands off to Plan/Build)"
+        }
+        DefaultPrimaryAgent::Build => "build (start on the coding agent — make the change now)",
+        DefaultPrimaryAgent::Plan => "plan (start on the planning agent — author a plan)",
     }
 }
 
@@ -468,6 +480,13 @@ impl SettingsDialog {
                     p.editing = Some(UiField::LoopGuardThreshold);
                 }
                 15 => {
+                    // Cycle which primary agent new sessions start on
+                    // (`auto` → `build` → `plan`, the auto-router feature).
+                    self.extended.default_primary_agent =
+                        self.extended.default_primary_agent.cycled();
+                    p.status = save_status(self.save_extended());
+                }
+                UI_INSTRUCTIONS_ROW => {
                     return Nav::Replace(Page::Instructions(InstructionsPage {
                         cursor: 0,
                         grabbed: None,
@@ -611,7 +630,7 @@ impl SettingsDialog {
         )));
         lines.push(Line::default());
 
-        let rows: [(&str, String); 16] = [
+        let rows: [(&str, String); 17] = [
             (
                 "vim mode",
                 vim_label(self.extended.tui.vim_mode).to_string(),
@@ -713,6 +732,10 @@ impl SettingsDialog {
                     "{} (consecutive identical tool calls before approval prompt; 2 = first repeat)",
                     self.extended.loop_guard.effective_threshold()
                 ),
+            ),
+            (
+                "default agent",
+                default_primary_agent_label(self.extended.default_primary_agent).to_string(),
             ),
             (
                 "instructions file",

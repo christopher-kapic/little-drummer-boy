@@ -114,7 +114,7 @@ impl SessionRegistry {
         let session = Session::create_deferred(
             self.inner.db.clone(),
             project_root,
-            session_worker::initial_active_agent(),
+            session_worker::initial_active_agent(extended_cfg),
         )
         .context("creating session")?;
         if let Some(active) = &providers_cfg.active_model {
@@ -193,6 +193,7 @@ impl SessionRegistry {
             model_override,
             project_root,
             client_no_sandbox,
+            extended_cfg,
         );
 
         self.inner

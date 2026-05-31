@@ -1258,6 +1258,40 @@ mod tests {
         assert_eq!(d.extended.llm_mode, LlmMode::Defensive);
     }
 
+    #[test]
+    fn ui_page_default_agent_row_cycles_and_persists() {
+        use crate::config::extended::{DefaultPrimaryAgent, ExtendedConfigDoc};
+        use ui_page::UiPage;
+        let tmp = TempDir::new().unwrap();
+        let mut d = fresh_dialog(&tmp);
+        // Default new sessions start on the front-door router.
+        assert_eq!(d.extended.default_primary_agent, DefaultPrimaryAgent::Auto);
+        // Open the UI page on the `default agent` row (index 15, just before
+        // the `instructions file` drill-in).
+        d.page = Page::Ui(UiPage {
+            cursor: 15,
+            editing: None,
+            buf: crate::tui::textfield::TextField::default(),
+            status: None,
+            utility_picker: None,
+            pending_mouse_capture: None,
+            reset: reset::ResetButton::default(),
+        });
+        d.handle_key(press(KeyCode::Enter));
+        assert_eq!(
+            d.extended.default_primary_agent,
+            DefaultPrimaryAgent::Build,
+            "cycling the default-agent row steps auto→build"
+        );
+        let reloaded = ExtendedConfigDoc::load(&d.extended_path).unwrap().config();
+        assert_eq!(reloaded.default_primary_agent, DefaultPrimaryAgent::Build);
+        // Cycle through plan and back to auto.
+        d.handle_key(press(KeyCode::Enter));
+        assert_eq!(d.extended.default_primary_agent, DefaultPrimaryAgent::Plan);
+        d.handle_key(press(KeyCode::Enter));
+        assert_eq!(d.extended.default_primary_agent, DefaultPrimaryAgent::Auto);
+    }
+
     fn dialog_with_one_provider(tmp: &TempDir) -> SettingsDialog {
         let path = tmp.path().join("config.json");
         std::fs::write(

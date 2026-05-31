@@ -22,6 +22,7 @@ use crate::tools::custom::CustomBashTool;
 /// authored opencode-style for forward-compat with [`crate::agents`]
 /// — we still pull the prompt out by hand here because the agent loop
 /// already knows the tool surface.
+pub(crate) const AUTO_PROMPT: &str = include_str!("auto.md");
 pub(crate) const BUILD_PROMPT: &str = include_str!("build.md");
 pub(crate) const CODER_PROMPT: &str = include_str!("coder.md");
 pub(crate) const EXPLORE_PROMPT: &str = include_str!("explore.md");
@@ -361,6 +362,7 @@ pub fn load(name: &str, args: &SpawnArgs) -> Result<Agent> {
     // Unreachable in practice: `resolve` returned an embedded default, so
     // `name` is a built-in and matches above. Kept exhaustive for safety.
     match name {
+        "Auto" => Ok(auto(args)),
         "Build" => Ok(build(args)),
         "coder" => Ok(coder(args)),
         "explore" => Ok(explore(args)),
@@ -479,6 +481,39 @@ mod tests {
         let args = test_spawn_args(tmp.path());
         assert_eq!(load("Plan", &args).unwrap().name, "Plan");
         assert_eq!(load("plan-author", &args).unwrap().name, "plan-author");
+    }
+
+    #[test]
+    fn auto_factory_routes_no_writes_no_delegation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = auto(&test_spawn_args(tmp.path()));
+        assert_eq!(agent.name, "Auto");
+        let names = agent.tools.names();
+        // The front-door router converses + hands off.
+        for t in ["handoff", "question", "read", "bash"] {
+            assert!(names.contains(&t), "Auto missing `{t}`: {names:?}");
+        }
+        // It owns no write/lock and no code-writing delegation — the
+        // swapped-in primary does the work.
+        for t in ["readlock", "writeunlock", "editunlock", "unlock", "task"] {
+            assert!(!names.contains(&t), "Auto must not hold `{t}`");
+        }
+    }
+
+    #[test]
+    fn load_dispatches_auto() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(
+            load("Auto", &test_spawn_args(tmp.path())).unwrap().name,
+            "Auto"
+        );
+    }
+
+    #[test]
+    fn auto_is_noninteractive_default() {
+        // `Auto` is a primary, never delegated to via `task`; it isn't in
+        // the interactive-handoff set, so it defaults to noninteractive.
+        assert!(is_noninteractive("Auto"));
     }
 
     #[test]
@@ -817,6 +852,7 @@ fn add_tool_by_name(
         "skill" => tb.with(Arc::new(tools::skill::SkillTool)),
         "question" => tb.with(Arc::new(tools::question::QuestionTool)),
         "jobs" => tb.with(Arc::new(tools::jobs::JobsTool)),
+        "handoff" => tb.with(Arc::new(tools::handoff::HandoffTool)),
         "plan_create" => tb.with(Arc::new(tools::plan::CreatePlanTool)),
         "add_step" => tb.with(Arc::new(tools::plan::AddStepTool)),
         "add_step_dependency" => tb.with(Arc::new(tools::plan::AddDependencyTool)),
@@ -932,6 +968,39 @@ fn resolve_agent_model(def: &crate::agents::AgentDef, args: &SpawnArgs) -> Arc<M
     match Model::for_provider(&cfg, &provider, &model_id) {
         Ok(m) => Arc::new(m),
         Err(_) => args.model.clone(),
+    }
+}
+
+/// `Auto` — the default front-door primary. Converses, answers plain
+/// questions directly, and hands off to `Plan`/`Build` via the structural
+/// `handoff` tool once the user's intent is clear (the spec's router).
+/// Holds no write/lock or delegation tools — the chosen primary owns the
+/// work after the swap.
+pub fn auto(args: &SpawnArgs) -> Agent {
+    let tools = with_recall_tools(
+        with_custom_tools(
+            ToolBox::new()
+                .with(Arc::new(crate::tools::read::ReadTool))
+                .with(Arc::new(crate::tools::bash::BashTool::new()))
+                // `question` (GOALS §3b): blocks the turn until the user
+                // disambiguates — the router's clarifying-exchange path.
+                .with(Arc::new(crate::tools::skill::SkillTool))
+                .with(Arc::new(crate::tools::question::QuestionTool))
+                // `handoff` (structural): the engine routes the chosen
+                // target to the driver's single primary-swap authority.
+                .with(Arc::new(crate::tools::handoff::HandoffTool)),
+            &args.cwd,
+        ),
+        args,
+    );
+
+    Agent {
+        name: "Auto".to_string(),
+        system: compose_system_prompt(AUTO_PROMPT, &args.session_short_id, &args.cwd),
+        tools,
+        model: args.effective_model(),
+        params: args.params.clone(),
+        llm_mode: args.llm_mode,
     }
 }
 

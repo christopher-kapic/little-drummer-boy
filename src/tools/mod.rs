@@ -23,6 +23,7 @@ pub mod docs;
 pub mod editunlock;
 pub mod glob;
 pub mod grep;
+pub mod handoff;
 pub mod intel;
 pub mod jobs;
 pub mod plan;

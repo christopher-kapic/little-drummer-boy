@@ -307,6 +307,18 @@ pub enum TurnOutcome {
         task_call_id: String,
         task_function_call_id: Option<String>,
     },
+    /// Agent invoked the `handoff` tool (the `Auto` front door). Like
+    /// `task`/`jobs` this is intercepted by the engine and routed to the
+    /// driver, which swaps the root-frame primary in place at the idle
+    /// boundary (the same machinery `/plan`/`/build` use) and delivers a
+    /// confirmation as this call's tool_result. The swapped-in primary
+    /// then takes over the conversation.
+    Handoff {
+        /// The target primary agent name (`Plan` or `Build`).
+        target: String,
+        task_call_id: String,
+        task_function_call_id: Option<String>,
+    },
 }
 
 /// Drive one round-trip with the model + dispatch any tool calls. The
@@ -599,6 +611,30 @@ pub async fn turn(
             let _ = repair(&mut args, &jobs_schema, "jobs");
             return Ok(TurnOutcome::JobAction {
                 args,
+                task_call_id: tc.id.clone(),
+                task_function_call_id: tc.call_id.clone(),
+            });
+        }
+
+        // `handoff` is structural: the driver owns the single primary-swap
+        // authority (same idle-boundary mechanism as `/plan`/`/build`), so
+        // the `Auto` front door routes the chosen target there via
+        // [`TurnOutcome::Handoff`] rather than dispatching a tool here.
+        if tc.function.name == "handoff" {
+            let mut args = tc.function.arguments.clone();
+            let schema = agent
+                .tools
+                .get("handoff")
+                .map(|t| t.parameters())
+                .unwrap_or(Value::Null);
+            let _ = repair(&mut args, &schema, "handoff");
+            let target = args
+                .get("target")
+                .and_then(Value::as_str)
+                .unwrap_or("Build")
+                .to_string();
+            return Ok(TurnOutcome::Handoff {
+                target,
                 task_call_id: tc.id.clone(),
                 task_function_call_id: tc.call_id.clone(),
             });

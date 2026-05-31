@@ -1829,6 +1829,53 @@ impl Driver {
                     );
                     continue;
                 }
+                TurnOutcome::Handoff {
+                    target,
+                    task_call_id,
+                    task_function_call_id,
+                } => {
+                    // The `Auto` front door hands the conversation to a
+                    // primary agent. Confirm the call as `handoff`'s
+                    // tool_result, persist the new active agent (so a resume
+                    // restarts on it), then swap the root-frame primary in
+                    // place — the same idle-boundary machinery `/plan`/`/build`
+                    // use, which preserves the root history so the swapped-in
+                    // primary continues this same conversation. Its next turn
+                    // (driven by the delivered tool_result below) is the
+                    // handoff: `Auto` is no longer in the loop.
+                    let agent_name = self.stack.last().unwrap().agent.name.clone();
+                    let _ = tx
+                        .send(TurnEvent::ToolStart {
+                            agent: agent_name.clone(),
+                            call_id: task_call_id.clone(),
+                            tool: "handoff".to_string(),
+                            args: serde_json::json!({ "target": target }),
+                        })
+                        .await;
+                    let output = format!("Handed off to `{target}`.");
+                    let _ = tx
+                        .send(TurnEvent::ToolEnd {
+                            agent: agent_name.clone(),
+                            call_id: task_call_id.clone(),
+                            tool: "handoff".to_string(),
+                            output: output.clone(),
+                            truncated: false,
+                        })
+                        .await;
+                    if let Err(e) = self.session.set_active_agent(&target) {
+                        tracing::warn!(error = %e, "set_active_agent on handoff failed");
+                    }
+                    // Deliver the confirmation before swapping so it lands in
+                    // the shared root history `swap_primary` preserves; the
+                    // swapped-in primary then takes the next turn on it.
+                    next_prompt = Message::tool_result_with_call_id(
+                        task_call_id,
+                        task_function_call_id,
+                        output,
+                    );
+                    self.swap_primary(&target, tx).await;
+                    continue;
+                }
             }
         }
     }
@@ -2002,11 +2049,12 @@ pub(crate) async fn run_noninteractive(
             }
             TurnOutcome::SpawnSubagent { .. }
             | TurnOutcome::SpawnNoninteractive { .. }
-            | TurnOutcome::JobAction { .. } => {
-                // explore is a leaf without `task`/`jobs`; this shouldn't
-                // happen, but if it does we bail rather than spin (the
-                // single async-job authority is the main driver, never a
-                // noninteractive subagent — §22 anti-runaway).
+            | TurnOutcome::JobAction { .. }
+            | TurnOutcome::Handoff { .. } => {
+                // explore is a leaf without `task`/`jobs`/`handoff`; this
+                // shouldn't happen, but if it does we bail rather than spin
+                // (the single async-job + primary-swap authority is the main
+                // driver, never a noninteractive subagent — §22 anti-runaway).
                 drop(sink_tx);
                 let _ = drain.await;
                 anyhow::bail!(

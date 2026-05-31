@@ -116,13 +116,19 @@ out new deps in PR descriptions.
   inference state live in the daemon, not the TUI process. Same wire
   schema will carry the v2 WebSocket relay (GOALS §8d).
 - **Multi-agent file locking, single writer.** The bundled cast is
-  `Build`, `Plan`, `explore`, `coder`,
+  `Auto`, `Build`, `Plan`, `explore`, `coder`,
   `docs`. Only `coder` holds file locks and writes/edits (GOALS §3a).
   Adding a new write-capable tool requires a design conversation —
   the lock manager assumes one writer per delegation tree.
+- **`Auto` is the default front-door primary.** New sessions start on
+  `Auto` (user-overridable via `extended.defaultPrimaryAgent`, exposed in
+  `/settings`): it converses, answers plain questions directly, and hands
+  off to `Plan`/`Build` once intent is clear via the structural `handoff`
+  tool, routed through the same idle-boundary `swap_primary()` machinery
+  `/plan`/`/build` use.
 - **Agent-name casing convention.** Primary (top-level) agents are
-  Capitalized (`Build`, `Plan`); subagents (`coder`, `explore`, `docs`)
-  are lowercase.
+  Capitalized (`Auto`, `Build`, `Plan`); subagents (`coder`, `explore`,
+  `docs`) are lowercase.
 - **`docs` is a fixed two-stage internal pipeline, not general
   delegation** (GOALS §3a). A caller delegates `task(agent="docs",
   prompt=<JSON {package, question}>)` and it behaves like one leaf
