@@ -1297,6 +1297,36 @@ patterns be tight in both directions. The TUI shows the seed-tool
 token cost on the subagent's first turn so an over-eager parent is
 debuggable. Same mechanism powers `/compact` handoff (T6.e step 3).
 
+**Re-queryable subagents + seeded context (normal mode only; GOALS §3c).**
+A `task` call carries two more optional fields, present in the schema from
+session start (fixed shape → cache-safe): `why` (the caller's motivation,
+injected into the subagent's context on spawn and follow-up) and
+`resume_handle` (a follow-up against a previously-spawned subagent). Both
+are inert in `defensive` mode: the feature is gated at the **capability**
+level (`crate::engine::tool::FollowupSeed::enabled(mode)`), not in
+description text — the first behavioral gate on the `LlmMode` axis.
+
+- On a read-only noninteractive subagent's report in `normal` mode, the
+  driver persists its transcript (`Vec<Message>` JSON) to
+  `subagent_handles` (migration `0021`) keyed by an opaque handle and
+  appends the handle to the report. "Read-only noninteractive" is derived
+  generically — `builtin::is_noninteractive(name)` true **and** the
+  agent's toolbox holds none of `invariants::LOCK_WRITE_TOOLS` — not a
+  hardcoded name list. The `docs` pipeline is excluded structurally: it
+  runs through `docs_pipeline::run`, never this save path, so it never
+  mints a handle.
+- A follow-up `task(resume_handle=…)` rehydrates the transcript and runs
+  the subagent again with the new question (+ `why`). A handle that can't
+  be rehydrated (unknown, evicted, or a `docs` run) → a clear tool error
+  telling the caller to spawn fresh; never a silent cold start.
+- The subagent may emit `seed({tool, args})` entries (read-only tools
+  only); on return the driver re-executes them in the caller's cwd and
+  injects them into the caller's transcript as native tool-call/result
+  pairs (reusing the `/compact` `run_seed_tools` machinery + `SeedTool`),
+  capped under the subagent-report budget via `BudgetedWriter` with a
+  deterministic truncation note. Both the seeded pairs and follow-up turns
+  preserve the wire-vs-user split (GOALS §14).
+
 **Fork — branch the conversation thread.**
 
 - A `task(mode: "fork", branch_from: turn_id?, ...)` (or a user

@@ -390,6 +390,71 @@ pub fn is_noninteractive(name: &str) -> bool {
     !matches!(name, "coder" | "plan-author")
 }
 
+/// The `docs` pipeline stage names. They run as a fixed two-stage,
+/// leaf-terminated internal flow (GOALS §3a) routed by the driver — never a
+/// general delegation — and are **excluded** from the re-queryable-subagent
+/// feature (GOALS §3c): their transcript is never persisted as a handle.
+fn is_docs_pipeline(name: &str) -> bool {
+    matches!(name, "docs" | "docs-resolver" | "docs-answerer")
+}
+
+/// True when `agent` is a **read-only noninteractive** subagent — the scope
+/// of the re-queryable-subagent + seeding feature (GOALS §3c). Derived
+/// generically, not from a hardcoded name list:
+///
+/// - it runs noninteractively ([`is_noninteractive`]),
+/// - it is not a `docs` pipeline stage (excluded structurally),
+/// - it holds **none** of the single-writer lock/write tools
+///   ([`crate::agents::invariants::LOCK_WRITE_TOOLS`]) — i.e. it cannot
+///   mutate the tree, so re-running it is side-effect-free, and
+/// - it is a leaf — it holds no `task`/`handoff` (it delegates to no one;
+///   re-querying must not grant a subagent new delegation powers,
+///   leaf-termination, GOALS §3c).
+///
+/// Today this is `explore` (and any custom read-only leaf subagent); a future
+/// read-only noninteractive leaf subagent qualifies automatically. A primary
+/// (`Build`/`Plan`/`Auto`) is excluded by the leaf check — it holds `task` /
+/// `handoff` — and is never delegated to via `task` anyway.
+pub fn is_read_only_noninteractive(agent: &Agent) -> bool {
+    if !is_noninteractive(&agent.name) || is_docs_pipeline(&agent.name) {
+        return false;
+    }
+    let names = agent.tools.names();
+    let writes = crate::agents::invariants::LOCK_WRITE_TOOLS
+        .iter()
+        .any(|w| names.contains(w));
+    let delegates = names.contains(&"task") || names.contains(&"handoff");
+    !writes && !delegates
+}
+
+/// Register the `seed` tool (GOALS §3c) on `tb` when this is a read-only
+/// noninteractive subagent spawned in `normal` mode. The capability is gated
+/// at the engine's point of action ([`crate::engine::tool::Capability`]); the
+/// tool surface follows the same gate so a `defensive`-mode subagent never
+/// even sees `seed`. `name` is the agent's own name; the read-only check
+/// against the lock/write tools is done on `tb` as it stands.
+fn maybe_with_seed_tool(
+    tb: ToolBox,
+    name: &str,
+    llm_mode: crate::config::extended::LlmMode,
+) -> ToolBox {
+    use crate::engine::tool::Capability;
+    if !Capability::FollowupSeed.enabled(llm_mode)
+        || !is_noninteractive(name)
+        || is_docs_pipeline(name)
+    {
+        return tb;
+    }
+    let names = tb.names();
+    let writes = crate::agents::invariants::LOCK_WRITE_TOOLS
+        .iter()
+        .any(|w| names.contains(w));
+    if writes {
+        return tb;
+    }
+    tb.with(Arc::new(crate::tools::seed::SeedEmitTool))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -523,6 +588,33 @@ mod tests {
         assert!(!is_noninteractive("coder"));
         assert!(is_noninteractive("explore"));
         assert!(is_noninteractive("docs"));
+    }
+
+    #[test]
+    fn explore_is_read_only_noninteractive_others_are_not() {
+        let tmp = tempfile::tempdir().unwrap();
+        let args = test_spawn_args(tmp.path());
+        // `explore`: noninteractive + holds no write/lock tools → in scope.
+        assert!(is_read_only_noninteractive(&explore(&args)));
+        // `coder`: holds the lock/write tools → out of scope (writer).
+        assert!(!is_read_only_noninteractive(&coder(&args)));
+        // `Build`: a primary that delegates + holds `task` — not a read-only
+        // noninteractive subagent either (it's interactive/primary, and the
+        // `docs` pipeline is excluded structurally by name in the helper).
+        assert!(!is_read_only_noninteractive(&build(&args)));
+    }
+
+    #[test]
+    fn explore_gets_seed_tool_in_normal_mode_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Defensive (default): the feature is gated off — no `seed` tool.
+        let mut args = test_spawn_args(tmp.path());
+        args.llm_mode = crate::config::extended::LlmMode::Defensive;
+        assert!(!explore(&args).tools.names().contains(&"seed"));
+        // Normal: the capability is enabled, so the read-only noninteractive
+        // subagent carries `seed`.
+        args.llm_mode = crate::config::extended::LlmMode::Normal;
+        assert!(explore(&args).tools.names().contains(&"seed"));
     }
 
     /// A bare [`crate::agents::AgentDef`] carrying an optional frontmatter
@@ -773,6 +865,11 @@ fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) -> Agent {
     tb = with_custom_tools(tb, &args.cwd);
     // Cross-session recall tools, gated on interactive spawn.
     tb = with_recall_tools(tb, args);
+    // `seed` (GOALS §3c): a custom read-only noninteractive subagent in
+    // normal mode may emit seeds to its caller. The helper re-checks the
+    // (now-built) tool surface for write/lock tools, so only a genuinely
+    // read-only custom subagent gets it.
+    tb = maybe_with_seed_tool(tb, &def.name, args.llm_mode);
 
     // Model precedence (plan → frontmatter → session): a plan-level override
     // wins outright; else a `provider/model` frontmatter selector is resolved
@@ -1114,6 +1211,10 @@ pub fn explore(args: &SpawnArgs) -> Agent {
         ),
         args,
     );
+    // `seed` (GOALS §3c): only on a read-only noninteractive subagent in
+    // normal mode. Gated by the behavioral capability check, not just the
+    // description text.
+    let tools = maybe_with_seed_tool(tools, "explore", args.llm_mode);
 
     Agent {
         name: "explore".to_string(),

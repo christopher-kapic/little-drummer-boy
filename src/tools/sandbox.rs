@@ -249,6 +249,7 @@ mod tests {
             cancel: tokio_util::sync::CancellationToken::new(),
             approver: Some(approver),
             deferred_log: crate::engine::deferred::DeferredLog::new(),
+            seeds: crate::engine::seed_collector::SeedCollector::new(),
         }
     }
 

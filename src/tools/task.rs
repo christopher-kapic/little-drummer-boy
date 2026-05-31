@@ -76,6 +76,14 @@ impl TaskTool {
                     "type": "string",
                     "description": "Delegation mode override",
                     "enum": ["subagent", "subagent_interactive"]
+                },
+                "why": {
+                    "type": "string",
+                    "description": "Motivation for this delegation"
+                },
+                "resume_handle": {
+                    "type": "string",
+                    "description": "Handle of a prior read-only subagent to re-query"
                 }
             },
             "required": ["agent", "prompt"]
@@ -96,6 +104,14 @@ impl TaskTool {
                     "type": "string",
                     "description": "Optional override of the subagent's default interactivity: `subagent` runs it noninteractively (it reports back), `subagent_interactive` lets it take over the conversation with the user. Omit to use the subagent's default",
                     "enum": ["subagent", "subagent_interactive"]
+                },
+                "why": {
+                    "type": "string",
+                    "description": "Why you are delegating this — what you intend to do with the answer. Passed into the subagent's context so it can tailor what it surfaces. Optional"
+                },
+                "resume_handle": {
+                    "type": "string",
+                    "description": "To re-query a read-only subagent you already spawned, pass the handle it returned with its report; the subagent answers with its existing context instead of starting cold. Omit to spawn a fresh subagent. Normal mode only"
                 }
             },
             "required": ["agent", "prompt"]
@@ -135,5 +151,35 @@ impl Tool for TaskTool {
         Err(anyhow::anyhow!(
             "`task` is intercepted by the engine dispatcher; this code path should be unreachable"
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The re-queryable-subagent fields (`why`, `resume_handle`, GOALS §3c)
+    /// are present in BOTH the normal and defensive `task` schemas from
+    /// session start — a fixed shape so enabling the follow-up path never
+    /// reserializes the cached tool prefix (cache safety). They are optional
+    /// (not in `required`).
+    #[test]
+    fn schema_carries_followup_fields_in_both_modes_and_optional() {
+        let tool = TaskTool::with_subagents(&["explore", "coder"]);
+        for schema in [tool.parameters(), tool.defensive_parameters().unwrap()] {
+            let props = schema["properties"].as_object().unwrap();
+            assert!(props.contains_key("why"), "missing `why`: {schema}");
+            assert!(
+                props.contains_key("resume_handle"),
+                "missing `resume_handle`: {schema}"
+            );
+            let required: Vec<&str> = schema["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(Value::as_str)
+                .collect();
+            assert_eq!(required, vec!["agent", "prompt"], "fields stay optional");
+        }
     }
 }

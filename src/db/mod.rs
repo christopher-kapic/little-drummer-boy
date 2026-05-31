@@ -33,6 +33,7 @@ pub mod session_log;
 pub mod session_search;
 pub mod sessions;
 pub mod stats;
+pub mod subagent_handles;
 pub mod tokenizer_calibration;
 pub mod tool_calls;
 pub mod usage_events;
@@ -196,6 +197,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0018_plan_model.sql"),
     include_str!("migrations/0019_plan_run_metrics.sql"),
     include_str!("migrations/0020_plan_project_and_attention_context.sql"),
+    include_str!("migrations/0021_subagent_handles.sql"),
 ];
 
 fn migrate(conn: &Connection) -> Result<()> {

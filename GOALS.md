@@ -1064,6 +1064,58 @@ keeps the file-lock manager, redaction layer, and tool registry
 single-implementation. The difference is purely about which
 process holds the report-back end of the channel.
 
+### 3c. Re-queryable subagents + seeded context (normal mode only)
+
+A caller that delegated to a **read-only noninteractive** subagent
+(today `explore`; generally any noninteractive agent that holds none of
+the single-writer lock/write tools) may **re-query that same subagent**
+instead of spawning a cold one. This is a `normal`-mode (`LlmMode::Normal`)
+capability only — in `defensive` mode the feature is **disabled at the
+capability level**, not merely hidden in description text.
+
+- **Handle.** When such a subagent reports back in normal mode, its full
+  transcript is persisted to the session DB and a stable opaque **handle**
+  is appended to the report. The caller may issue a follow-up `task` call
+  that names the handle in `resume_handle`; the engine rehydrates the
+  subagent's prior transcript from the DB and runs it again with the new
+  question, so it answers with full knowledge of what it already did.
+  Persist-and-rehydrate (not in-memory retention) means re-queries survive
+  a daemon restart and the history is inspectable.
+
+- **`docs` is excluded.** The fixed two-stage `docs` pipeline (§3a) stays
+  strictly leaf-terminated and is **never** re-queryable, in either mode —
+  its transcript is never persisted as a handle, and a `resume_handle`
+  pointing at a docs run fails as a stale handle.
+
+- **`why`.** `task` carries an optional structured `why` field — the
+  caller's motivation, supplied on both the initial spawn and any
+  follow-up — injected into the subagent's context so it can tailor what
+  it surfaces and seeds.
+
+- **Seeds.** A re-queryable subagent may, beside its prose report, emit a
+  small set of **read-only** results (`read`/`grep`/`glob`/intel `search`)
+  via the `seed` tool; on return they are injected into the *caller's*
+  transcript as native tool-call/tool-result pairs (so to the caller they
+  look like calls it made itself, and stay cache-stable). The `seed` tool
+  description steers the subagent to seed only what is directly relevant —
+  the purpose is to save the caller's context, so irrelevant seeds defeat
+  it. Seeded content is real injected context and is capped under the
+  subagent-report budget (§10) via `BudgetedWriter`, truncated
+  deterministically with a visible truncation note.
+
+- **Invariants unchanged.** A follow-up is the *caller* re-invoking an
+  existing subagent — the subagent gains no new powers: leaf-termination
+  and the single-async-job authority (§22) hold. A `resume_handle` that
+  cannot be rehydrated (unknown, evicted, or `docs`) fails with a clear
+  tool error telling the caller to spawn a fresh subagent — never a silent
+  cold start under the old handle. Both the seeded pairs and the follow-up
+  turns preserve the wire-vs-user transcript split (§14).
+
+- **Cache safety.** `why` and `resume_handle` are present in the `task`
+  schema from session start (fixed shape) so enabling the follow-up path
+  never reserializes the cached tool prefix — the same cache-safe
+  capability-growth discipline as the `jobs` meta-tool (§22).
+
 ---
 
 ## 4. Config schema (`config.json`)

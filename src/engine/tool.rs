@@ -226,6 +226,13 @@ pub struct ToolCtx {
     /// with no subagent (tests, seed-tool re-exec) — defer there is a no-op
     /// drain nobody reads.
     pub deferred_log: crate::engine::deferred::DeferredLog,
+    /// The current frame's seed collector (GOALS §3c). A re-queryable
+    /// read-only noninteractive subagent's `seed` tool appends `{tool, args}`
+    /// entries here; the driver drains them on return and injects them into
+    /// the caller's transcript. `Default` (empty) for the root frame, the
+    /// interactive path, and contexts with no subagent (tests, seed-tool
+    /// re-exec) — `seed` there is a no-op drain nobody reads.
+    pub seeds: crate::engine::seed_collector::SeedCollector,
 }
 
 /// Project the `Tool` trait into a `ToolDefinition` rig understands.
@@ -252,6 +259,41 @@ pub fn definition_of(tool: &dyn Tool, mode: crate::config::extended::LlmMode) ->
         name: tool.name().to_string(),
         description,
         parameters,
+    }
+}
+
+/// Behavioral capabilities gated on the [`LlmMode`] axis.
+///
+/// [`definition_of`] above is the *description-verbosity* seam — it changes
+/// how a tool's schema reads, never what the engine will accept. This is the
+/// separate **behavioral** seam: a real capability check the engine consults
+/// before *acting*, so a mode can disable a feature outright rather than just
+/// rewording its prose. [`Capability::enabled`] is the single predicate; the
+/// engine calls it at the point of action (e.g. before minting a re-query
+/// handle or honoring a `resume_handle`/`seed`), so a disabled capability is
+/// rejected/inert regardless of what the model asked for.
+///
+/// [`LlmMode`]: crate::config::extended::LlmMode
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Capability {
+    /// Re-queryable read-only noninteractive subagents + seeded tool calls
+    /// (GOALS §3c): the follow-up handle, `resume_handle` rehydration, and
+    /// `seed` injection. `normal`-mode only — the first behavioral gate on
+    /// the `LlmMode` axis.
+    FollowupSeed,
+}
+
+impl Capability {
+    /// Whether this capability is available under `mode`. Disabled
+    /// capabilities are gated at the engine's point of action, not merely
+    /// hidden in description text.
+    pub fn enabled(self, mode: crate::config::extended::LlmMode) -> bool {
+        use crate::config::extended::LlmMode;
+        match self {
+            // Follow-up/seed is a strong-model affordance: the weak-model
+            // (defensive) target re-spawns cold instead (GOALS §3c).
+            Capability::FollowupSeed => matches!(mode, LlmMode::Normal),
+        }
     }
 }
 
@@ -292,6 +334,20 @@ impl ToolBox {
 
     pub fn is_empty(&self) -> bool {
         self.tools.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod capability_tests {
+    use super::*;
+    use crate::config::extended::LlmMode;
+
+    /// The follow-up/seed capability is the first behavioral `LlmMode` gate:
+    /// available in normal mode, disabled in defensive (GOALS §3c).
+    #[test]
+    fn followup_seed_is_normal_only() {
+        assert!(Capability::FollowupSeed.enabled(LlmMode::Normal));
+        assert!(!Capability::FollowupSeed.enabled(LlmMode::Defensive));
     }
 }
 

@@ -39,6 +39,7 @@ pub mod prune;
 pub mod repair;
 pub mod retry;
 pub mod safety_gate;
+pub mod seed_collector;
 pub mod tool;
 pub mod translate;
 

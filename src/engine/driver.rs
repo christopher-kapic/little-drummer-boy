@@ -1520,8 +1520,10 @@ impl Driver {
             // is consulted in earnest; a missing approver skips the
             // boundary prompt (never denies).
             approver: self.approver.clone(),
-            // Seed re-exec runs read-only tools only; nothing defers.
+            // Seed re-exec runs read-only tools only; nothing defers or
+            // re-seeds.
             deferred_log: crate::engine::deferred::DeferredLog::new(),
+            seeds: crate::engine::seed_collector::SeedCollector::new(),
         };
         let mut blocks: Vec<String> = Vec::new();
         for seed in seeds {
@@ -1568,6 +1570,263 @@ impl Driver {
             // user turn (which would put two user messages back-to-back).
             self.pending_seed_context = Some(combined);
         }
+    }
+
+    /// Rehydrate a re-query `resume_handle` (GOALS §3c) into the prior
+    /// transcript to resume the subagent from. Returns `Err(message)` — a
+    /// ready-to-deliver clear tool error — when the handle can't be
+    /// rehydrated, so the caller is told to spawn fresh rather than silently
+    /// cold-started:
+    ///
+    /// - the feature is disabled (`defensive` mode — `followup_enabled`
+    ///   false),
+    /// - the handle is unknown / evicted / belongs to another session, or
+    /// - the stored agent doesn't match the requested one / the transcript
+    ///   is unreadable.
+    fn rehydrate_handle(
+        &self,
+        handle: &str,
+        child_agent: &str,
+        followup_enabled: bool,
+    ) -> std::result::Result<Vec<Message>, String> {
+        if !followup_enabled {
+            return Err(stale_handle_error(child_agent));
+        }
+        let loaded = self
+            .session
+            .db
+            .load_subagent_handle(handle, self.session.id)
+            .ok()
+            .flatten();
+        let Some(row) = loaded else {
+            return Err(stale_handle_error(child_agent));
+        };
+        // The handle must belong to the agent the caller is re-querying.
+        if row.agent != child_agent {
+            return Err(stale_handle_error(child_agent));
+        }
+        match serde_json::from_str::<Vec<Message>>(&row.transcript_json) {
+            Ok(history) => Ok(history),
+            Err(_) => Err(stale_handle_error(child_agent)),
+        }
+    }
+
+    /// Persist a read-only noninteractive subagent's transcript and return a
+    /// stable follow-up handle (GOALS §3c). Reuses an existing handle when
+    /// this run was itself a follow-up (so the same handle keeps re-querying);
+    /// otherwise mints a fresh opaque id. Best-effort: a DB failure returns
+    /// `None` (no handle offered) rather than failing the run.
+    fn persist_subagent_handle(
+        &self,
+        child_agent: &str,
+        history: &[Message],
+        existing: Option<&str>,
+    ) -> Option<String> {
+        let transcript_json = serde_json::to_string(history).ok()?;
+        let handle = existing
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("sub-{}", uuid::Uuid::new_v4()));
+        match self.session.db.save_subagent_handle(
+            &handle,
+            self.session.id,
+            child_agent,
+            &transcript_json,
+        ) {
+            Ok(()) => Some(handle),
+            Err(e) => {
+                tracing::warn!(error = %e, "persisting subagent handle failed");
+                None
+            }
+        }
+    }
+
+    /// Inject a re-queryable subagent's seeded read-only results into the
+    /// caller's transcript as native tool-call/result pairs (GOALS §3c). Each
+    /// seed is **re-executed** in the caller's cwd (never replayed from the
+    /// subagent's snapshot), capped under the subagent-report budget via
+    /// [`crate::intel::budget::BudgetedWriter`] with a deterministic
+    /// truncation note. The seed `ToolCall`s are folded into the SAME
+    /// assistant turn that emitted the `task` call — so to the caller they
+    /// look like calls it made itself, and the cached prefix is undisturbed —
+    /// and their `tool_result`s are pushed before the task call's result.
+    ///
+    /// Reuses the seed-replay machinery shape from [`Self::run_seed_tools`]:
+    /// restricted to tools the caller actually holds, read-only, and
+    /// redaction-scrubbed before entering context.
+    async fn inject_seeds(
+        &mut self,
+        seeds: &[crate::engine::compact::SeedTool],
+        task_call_id: &str,
+        tx: &mpsc::Sender<TurnEvent>,
+    ) -> bool {
+        use crate::engine::message::{AssistantContent, Message, OneOrMany, ToolCall};
+        use rig::message::{ToolFunction, ToolResult, ToolResultContent, UserContent};
+
+        let agent = self.stack.last().expect("stack never empty").agent.clone();
+        let ctx = crate::engine::tool::ToolCtx {
+            agent_id: agent.name.clone(),
+            locks: self.locks.clone(),
+            session: self.session.clone(),
+            cwd: self.cwd.clone(),
+            redact: self.redact.clone(),
+            interrupts: self.interrupts.clone(),
+            cancel: tokio_util::sync::CancellationToken::new(),
+            approver: self.approver.clone(),
+            deferred_log: crate::engine::deferred::DeferredLog::new(),
+            seeds: crate::engine::seed_collector::SeedCollector::new(),
+        };
+
+        // Token-budget the combined seed output deterministically: one
+        // `BudgetedWriter` across all seeds, dropping whole seeds once the cap
+        // is reached (atomic, sticky — never a half-written record).
+        let mut budget = crate::intel::budget::BudgetedWriter::new(SEED_INJECTION_TOKEN_CAP);
+        let mut seed_calls: Vec<ToolCall> = Vec::new();
+        let mut seed_results: Vec<Message> = Vec::new();
+
+        for seed in seeds {
+            // Restrict to read-only tools the caller actually holds — never
+            // dispatch a write path or a tool the caller can't see.
+            if !crate::engine::compact::is_read_only_seed_tool(&seed.tool) {
+                continue;
+            }
+            let Some(tool) = agent.tools.get(&seed.tool) else {
+                continue;
+            };
+            let started = std::time::Instant::now();
+            let result = tool.call(seed.args.clone(), &ctx).await;
+            let body = match result {
+                Ok(out) => self.redact.scrub(&out.content),
+                Err(e) => format!("Error: {e}"),
+            };
+            let duration_ms = started.elapsed().as_millis() as u64;
+            // Reserve this seed's output against the shared budget. Drop the
+            // whole seed (call + result) once the cap is reached.
+            if !budget.write(&body) {
+                break;
+            }
+            let call_id = format!("seed-{}", uuid::Uuid::new_v4());
+            let _ = tx
+                .send(TurnEvent::ToolStart {
+                    agent: agent.name.clone(),
+                    call_id: call_id.clone(),
+                    tool: seed.tool.clone(),
+                    args: seed.args.clone(),
+                })
+                .await;
+            let _ = tx
+                .send(TurnEvent::ToolEnd {
+                    agent: agent.name.clone(),
+                    call_id: call_id.clone(),
+                    tool: seed.tool.clone(),
+                    output: body.clone(),
+                    truncated: false,
+                })
+                .await;
+            // Persist the seed as a tool-call audit row + timeline event
+            // (GOALS §14), exactly like a call the caller made itself: a seed
+            // is emitted verbatim, so `wire == original` and there is no
+            // recovery. Without this the injected pair would stream to the
+            // live client but vanish from a session export.
+            if let Err(e) = self.session.record_tool_call(crate::session::ToolCallRow {
+                event_id: uuid::Uuid::new_v4(),
+                timestamp: chrono::Utc::now(),
+                agent: agent.name.clone(),
+                call_id: call_id.clone(),
+                tool: seed.tool.clone(),
+                path: None,
+                original_input_json: seed.args.clone(),
+                wire_input_json: seed.args.clone(),
+                recovery: crate::engine::repair::Recovery::Clean,
+                hard_fail: false,
+                output: body.clone(),
+                truncated: false,
+                duration_ms,
+            }) {
+                tracing::warn!(error = %e, tool = %seed.tool, "persisting seed tool_call failed");
+            }
+            if let Err(e) = self.session.record_event(
+                crate::db::session_log::SessionEventKind::ToolCall,
+                Some(&agent.name),
+                Some(&call_id),
+                &serde_json::json!({
+                    "tool": seed.tool,
+                    "original_input": seed.args,
+                    "wire_input": seed.args,
+                    "recovery_kind": Option::<&str>::None,
+                    "recovery_stage": Option::<&str>::None,
+                    "hard_fail": false,
+                    "output": body,
+                    "truncated": false,
+                    "duration_ms": duration_ms,
+                    "seed": true,
+                }),
+            ) {
+                tracing::warn!(error = %e, "recording seed timeline event failed");
+            }
+            seed_calls.push(ToolCall {
+                id: call_id.clone(),
+                call_id: None,
+                function: ToolFunction {
+                    name: seed.tool.clone(),
+                    arguments: seed.args.clone(),
+                },
+                signature: None,
+                additional_params: None,
+            });
+            seed_results.push(Message::User {
+                content: OneOrMany::one(UserContent::ToolResult(ToolResult {
+                    id: call_id,
+                    call_id: None,
+                    content: OneOrMany::one(ToolResultContent::text(body)),
+                })),
+            });
+        }
+
+        if seed_calls.is_empty() {
+            return budget.is_truncated();
+        }
+
+        // Fold the seed `ToolCall`s into the caller's most recent assistant
+        // message (the turn that emitted the `task` call). This keeps them on
+        // the same turn the model already produced — cache-safe and native —
+        // rather than synthesizing a fresh assistant turn. The matching
+        // `tool_result`s are pushed before the task call's result (delivered
+        // as `next_prompt`), so every tool call in the turn is answered.
+        let history = &mut self.stack.last_mut().expect("stack never empty").history;
+        let mut folded = false;
+        if let Some(Message::Assistant { content, .. }) = history.last_mut() {
+            let has_task_call = content
+                .iter()
+                .any(|c| matches!(c, AssistantContent::ToolCall(tc) if tc.id == task_call_id));
+            if has_task_call {
+                let mut parts: Vec<AssistantContent> = content.iter().cloned().collect();
+                for call in &seed_calls {
+                    parts.push(AssistantContent::ToolCall(call.clone()));
+                }
+                if let Ok(merged) = OneOrMany::many(parts) {
+                    *content = merged;
+                    folded = true;
+                }
+            }
+        }
+        if !folded {
+            // Defensive fallback (the assistant turn wasn't where we expected):
+            // push a fresh assistant turn carrying just the seed calls so the
+            // pairs are still well-formed.
+            if let Ok(content) = OneOrMany::many(
+                seed_calls
+                    .iter()
+                    .cloned()
+                    .map(AssistantContent::ToolCall)
+                    .collect::<Vec<_>>(),
+            ) {
+                history.push(Message::Assistant { id: None, content });
+            }
+        }
+        for msg in seed_results {
+            history.push(msg);
+        }
+        budget.is_truncated()
     }
 
     /// Begin compact-after-delegation tracking for the paused parent frame
@@ -1971,6 +2230,11 @@ impl Driver {
                     self.loop_guard_threshold,
                     is_root,
                     deferred_log,
+                    // The main/interactive frames never register the `seed`
+                    // tool (it's a read-only-noninteractive-subagent + normal-
+                    // mode affordance, GOALS §3c); a fresh empty collector
+                    // satisfies the signature and is never drained here.
+                    crate::engine::seed_collector::SeedCollector::new(),
                     tx,
                 )
                 .await
@@ -2169,6 +2433,8 @@ impl Driver {
                 TurnOutcome::SpawnNoninteractive {
                     child_agent,
                     prompt: brief,
+                    why,
+                    resume_handle,
                     task_call_id,
                     task_function_call_id,
                 } => {
@@ -2202,44 +2468,106 @@ impl Driver {
                         .clone();
                     let (tracker, shrink_handle) = self.begin_delegation_shrink(parent_full);
 
-                    // `docs` is a fixed two-stage pipeline (Docs.1
-                    // resolver in caller cwd → Docs.2 answerer in the
-                    // resolved package dir). Everything else is a single
-                    // noninteractive agent loop.
+                    // The whole re-query/seed feature is `normal`-mode only
+                    // (GOALS §3c). Gated at the capability level, not just in
+                    // description text — the first behavioral gate on the
+                    // `LlmMode` axis.
+                    let llm_mode = self.stack[0].agent.llm_mode;
+                    let followup_enabled =
+                        crate::engine::tool::Capability::FollowupSeed.enabled(llm_mode);
+
+                    // Compose the child's brief, injecting the caller's `why`
+                    // (motivation) so the subagent can tailor what it surfaces.
+                    let composed_brief = compose_subagent_brief(&brief, &why);
+
+                    // `docs` is a fixed two-stage pipeline (Docs.1 resolver in
+                    // caller cwd → Docs.2 answerer in the resolved package
+                    // dir), leaf-terminated and NEVER re-queryable (GOALS §3c).
+                    // Everything else is a single noninteractive agent loop.
+                    //
+                    // `seeds`, `transcript`, and `handle` are produced only on
+                    // the re-queryable read-only noninteractive path.
+                    let mut seeds: Vec<crate::engine::compact::SeedTool> = Vec::new();
+                    let mut new_handle: Option<String> = None;
                     let report = if child_agent == "docs" {
-                        match crate::engine::docs_pipeline::run(
-                            &brief,
-                            &self.spawn_args(false),
-                            self.session.clone(),
-                            self.locks.clone(),
-                            self.redact.clone(),
-                            cancel.clone(),
-                        )
-                        .await
-                        {
-                            Ok(text) => text,
-                            Err(e) => format!("Error: {e:#}"),
+                        // Reject a follow-up against a docs run outright — the
+                        // pipeline is excluded; never silently cold-start it.
+                        if resume_handle.is_some() {
+                            stale_handle_error(&child_agent)
+                        } else {
+                            match crate::engine::docs_pipeline::run(
+                                &brief,
+                                &self.spawn_args(false),
+                                self.session.clone(),
+                                self.locks.clone(),
+                                self.redact.clone(),
+                                cancel.clone(),
+                            )
+                            .await
+                            {
+                                Ok(text) => text,
+                                Err(e) => format!("Error: {e:#}"),
+                            }
                         }
                     } else {
-                        let child =
-                            crate::engine::builtin::load(&child_agent, &self.spawn_args(false))?;
-                        match run_noninteractive(
-                            child,
-                            self.redact.scrub(&brief),
-                            self.session.clone(),
-                            self.locks.clone(),
-                            self.redact.clone(),
-                            self.cwd.clone(),
-                            self.interrupts.clone(),
-                            cancel.clone(),
-                            self.approver.clone(),
-                            self.loop_guard_threshold,
-                            EXPLORE_MAX_TURNS,
-                        )
-                        .await
-                        {
-                            Ok(text) => text,
-                            Err(e) => format!("Error: {e:#}"),
+                        // Rehydrate a prior transcript when a follow-up names a
+                        // handle. A handle that can't be rehydrated (disabled
+                        // mode, unknown/evicted, or a non-read-only agent) is a
+                        // clear tool error — never a silent cold start.
+                        let rehydrated = match &resume_handle {
+                            None => Ok(Vec::new()),
+                            Some(handle) => {
+                                self.rehydrate_handle(handle, &child_agent, followup_enabled)
+                            }
+                        };
+                        match rehydrated {
+                            Err(msg) => msg,
+                            Ok(prior_history) => {
+                                let child = crate::engine::builtin::load(
+                                    &child_agent,
+                                    &self.spawn_args(false),
+                                )?;
+                                let read_only =
+                                    crate::engine::builtin::is_read_only_noninteractive(&child);
+                                // Seeds are collected only when the feature is
+                                // on AND this is a read-only noninteractive
+                                // subagent (the only agents granted `seed`).
+                                let collector = crate::engine::seed_collector::SeedCollector::new();
+                                let run = run_noninteractive_resumable(
+                                    child,
+                                    self.redact.scrub(&composed_brief),
+                                    prior_history,
+                                    collector.clone(),
+                                    self.session.clone(),
+                                    self.locks.clone(),
+                                    self.redact.clone(),
+                                    self.cwd.clone(),
+                                    self.interrupts.clone(),
+                                    cancel.clone(),
+                                    self.approver.clone(),
+                                    self.loop_guard_threshold,
+                                    EXPLORE_MAX_TURNS,
+                                )
+                                .await;
+                                match run {
+                                    Err(e) => format!("Error: {e:#}"),
+                                    Ok(outcome) => {
+                                        if followup_enabled && read_only {
+                                            // Persist the transcript + mint a
+                                            // stable handle (GOALS §3c). On
+                                            // failure the run still succeeds —
+                                            // we just don't offer a handle.
+                                            new_handle = self.persist_subagent_handle(
+                                                &child_agent,
+                                                &outcome.history,
+                                                resume_handle.as_deref(),
+                                            );
+                                            seeds = collector.drain();
+                                        }
+                                        outcome.report
+                                    }
+                                }
+                            }
                         }
                     };
 
@@ -2248,6 +2576,36 @@ impl Driver {
                     // and apply to the paused parent frame.
                     self.finish_delegation_shrink(tracker, shrink_handle, tx)
                         .await;
+
+                    // Inject any seeded read-only results into the caller's
+                    // transcript as native tool-call/result pairs, capped under
+                    // the subagent-report budget (GOALS §3c/§10). Must run
+                    // AFTER `finish_delegation_shrink` — that may replace the
+                    // parent history with a shrunk clone, which would drop the
+                    // appended pairs. The seed calls are folded into the SAME
+                    // assistant turn that emitted the `task` call (cache-safe),
+                    // and their tool_results are pushed before the task result.
+                    let seeds_truncated = if seeds.is_empty() {
+                        false
+                    } else {
+                        self.inject_seeds(&seeds, &task_call_id, tx).await
+                    };
+
+                    // Append the re-query handle to the report so the caller
+                    // can follow up, plus a deterministic truncation note when
+                    // seeds were dropped under the budget (GOALS §3c). Done
+                    // after the shrink so the capped report carries them.
+                    let mut report = report;
+                    if seeds_truncated {
+                        report.push_str(
+                            "\n\n[note: some seeded results were omitted to stay within the report budget]",
+                        );
+                    }
+                    let report = match &new_handle {
+                        Some(handle) => format!("{report}{}", handle_footer(handle)),
+                        None => report,
+                    };
+
                     // Timeline event (Part B): the noninteractive subagent's
                     // report. This path emits ToolStart/End directly (not
                     // through `turn`'s dispatch loop), so the report is
@@ -2269,6 +2627,7 @@ impl Driver {
                             report: report.clone(),
                         })
                         .await;
+
                     // Deliver the result as the parent's next prompt.
                     next_prompt = Message::tool_result_with_call_id(
                         task_call_id,
@@ -2514,6 +2873,43 @@ fn context_metrics(
 /// without cutting legitimate work short.
 pub(crate) const EXPLORE_MAX_TURNS: usize = 64;
 
+/// Token cap on the seeded read-only results a re-queryable subagent injects
+/// into its caller's transcript (GOALS §3c). Seeds are real injected context,
+/// so they ride the standard subagent-report budget (§10) — the same default
+/// cap as an async job's injected result ([`crate::engine::jobs::ASYNC_RESULT_TOKEN_CAP`]).
+/// Enforced via [`crate::intel::budget::BudgetedWriter`]: whole seeds are
+/// dropped once the cap is reached, deterministically, with a truncation note.
+const SEED_INJECTION_TOKEN_CAP: usize = crate::engine::jobs::ASYNC_RESULT_TOKEN_CAP;
+
+/// Compose a noninteractive subagent's brief, injecting the caller's `why`
+/// (motivation, GOALS §3c) as a terse leading line so the subagent can tailor
+/// what it surfaces/seeds. An empty `why` adds nothing (token economy).
+fn compose_subagent_brief(brief: &str, why: &str) -> String {
+    let why = why.trim();
+    if why.is_empty() {
+        return brief.to_string();
+    }
+    format!("[why the caller is asking: {why}]\n\n{brief}")
+}
+
+/// The clear tool error returned when a `resume_handle` can't be rehydrated
+/// (unknown, evicted, a `docs` run, or the feature is disabled). Tells the
+/// caller to spawn a fresh subagent — never a silent cold start (GOALS §3c).
+fn stale_handle_error(child_agent: &str) -> String {
+    format!(
+        "Error: no resumable subagent for that `resume_handle` (unknown, expired, \
+         or not re-queryable). Spawn a fresh `{child_agent}` subagent instead (omit \
+         `resume_handle`)."
+    )
+}
+
+/// The footer appended to a re-queryable subagent's report carrying its
+/// follow-up handle (GOALS §3c). Terse + machine-stable so the caller's model
+/// can extract and re-use it.
+fn handle_footer(handle: &str) -> String {
+    format!("\n\n[follow-up handle: {handle} — pass as `resume_handle` to re-query this subagent]")
+}
+
 /// Run a child agent's loop to completion synchronously. Used for
 /// noninteractive subagents — explore primarily. Drops the child's
 /// per-turn events on the floor (the parent's history already has a
@@ -2536,6 +2932,59 @@ pub(crate) async fn run_noninteractive(
     loop_guard_threshold: u32,
     max_turns: usize,
 ) -> Result<String> {
+    // The docs pipeline (the only other caller) neither rehydrates nor
+    // seeds: a fresh transcript, no prior history, and a throwaway seed
+    // collector. It only needs the report text.
+    let out = run_noninteractive_resumable(
+        child,
+        brief,
+        Vec::new(),
+        crate::engine::seed_collector::SeedCollector::new(),
+        session,
+        locks,
+        redact,
+        cwd,
+        interrupts,
+        cancel,
+        approver,
+        loop_guard_threshold,
+        max_turns,
+    )
+    .await?;
+    Ok(out.report)
+}
+
+/// A finished noninteractive run: the report text plus the full transcript
+/// (so the driver can persist a re-query handle, GOALS §3c).
+pub(crate) struct NoninteractiveOutcome {
+    /// The subagent's final text + any deferred-log section.
+    pub report: String,
+    /// The complete `Vec<Message>` transcript (prior history + this run),
+    /// persisted as a handle for read-only noninteractive subagents in
+    /// normal mode.
+    pub history: Vec<Message>,
+}
+
+/// Run a child agent's loop to completion, optionally **rehydrated** from a
+/// prior transcript (`prior_history`) and collecting any `seed` calls into
+/// `seeds`. Returns the report + the full transcript. [`run_noninteractive`]
+/// is the no-rehydrate, no-seed wrapper used by the `docs` pipeline.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_noninteractive_resumable(
+    child: Agent,
+    brief: String,
+    prior_history: Vec<Message>,
+    seeds: crate::engine::seed_collector::SeedCollector,
+    session: Arc<Session>,
+    locks: Arc<crate::locks::LockManager>,
+    redact: Arc<RedactionTable>,
+    cwd: std::path::PathBuf,
+    interrupts: Arc<crate::engine::interrupt::InterruptHub>,
+    cancel: tokio_util::sync::CancellationToken,
+    approver: Option<Arc<crate::approval::Approver>>,
+    loop_guard_threshold: u32,
+    max_turns: usize,
+) -> Result<NoninteractiveOutcome> {
     use crate::engine::agent::turn;
 
     // The child needs an event channel; we drain and discard.
@@ -2543,7 +2992,9 @@ pub(crate) async fn run_noninteractive(
     let drain = tokio::spawn(async move { while sink_rx.recv().await.is_some() {} });
 
     let agent = Arc::new(child);
-    let mut history: Vec<Message> = Vec::new();
+    // Rehydration: a follow-up starts from the subagent's prior transcript,
+    // so it answers with full knowledge of what it already did (GOALS §3c).
+    let mut history: Vec<Message> = prior_history;
     let mut next_prompt = Message::user(brief);
     // A noninteractive subagent's own deferred-log (`plan.md §3d`). The
     // bundled leaves (explore/docs) lack `defer_to_orchestrator`, so this
@@ -2569,6 +3020,7 @@ pub(crate) async fn run_noninteractive(
             // instructions-file diff injection.
             false,
             deferred_log.clone(),
+            seeds.clone(),
             &sink_tx,
         )
         .await?;
@@ -2582,11 +3034,12 @@ pub(crate) async fn run_noninteractive(
                 drop(sink_tx);
                 let _ = drain.await;
                 let deferred = deferred_log.drain();
-                return Ok(format!(
+                let report = format!(
                     "{}{}",
                     collect_final_text(&history),
                     crate::engine::deferred::format_section(&deferred)
-                ));
+                );
+                return Ok(NoninteractiveOutcome { report, history });
             }
             TurnOutcome::SpawnSubagent { .. }
             | TurnOutcome::SpawnNoninteractive { .. }
@@ -3331,5 +3784,265 @@ mod tests {
 
         // No-cache provider is always cold → swapped to the shrunk context.
         assert!(prune::dedup_plan(&driver.stack[0].history).is_empty());
+    }
+
+    // ---- re-queryable subagents + seeding (GOALS §3c) --------------------
+
+    use crate::engine::compact::SeedTool;
+
+    /// Persist a transcript under a handle, then rehydrate it: the round trip
+    /// returns the same messages, so a follow-up resumes with prior context.
+    #[test]
+    fn rehydrate_handle_persist_round_trip() {
+        let (driver, _t) = test_driver(8);
+        let history = vec![
+            Message::user("earlier question"),
+            Message::assistant("earlier answer"),
+        ];
+        let handle = driver
+            .persist_subagent_handle("explore", &history, None)
+            .expect("a handle is minted");
+        // Enabled (normal-mode gate passed) + matching agent → rehydrated.
+        let got = driver
+            .rehydrate_handle(&handle, "explore", true)
+            .expect("rehydrates");
+        assert_eq!(got.len(), history.len());
+    }
+
+    /// An unknown handle is a clear tool error telling the caller to spawn
+    /// fresh — never a silent cold start.
+    #[test]
+    fn rehydrate_handle_unknown_is_stale_error() {
+        let (driver, _t) = test_driver(8);
+        let err = driver
+            .rehydrate_handle("sub-does-not-exist", "explore", true)
+            .unwrap_err();
+        assert!(err.contains("resume_handle"), "{err}");
+        assert!(err.contains("fresh"), "{err}");
+    }
+
+    /// In defensive mode the whole feature is disabled at the capability
+    /// level: even a valid handle is rejected (the only path is a fresh
+    /// spawn). Gates behavior, not just description text.
+    #[test]
+    fn rehydrate_handle_disabled_in_defensive() {
+        let (driver, _t) = test_driver(8);
+        let history = vec![Message::user("q")];
+        let handle = driver
+            .persist_subagent_handle("explore", &history, None)
+            .unwrap();
+        // `followup_enabled = false` models the defensive gate
+        // (`Capability::FollowupSeed.enabled(Defensive) == false`).
+        let err = driver
+            .rehydrate_handle(&handle, "explore", false)
+            .unwrap_err();
+        assert!(err.contains("fresh"), "{err}");
+    }
+
+    /// A handle that belongs to a different agent (and, by construction, any
+    /// `docs` follow-up — the pipeline never persists a handle) is stale.
+    #[test]
+    fn rehydrate_handle_wrong_agent_is_stale() {
+        let (driver, _t) = test_driver(8);
+        let handle = driver
+            .persist_subagent_handle("explore", &[Message::user("q")], None)
+            .unwrap();
+        // Re-querying as `docs` against an `explore` handle → stale (and docs
+        // never mints one anyway, so this is the only outcome it can hit).
+        let err = driver.rehydrate_handle(&handle, "docs", true).unwrap_err();
+        assert!(err.contains("fresh"), "{err}");
+    }
+
+    /// A follow-up persists under the SAME handle (passed as `existing`), so
+    /// the caller can keep re-querying with one stable handle.
+    #[test]
+    fn persist_reuses_existing_handle_on_followup() {
+        let (driver, _t) = test_driver(8);
+        let h1 = driver
+            .persist_subagent_handle("explore", &[Message::user("q1")], None)
+            .unwrap();
+        let h2 = driver
+            .persist_subagent_handle(
+                "explore",
+                &[Message::user("q1"), Message::user("q2")],
+                Some(&h1),
+            )
+            .unwrap();
+        assert_eq!(h1, h2, "a follow-up keeps the same handle");
+        // The transcript was refreshed (upsert) to the longer history.
+        let got = driver.rehydrate_handle(&h2, "explore", true).unwrap();
+        assert_eq!(got.len(), 2);
+    }
+
+    /// Build a driver whose root (caller) agent holds the `read` tool so
+    /// `inject_seeds` can re-execute a `read` seed in the caller's cwd.
+    fn driver_with_read_caller() -> (Driver, tempfile::TempDir) {
+        let (mut driver, tmp) = test_driver(8);
+        let old = driver.stack[0].agent.clone();
+        let tools = crate::engine::tool::ToolBox::new()
+            .with(std::sync::Arc::new(crate::tools::read::ReadTool));
+        driver.stack[0].agent = std::sync::Arc::new(Agent {
+            name: old.name.clone(),
+            system: old.system.clone(),
+            tools,
+            model: old.model.clone(),
+            params: old.params.clone(),
+            llm_mode: crate::config::extended::LlmMode::Normal,
+        });
+        (driver, tmp)
+    }
+
+    /// A caller assistant turn that ends in a `task` tool call (the turn a
+    /// noninteractive delegation came from). `inject_seeds` folds seed calls
+    /// into this turn.
+    fn assistant_with_task_call(task_call_id: &str) -> Message {
+        use crate::engine::message::{AssistantContent, OneOrMany, ToolCall};
+        use rig::message::ToolFunction;
+        Message::Assistant {
+            id: None,
+            content: OneOrMany::one(AssistantContent::ToolCall(ToolCall {
+                id: task_call_id.to_string(),
+                call_id: None,
+                function: ToolFunction {
+                    name: "task".into(),
+                    arguments: serde_json::json!({ "agent": "explore", "prompt": "go" }),
+                },
+                signature: None,
+                additional_params: None,
+            })),
+        }
+    }
+
+    /// Seeds re-execute in the caller's cwd and land as native tool-call/
+    /// result pairs folded into the task turn; oversized seeds are dropped
+    /// under the budget and truncation is reported.
+    #[tokio::test]
+    async fn inject_seeds_caps_under_budget_and_injects_pairs() {
+        let (mut driver, tmp) = driver_with_read_caller();
+        // A small file (fits) followed by several sizeable ones. Each
+        // sizeable file is ~1.5K tokens of distinct lines; the shared 2K-token
+        // seed budget admits the small one, then trips before all the big ones
+        // fit — so at least one whole seed is dropped, deterministically.
+        let small = tmp.path().join("small.txt");
+        std::fs::write(&small, "hello\n").unwrap();
+        let mut big_paths = Vec::new();
+        for i in 0..3 {
+            let p = tmp.path().join(format!("big{i}.txt"));
+            // ~600 short, distinct lines → comfortably above ~1K tokens each.
+            let body: String = (0..600).map(|n| format!("file{i} line {n}\n")).collect();
+            std::fs::write(&p, body).unwrap();
+            big_paths.push(p);
+        }
+
+        // The caller's last turn is the `task` call the delegation came from.
+        let task_call_id = "task-1";
+        driver.stack[0].history = vec![
+            Message::user("please investigate"),
+            assistant_with_task_call(task_call_id),
+        ];
+
+        let mut seeds = vec![SeedTool {
+            tool: "read".into(),
+            args: serde_json::json!({ "path": small.to_string_lossy() }),
+        }];
+        for p in &big_paths {
+            seeds.push(SeedTool {
+                tool: "read".into(),
+                args: serde_json::json!({ "path": p.to_string_lossy() }),
+            });
+        }
+
+        let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
+        let truncated = driver.inject_seeds(&seeds, task_call_id, &tx).await;
+        drop(tx);
+        while rx.recv().await.is_some() {}
+
+        // The cumulative seed output blew the 2K budget → truncation reported,
+        // at least one whole seed dropped.
+        assert!(truncated, "oversized seeds should trip the budget");
+
+        let history = &driver.stack[0].history;
+        // The task turn now carries the original task call PLUS exactly one
+        // seed tool call (the small read); the big one was dropped whole.
+        let last_assistant = history
+            .iter()
+            .rev()
+            .find_map(|m| match m {
+                Message::Assistant { content, .. } => Some(content),
+                _ => None,
+            })
+            .unwrap();
+        use crate::engine::message::AssistantContent;
+        let tool_calls: Vec<_> = last_assistant
+            .iter()
+            .filter_map(|c| match c {
+                AssistantContent::ToolCall(tc) => Some(tc.function.name.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            tool_calls.iter().any(|n| n == "task"),
+            "task call preserved"
+        );
+        let seed_calls = tool_calls.iter().filter(|n| *n == "read").count();
+        // At least the small seed fit, and at least one big seed was dropped
+        // (so fewer than the 4 requested were folded in).
+        assert!(seed_calls >= 1, "in-budget seeds folded in");
+        assert!(seed_calls < seeds.len(), "an over-budget seed was dropped");
+
+        // Each folded seed call has exactly one matching tool_result pair.
+        use rig::message::UserContent;
+        let tool_results = history
+            .iter()
+            .filter(|m| {
+                matches!(m, Message::User { content }
+                    if content.iter().any(|c| matches!(c, UserContent::ToolResult(_))))
+            })
+            .count();
+        assert_eq!(tool_results, seed_calls, "one result pair per folded seed");
+
+        // Each folded seed is also persisted as a tool-call audit row (GOALS
+        // §14) so it survives in a session export, not just the live stream.
+        // A seed is emitted verbatim → `wire == original`, no recovery.
+        let rows = driver
+            .session
+            .db
+            .list_tool_calls_for_session(driver.session.id)
+            .unwrap();
+        let seed_rows: Vec<_> = rows.iter().filter(|r| r.tool == "read").collect();
+        assert_eq!(
+            seed_rows.len(),
+            seed_calls,
+            "each folded seed has a persisted tool-call row"
+        );
+        for r in seed_rows {
+            assert!(r.call_id.starts_with("seed-"), "seed row tagged as a seed");
+            assert_eq!(
+                r.wire_input_json, r.original_input_json,
+                "a seed is verbatim: wire == original (GOALS §14)"
+            );
+            assert_eq!(r.recovery, crate::engine::repair::Recovery::Clean);
+        }
+    }
+
+    /// A seed naming a tool the caller doesn't hold (or a non-read-only tool)
+    /// is skipped — `inject_seeds` never dispatches a write/unknown path.
+    #[tokio::test]
+    async fn inject_seeds_skips_tools_the_caller_lacks() {
+        let (mut driver, _t) = driver_with_read_caller();
+        let task_call_id = "task-1";
+        driver.stack[0].history = vec![assistant_with_task_call(task_call_id)];
+        // `outline` is read-only but the caller (read-only `read` toolbox)
+        // doesn't hold it → skipped; nothing is folded in.
+        let seeds = vec![SeedTool {
+            tool: "outline".into(),
+            args: serde_json::json!({ "path": "/x.rs" }),
+        }];
+        let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
+        let _ = driver.inject_seeds(&seeds, task_call_id, &tx).await;
+        drop(tx);
+        while rx.recv().await.is_some() {}
+        // History unchanged: only the original task turn remains.
+        assert_eq!(driver.stack[0].history.len(), 1);
     }
 }

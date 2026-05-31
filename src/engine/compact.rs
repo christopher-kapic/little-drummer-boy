@@ -51,6 +51,16 @@ fn is_seed_tool(name: &str) -> bool {
     SEED_TOOLS.contains(&name)
 }
 
+/// Whether `name` is a read-only / idempotent tool eligible to be emitted as
+/// a seed and re-executed in another agent's context. Shared by the
+/// `/compact` handoff and the re-queryable-subagent `seed` tool (GOALS §3c)
+/// so both honor one allowlist. The sandboxed `grep`/`glob` (docs-answerer
+/// only) are included as read-only for completeness; the driver re-exec is
+/// the hard gate (it only dispatches a seed the *caller* actually holds).
+pub fn is_read_only_seed_tool(name: &str) -> bool {
+    is_seed_tool(name) || matches!(name, "grep" | "glob")
+}
+
 /// One seed-tool to re-execute at the start of the new thread. Carries
 /// the tool name + the canonical args from the prior call; the new
 /// session dispatches it fresh (never replays the old output).

@@ -208,6 +208,9 @@ async fn run_iteration(
             // A loop fork is a leaf with no parent to defer to; it carries a
             // fresh empty deferred-log that nobody reads (`plan.md §3d`).
             crate::engine::deferred::DeferredLog::new(),
+            // A loop fork is a leaf that never seeds to a caller (GOALS §3c);
+            // a fresh empty collector satisfies the signature, never drained.
+            crate::engine::seed_collector::SeedCollector::new(),
             turn_tx,
         )
         .await?;

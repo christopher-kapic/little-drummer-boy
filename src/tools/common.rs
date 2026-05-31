@@ -201,6 +201,7 @@ pub(crate) fn test_ctx(root: &Path) -> ToolCtx {
         cancel: tokio_util::sync::CancellationToken::new(),
         approver: None,
         deferred_log: crate::engine::deferred::DeferredLog::new(),
+        seeds: crate::engine::seed_collector::SeedCollector::new(),
     }
 }
 

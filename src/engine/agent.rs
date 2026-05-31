@@ -307,6 +307,14 @@ pub enum TurnOutcome {
     SpawnNoninteractive {
         child_agent: String,
         prompt: String,
+        /// The caller's motivation (`task.why`, GOALS §3c), threaded into the
+        /// subagent's context so it can tailor what it surfaces/seeds. Empty
+        /// when omitted.
+        why: String,
+        /// A follow-up against a prior read-only subagent (`task.resume_handle`,
+        /// GOALS §3c): the driver rehydrates that subagent's transcript and
+        /// re-runs it. `None` for a fresh spawn. Honored only in normal mode.
+        resume_handle: Option<String>,
         task_call_id: String,
         task_function_call_id: Option<String>,
     },
@@ -360,6 +368,7 @@ pub async fn turn(
     loop_guard_threshold: u32,
     is_root: bool,
     deferred_log: crate::engine::deferred::DeferredLog,
+    seeds: crate::engine::seed_collector::SeedCollector,
     tx: &mpsc::Sender<TurnEvent>,
 ) -> Result<TurnOutcome> {
     let tools = agent.tools.definitions(agent.llm_mode);
@@ -544,6 +553,7 @@ pub async fn turn(
         cancel,
         approver,
         deferred_log,
+        seeds,
     };
 
     for tc in &calls {
@@ -580,6 +590,24 @@ pub async fn turn(
                 Some("subagent") => true,
                 _ => crate::engine::builtin::is_noninteractive(&child),
             };
+            // Re-queryable-subagent fields (GOALS §3c). Both are present in the
+            // `task` schema from session start (cache-safe fixed shape); the
+            // capability is gated behaviorally in the driver, not here.
+            let why = tc
+                .function
+                .arguments
+                .get("why")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let resume_handle = tc
+                .function
+                .arguments
+                .get("resume_handle")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
             // Timeline event (Part B): a `task` delegation spawned a
             // child. Carries the child agent, the triggering task call id,
             // and the brief. (Interactive subagents share this session's
@@ -616,6 +644,8 @@ pub async fn turn(
             return Ok(TurnOutcome::SpawnNoninteractive {
                 child_agent: child,
                 prompt,
+                why,
+                resume_handle,
                 task_call_id: tc.id.clone(),
                 task_function_call_id: tc.call_id.clone(),
             });
@@ -1475,6 +1505,7 @@ mod safety_gate_tests {
             cancel: tokio_util::sync::CancellationToken::new(),
             approver,
             deferred_log: crate::engine::deferred::DeferredLog::new(),
+            seeds: crate::engine::seed_collector::SeedCollector::new(),
         }
     }
 
